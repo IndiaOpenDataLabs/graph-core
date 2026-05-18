@@ -17,7 +17,7 @@ class CreateCollectionRequest(BaseModel):
     default_query_mode: str | None = None
 
 
-class CollectionResponse(BaseModel):
+class CreateCollectionResponse(BaseModel):
     id: str
     name: str
     strategy: str
@@ -35,7 +35,7 @@ async def create_collection(
     body: CreateCollectionRequest,
     namespace_id: uuid.UUID,
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> CollectionResponse:
+) -> CreateCollectionResponse:
     """Create a new collection bound to the namespace."""
     try:
         collection = await service.create_collection(
@@ -54,13 +54,13 @@ async def create_collection(
 async def list_collections(
     namespace_id: uuid.UUID,
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> list[CollectionResponse]:
+) -> list[CreateCollectionResponse]:
     collections = await service.list_collections(namespace_id)
     return [_to_response(c) for c in collections]
 
 
-def _to_response(c) -> CollectionResponse:
-    return CollectionResponse(
+def _to_response(c) -> CreateCollectionResponse:
+    return CreateCollectionResponse(
         id=str(c.id),
         name=c.name,
         strategy=c.strategy,

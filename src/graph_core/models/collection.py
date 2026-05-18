@@ -19,7 +19,7 @@ class Collection(Base):
     description = Column(String(1024), nullable=True)
 
     # Strategy: immutable after creation
-    strategy = Column(Enum("vector", "custom_graph_rag", name="rag_strategy", create_type=True), nullable=False)
+    strategy = Column(Enum("vector", "light_rag", "custom_graph_rag", name="rag_strategy", create_type=True), nullable=False)
     default_query_mode = Column(String(64), nullable=True)
 
     # Embedding profile: immutable after creation

@@ -51,7 +51,7 @@ class GraphService:
         self,
         name: str,
         namespace_id: uuid.UUID,
-        strategy: Literal["vector", "custom_graph_rag"] = "vector",
+        strategy: Literal["vector", "custom_graph_rag", "light_rag"] = "vector",
         embedding_profile_id: uuid.UUID | None = None,
         default_query_mode: str | None = None,
     ) -> Collection:
@@ -107,6 +107,8 @@ class GraphService:
         # Strategy dispatch
         if collection.strategy == "vector":
             result = await self._ingest_vector_chunk(sanitized_text, collection, chunk_hash, report)
+        elif collection.strategy == "light_rag":
+            result = await self._ingest_lightrag_chunk(sanitized_text, collection, chunk_hash, report)
         else:
             result = await self._ingest_graph_chunk(sanitized_text, collection, chunk_hash, report)
 
@@ -223,6 +225,12 @@ class GraphService:
         self, text: str, collection: Collection, chunk_hash: str, report
     ) -> ChunkIngestionResult:
         # TODO: chunk → embed → ChromaDB upsert
+        return ChunkIngestionResult(chunk_hash=chunk_hash, entity_count=0, relationship_count=0)
+
+    async def _ingest_lightrag_chunk(
+        self, text: str, collection: Collection, chunk_hash: str, report
+    ) -> ChunkIngestionResult:
+        # TODO: LightRAG.insert(text) → library-managed storage → returns extraction summary
         return ChunkIngestionResult(chunk_hash=chunk_hash, entity_count=0, relationship_count=0)
 
     async def _ingest_graph_chunk(

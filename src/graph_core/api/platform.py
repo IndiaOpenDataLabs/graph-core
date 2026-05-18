@@ -12,7 +12,7 @@ class RegisterCredentialRequest(BaseModel):
     label: str | None = None
 
 
-class CredentialResponse(BaseModel):
+class RegisterCredentialResponse(BaseModel):
     credential_id: str
     provider: str
     label: str | None
@@ -32,11 +32,11 @@ async def get_capabilities() -> dict:
     }
 
 
-@router.post("/credentials", response_model=CredentialResponse)
+@router.post("/credentials", response_model=RegisterCredentialResponse)
 async def register_cred(
     body: RegisterCredentialRequest,
     namespace_id: uuid.UUID,
-) -> CredentialResponse:
+) -> RegisterCredentialResponse:
     """Register encrypted credential. Returns credential_id for profile binding."""
     # TODO: encrypt secret, store in Credential model
     raise NotImplementedError("Credential storage pending encryption implementation")
