@@ -1,15 +1,17 @@
 """GraphService — unit tests."""
 
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
+from sqlalchemy import select
 
 from graph_core.models.job import Job
+from graph_core.models.profile import Profile
+from graph_core.models.vector_chunk import VectorChunk
 from graph_core.services.graph import (
     ChunkIngestionResult,
     DocumentIngestionResult,
-    GraphService,
 )
 
 
@@ -62,6 +64,13 @@ async def test_ingest_chunk_vector(service, test_collection):
     assert isinstance(result, ChunkIngestionResult)
     assert result.chunk_hash is not None
 
+    from graph_core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(select(VectorChunk))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].content == "hello world"
+
 
 @pytest.mark.asyncio
 async def test_ingest_chunk_namespace_enforcement(service, test_collection, test_namespace):
@@ -110,6 +119,61 @@ async def test_query_uses_collection_default(service, test_collection):
 
 
 @pytest.mark.asyncio
+async def test_query_vector_returns_relevant_chunks(service, test_collection):
+    await service.ingest_chunk(
+        "Krishna teaches Arjuna about duty and devotion.",
+        test_collection.id,
+        test_collection.namespace_id,
+    )
+    await service.ingest_chunk(
+        "A recipe for lentil soup uses cumin and turmeric.",
+        test_collection.id,
+        test_collection.namespace_id,
+    )
+
+    result = await service.query(
+        "What does Krishna teach Arjuna?",
+        test_collection.id,
+        test_collection.namespace_id,
+    )
+
+    assert "Krishna teaches Arjuna" in result.response
+    assert "lentil soup" not in result.response
+
+
+@pytest.mark.asyncio
+async def test_collection_embedding_profile_is_used(service, test_namespace):
+    from graph_core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        profile = Profile(
+            namespace_id=test_namespace.id,
+            kind="embedding",
+            provider="local_hash",
+            model="hash-256",
+            dimensions=16,
+            distance_metric="cosine",
+        )
+        session.add(profile)
+        await session.commit()
+        await session.refresh(profile)
+
+    collection = await service.create_collection(
+        name="profile-bound",
+        namespace_id=test_namespace.id,
+        strategy="vector",
+        embedding_profile_id=profile.id,
+    )
+
+    result = await service.ingest_chunk(
+        "Rama walks through the forest with Sita.",
+        collection.id,
+        test_namespace.id,
+    )
+    assert result.chunk_hash
+
+
+@pytest.mark.asyncio
 async def test_get_job_not_found(service):
     with pytest.raises(ValueError, match="not found"):
         await service.get_job(uuid.uuid4())
@@ -122,3 +186,65 @@ async def test_update_and_get_job(service):
     await service.update_job_status(job_id, "running", progress_percent=50)
     # Note: job doesn't exist yet, update is a no-op in current impl
     # This tests the update path without crash
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_pipeline_processes_stored_payload(
+    service, test_collection
+):
+    from graph_core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="pending",
+            payload={
+                "text": "Krishna teaches Arjuna. " * 200,
+            },
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        job_id = job.id
+
+    await service.ingest_document_pipeline(job_id)
+
+    async with AsyncSessionLocal() as session:
+        vector_rows = (await session.execute(select(VectorChunk))).scalars().all()
+        refreshed_job = await session.get(Job, job_id)
+
+    assert len(vector_rows) >= 1
+    assert refreshed_job is not None
+    assert refreshed_job.progress_percent == 100
+
+
+@pytest.mark.asyncio
+async def test_query_accepts_llm_profile_id(service, test_namespace, test_collection):
+    from graph_core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        llm_profile = Profile(
+            namespace_id=test_namespace.id,
+            kind="llm",
+            provider="local_echo",
+            model="echo-v1",
+            label="local-echo",
+        )
+        session.add(llm_profile)
+        await session.commit()
+        await session.refresh(llm_profile)
+
+    await service.ingest_chunk(
+        "Bhishma explains duty from the bed of arrows.",
+        test_collection.id,
+        test_collection.namespace_id,
+    )
+    result = await service.query(
+        "What does Bhishma explain?",
+        test_collection.id,
+        test_collection.namespace_id,
+        llm_profile_id=llm_profile.id,
+    )
+    assert "Bhishma explains duty" in result.response

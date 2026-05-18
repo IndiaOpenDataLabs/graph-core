@@ -6,6 +6,7 @@ from graph_core.models.credential import Credential
 from graph_core.models.profile import Profile
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.ingestion import IngestionRecord
+from graph_core.models.vector_chunk import VectorChunk
 
 __all__ = [
     "Namespace",
@@ -15,4 +16,5 @@ __all__ = [
     "Job",
     "JobEvent",
     "IngestionRecord",
+    "VectorChunk",
 ]

@@ -62,6 +62,7 @@ docker-up-dev:        ## Start infra + wait for health, then run migrations
 	docker compose up -d postgres falkordb redis
 	@echo "Waiting for services to be healthy..."
 	@sleep 5 && make infra-check
+	@$(MAKE) db-migrate
 
 docker-down:          ## Stop all infrastructure services
 	docker compose down

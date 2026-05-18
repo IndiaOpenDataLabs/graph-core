@@ -17,7 +17,7 @@ async def run_ingestion(job_id: str):
     await service.append_job_event(job_uuid, "started")
 
     try:
-        # TODO: fetch job details, call ingest_document_pipeline
+        await service.ingest_document_pipeline(job_uuid)
         await service.append_job_event(job_uuid, "completed")
         await service.update_job_status(job_uuid, "completed", progress_percent=100)
     except Exception as e:
