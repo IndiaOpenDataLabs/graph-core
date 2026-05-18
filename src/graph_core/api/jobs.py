@@ -26,6 +26,8 @@ async def stream_job_events(job_id: uuid.UUID):
     """SSE stream of transient job events via Redis pubsub."""
     # TODO: subscribe to Redis channel f"job:{job_id}" and yield SSE events
     async def event_generator():
-        yield f"data: {{"status": "subscribed", "job_id": "{job_id}"}}\n\n"
+        import json
+        payload = json.dumps({"status": "subscribed", "job_id": str(job_id)})
+        yield f"data: {payload}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")

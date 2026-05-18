@@ -7,7 +7,7 @@ install:              ## Install dependencies
 	uv sync --all-groups
 
 install-dev:          ## Install dependencies + dev tools (pytest, ruff, mypy, etc.)
-	uv sync --all-groups --extra dev
+	uv sync --group dev
 
 dev:                  ## Start dev server with reload
 	uv run uvicorn graph_core.main:app --reload --host 0.0.0.0 --port 8000
