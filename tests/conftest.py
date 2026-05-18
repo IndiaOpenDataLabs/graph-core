@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import graph_core.config
 
 graph_core.config.settings.database_url = "sqlite+aiosqlite:///:memory:"
+graph_core.config.settings.credential_encryption_key = "test-key"
 
 # Now import — engine will be created with SQLite
 from graph_core.database import AsyncSessionLocal, Base, engine

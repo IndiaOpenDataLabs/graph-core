@@ -9,19 +9,21 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
+from graph_core.embedding import get_embedding_provider
+from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
 from graph_core.models.collection import Collection
+from graph_core.models.credential import Credential
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
-from graph_core.models.vector_chunk import VectorChunk
-from graph_core.embedding import get_embedding_provider
-from graph_core.config import settings
-from graph_core.services.sanitizer import TextSanitizer
+from graph_core.models.profile import Profile
 from graph_core.services.chunking import TokenChunker
+from graph_core.services.crypto import CredentialCrypto
+from graph_core.services.sanitizer import TextSanitizer
 from graph_core.storage.vector_store import VectorStore
 
 
@@ -49,11 +51,11 @@ class QueryResult:
 class GraphService:
     def __init__(self):
         self._sanitizer = TextSanitizer()
-        self._embedding_provider = get_embedding_provider()
         self._chunker = TokenChunker(
             chunk_size_tokens=settings.chunk_size_tokens,
             chunk_overlap_tokens=settings.chunk_overlap_tokens,
         )
+        self._crypto = CredentialCrypto()
         self._vector_store = VectorStore()
 
     # ── Collections ──
@@ -72,6 +74,16 @@ class GraphService:
             ns = await session.get(Namespace, namespace_id)
             if not ns:
                 raise ValueError(f"Namespace {namespace_id} not found")
+            if embedding_profile_id is not None:
+                profile = await session.get(Profile, embedding_profile_id)
+                if not profile:
+                    raise ValueError(
+                        f"Embedding profile {embedding_profile_id} not found"
+                    )
+                if profile.namespace_id != namespace_id:
+                    raise ValueError("Embedding profile does not belong to namespace")
+                if profile.kind != "embedding":
+                    raise ValueError("Profile kind must be embedding")
 
             collection = Collection(
                 name=name,
@@ -184,13 +196,20 @@ class GraphService:
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
         mode: str | None = None,
+        llm_profile_id: uuid.UUID | None = None,
     ) -> QueryResult:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
 
         effective_mode = mode or collection.default_query_mode or "local"
         if collection.strategy == "vector":
-            return await self._query_vector(question, collection, effective_mode)
+            return await self._query_vector(
+                question,
+                collection,
+                namespace_id,
+                effective_mode,
+                llm_profile_id=llm_profile_id,
+            )
 
         return QueryResult(
             response="",
@@ -233,12 +252,12 @@ class GraphService:
                 job.progress_percent = progress_percent
             if error:
                 job.error = error
-            from datetime import datetime, timezone
+            from datetime import UTC, datetime
 
             if status == "running" and not job.started_at:
-                job.started_at = datetime.now(timezone.utc)
+                job.started_at = datetime.now(UTC)
             if status in ("completed", "failed", "cancelled"):
-                job.completed_at = datetime.now(timezone.utc)
+                job.completed_at = datetime.now(UTC)
             await session.commit()
 
     async def append_job_event(self, job_id: uuid.UUID, event_type: str, payload: dict | None = None):
@@ -299,7 +318,10 @@ class GraphService:
         report,
         chunk_index: int,
     ) -> ChunkIngestionResult:
-        embedding = await self._embedding_provider.embed_query(text)
+        embedding_provider = await self._get_embedding_provider_for_collection(
+            collection
+        )
+        embedding = await embedding_provider.embed_query(text)
         token_count = len(text.split())
         await self._vector_store.upsert_chunks(
             namespace_id=collection.namespace_id,
@@ -355,19 +377,123 @@ class GraphService:
         self,
         question: str,
         collection: Collection,
+        namespace_id: uuid.UUID,
         mode: str,
+        llm_profile_id: uuid.UUID | None = None,
     ) -> QueryResult:
-        query_embedding = await self._embedding_provider.embed_query(question)
+        embedding_provider = await self._get_embedding_provider_for_collection(
+            collection
+        )
+        query_embedding = await embedding_provider.embed_query(question)
         results = await self._vector_store.query_chunks(
             collection_id=collection.id,
             query_embedding=query_embedding,
             top_k=settings.vector_query_top_k,
         )
         chunks = [result.content for result in results]
-        response = chunks[0] if chunks else ""
+        response = await self._generate_vector_answer(
+            question=question,
+            chunks=chunks,
+            namespace_id=namespace_id,
+            llm_profile_id=llm_profile_id,
+        )
         return QueryResult(
             response=response,
             entities_used=[],
             relationships_used=[],
             mode=mode,
         )
+
+    async def _get_embedding_provider_for_collection(
+        self,
+        collection: Collection,
+    ):
+        if collection.embedding_profile_id is None:
+            return get_embedding_provider()
+
+        async with AsyncSessionLocal() as session:
+            profile = await session.get(Profile, collection.embedding_profile_id)
+            if not profile:
+                raise ValueError(
+                    f"Embedding profile {collection.embedding_profile_id} not found"
+                )
+            api_key = await self._get_profile_api_key(session, profile)
+            return get_embedding_provider(
+                provider_name=profile.provider,
+                model=profile.model,
+                dimensions=profile.dimensions,
+                api_key=api_key,
+            )
+
+    async def _generate_vector_answer(
+        self,
+        *,
+        question: str,
+        chunks: list[str],
+        namespace_id: uuid.UUID,
+        llm_profile_id: uuid.UUID | None,
+    ) -> str:
+        if not chunks:
+            return ""
+
+        llm_provider = await self._get_llm_provider(
+            namespace_id=namespace_id,
+            llm_profile_id=llm_profile_id,
+        )
+        if isinstance(llm_provider, LocalEchoLLMProvider):
+            return chunks[0]
+
+        context = "\n\n".join(
+            f"Chunk {index + 1}:\n{chunk}"
+            for index, chunk in enumerate(chunks)
+        )
+        return await llm_provider.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Answer the question using only the provided context. "
+                        "If the answer is not present, say so."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\n"
+                        f"Context:\n{context}\n\n"
+                        "Answer using the context above."
+                    ),
+                },
+            ]
+        )
+
+    async def _get_llm_provider(
+        self,
+        *,
+        namespace_id: uuid.UUID,
+        llm_profile_id: uuid.UUID | None,
+    ):
+        if llm_profile_id is None:
+            return get_llm_provider()
+
+        async with AsyncSessionLocal() as session:
+            profile = await session.get(Profile, llm_profile_id)
+            if not profile or profile.namespace_id != namespace_id:
+                raise ValueError("LLM profile not found in namespace")
+            if profile.kind != "llm":
+                raise ValueError("Profile kind must be llm")
+            api_key = await self._get_profile_api_key(session, profile)
+            return get_llm_provider(
+                provider_name=profile.provider,
+                model=profile.model,
+                api_key=api_key,
+            )
+
+    async def _get_profile_api_key(self, session, profile: Profile) -> str | None:
+        if profile.credential_id is None:
+            return None
+
+        credential = await session.get(Credential, profile.credential_id)
+        if not credential:
+            raise ValueError(f"Credential {profile.credential_id} not found")
+        return self._crypto.decrypt(credential.encrypted_secret)

@@ -13,6 +13,7 @@ from graph_core.services.graph import GraphService
 class QueryRequest(BaseModel):
     question: str
     mode: str | None = None
+    llm_profile_id: uuid.UUID | None = None
 
 
 class QueryResponse(BaseModel):
@@ -33,7 +34,13 @@ async def query_collection(
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
 ) -> QueryResponse:
     try:
-        result = await service.query(body.question, collection_id, namespace_id, body.mode)
+        result = await service.query(
+            body.question,
+            collection_id,
+            namespace_id,
+            body.mode,
+            llm_profile_id=body.llm_profile_id,
+        )
         return QueryResponse(**result.__dict__)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))

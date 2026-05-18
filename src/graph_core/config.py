@@ -10,6 +10,8 @@ class Settings(BaseSettings):
 
     # Encryption key for credential storage (32 bytes, base64 or hex encoded)
     credential_encryption_key: str = ""
+    openai_api_key: str = ""
+    openai_base_url: str | None = None
 
     # Defaults for new collections
     default_embedding_provider: str = "local_hash"
@@ -21,8 +23,8 @@ class Settings(BaseSettings):
     chunk_overlap_tokens: int = 40
     vector_query_top_k: int = 5
 
-    default_llm_provider: str = "openai"
-    default_llm_model: str = "gpt-4o"
+    default_llm_provider: str = "local_echo"
+    default_llm_model: str = "echo-v1"
 
     model_config = {
         "env_file": ".env",
