@@ -42,4 +42,4 @@ async def register_cred(
 ) -> RegisterCredentialResponse:
     """Register encrypted credential. Returns credential_id for profile binding."""
     # TODO: encrypt secret, store in Credential model
-    raise NotImplementedError("Credential storage pending encryption implementation")
+    raise HTTPException(status_code=501, detail="Credential storage not yet implemented")

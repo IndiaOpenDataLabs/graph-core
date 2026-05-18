@@ -21,4 +21,4 @@ async def test_register_credential_not_implemented(async_client):
         "/platform/credentials",
         json={"provider": "openai", "secret": "sk-fake", "label": "test"},
     )
-    assert resp.status_code == 501  # NotImplementedError
+    assert resp.status_code == 501  # Not Implemented
