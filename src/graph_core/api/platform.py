@@ -1,9 +1,12 @@
 """FastAPI router — platform control plane (credentials, profiles, capabilities)."""
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+from graph_core.api.dependencies import get_namespace_id
 
 
 class RegisterCredentialRequest(BaseModel):
@@ -35,7 +38,7 @@ async def get_capabilities() -> dict:
 @router.post("/credentials", response_model=RegisterCredentialResponse)
 async def register_cred(
     body: RegisterCredentialRequest,
-    namespace_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
 ) -> RegisterCredentialResponse:
     """Register encrypted credential. Returns credential_id for profile binding."""
     # TODO: encrypt secret, store in Credential model

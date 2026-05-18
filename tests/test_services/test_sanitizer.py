@@ -17,8 +17,8 @@ def trusted_sanitizer():
 
 class TestUnicodeNormalization:
     def test_nfc_normalizes_text(self, sanitizer):
-        # U+006E + U+030A (n + combining tilde) → U+00F1 (ñ)
-        text = "caf\u006E\u030A"  # "café" with decomposed ñ
+        # U+006E + U+0303 (n + combining tilde) → U+00F1 (ñ)
+        text = "caf\u006E\u0303"  # "cafe" with decomposed ñ
         sanitized, report = sanitizer.sanitize(text, "test-ns")
         assert sanitized == "caf\u00F1"  # NFC normalized
         assert report.normalized is True

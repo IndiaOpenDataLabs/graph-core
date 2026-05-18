@@ -1,5 +1,7 @@
 """Ingest API — integration tests."""
 
+from unittest.mock import patch
+
 import pytest
 
 
@@ -17,10 +19,11 @@ async def test_ingest_chunk(async_client, test_collection):
 
 @pytest.mark.asyncio
 async def test_ingest_document_returns_job_id(async_client, test_collection):
-    resp = await async_client.post(
-        f"/collections/{test_collection.id}/ingest/doc",
-        json={"text": "this is a longer document that gets queued"},
-    )
+    with patch("graph_core.workers.ingestion.run_ingestion"):
+        resp = await async_client.post(
+            f"/collections/{test_collection.id}/ingest/doc",
+            json={"text": "this is a longer document that gets queued"},
+        )
     assert resp.status_code == 200
     data = resp.json()
     assert "job_id" in data

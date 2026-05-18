@@ -1,4 +1,4 @@
-"""Shared test fixtures."""
+"""Shared test fixtures — uses in-memory SQLite, no Postgres required."""
 
 import asyncio
 import uuid
@@ -6,7 +6,14 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# Patch config BEFORE any graph_core modules import database.py
+import graph_core.config
+
+graph_core.config.settings.database_url = "sqlite+aiosqlite:///:memory:"
+
+# Now import — engine will be created with SQLite
 from graph_core.database import AsyncSessionLocal, Base, engine
 from graph_core.main import app
 from graph_core.models.collection import Collection
@@ -21,11 +28,19 @@ def event_loop():
     loop.close()
 
 
-@pytest_asyncio.fixture(scope="function")
-async def db_session():
-    """Create tables and yield a session wrapped in a transaction that rolls back."""
+@pytest_asyncio.fixture(scope="function", autouse=True)
+async def _setup_tables():
+    """Create/destroy tables before/after each test."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest_asyncio.fixture(scope="function")
+async def db_session():
+    """Yield a session wrapped in a transaction that rolls back after each test."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -83,7 +98,6 @@ async def test_light_rag_collection(db_session, test_namespace):
 
 @pytest_asyncio.fixture(scope="function")
 async def async_client(test_namespace):
-    """HTTPX async client with namespace header."""
     transport = ASGITransport(app=app)
     headers = {"X-Namespace-ID": str(test_namespace.id)}
     async with AsyncClient(transport=transport, base_url="http://test", headers=headers) as client:
