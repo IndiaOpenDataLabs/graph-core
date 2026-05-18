@@ -31,6 +31,22 @@ async def test_ingest_document_returns_job_id(async_client, test_collection):
 
 
 @pytest.mark.asyncio
+async def test_ingest_chunk_then_query_returns_vector_context(async_client, test_collection):
+    ingest_resp = await async_client.post(
+        f"/collections/{test_collection.id}/ingest/chunk",
+        json={"text": "Krishna teaches Arjuna about dharma."},
+    )
+    assert ingest_resp.status_code == 200
+
+    query_resp = await async_client.post(
+        f"/collections/{test_collection.id}/query",
+        json={"question": "What does Krishna teach Arjuna?"},
+    )
+    assert query_resp.status_code == 200
+    assert "Krishna teaches Arjuna" in query_resp.json()["response"]
+
+
+@pytest.mark.asyncio
 async def test_ingest_chunk_wrong_namespace(async_client, test_collection):
     import uuid
 

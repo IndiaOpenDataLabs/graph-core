@@ -1,1 +1,1 @@
-"""Storage interfaces."""
+"""Storage package."""

@@ -14,10 +14,15 @@ from sqlalchemy.orm import selectinload
 
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.collection import Collection
-from graph_core.models.namespace import Namespace
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job, JobEvent
+from graph_core.models.namespace import Namespace
+from graph_core.models.vector_chunk import VectorChunk
+from graph_core.embedding import get_embedding_provider
+from graph_core.config import settings
 from graph_core.services.sanitizer import TextSanitizer
+from graph_core.services.chunking import TokenChunker
+from graph_core.storage.vector_store import VectorStore
 
 
 @dataclass
@@ -44,6 +49,12 @@ class QueryResult:
 class GraphService:
     def __init__(self):
         self._sanitizer = TextSanitizer()
+        self._embedding_provider = get_embedding_provider()
+        self._chunker = TokenChunker(
+            chunk_size_tokens=settings.chunk_size_tokens,
+            chunk_overlap_tokens=settings.chunk_overlap_tokens,
+        )
+        self._vector_store = VectorStore()
 
     # ── Collections ──
 
@@ -98,6 +109,20 @@ class GraphService:
     ) -> ChunkIngestionResult:
         """Ingest a single chunk of text. Synchronous from caller's perspective."""
         collection = await self.get_collection(collection_id)
+        return await self._ingest_collection_chunk(
+            text=text,
+            collection=collection,
+            namespace_id=namespace_id,
+            chunk_index=0,
+        )
+
+    async def _ingest_collection_chunk(
+        self,
+        text: str,
+        collection: Collection,
+        namespace_id: uuid.UUID,
+        chunk_index: int,
+    ) -> ChunkIngestionResult:
         self._enforce_namespace(collection, namespace_id)
 
         # Sanitize
@@ -106,7 +131,13 @@ class GraphService:
 
         # Strategy dispatch
         if collection.strategy == "vector":
-            result = await self._ingest_vector_chunk(sanitized_text, collection, chunk_hash, report)
+            result = await self._ingest_vector_chunk(
+                sanitized_text,
+                collection,
+                chunk_hash,
+                report,
+                chunk_index=chunk_index,
+            )
         elif collection.strategy == "light_rag":
             result = await self._ingest_lightrag_chunk(sanitized_text, collection, chunk_hash, report)
         else:
@@ -132,6 +163,7 @@ class GraphService:
                 collection_id=collection_id,
                 job_type="ingest_document",
                 status="pending",
+                payload={"text": text},
             )
             session.add(job)
             await session.commit()
@@ -157,7 +189,9 @@ class GraphService:
         self._enforce_namespace(collection, namespace_id)
 
         effective_mode = mode or collection.default_query_mode or "local"
-        # TODO: dispatch to retriever based on collection.strategy + mode
+        if collection.strategy == "vector":
+            return await self._query_vector(question, collection, effective_mode)
+
         return QueryResult(
             response="",
             entities_used=[],
@@ -213,6 +247,42 @@ class GraphService:
             session.add(event)
             await session.commit()
 
+    async def ingest_document_pipeline(self, job_id: uuid.UUID):
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            if not job.payload or "text" not in job.payload:
+                raise ValueError(f"Job {job_id} does not contain input text")
+
+            collection = await session.get(Collection, job.collection_id)
+            if not collection:
+                raise ValueError(f"Collection {job.collection_id} not found")
+
+            text = str(job.payload["text"])
+
+        chunks = self._chunker.chunk_text(text)
+        total_chunks = max(len(chunks), 1)
+
+        if not chunks:
+            await self.update_job_status(job_id, "completed", progress_percent=100)
+            return
+
+        for index, chunk in enumerate(chunks, start=1):
+            await self._ingest_collection_chunk(
+                text=chunk,
+                collection=collection,
+                namespace_id=collection.namespace_id,
+                chunk_index=index - 1,
+            )
+            progress = int(index * 100 / total_chunks)
+            await self.update_job_status(job_id, "running", progress_percent=progress)
+            await self.append_job_event(
+                job_id,
+                "chunk_completed",
+                {"chunk_index": index - 1, "total_chunks": total_chunks},
+            )
+
     # ── Internal ──
 
     def _enforce_namespace(self, collection: Collection, namespace_id: uuid.UUID):
@@ -222,9 +292,32 @@ class GraphService:
             )
 
     async def _ingest_vector_chunk(
-        self, text: str, collection: Collection, chunk_hash: str, report
+        self,
+        text: str,
+        collection: Collection,
+        chunk_hash: str,
+        report,
+        chunk_index: int,
     ) -> ChunkIngestionResult:
-        # TODO: chunk → embed → ChromaDB upsert
+        embedding = await self._embedding_provider.embed_query(text)
+        token_count = len(text.split())
+        await self._vector_store.upsert_chunks(
+            namespace_id=collection.namespace_id,
+            collection_id=collection.id,
+            chunks=[
+                {
+                    "chunk_hash": chunk_hash,
+                    "chunk_index": chunk_index,
+                    "content": text,
+                    "token_count": token_count,
+                    "metadata": {
+                        "strategy": collection.strategy,
+                        "default_query_mode": collection.default_query_mode,
+                    },
+                    "embedding": embedding,
+                }
+            ],
+        )
         return ChunkIngestionResult(chunk_hash=chunk_hash, entity_count=0, relationship_count=0)
 
     async def _ingest_lightrag_chunk(
@@ -257,3 +350,24 @@ class GraphService:
             )
             session.add(record)
             await session.commit()
+
+    async def _query_vector(
+        self,
+        question: str,
+        collection: Collection,
+        mode: str,
+    ) -> QueryResult:
+        query_embedding = await self._embedding_provider.embed_query(question)
+        results = await self._vector_store.query_chunks(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=settings.vector_query_top_k,
+        )
+        chunks = [result.content for result in results]
+        response = chunks[0] if chunks else ""
+        return QueryResult(
+            response=response,
+            entities_used=[],
+            relationships_used=[],
+            mode=mode,
+        )

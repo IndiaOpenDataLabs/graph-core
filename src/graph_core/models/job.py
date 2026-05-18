@@ -27,6 +27,7 @@ class Job(Base):
     )
     progress_percent = Column(Integer, default=0)
     error = Column(Text, nullable=True)
+    payload = Column(JSON, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)
