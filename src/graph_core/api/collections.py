@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from graph_core.api.dependencies import get_namespace_id
 from graph_core.database import AsyncSession, get_session
 from graph_core.services.graph import GraphService
 
@@ -17,7 +18,7 @@ class CreateCollectionRequest(BaseModel):
     default_query_mode: str | None = None
 
 
-class CreateCollectionResponse(BaseModel):
+class CollectionResponse(BaseModel):
     id: str
     name: str
     strategy: str
@@ -33,10 +34,9 @@ service = GraphService()
 @router.post("/")
 async def create_collection(
     body: CreateCollectionRequest,
-    namespace_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> CreateCollectionResponse:
-    """Create a new collection bound to the namespace."""
+) -> CollectionResponse:
     try:
         collection = await service.create_collection(
             name=body.name,
@@ -52,15 +52,15 @@ async def create_collection(
 
 @router.get("/")
 async def list_collections(
-    namespace_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> list[CreateCollectionResponse]:
+) -> list[CollectionResponse]:
     collections = await service.list_collections(namespace_id)
     return [_to_response(c) for c in collections]
 
 
-def _to_response(c) -> CreateCollectionResponse:
-    return CreateCollectionResponse(
+def _to_response(c) -> CollectionResponse:
+    return CollectionResponse(
         id=str(c.id),
         name=c.name,
         strategy=c.strategy,

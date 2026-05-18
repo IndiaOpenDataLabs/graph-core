@@ -1,10 +1,12 @@
 """FastAPI router — query endpoint."""
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from graph_core.api.dependencies import get_namespace_id
 from graph_core.services.graph import GraphService
 
 
@@ -28,9 +30,8 @@ service = GraphService()
 async def query_collection(
     body: QueryRequest,
     collection_id: uuid.UUID,
-    namespace_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
 ) -> QueryResponse:
-    """Query a collection's knowledge graph."""
     try:
         result = await service.query(body.question, collection_id, namespace_id, body.mode)
         return QueryResponse(**result.__dict__)
