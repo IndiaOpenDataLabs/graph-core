@@ -1,10 +1,13 @@
-.PHONY: help install dev start worker lint format fix clean
+.PHONY: help install install-dev dev start worker lint format fix test clean
 
 help:                 ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 install:              ## Install dependencies
 	uv sync --all-groups
+
+install-dev:          ## Install dependencies + dev tools (pytest, ruff, mypy, etc.)
+	uv sync --all-groups --extra dev
 
 dev:                  ## Start dev server with reload
 	uv run uvicorn graph_core.main:app --reload --host 0.0.0.0 --port 8000
@@ -18,6 +21,9 @@ worker:               ## Start Dramatiq worker
 lint:                 ## Run all lint checks
 	uv run ruff check src/
 	uv run mypy src/
+
+test:                 ## Run tests (requires make install-dev)
+	uv run pytest
 
 format:               ## Check formatting (no changes)
 	uv run black --check src/
