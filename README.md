@@ -14,22 +14,74 @@ Applications / Clients
             └── Storage (Postgres, Vector DB, Graph DB, Redis)
 ```
 
-## Quick Start
+## Starting the Stack
 
 ```bash
 uv sync --all-groups
-docker compose up -d postgres redis falkordb
+make docker-up-dev
 uv run uvicorn graph_core.main:app --reload
 ```
 
-Draft schema note:
-This repo does not yet have working Alembic files checked in. The SQLAlchemy
-models are the current source of truth. If your local Postgres volume was
-created before recent model changes, recreate it before testing the latest code:
+For background jobs, start the worker in a second terminal:
 
 ```bash
-docker compose down -v
-docker compose up -d postgres redis falkordb
+uv run dramatiq graph_core.workers --processes 4 --threads 8
+```
+
+Recommended local flow:
+
+1. Install dependencies:
+
+```bash
+uv sync --all-groups
+```
+
+2. Start infrastructure and run migrations:
+
+```bash
+make docker-up-dev
+```
+
+This starts:
+- Postgres with `pgvector`
+- Redis
+- FalkorDB
+
+It then waits for health checks and runs:
+
+```bash
+uv run alembic upgrade head
+```
+
+3. Start the API server:
+
+```bash
+uv run uvicorn graph_core.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+4. Start the worker for async ingestion jobs:
+
+```bash
+uv run dramatiq graph_core.workers --processes 4 --threads 8
+```
+
+5. Verify infra if needed:
+
+```bash
+make infra-check
+```
+
+Schema note:
+This repo now includes Alembic migrations. For a fresh local setup, `make
+docker-up-dev` starts Postgres, Redis, and FalkorDB, waits for health, and then
+runs `alembic upgrade head`.
+
+If your local Postgres volume was created before recent schema changes, recreate
+it and rerun migrations:
+
+```bash
+make docker-clean
+make docker-up-dev
 ```
 
 ## Concepts
