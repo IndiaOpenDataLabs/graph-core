@@ -1,4 +1,9 @@
-.PHONY: help install install-dev dev start worker lint format fix test clean
+.PHONY: help install install-dev dev start worker lint format fix test clean \
+	docker-up docker-down docker-logs docker-clean docker-ps \
+	db-migrate db-revision db-current db-stamp db-downgrade \
+	infra-check seed
+
+# ─── Project ──────────────────────────────────────────────────────────────────
 
 help:                 ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -9,14 +14,18 @@ install:              ## Install dependencies
 install-dev:          ## Install dependencies + dev tools (pytest, ruff, mypy, etc.)
 	uv sync --group dev
 
+# ─── Application ──────────────────────────────────────────────────────────────
+
 dev:                  ## Start dev server with reload
 	uv run uvicorn graph_core.main:app --reload --host 0.0.0.0 --port 8000
 
 start:                ## Start production server
 	uv run uvicorn graph_core.main:app --host 0.0.0.0 --port 8000 --workers 4
 
-worker:               ## Start Dramatiq worker
+worker:               ## Start Dramatiq worker (background execution layer)
 	uv run dramatiq graph_core.workers --processes 4 --threads 8
+
+# ─── Quality ──────────────────────────────────────────────────────────────────
 
 lint:                 ## Run all lint checks
 	uv run ruff check src/
@@ -42,3 +51,66 @@ clean:                ## Remove build artifacts
 	find . -type d -name '.ruff_cache' -exec rm -rf {} +
 	find . -type d -name '.pytest_cache' -exec rm -rf {} +
 	rm -rf build/ dist/ .coverage htmlcov/
+
+# ─── Docker Infrastructure ───────────────────────────────────────────────────
+## Services: postgres (pgvector), falkordb (graph db), redis (dramatiq + sse)
+
+docker-up:            ## Start all infrastructure services (postgres, falkordb, redis)
+	docker compose up -d postgres falkordb redis
+
+docker-up-dev:        ## Start infra + wait for health, then run migrations
+	docker compose up -d postgres falkordb redis
+	@echo "Waiting for services to be healthy..."
+	@sleep 5 && make infra-check
+
+docker-down:          ## Stop all infrastructure services
+	docker compose down
+
+docker-logs:          ## Follow logs for all services
+	docker compose logs -f
+
+docker-logs-postgres: ## Follow postgres logs
+	docker compose logs -f postgres
+
+docker-logs-falkordb: ## Follow falkordb logs
+	docker compose logs -f falkordb
+
+docker-logs-redis:    ## Follow redis logs
+	docker compose logs -f redis
+
+docker-ps:            ## List running containers
+	docker compose ps
+
+docker-clean:         ## Stop and remove all containers, volumes, networks
+	docker compose down -v --remove-orphans
+
+# ─── Database Migrations (Alembic) ───────────────────────────────────────────
+
+db-migrate:           ## Run pending Alembic migrations
+	uv run alembic upgrade head
+
+db-revision:          ## Generate a new migration (pass message: make db-revision m="add jobs table")
+	uv run alembic revision --autogenerate -m "$(m)"
+
+db-current:           ## Show current migration version
+	uv run alembic current
+
+db-stamp:             ## Set current migration version without running
+	uv run alembic stamp head
+
+db-downgrade:         ## Downgrade one migration revision
+	uv run alembic downgrade -1
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+infra-check:          ## Verify all infrastructure services are reachable
+	@echo "Checking PostgreSQL..."
+	@docker compose exec -T postgres pg_isready -U graphcore -d graphcore || echo "  PostgreSQL: NOT READY"
+	@echo "Checking Redis..."
+	@docker compose exec -T redis redis-cli ping || echo "  Redis: NOT READY"
+	@echo "Checking FalkorDB..."
+	@docker compose exec -T falkordb redis-cli ping || echo "  FalkorDB: NOT READY"
+	@echo "All services checked."
+
+seed:                 ## Run seed script (create default embedding/llm profiles)
+	uv run python -m graph_core.scripts.seed
