@@ -220,8 +220,8 @@ class GraphService:
             await self.update_job_status(job_id, "completed", progress_percent=100)
             return
 
-        # For graph_rag/light_rag: fan-out chunks to parallel workers
-        if collection.strategy in ("custom_graph_rag", "light_rag"):
+        # For custom_graph_rag: fan-out chunks to parallel workers
+        if collection.strategy == "custom_graph_rag":
             await self._fan_out_chunks(job_id, collection.id, chunks)
         else:
             # Vector strategy: sequential processing
@@ -573,7 +573,7 @@ class GraphService:
             return await self._query_vector(
                 question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
             )
-        if collection.strategy in ("custom_graph_rag", "light_rag"):
+        if collection.strategy == "custom_graph_rag":
             return await self._query_graph_rag(
                 question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
             )
