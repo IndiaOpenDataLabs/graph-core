@@ -1483,8 +1483,8 @@ Source Text:
                     )
 
             desc_embedding = await embedding_provider.embed_query(entity.description)
-            entity_uuid = self._deterministic_uuid(name)
-            desc_id = self._deterministic_uuid(f"desc:{name}:{chunk_hash}")
+            entity_uuid = self._deterministic_uuid(collection.id, name)
+            desc_id = self._deterministic_uuid(collection.id, f"desc:{name}:{chunk_hash}")
             await self._graph_rag_vectors.upsert_entity_embedding(
                 entity_id=entity_uuid,
                 collection_id=collection.id,
@@ -1502,7 +1502,7 @@ Source Text:
                 continue
 
             rel_id_str = f"{source_name}__{target_name}"
-            rel_uuid = self._deterministic_uuid(rel_id_str)
+            rel_uuid = self._deterministic_uuid(collection.id, rel_id_str)
 
             rel_embedding = await embedding_provider.embed_query(rel.description)
             await self._graph_rag_vectors.upsert_relationship_embedding(
@@ -1534,10 +1534,10 @@ Source Text:
         )
 
     @staticmethod
-    def _deterministic_uuid(name: str) -> uuid.UUID:
-        """Generate a deterministic UUID from a string (namespace-less MD5)."""
+    def _deterministic_uuid(collection_id: uuid.UUID, name: str) -> uuid.UUID:
+        """Generate a deterministic UUID scoped to a collection."""
         import hashlib
-        return uuid.UUID(hashlib.md5(name.encode()).hexdigest())
+        return uuid.UUID(hashlib.md5(f"{collection_id}:{name}".encode()).hexdigest())
 
     async def _write_ledger(
         self,
