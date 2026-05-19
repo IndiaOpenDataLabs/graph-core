@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://graphcore:graphcore@localhost:5432/graphcore"
     redis_url: str = "redis://localhost:6379/0"
     falkordb_url: str = "falkordb://localhost:6379"
+    redis_semaphore_url: str = "redis://localhost:6380/0"
 
     # Encryption key for credential storage (32 bytes, base64 or hex encoded)
     credential_encryption_key: str = ""
@@ -25,6 +26,16 @@ class Settings(BaseSettings):
 
     default_llm_provider: str = "local_echo"
     default_llm_model: str = "echo-v1"
+
+    # Graph RAG settings
+    falkordb_graph_name: str = "knowledge_graph"
+    graph_rag_max_concurrent_workers: int = 5
+    graph_rag_high_confidence_threshold: float = 0.3
+    graph_rag_medium_confidence_threshold: float = 0.7
+    graph_rag_fuzzy_name_threshold: float = 0.8
+    graph_rag_description_similarity_threshold: float = 0.90
+    graph_rag_max_relationship_weight: int = 100
+    graph_rag_min_edge_similarity: float = 0.3
 
     model_config = {
         "env_file": ".env",

@@ -32,6 +32,7 @@ class Collection(Base):
     embedding_profile = relationship("Profile", foreign_keys=[embedding_profile_id])
     ingestion_records = relationship("IngestionRecord", back_populates="collection", cascade="all, delete-orphan")
     jobs = relationship("Job", back_populates="collection", cascade="all, delete-orphan")
+    graph_entities = relationship("GraphEntity", back_populates="collection", cascade="all, delete-orphan")
 
     __table_args__ = (
         # Unique name per namespace

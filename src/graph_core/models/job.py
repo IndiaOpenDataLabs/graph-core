@@ -28,6 +28,8 @@ class Job(Base):
     progress_percent = Column(Integer, default=0)
     error = Column(Text, nullable=True)
     payload = Column(JSON, nullable=True)
+    chunks_total = Column(Integer, default=0)
+    chunks_completed = Column(Integer, default=0)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)
@@ -36,6 +38,7 @@ class Job(Base):
     namespace = relationship("Namespace", back_populates="jobs")
     collection = relationship("Collection", back_populates="jobs")
     events = relationship("JobEvent", back_populates="job", cascade="all, delete-orphan")
+    chunks = relationship("IngestionChunk", back_populates="job", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<Job {self.job_type} {self.status}>"

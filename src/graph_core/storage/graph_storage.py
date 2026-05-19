@@ -1,0 +1,275 @@
+"""FalkorDB graph storage for Custom Graph RAG.
+
+Stores knowledge graph nodes and edges in FalkorDB.
+Schema:
+  - Nodes: (:Entity {id, name, collection_id})
+  - Edges: [:RELATES_TO {id, weight, keywords, collection_id}]
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Optional
+
+from graph_core.config import settings
+
+# FalkorDB is optional — only import when available
+try:
+    from falkordb.asyncio import FalkorDB
+    from redis.asyncio import BlockingConnectionPool
+except ImportError:
+    FalkorDB = None  # type: ignore[misc,assignment]
+    BlockingConnectionPool = None  # type: ignore[misc,assignment]
+
+logger = logging.getLogger(__name__)
+
+
+class FalkorDBGraphStorage:
+    """FalkorDB-backed knowledge graph storage.
+
+    Uses the async falkordb Python client with connection pooling.
+    """
+
+    _connection_pool: Optional[BlockingConnectionPool] = None
+
+    def __init__(self, namespace: str, **kwargs: Any) -> None:
+        self._graph_name = namespace or settings.falkordb_graph_name
+        self._host = "localhost"
+        self._port = 6379
+        # Parse URL if provided
+        if settings.falkordb_url:
+            url = settings.falkordb_url
+            if url.startswith("falkordb://"):
+                url = "redis://" + url[len("falkordb://"):]
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            self._host = parsed.hostname or "localhost"
+            self._port = parsed.port or 6379
+        self._test_client: Optional[Any] = kwargs.get("_client")
+
+    @classmethod
+    def _get_connection_pool(cls) -> BlockingConnectionPool:
+        if cls._connection_pool is None:
+            url = settings.falkordb_url
+            host = "localhost"
+            port = 6379
+            if url:
+                if url.startswith("falkordb://"):
+                    url = "redis://" + url[len("falkordb://"):]
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                host = parsed.hostname or "localhost"
+                port = parsed.port or 6379
+
+            cls._connection_pool = BlockingConnectionPool(
+                max_connections=16,
+                timeout=None,
+                decode_responses=True,
+                host=host,
+                port=port,
+            )
+        return cls._connection_pool
+
+    async def _get_graph(self):
+        if FalkorDB is None:
+            raise RuntimeError(
+                "FalkorDB client not installed. Install with: pip install graph-core[graph]"
+            )
+        if self._test_client is not None:
+            return self._test_client.select_graph(self._graph_name)
+
+        pool = self._get_connection_pool()
+        client = FalkorDB(connection_pool=pool)
+        return client.select_graph(self._graph_name)
+
+    async def has_node(self, node_id: str) -> bool:
+        graph = await self._get_graph()
+        result = await graph.query(
+            "MATCH (n:Entity {id: $id}) RETURN count(n) as count",
+            {"id": node_id},
+        )
+        if result and result.result_set:
+            count = result.result_set[0][0] or 0
+            return count > 0
+        return False
+
+    async def get_node(self, node_id: str) -> Optional[dict[str, Any]]:
+        graph = await self._get_graph()
+        result = await graph.query(
+            "MATCH (n:Entity {id: $id}) RETURN n",
+            {"id": node_id},
+        )
+        if result and result.result_set:
+            node = result.result_set[0][0]
+            if node:
+                return dict(node.properties)
+        return None
+
+    async def upsert_nodes(self, nodes: list[dict[str, Any]]) -> None:
+        if not nodes:
+            return
+        graph = await self._get_graph()
+        payload = [
+            {
+                "id": n["id"],
+                "name": n.get("name", ""),
+                "collection_id": str(n.get("collection_id", "")),
+            }
+            for n in nodes
+        ]
+        await graph.query(
+            "UNWIND $nodes AS node"
+            " MERGE (n:Entity {id: node.id})"
+            " SET n.name = node.name, n.collection_id = node.collection_id",
+            {"nodes": payload},
+        )
+
+    async def upsert_edges(self, edges: list[dict[str, Any]]) -> None:
+        if not edges:
+            return
+        graph = await self._get_graph()
+        payload = [
+            {
+                "source_id": e["source_id"],
+                "target_id": e["target_id"],
+                "id": e.get("id", ""),
+                "weight": e.get("weight", 1),
+                "keywords": json.dumps(e["keywords"]) if isinstance(e.get("keywords"), list) else (e.get("keywords") or "[]"),
+                "collection_id": str(e.get("collection_id", "")),
+            }
+            for e in edges
+        ]
+        await graph.query(
+            "UNWIND $edges AS edge"
+            " MERGE (a:Entity {id: edge.source_id})"
+            " MERGE (b:Entity {id: edge.target_id})"
+            " MERGE (a)-[r:RELATES_TO]->(b)"
+            " SET r.id = edge.id, r.weight = edge.weight,"
+            "     r.keywords = edge.keywords, r.collection_id = edge.collection_id",
+            {"edges": payload},
+        )
+
+    async def upsert_node(self, node_id: str, properties: dict[str, Any]) -> None:
+        graph = await self._get_graph()
+        allowed_keys = {"id", "name", "collection_id"}
+        set_clauses = []
+        params: dict[str, object] = {"id": node_id}
+        for key, value in properties.items():
+            if key != "id" and key in allowed_keys:
+                set_clauses.append(f"n.{key} = ${key}")
+                params[key] = value
+
+        if set_clauses:
+            set_str = ", ".join(set_clauses)
+            query = f"MERGE (n:Entity {{id: $id}}) SET {set_str}"
+        else:
+            query = "MERGE (n:Entity {id: $id})"
+
+        await graph.query(query, params)
+
+    async def upsert_edge(
+        self, source_id: str, target_id: str, properties: dict[str, Any]
+    ) -> None:
+        graph = await self._get_graph()
+        allowed_keys = {"id", "weight", "keywords", "collection_id"}
+        set_clauses = []
+        params: dict[str, object] = {"source_id": source_id, "target_id": target_id}
+        for key, value in properties.items():
+            if key not in ("source", "target") and key in allowed_keys:
+                stored_value = json.dumps(value) if isinstance(value, list) else value
+                set_clauses.append(f"r.{key} = $r_{key}")
+                params[f"r_{key}"] = stored_value
+
+        if set_clauses:
+            set_str = ", ".join(set_clauses)
+            query = (
+                "MERGE (a:Entity {id: $source_id})"
+                " MERGE (b:Entity {id: $target_id})"
+                f" MERGE (a)-[r:RELATES_TO]->(b) SET {set_str}"
+            )
+        else:
+            query = (
+                "MERGE (a:Entity {id: $source_id})"
+                " MERGE (b:Entity {id: $target_id})"
+                " MERGE (a)-[r:RELATES_TO]->(b)"
+            )
+
+        await graph.query(query, params)
+
+    async def get_node_edges(self, node_id: str) -> list[tuple[str, str]]:
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH (n:Entity {id: $node_id})-[r:RELATES_TO]-(m:Entity)
+            RETURN n.id as source, m.id as target
+            """,
+            {"node_id": node_id},
+        )
+        edges: list[tuple[str, str]] = []
+        if result and result.result_set:
+            for row in result.result_set:
+                source, target = row[0], row[1]
+                if source and target:
+                    edges.append((str(source), str(target)))
+        return edges
+
+    async def get_knowledge_graph(
+        self, node_id: str, max_depth: int = 3, max_nodes: int = 100
+    ) -> dict[str, Any]:
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH path = (n:Entity {id: $node_id})-[*1..$max_depth]-(m:Entity)
+            WITH path, m
+            LIMIT $max_nodes
+            RETURN path
+            """,
+            {"node_id": node_id, "max_depth": max_depth, "max_nodes": max_nodes},
+        )
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        node_ids_seen: set[str] = set()
+        edge_ids_seen: set[str] = set()
+
+        if result and result.result_set:
+            for row in result.result_set:
+                path = row[0]
+                if path:
+                    for node in path.nodes:
+                        node_props = dict(node.properties)
+                        nid = node_props.get("id")
+                        if nid and nid not in node_ids_seen:
+                            nodes.append(node_props)
+                            node_ids_seen.add(nid)
+                    for rel in path.relationships:
+                        edge_props = dict(rel.properties)
+                        edge_id = edge_props.get("id")
+                        if not edge_id:
+                            start_id = rel.src_node
+                            end_id = rel.dest_node
+                            if start_id and end_id:
+                                edge_id = f"{start_id}__{end_id}"
+                                edge_props["id"] = edge_id
+                        if edge_id and edge_id not in edge_ids_seen:
+                            edges.append(edge_props)
+                            edge_ids_seen.add(edge_id)
+
+        return {"nodes": nodes, "edges": edges}
+
+    async def delete_nodes_by_collection(self, collection_id: str) -> int:
+        graph = await self._get_graph()
+        result = await graph.query(
+            "MATCH (n:Entity {collection_id: $collection_id}) DETACH DELETE n",
+            {"collection_id": str(collection_id)},
+        )
+        count = int(result.nodes_deleted) if result.nodes_deleted else 0
+        logger.info("FalkorDB deleted %d nodes for collection_id=%s", count, collection_id)
+        return count
+
+    async def drop(self) -> None:
+        graph = await self._get_graph()
+        await graph.query("MATCH (n:Entity) DETACH DELETE n")
+
+    async def close(self) -> None:
+        pass

@@ -6,24 +6,43 @@ MCP tools, and background workers. All dependencies are injected.
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, text
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.embedding import get_embedding_provider
+from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
+from graph_core.llm.interface import LLMProvider
+from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
+from graph_core.models.graph_rag import (
+    EntityAlias,
+    EntityDescription,
+    GraphEntity,
+    GraphRelationship,
+    RelationshipDescription,
+    RawChunkExtraction,
+)
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
 from graph_core.services.chunking import TokenChunker
 from graph_core.services.crypto import CredentialCrypto
+from graph_core.services.graph_rag.entity_resolver import (
+    IncrementalEntityResolver,
+)
+from graph_core.services.graph_rag.extractor import (
+    LLMGraphExtractor,
+    ExtractionResult,
+)
 from graph_core.services.sanitizer import TextSanitizer
+from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.vector_store import VectorStore
 
 
@@ -57,6 +76,8 @@ class GraphService:
         )
         self._crypto = CredentialCrypto()
         self._vector_store = VectorStore()
+        self._graph_storage = None
+        self._graph_rag_vectors = GraphRAGVectorStore()
 
     # ── Collections ──
 
@@ -68,18 +89,14 @@ class GraphService:
         embedding_profile_id: uuid.UUID | None = None,
         default_query_mode: str | None = None,
     ) -> Collection:
-        """Create a new collection bound to a namespace and embedding profile."""
         async with AsyncSessionLocal() as session:
-            # Verify namespace exists
             ns = await session.get(Namespace, namespace_id)
             if not ns:
                 raise ValueError(f"Namespace {namespace_id} not found")
             if embedding_profile_id is not None:
                 profile = await session.get(Profile, embedding_profile_id)
                 if not profile:
-                    raise ValueError(
-                        f"Embedding profile {embedding_profile_id} not found"
-                    )
+                    raise ValueError(f"Embedding profile {embedding_profile_id} not found")
                 if profile.namespace_id != namespace_id:
                     raise ValueError("Embedding profile does not belong to namespace")
                 if profile.kind != "embedding":
@@ -106,7 +123,7 @@ class GraphService:
 
     async def get_collection(self, collection_id: uuid.UUID) -> Collection:
         async with AsyncSessionLocal() as session:
-            collection = await session.get(Collection, collection_id, options=[selectinload(Collection.namespace)])
+            collection = await session.get(Collection, collection_id)
             if not collection:
                 raise ValueError(f"Collection {collection_id} not found")
             return collection
@@ -119,7 +136,6 @@ class GraphService:
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
     ) -> ChunkIngestionResult:
-        """Ingest a single chunk of text. Synchronous from caller's perspective."""
         collection = await self.get_collection(collection_id)
         return await self._ingest_collection_chunk(
             text=text,
@@ -136,26 +152,22 @@ class GraphService:
         chunk_index: int,
     ) -> ChunkIngestionResult:
         self._enforce_namespace(collection, namespace_id)
-
-        # Sanitize
         sanitized_text, report = self._sanitizer.sanitize(text, str(namespace_id))
         chunk_hash = self._sanitizer.chunk_hash(sanitized_text)
 
-        # Strategy dispatch
         if collection.strategy == "vector":
             result = await self._ingest_vector_chunk(
-                sanitized_text,
-                collection,
-                chunk_hash,
-                report,
-                chunk_index=chunk_index,
+                sanitized_text, collection, chunk_hash, report, chunk_index=chunk_index,
             )
         elif collection.strategy == "light_rag":
-            result = await self._ingest_lightrag_chunk(sanitized_text, collection, chunk_hash, report)
+            result = await self._ingest_lightrag_chunk(
+                sanitized_text, collection, chunk_hash, report,
+            )
         else:
-            result = await self._ingest_graph_chunk(sanitized_text, collection, chunk_hash, report)
+            result = await self._ingest_graph_chunk(
+                sanitized_text, collection, chunk_hash, report,
+            )
 
-        # Write ledger record
         await self._write_ledger(collection, chunk_hash, report, result)
         return result
 
@@ -165,7 +177,6 @@ class GraphService:
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
     ) -> DocumentIngestionResult:
-        """Queue a document ingestion job. Returns immediately with job_id."""
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
 
@@ -181,12 +192,368 @@ class GraphService:
             await session.commit()
             await session.refresh(job)
 
-        # Enqueue Dramatiq worker
         from graph_core.workers.ingestion import run_ingestion
-
         run_ingestion.send(str(job.id))
-
         return DocumentIngestionResult(job_id=job.id, status="pending")
+
+    # ── Document pipeline ──
+
+    async def ingest_document_pipeline(self, job_id: uuid.UUID):
+        """Main pipeline — dispatches chunks based on collection strategy."""
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            if not job.payload or "text" not in job.payload:
+                raise ValueError(f"Job {job_id} does not contain input text")
+
+            collection = await session.get(Collection, job.collection_id)
+            if not collection:
+                raise ValueError(f"Collection {job.collection_id} not found")
+
+            text = str(job.payload["text"])
+
+        chunks = self._chunker.chunk_text(text)
+        total_chunks = max(len(chunks), 1)
+
+        if not chunks:
+            await self.update_job_status(job_id, "completed", progress_percent=100)
+            return
+
+        # For graph_rag/light_rag: fan-out chunks to parallel workers
+        if collection.strategy in ("custom_graph_rag", "light_rag"):
+            await self._fan_out_chunks(job_id, collection.id, chunks)
+        else:
+            # Vector strategy: sequential processing
+            for index, chunk in enumerate(chunks, start=1):
+                await self._ingest_collection_chunk(
+                    text=chunk,
+                    collection=collection,
+                    namespace_id=collection.namespace_id,
+                    chunk_index=index - 1,
+                )
+                progress = int(index * 100 / total_chunks)
+                await self.update_job_status(job_id, "running", progress_percent=progress)
+                await self.append_job_event(
+                    job_id, "chunk_completed",
+                    {"chunk_index": index - 1, "total_chunks": total_chunks},
+                )
+            await self.update_job_status(job_id, "completed", progress_percent=100)
+
+    async def _fan_out_chunks(
+        self, job_id: uuid.UUID, collection_id: uuid.UUID, chunks: list[str]
+    ) -> None:
+        """Create chunk records and enqueue parallel workers."""
+        async with AsyncSessionLocal() as session:
+            for index, chunk_text in enumerate(chunks):
+                chunk = IngestionChunk(
+                    job_id=job_id,
+                    chunk_index=index,
+                    text=chunk_text,
+                    status="pending",
+                )
+                session.add(chunk)
+
+            await session.execute(
+                text("UPDATE jobs SET chunks_total = :total WHERE id = :jid"),
+                {"total": len(chunks), "jid": job_id},
+            )
+            await session.commit()
+
+        from graph_core.workers.ingestion import run_chunk
+        for index in range(len(chunks)):
+            run_chunk.send(str(job_id), index)
+
+    async def process_single_chunk(
+        self, job_id: str, chunk_index: int
+    ) -> None:
+        """Process a single chunk — called by run_chunk worker."""
+        job_uuid = uuid.UUID(job_id)
+
+        async with AsyncSessionLocal() as session:
+            chunk = await session.execute(
+                select(IngestionChunk).where(
+                    IngestionChunk.job_id == job_uuid,
+                    IngestionChunk.chunk_index == chunk_index,
+                )
+            )
+            chunk = chunk.scalar_one()
+            chunk.status = "processing"  # type: ignore[assignment]
+            await session.commit()
+
+            job = await session.get(Job, job_uuid)
+            collection = await session.get(Collection, job.collection_id)
+            text = chunk.text
+
+        result = await self._ingest_collection_chunk(
+            text=text,
+            collection=collection,
+            namespace_id=collection.namespace_id,
+            chunk_index=chunk_index,
+        )
+
+        await self.update_chunk_status(job_uuid, chunk_index, "completed")
+
+        progress = await self._increment_chunk_counter(job_uuid)
+        await self.append_job_event(
+            job_uuid, "chunk_completed",
+            {"chunk_index": chunk_index, "entity_count": result.entity_count, "relationship_count": result.relationship_count},
+        )
+
+    async def update_chunk_status(
+        self, job_id: uuid.UUID, chunk_index: int, status: str, error: str | None = None
+    ) -> None:
+        async with AsyncSessionLocal() as session:
+            chunk = await session.execute(
+                select(IngestionChunk).where(
+                    IngestionChunk.job_id == job_id,
+                    IngestionChunk.chunk_index == chunk_index,
+                )
+            )
+            chunk = chunk.scalar_one()
+            chunk.status = status  # type: ignore[assignment]
+            if error:
+                chunk.error = error  # type: ignore[attr-defined]
+            if status in ("completed", "failed"):
+                chunk.completed_at = datetime.now(UTC)  # type: ignore[attr-defined]
+            await session.commit()
+
+    async def _increment_chunk_counter(self, job_id: uuid.UUID) -> int:
+        """Atomically increment chunks_completed and return progress percent."""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE jobs SET chunks_completed = chunks_completed + 1, "
+                    "progress_percent = CAST(((chunks_completed + 1)::float / NULLIF(chunks_total, 0) * 100) AS integer), "
+                    "status = CASE WHEN chunks_completed + 1 >= chunks_total THEN 'completed' ELSE 'running' END "
+                    "WHERE id = :jid "
+                    "RETURNING chunks_completed, chunks_total, status"
+                ),
+                {"jid": job_id},
+            )
+            row = result.fetchone()
+            if row:
+                completed, total, status = row
+                if total and completed >= total:
+                    await session.execute(
+                        text("UPDATE jobs SET completed_at = :now WHERE id = :jid AND status = 'completed'"),
+                        {"now": datetime.now(UTC), "jid": job_id},
+                    )
+                    await session.commit()
+                await session.commit()
+                return int((completed / total * 100) if total else 0)
+            return 0
+
+    # ── Graph RAG ingestion pipeline ──
+
+    def _get_graph_storage(self):
+        if self._graph_storage is None:
+            from graph_core.storage.graph_storage import FalkorDBGraphStorage
+            self._graph_storage = FalkorDBGraphStorage(settings.falkordb_graph_name)
+        return self._graph_storage
+
+    async def _ingest_graph_chunk(
+        self,
+        text: str,
+        collection: Collection,
+        chunk_hash: str,
+        report,
+    ) -> ChunkIngestionResult:
+        """Full Graph RAG pipeline: extract → resolve → store."""
+        embedding_provider = await self._get_embedding_provider_for_collection(collection)
+        llm_provider = await self._get_llm_provider(namespace_id=collection.namespace_id)
+
+        # Check raw extraction cache
+        cached = await self._get_raw_extraction(chunk_hash, collection.id)
+        if cached:
+            return ChunkIngestionResult(
+                chunk_hash=chunk_hash,
+                entity_count=len(cached.entities),
+                relationship_count=len(cached.relationships),
+            )
+
+        # LLM extraction
+        extractor = LLMGraphExtractor(llm=llm_provider)
+        extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
+
+        # Save raw extraction cache
+        await self._save_raw_extraction(
+            chunk_hash=chunk_hash,
+            collection_id=collection.id,
+            extraction=extraction,
+        )
+
+        # Embed and store chunk for naive retrieval fallback
+        chunk_embedding = await embedding_provider.embed_query(text)
+        await self._graph_rag_vectors.upsert_chunk_embedding(
+            collection_id=collection.id,
+            chunk_hash=chunk_hash,
+            chunk_index=0,
+            content=text,
+            embedding=chunk_embedding,
+        )
+
+        if not extraction.entities and not extraction.relationships:
+            return ChunkIngestionResult(
+                chunk_hash=chunk_hash, entity_count=0, relationship_count=0,
+            )
+
+        # Entity resolution + storage
+        from graph_core.services.entity_name_cache import EntityNameCache
+
+        resolver = IncrementalEntityResolver(
+            embedding_provider=embedding_provider,
+            collection_id=collection.id,
+        )
+        name_cache = EntityNameCache(str(collection.id))
+
+        resolved_entity_ids: dict[str, uuid.UUID] = {}
+
+        async with AsyncSessionLocal() as session:
+            for entity in extraction.entities:
+                # Check cache first
+                cached_id = await name_cache.get(entity.name)
+                if cached_id:
+                    resolved_entity_ids[entity.name] = cached_id
+                    continue
+
+                result = await resolver.resolve_entity(
+                    session=session,
+                    name=entity.name,
+                    entity_type=entity.entity_type,
+                    description=entity.description,
+                    source_chunk_hash=chunk_hash,
+                )
+                resolved_entity_ids[entity.name] = result.entity_id
+
+                if result.is_new:
+                    await name_cache.set_many(
+                        [entity.name, result.canonical_name], result.entity_id
+                    )
+
+                await session.commit()
+
+            # Resolve relationships + FalkorDB upsert
+            nodes_to_upsert = []
+            edges_to_upsert = []
+
+            for rel in extraction.relationships:
+                source_id = resolved_entity_ids.get(rel.source_name)
+                target_id = resolved_entity_ids.get(rel.target_name)
+                if not source_id or not target_id:
+                    continue
+
+                rel_result = await resolver.resolve_relationship(
+                    session=session,
+                    source_entity_id=source_id,
+                    target_entity_id=target_id,
+                    description=rel.description,
+                    keywords=rel.keywords,
+                    weight=rel.weight,
+                    source_chunk_hash=chunk_hash,
+                )
+                await session.commit()
+
+                nodes_to_upsert.append({
+                    "id": str(source_id),
+                    "name": rel.source_name,
+                    "collection_id": str(collection.id),
+                })
+                nodes_to_upsert.append({
+                    "id": str(target_id),
+                    "name": rel.target_name,
+                    "collection_id": str(collection.id),
+                })
+                edges_to_upsert.append({
+                    "source_id": str(source_id),
+                    "target_id": str(target_id),
+                    "id": str(rel_result.relationship_id),
+                    "weight": int(rel.weight * 10),
+                    "keywords": rel.keywords,
+                    "collection_id": str(collection.id),
+                })
+
+        # Deduplicate nodes
+        unique_nodes = {n["id"]: n for n in nodes_to_upsert}.values()
+
+        # Batch upsert to FalkorDB
+        graph_storage = self._get_graph_storage()
+        if unique_nodes:
+            await graph_storage.upsert_nodes(list(unique_nodes))
+        if edges_to_upsert:
+            await graph_storage.upsert_edges(edges_to_upsert)
+
+        return ChunkIngestionResult(
+            chunk_hash=chunk_hash,
+            entity_count=len(extraction.entities),
+            relationship_count=len(extraction.relationships),
+        )
+
+    async def _save_raw_extraction(
+        self,
+        chunk_hash: str,
+        collection_id: uuid.UUID,
+        extraction: ExtractionResult,
+    ) -> None:
+        async with AsyncSessionLocal() as session:
+            record = RawChunkExtraction(
+                chunk_content_hash=chunk_hash,
+                collection_id=collection_id,
+                entities_json=[
+                    {"name": e.name, "type": e.entity_type, "description": e.description}
+                    for e in extraction.entities
+                ],
+                relationships_json=[
+                    {
+                        "source_name": r.source_name,
+                        "target_name": r.target_name,
+                        "description": r.description,
+                        "keywords": r.keywords,
+                        "weight": r.weight,
+                    }
+                    for r in extraction.relationships
+                ],
+            )
+            session.add(record)
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+
+    async def _get_raw_extraction(
+        self, chunk_hash: str, collection_id: uuid.UUID
+    ) -> ExtractionResult | None:
+        from graph_core.services.graph_rag.extractor import (
+            ExtractedEntity,
+            ExtractedRelationship,
+        )
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(RawChunkExtraction).where(
+                    RawChunkExtraction.chunk_content_hash == chunk_hash,
+                    RawChunkExtraction.collection_id == collection_id,
+                )
+            )
+            record = result.scalar_one_or_none()
+            if not record:
+                return None
+
+            entities = [
+                ExtractedEntity(name=e["name"], entity_type=e["type"], description=e["description"])
+                for e in (record.entities_json or [])
+            ]
+            relationships = [
+                ExtractedRelationship(
+                    source_name=r["source_name"],
+                    target_name=r["target_name"],
+                    description=r["description"],
+                    keywords=r.get("keywords", []),
+                    weight=r.get("weight", 1.0),
+                )
+                for r in (record.relationships_json or [])
+            ]
+            return ExtractionResult(entities=entities, relationships=relationships)
 
     # ── Query ──
 
@@ -200,15 +567,15 @@ class GraphService:
     ) -> QueryResult:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
-
         effective_mode = mode or collection.default_query_mode or "local"
+
         if collection.strategy == "vector":
             return await self._query_vector(
-                question,
-                collection,
-                namespace_id,
-                effective_mode,
-                llm_profile_id=llm_profile_id,
+                question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
+            )
+        if collection.strategy in ("custom_graph_rag", "light_rag"):
+            return await self._query_graph_rag(
+                question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
             )
 
         return QueryResult(
@@ -217,6 +584,288 @@ class GraphService:
             relationships_used=[],
             mode=effective_mode,
         )
+
+    # ── Graph RAG Query ──
+
+    async def _query_graph_rag(
+        self,
+        question: str,
+        collection: Collection,
+        namespace_id: uuid.UUID,
+        mode: str,
+        llm_profile_id: uuid.UUID | None = None,
+    ) -> QueryResult:
+        """Full Graph RAG query pipeline with energy-decay DFS traversal.
+
+        Steps:
+        1. Embed query
+        2. Seed entity search (pgvector entity embeddings + alias ILIKE)
+        3. Score seeds by relationship relevance
+        4. Energy-decay DFS traversal in FalkorDB
+        5. Fetch EntityDescriptions from Postgres
+        6. Fetch RelationshipDescriptions from Postgres
+        7. Build context and call LLM
+        """
+        embedding_provider = await self._get_embedding_provider_for_collection(collection)
+
+        # Step 1: Embed query
+        query_embedding = await embedding_provider.embed_query(question)
+
+        # Step 2: Seed entity search
+        TOP_K = 10
+        MIN_EDGE_SIM = settings.graph_rag_min_edge_similarity
+        MIN_SEED_SIM = 0.4
+        ENERGY_BUDGET = 7.0
+        MAX_DEPTH = 8
+        MAX_ENTITIES = 10
+        MAX_ENTITY_DESCS = 4
+        MAX_REL_DESCS = 4
+
+        entity_hits = await self._graph_rag_vectors.search_entity_embeddings(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=TOP_K,
+        )
+
+        seed_entity_ids: list[str] = []
+        entity_relevance: dict[str, float] = {}
+
+        for hit in entity_hits:
+            meta = hit.metadata
+            entity_id_str = meta.get("entity_id", "")
+            sim = 1.0 - hit.distance
+            if entity_id_str and entity_id_str not in seed_entity_ids:
+                seed_entity_ids.append(entity_id_str)
+                entity_relevance[entity_id_str] = sim
+
+        # Step 2b: Alias lookup — catch entities missed by vector search
+        async with AsyncSessionLocal() as session:
+            import string
+            stop_words = {
+                "the", "a", "an", "and", "or", "in", "on", "at", "to",
+                "for", "of", "with", "is", "what", "how", "why", "who",
+                "i", "me", "my",
+            }
+            tokens = [w.strip(string.punctuation).lower() for w in question.split()]
+            keywords = [w for w in tokens if w and w not in stop_words and len(w) > 2]
+            keywords = list(dict.fromkeys([question] + keywords))
+
+            for kw in keywords[:5]:
+                alias_result = await session.execute(
+                    select(EntityAlias).join(
+                        GraphEntity, GraphEntity.id == EntityAlias.entity_id
+                    ).where(
+                        EntityAlias.alias_name.ilike(f"%{kw}%"),
+                        GraphEntity.collection_id == collection.id,
+                    ).limit(5)
+                )
+                for alias in alias_result.scalars().all():
+                    eid = str(alias.entity_id)
+                    if eid not in seed_entity_ids:
+                        seed_entity_ids.append(eid)
+                        entity_relevance[eid] = 1.0
+
+        # Step 3: Score seed entities by relationship relevance
+        rel_hits = await self._graph_rag_vectors.search_relationship_embeddings(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=max(TOP_K * 5, 50),
+        )
+
+        # Build name -> entity_id map
+        async with AsyncSessionLocal() as session:
+            seed_entity_rows = await session.execute(
+                select(GraphEntity).where(
+                    GraphEntity.collection_id == collection.id
+                )
+            )
+            name_to_eid = {
+                e.canonical_name.lower(): str(e.id)
+                for e in seed_entity_rows.scalars().all()
+            }
+
+        seed_rel_scores: dict[str, float] = {eid: 0.0 for eid in seed_entity_ids}
+        for hit in rel_hits:
+            meta = hit.metadata
+            sim = 1.0 - hit.distance
+            if sim < MIN_EDGE_SIM:
+                continue
+            for name_field in ("source_name", "target_name"):
+                name = meta.get(name_field, "").lower()
+                eid = name_to_eid.get(name)
+                if eid and sim > seed_rel_scores.get(eid, 0.0):
+                    seed_rel_scores[eid] = sim
+
+        # Step 4: Energy-decay DFS traversal in FalkorDB
+        graph_storage = self._get_graph_storage()
+        visited = set(seed_entity_ids)
+        traversed_rel_ids: list[str] = []
+        discovered_entity_ids = list(seed_entity_ids)
+        energy = ENERGY_BUDGET
+        rel_score_cache: dict[str, float] = {}
+
+        best_seed_sim = max(entity_relevance.values()) if entity_relevance else 0.0
+        effective_depth = 1 if best_seed_sim < MIN_SEED_SIM else MAX_DEPTH
+
+        # Sort seeds by relationship relevance ascending so highest-rel seeds
+        # sit on top of stack (LIFO = explored first)
+        sorted_seeds = sorted(
+            seed_entity_ids,
+            key=lambda e: seed_rel_scores.get(e, 0.0),
+        )
+        stack = [(node_id, 0) for node_id in sorted_seeds]
+
+        async with AsyncSessionLocal() as session:
+            while stack and energy > 0:
+                node_id, depth = stack.pop()
+                if depth >= effective_depth:
+                    continue
+
+                edges = await graph_storage.get_node_edges(node_id)
+                scored_edges: list[tuple[float, str, str]] = []
+
+                for src, tgt in edges:
+                    neighbor = tgt if src == node_id else src
+                    if neighbor in visited:
+                        continue
+
+                    edge_props = await graph_storage.get_edge(src, tgt)
+                    if not edge_props:
+                        edge_props = await graph_storage.get_edge(tgt, src)
+                    if not (edge_props and edge_props.get("id")):
+                        continue
+
+                    rel_id_str = str(edge_props["id"])
+
+                    # Score edge by relationship embedding similarity
+                    rel_vdb_hits = await self._graph_rag_vectors.search_relationship_embeddings(
+                        collection_id=collection.id,
+                        query_embedding=query_embedding,
+                        top_k=MAX_REL_DESCS,
+                        relationship_id=uuid.UUID(rel_id_str),
+                    )
+                    sim = max(1.0 - r.distance for r in rel_vdb_hits) if rel_vdb_hits else 0.0
+                    rel_score_cache[rel_id_str] = sim
+
+                    if sim >= MIN_EDGE_SIM:
+                        scored_edges.append((sim, neighbor, rel_id_str))
+
+                # Push low-sim edges first so high-sim edges are on top of stack
+                for sim, neighbor, rel_id_str in sorted(scored_edges, key=lambda x: x[0]):
+                    cost = max(0.05, 1.0 - sim)
+                    if energy - cost > 0:
+                        energy -= cost
+                        visited.add(neighbor)
+                        stack.append((neighbor, depth + 1))
+                        if rel_id_str and rel_id_str not in traversed_rel_ids:
+                            traversed_rel_ids.append(rel_id_str)
+                        if neighbor not in discovered_entity_ids:
+                            discovered_entity_ids.append(neighbor)
+                        edge_sim = 1.0 - cost
+                        if neighbor not in entity_relevance or edge_sim > entity_relevance[neighbor]:
+                            entity_relevance[neighbor] = edge_sim
+
+            # Step 5: Fetch EntityDescriptions from Postgres
+            ranked_entity_ids = sorted(
+                discovered_entity_ids,
+                key=lambda eid: entity_relevance.get(eid, 0.0),
+                reverse=True,
+            )
+
+            entity_context_parts: list[str] = []
+            entities_used: list[str] = []
+            for eid_str in ranked_entity_ids[:MAX_ENTITIES]:
+                try:
+                    eid = uuid.UUID(eid_str)
+                except ValueError:
+                    continue
+                entity = await session.get(GraphEntity, eid)
+                if not entity:
+                    continue
+                descs_result = await session.execute(
+                    select(EntityDescription)
+                    .where(EntityDescription.entity_id == eid)
+                    .order_by(EntityDescription.weight.desc())
+                    .limit(MAX_ENTITY_DESCS)
+                )
+                descs = descs_result.scalars().all()
+                if descs:
+                    desc_texts = " | ".join(d.description for d in descs)
+                    entity_context_parts.append(
+                        f"{entity.canonical_name} ({entity.primary_type or 'unknown'}): {desc_texts}"
+                    )
+                    entities_used.append(entity.canonical_name)
+
+            # Step 6: Fetch RelationshipDescriptions from Postgres
+            rel_context_parts: list[str] = []
+            relationships_used: list[str] = []
+            for rel_id_str in traversed_rel_ids[:50]:
+                try:
+                    rel_uuid = uuid.UUID(rel_id_str)
+                except ValueError:
+                    continue
+                rel = await session.get(GraphRelationship, rel_uuid)
+                if not rel:
+                    continue
+                src_entity = await session.get(GraphEntity, rel.source_entity_id)
+                tgt_entity = await session.get(GraphEntity, rel.target_entity_id)
+                src_name = src_entity.canonical_name if src_entity else "?"
+                tgt_name = tgt_entity.canonical_name if tgt_entity else "?"
+                descs_result = await session.execute(
+                    select(RelationshipDescription)
+                    .where(RelationshipDescription.relationship_id == rel_uuid)
+                    .order_by(RelationshipDescription.weight.desc())
+                    .limit(MAX_REL_DESCS)
+                )
+                descs = descs_result.scalars().all()
+                sim = rel_score_cache.get(rel_id_str, 0.0)
+                for d in descs:
+                    rel_text = f"{src_name} \u2192 {tgt_name}: {d.description}"
+                    rel_context_parts.append((sim, rel_text))
+                    relationships_used.append(f"{src_name} \u2192 {tgt_name}")
+
+            rel_context_parts.sort(key=lambda x: x[0], reverse=True)
+
+            # Step 7: Build context and call LLM
+            entity_context = "\n".join(entity_context_parts)
+            rel_context = "\n".join(text for _, text in rel_context_parts)
+
+            context = f"""Context:
+Entities:
+{entity_context or "(none)"}
+Relationships:
+{rel_context or "(none)"}"""
+
+            llm_provider = await self._get_llm_provider(
+                namespace_id=namespace_id, llm_profile_id=llm_profile_id,
+            )
+            if isinstance(llm_provider, LocalEchoLLMProvider):
+                response = entity_context or rel_context or "No relevant context found."
+            else:
+                response = await llm_provider.chat([
+                    {
+                        "role": "system",
+                        "content": (
+                            "Use the context below to answer the question. "
+                            "Draw on the entities and relationships to reason through your answer - "
+                            "explain, connect, and illuminate rather than just report. "
+                            "Write in natural prose. If the context is insufficient for part of the "
+                            "question, acknowledge it briefly without making it the focus."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"{context}\n\nQuestion: {question}",
+                    },
+                ])
+
+            return QueryResult(
+                response=response,
+                entities_used=entities_used,
+                relationships_used=list(dict.fromkeys(relationships_used)),
+                mode=mode,
+            )
+
 
     # ── Jobs ──
 
@@ -252,55 +901,19 @@ class GraphService:
                 job.progress_percent = progress_percent
             if error:
                 job.error = error
-            from datetime import UTC, datetime
-
             if status == "running" and not job.started_at:
                 job.started_at = datetime.now(UTC)
             if status in ("completed", "failed", "cancelled"):
                 job.completed_at = datetime.now(UTC)
             await session.commit()
 
-    async def append_job_event(self, job_id: uuid.UUID, event_type: str, payload: dict | None = None):
+    async def append_job_event(
+        self, job_id: uuid.UUID, event_type: str, payload: dict | None = None
+    ):
         async with AsyncSessionLocal() as session:
             event = JobEvent(job_id=job_id, event_type=event_type, payload=payload)
             session.add(event)
             await session.commit()
-
-    async def ingest_document_pipeline(self, job_id: uuid.UUID):
-        async with AsyncSessionLocal() as session:
-            job = await session.get(Job, job_id)
-            if not job:
-                raise ValueError(f"Job {job_id} not found")
-            if not job.payload or "text" not in job.payload:
-                raise ValueError(f"Job {job_id} does not contain input text")
-
-            collection = await session.get(Collection, job.collection_id)
-            if not collection:
-                raise ValueError(f"Collection {job.collection_id} not found")
-
-            text = str(job.payload["text"])
-
-        chunks = self._chunker.chunk_text(text)
-        total_chunks = max(len(chunks), 1)
-
-        if not chunks:
-            await self.update_job_status(job_id, "completed", progress_percent=100)
-            return
-
-        for index, chunk in enumerate(chunks, start=1):
-            await self._ingest_collection_chunk(
-                text=chunk,
-                collection=collection,
-                namespace_id=collection.namespace_id,
-                chunk_index=index - 1,
-            )
-            progress = int(index * 100 / total_chunks)
-            await self.update_job_status(job_id, "running", progress_percent=progress)
-            await self.append_job_event(
-                job_id,
-                "chunk_completed",
-                {"chunk_index": index - 1, "total_chunks": total_chunks},
-            )
 
     # ── Internal ──
 
@@ -318,9 +931,7 @@ class GraphService:
         report,
         chunk_index: int,
     ) -> ChunkIngestionResult:
-        embedding_provider = await self._get_embedding_provider_for_collection(
-            collection
-        )
+        embedding_provider = await self._get_embedding_provider_for_collection(collection)
         embedding = await embedding_provider.embed_query(text)
         token_count = len(text.split())
         await self._vector_store.upsert_chunks(
@@ -345,13 +956,6 @@ class GraphService:
     async def _ingest_lightrag_chunk(
         self, text: str, collection: Collection, chunk_hash: str, report
     ) -> ChunkIngestionResult:
-        # TODO: LightRAG.insert(text) → library-managed storage → returns extraction summary
-        return ChunkIngestionResult(chunk_hash=chunk_hash, entity_count=0, relationship_count=0)
-
-    async def _ingest_graph_chunk(
-        self, text: str, collection: Collection, chunk_hash: str, report
-    ) -> ChunkIngestionResult:
-        # TODO: sanitize → chunk → LLM extraction → entity resolution → embed → FalkorDB + ChromaDB
         return ChunkIngestionResult(chunk_hash=chunk_hash, entity_count=0, relationship_count=0)
 
     async def _write_ledger(
@@ -368,7 +972,10 @@ class GraphService:
                 strategy=collection.strategy,
                 entity_count=result.entity_count,
                 relationship_count=result.relationship_count,
-                sanitization_flags={"severity": report.severity, "details": report.details} if report.severity != "none" else None,
+                sanitization_flags=(
+                    {"severity": report.severity, "details": report.details}
+                    if report.severity != "none" else None
+                ),
             )
             session.add(record)
             await session.commit()
@@ -381,16 +988,14 @@ class GraphService:
         mode: str,
         llm_profile_id: uuid.UUID | None = None,
     ) -> QueryResult:
-        embedding_provider = await self._get_embedding_provider_for_collection(
-            collection
-        )
+        embedding_provider = await self._get_embedding_provider_for_collection(collection)
         query_embedding = await embedding_provider.embed_query(question)
         results = await self._vector_store.query_chunks(
             collection_id=collection.id,
             query_embedding=query_embedding,
             top_k=settings.vector_query_top_k,
         )
-        chunks = [result.content for result in results]
+        chunks = [r.content for r in results]
         response = await self._generate_vector_answer(
             question=question,
             chunks=chunks,
@@ -398,25 +1003,18 @@ class GraphService:
             llm_profile_id=llm_profile_id,
         )
         return QueryResult(
-            response=response,
-            entities_used=[],
-            relationships_used=[],
-            mode=mode,
+            response=response, entities_used=[], relationships_used=[], mode=mode,
         )
 
     async def _get_embedding_provider_for_collection(
-        self,
-        collection: Collection,
-    ):
+        self, collection: Collection,
+    ) -> EmbeddingProvider:
         if collection.embedding_profile_id is None:
             return get_embedding_provider()
-
         async with AsyncSessionLocal() as session:
             profile = await session.get(Profile, collection.embedding_profile_id)
             if not profile:
-                raise ValueError(
-                    f"Embedding profile {collection.embedding_profile_id} not found"
-                )
+                raise ValueError(f"Embedding profile {collection.embedding_profile_id} not found")
             api_key = await self._get_profile_api_key(session, profile)
             return get_embedding_provider(
                 provider_name=profile.provider,
@@ -435,47 +1033,25 @@ class GraphService:
     ) -> str:
         if not chunks:
             return ""
-
         llm_provider = await self._get_llm_provider(
-            namespace_id=namespace_id,
-            llm_profile_id=llm_profile_id,
+            namespace_id=namespace_id, llm_profile_id=llm_profile_id,
         )
         if isinstance(llm_provider, LocalEchoLLMProvider):
             return chunks[0]
-
-        context = "\n\n".join(
-            f"Chunk {index + 1}:\n{chunk}"
-            for index, chunk in enumerate(chunks)
-        )
-        return await llm_provider.chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Answer the question using only the provided context. "
-                        "If the answer is not present, say so."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Question:\n{question}\n\n"
-                        f"Context:\n{context}\n\n"
-                        "Answer using the context above."
-                    ),
-                },
-            ]
-        )
+        context = "\n\n".join(f"Chunk {i + 1}:\n{c}" for i, c in enumerate(chunks))
+        return await llm_provider.chat([
+            {"role": "system", "content": "Answer using only the provided context."},
+            {"role": "user", "content": f"Question:\n{question}\n\nContext:\n{context}"},
+        ])
 
     async def _get_llm_provider(
         self,
         *,
         namespace_id: uuid.UUID,
-        llm_profile_id: uuid.UUID | None,
-    ):
+        llm_profile_id: uuid.UUID | None = None,
+    ) -> LLMProvider:
         if llm_profile_id is None:
             return get_llm_provider()
-
         async with AsyncSessionLocal() as session:
             profile = await session.get(Profile, llm_profile_id)
             if not profile or profile.namespace_id != namespace_id:
@@ -484,15 +1060,12 @@ class GraphService:
                 raise ValueError("Profile kind must be llm")
             api_key = await self._get_profile_api_key(session, profile)
             return get_llm_provider(
-                provider_name=profile.provider,
-                model=profile.model,
-                api_key=api_key,
+                provider_name=profile.provider, model=profile.model, api_key=api_key,
             )
 
     async def _get_profile_api_key(self, session, profile: Profile) -> str | None:
         if profile.credential_id is None:
             return None
-
         credential = await session.get(Credential, profile.credential_id)
         if not credential:
             raise ValueError(f"Credential {profile.credential_id} not found")
