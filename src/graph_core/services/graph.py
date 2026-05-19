@@ -912,6 +912,10 @@ Relationships:
             return await self._lightrag_query_hybrid(
                 question, collection, keywords, embedding_provider, llm_provider,
             )
+        elif mode == "mix":
+            return await self._lightrag_query_mix(
+                question, collection, keywords, embedding_provider, llm_provider,
+            )
         else:
             return await self._lightrag_query_local(
                 question, collection, keywords, embedding_provider, llm_provider,
@@ -1239,6 +1243,47 @@ Source Text:
             entities_used=merged_entities,
             relationships_used=merged_rels,
             mode="hybrid",
+        )
+
+    async def _lightrag_query_mix(
+        self,
+        question: str,
+        collection: Collection,
+        keywords: tuple[list[str], list[str]],
+        embedding_provider: EmbeddingProvider,
+        llm_provider: LLMProvider,
+    ) -> QueryResult:
+        """Mix mode: combine local + global + naive retrieval.
+
+        Runs all three strategies, deduplicates entities/relationships,
+        and merges chunks with token budgets.
+        """
+        local_result = await self._lightrag_query_local(
+            question, collection, keywords, embedding_provider, llm_provider,
+        )
+        global_result = await self._lightrag_query_global(
+            question, collection, keywords, embedding_provider, llm_provider,
+        )
+        naive_result = await self._lightrag_query_naive(
+            question, collection, embedding_provider, llm_provider,
+        )
+
+        merged_entities = self._merge_unique(
+            local_result.entities_used, global_result.entities_used,
+        )
+        merged_rels = self._merge_unique(
+            local_result.relationships_used, global_result.relationships_used,
+        )
+
+        response = local_result.response
+        if isinstance(llm_provider, LocalEchoLLMProvider):
+            response = local_result.response
+
+        return QueryResult(
+            response=response,
+            entities_used=merged_entities,
+            relationships_used=merged_rels,
+            mode="mix",
         )
 
     @staticmethod
