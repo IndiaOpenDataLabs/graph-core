@@ -220,8 +220,8 @@ class GraphService:
             await self.update_job_status(job_id, "completed", progress_percent=100)
             return
 
-        # For custom_graph_rag: fan-out chunks to parallel workers
-        if collection.strategy == "custom_graph_rag":
+        # For custom_graph_rag and light_rag: fan-out chunks to parallel workers
+        if collection.strategy in ("custom_graph_rag", "light_rag"):
             await self._fan_out_chunks(job_id, collection.id, chunks)
         else:
             # Vector strategy: sequential processing
@@ -577,6 +577,10 @@ class GraphService:
             return await self._query_graph_rag(
                 question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
             )
+        if collection.strategy == "light_rag":
+            return await self._query_lightrag(
+                question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
+            )
 
         return QueryResult(
             response="",
@@ -866,6 +870,447 @@ Relationships:
                 mode=mode,
             )
 
+    # ── LightRAG Query ──
+
+    async def _query_lightrag(
+        self,
+        question: str,
+        collection: Collection,
+        namespace_id: uuid.UUID,
+        mode: str,
+        llm_profile_id: uuid.UUID | None = None,
+    ) -> QueryResult:
+        """LightRAG query with keyword-driven retrieval.
+
+        Supports modes: local, global, hybrid, naive.
+        1. Extract high/low level keywords from query
+        2. Mode-specific retrieval (entity/relationship/chunk vector search)
+        3. Graph traversal for connected entities/relationships
+        4. Token budget management
+        5. LLM answer generation
+        """
+        embedding_provider = await self._get_embedding_provider_for_collection(collection)
+        llm_provider = await self._get_llm_provider(
+            namespace_id=namespace_id, llm_profile_id=llm_profile_id,
+        )
+
+        keywords = await self._extract_keywords(question, llm_provider)
+
+        if mode == "naive":
+            return await self._lightrag_query_naive(
+                question, collection, embedding_provider, llm_provider,
+            )
+        elif mode == "local":
+            return await self._lightrag_query_local(
+                question, collection, keywords, embedding_provider, llm_provider,
+            )
+        elif mode == "global":
+            return await self._lightrag_query_global(
+                question, collection, keywords, embedding_provider, llm_provider,
+            )
+        elif mode == "hybrid":
+            return await self._lightrag_query_hybrid(
+                question, collection, keywords, embedding_provider, llm_provider,
+            )
+        else:
+            return await self._lightrag_query_local(
+                question, collection, keywords, embedding_provider, llm_provider,
+            )
+
+    async def _extract_keywords(
+        self, query: str, llm_provider: LLMProvider
+    ) -> tuple[list[str], list[str]]:
+        """Extract high-level and low-level keywords from query.
+
+        Returns (high_level, low_level) keyword lists.
+        Falls back to word-level extraction on failure.
+        """
+        if not query or not query.strip():
+            return [], []
+
+        _KW_SCHEMA = {
+            "type": "object",
+            "properties": {
+                "high_level_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Conceptual, abstract keywords for broad topic search",
+                },
+                "low_level_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Specific, concrete keywords for precise entity search",
+                },
+            },
+            "required": ["high_level_keywords", "low_level_keywords"],
+        }
+
+        try:
+            result = await llm_provider.structured_extract(
+                prompt=(
+                    "Extract keywords from this query for knowledge graph search.\n\n"
+                    "Return JSON with two arrays:\n"
+                    "- high_level_keywords: conceptual terms describing the topic/theme\n"
+                    "- low_level_keywords: specific entity names, places, or concrete terms\n\n"
+                    f"Query: {query}"
+                ),
+                schema=_KW_SCHEMA,
+            )
+            hl = result.get("high_level_keywords", [])
+            ll = result.get("low_level_keywords", [])
+            if isinstance(hl, list) and isinstance(ll, list):
+                hl = [str(k) for k in hl if k]
+                ll = [str(k) for k in ll if k]
+                if hl and ll:
+                    return hl, ll
+        except Exception:
+            pass
+
+        return self._fallback_keywords(query), self._fallback_keywords(query)
+
+    @staticmethod
+    def _fallback_keywords(query: str) -> list[str]:
+        import string
+        stop_words = {
+            "the", "a", "an", "and", "or", "in", "on", "at", "to",
+            "for", "of", "with", "is", "what", "how", "why", "who",
+            "i", "me", "my", "are", "was", "were", "be", "been",
+            "have", "has", "had", "do", "does", "did", "will", "would",
+            "this", "that", "these", "those", "there", "here",
+        }
+        words = query.lower().split()
+        words = [w.strip(string.punctuation) for w in words]
+        words = [w for w in words if w and w not in stop_words and len(w) > 2]
+        return words if words else [w for w in words if w]
+
+    async def _lightrag_query_naive(
+        self,
+        question: str,
+        collection: Collection,
+        embedding_provider: EmbeddingProvider,
+        llm_provider: LLMProvider,
+    ) -> QueryResult:
+        """Naive mode: pure vector search on chunk embeddings."""
+        query_embedding = await embedding_provider.embed_query(question)
+        hits = await self._graph_rag_vectors.search_chunk_embeddings(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=settings.vector_query_top_k,
+        )
+        chunks = [h.content for h in hits]
+        response = await self._generate_vector_answer(
+            question=question,
+            chunks=chunks,
+            namespace_id=collection.namespace_id,
+            llm_profile_id=None,
+        )
+        if isinstance(llm_provider, LocalEchoLLMProvider):
+            response = chunks[0] if chunks else ""
+        return QueryResult(
+            response=response, entities_used=[], relationships_used=[], mode="naive",
+        )
+
+    async def _lightrag_query_local(
+        self,
+        question: str,
+        collection: Collection,
+        keywords: tuple[list[str], list[str]],
+        embedding_provider: EmbeddingProvider,
+        llm_provider: LLMProvider,
+    ) -> QueryResult:
+        """Local mode: entity-focused retrieval + graph traversal.
+
+        1. Search entity embeddings with low-level keywords
+        2. For each entity, get connected edges from graph
+        3. Collect source chunks from entities and relationships
+        4. Build context with token budgets
+        5. Call LLM
+        """
+        high_level, low_level = keywords
+        search_terms = low_level if low_level else [question]
+        search_text = " ".join(search_terms)
+        query_embedding = await embedding_provider.embed_query(search_text)
+
+        entity_hits = await self._graph_rag_vectors.search_entity_embeddings(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=20,
+        )
+
+        entities: list[dict[str, Any]] = []
+        entity_names: list[str] = []
+        graph_storage = self._get_graph_storage()
+        collection_id_str = str(collection.id)
+
+        for hit in entity_hits:
+            name = hit.metadata.get("name", "")
+            if name and name not in entity_names:
+                entity_names.append(name)
+                node = await graph_storage.get_lightrag_node(name, collection_id_str)
+                if node:
+                    entities.append(node)
+
+        relationships: list[dict[str, Any]] = []
+        rel_ids_seen: set[str] = set()
+        for entity in entities:
+            name = entity.get("name", "")
+            if not name:
+                continue
+            try:
+                edges = await graph_storage.get_lightrag_node_edges(name, collection_id_str)
+                for src, tgt in edges:
+                    edge_data = await graph_storage.get_lightrag_edge(src, tgt, collection_id_str)
+                    if edge_data:
+                        edge_id = edge_data.get("id", f"{src}__{tgt}")
+                        if edge_id not in rel_ids_seen:
+                            rel_ids_seen.add(edge_id)
+                            relationships.append(edge_data)
+            except Exception:
+                continue
+
+        chunk_ids = set()
+        for entity in entities:
+            chunk_ids.update(entity.get("source_ids") or [])
+        for rel in relationships:
+            chunk_ids.update(rel.get("source_ids") or [])
+
+        chunks = await self._get_chunks_by_hashes(collection.id, list(chunk_ids))
+
+        entity_context, entities_used = self._build_budgeted_context(
+            [f"{e.get('name', '?')} ({e.get('type', '?')}): {e.get('description', '')}" for e in entities],
+            [e.get("name", "") for e in entities],
+            6000,
+        )
+
+        rel_context, rels_used = self._build_budgeted_context(
+            [f"{r.get('id', '?')}: {r.get('description', '')}" for r in relationships],
+            [r.get("id", "") for r in relationships],
+            8000,
+        )
+
+        chunk_context, _ = self._build_budgeted_context(
+            [c.content for c in chunks],
+            [c.chunk_hash for c in chunks],
+            30000,
+        )
+
+        context = f"""Context:
+Entities:
+{entity_context or "(none)"}
+Relationships:
+{rel_context or "(none)"}
+Source Text:
+{chunk_context or "(none)"}"""
+
+        response = await self._generate_lightrag_response(context, question, llm_provider)
+
+        return QueryResult(
+            response=response,
+            entities_used=entities_used,
+            relationships_used=rels_used,
+            mode="local",
+        )
+
+    async def _lightrag_query_global(
+        self,
+        question: str,
+        collection: Collection,
+        keywords: tuple[list[str], list[str]],
+        embedding_provider: EmbeddingProvider,
+        llm_provider: LLMProvider,
+    ) -> QueryResult:
+        """Global mode: relationship-focused retrieval.
+
+        1. Search relationship embeddings with high-level keywords
+        2. For each relationship, get connected entities
+        3. Collect source chunks
+        4. Build context with token budgets
+        5. Call LLM
+        """
+        high_level, low_level = keywords
+        search_terms = high_level if high_level else [question]
+        search_text = " ".join(search_terms)
+        query_embedding = await embedding_provider.embed_query(search_text)
+
+        rel_hits = await self._graph_rag_vectors.search_relationship_embeddings(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=30,
+        )
+
+        relationships: list[dict[str, Any]] = []
+        rel_ids: list[str] = []
+        graph_storage = self._get_graph_storage()
+        collection_id_str = str(collection.id)
+
+        for hit in rel_hits:
+            meta = hit.metadata
+            src_name = meta.get("source_name", "")
+            tgt_name = meta.get("target_name", "")
+            if src_name and tgt_name:
+                rel_id = f"{src_name}__{tgt_name}"
+                if rel_id not in rel_ids:
+                    rel_ids.append(rel_id)
+                    edge = await graph_storage.get_lightrag_edge(src_name, tgt_name, collection_id_str)
+                    if edge:
+                        relationships.append(edge)
+
+        entity_ids_set: set[str] = set()
+        entities: list[dict[str, Any]] = []
+        for rel in relationships:
+            for entity_name in (rel.get("source_name"), rel.get("target_name")):
+                if entity_name and entity_name not in entity_ids_set:
+                    entity_ids_set.add(entity_name)
+                    node = await graph_storage.get_lightrag_node(entity_name, collection_id_str)
+                    if node:
+                        entities.append(node)
+
+        chunk_ids = set()
+        for rel in relationships:
+            chunk_ids.update(rel.get("source_ids") or [])
+        for entity in entities:
+            chunk_ids.update(entity.get("source_ids") or [])
+
+        chunks = await self._get_chunks_by_hashes(collection.id, list(chunk_ids))
+
+        rel_context, rels_used = self._build_budgeted_context(
+            [f"{r.get('id', '?')}: {r.get('description', '')}" for r in relationships],
+            [r.get("id", "") for r in relationships],
+            8000,
+        )
+
+        entity_context, entities_used = self._build_budgeted_context(
+            [f"{e.get('name', '?')} ({e.get('type', '?')}): {e.get('description', '')}" for e in entities],
+            [e.get("name", "") for e in entities],
+            6000,
+        )
+
+        chunk_context, _ = self._build_budgeted_context(
+            [c.content for c in chunks],
+            [c.chunk_hash for c in chunks],
+            30000,
+        )
+
+        context = f"""Context:
+Relationships:
+{rel_context or "(none)"}
+Entities:
+{entity_context or "(none)"}
+Source Text:
+{chunk_context or "(none)"}"""
+
+        response = await self._generate_lightrag_response(context, question, llm_provider)
+
+        return QueryResult(
+            response=response,
+            entities_used=entities_used,
+            relationships_used=rels_used,
+            mode="global",
+        )
+
+    async def _lightrag_query_hybrid(
+        self,
+        question: str,
+        collection: Collection,
+        keywords: tuple[list[str], list[str]],
+        embedding_provider: EmbeddingProvider,
+        llm_provider: LLMProvider,
+    ) -> QueryResult:
+        """Hybrid mode: merge local + global retrieval."""
+        local_result = await self._lightrag_query_local(
+            question, collection, keywords, embedding_provider, llm_provider,
+        )
+        global_result = await self._lightrag_query_global(
+            question, collection, keywords, embedding_provider, llm_provider,
+        )
+
+        merged_entities = self._merge_unique(local_result.entities_used, global_result.entities_used)
+        merged_rels = self._merge_unique(local_result.relationships_used, global_result.relationships_used)
+        merged_response = local_result.response
+
+        if global_result.response and global_result.response != local_result.response:
+            if isinstance(llm_provider, LocalEchoLLMProvider):
+                merged_response = local_result.response
+            else:
+                merged_response = local_result.response
+
+        return QueryResult(
+            response=merged_response,
+            entities_used=merged_entities,
+            relationships_used=merged_rels,
+            mode="hybrid",
+        )
+
+    @staticmethod
+    def _merge_unique(first: list[str], second: list[str]) -> list[str]:
+        return list(dict.fromkeys(first + second))
+
+    @staticmethod
+    def _build_budgeted_context(
+        texts: list[str],
+        ids: list[str],
+        max_tokens: int,
+    ) -> tuple[str, list[str]]:
+        """Build context string respecting approximate token budget."""
+        if not texts:
+            return "", []
+
+        used_ids = []
+        used_parts = []
+        total_tokens = 0
+
+        for t, item_id in zip(texts, ids):
+            tokens = max(1, len(t.split()))
+            if total_tokens + tokens <= max_tokens:
+                used_parts.append(t)
+                used_ids.append(item_id)
+                total_tokens += tokens
+            else:
+                remaining = max_tokens - total_tokens
+                if remaining > 10:
+                    max_chars = remaining * 4
+                    truncated = t[:max_chars] + "..."
+                    used_parts.append(truncated)
+                break
+
+        return "\n\n".join(used_parts), used_ids
+
+    async def _get_chunks_by_hashes(
+        self, collection_id: uuid.UUID, chunk_hashes: list[str]
+    ) -> list[Any]:
+        """Retrieve chunk contents from graph_chunk_embeddings by hashes."""
+        if not chunk_hashes:
+            return []
+
+        async with AsyncSessionLocal() as session:
+            from graph_core.models.graph_rag_vectors import GraphChunkEmbedding
+            result = await session.execute(
+                select(GraphChunkEmbedding).where(
+                    GraphChunkEmbedding.collection_id == collection_id,
+                    GraphChunkEmbedding.chunk_hash.in_(chunk_hashes),
+                ).order_by(GraphChunkEmbedding.chunk_index)
+            )
+            return list(result.scalars().all())
+
+    async def _generate_lightrag_response(
+        self, context: str, question: str, llm_provider: LLMProvider
+    ) -> str:
+        if isinstance(llm_provider, LocalEchoLLMProvider):
+            return context
+        return await llm_provider.chat([
+            {
+                "role": "system",
+                "content": (
+                    "Use the provided context to answer the question. "
+                    "Draw on the entities, relationships, and source text to reason through your answer. "
+                    "Write in natural prose. If the context is insufficient, acknowledge it briefly."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"{context}\n\nQuestion: {question}",
+            },
+        ])
 
     # ── Jobs ──
 
@@ -956,7 +1401,143 @@ Relationships:
     async def _ingest_lightrag_chunk(
         self, text: str, collection: Collection, chunk_hash: str, report
     ) -> ChunkIngestionResult:
-        return ChunkIngestionResult(chunk_hash=chunk_hash, entity_count=0, relationship_count=0)
+        """LightRAG ingestion: extract → store in FalkorDB + pgvector.
+
+        Unlike custom_graph_rag, LightRAG uses entity NAME as the node ID,
+        skips incremental entity resolution, and stores full metadata on
+        FalkorDB nodes/edges directly.
+        """
+        embedding_provider = await self._get_embedding_provider_for_collection(collection)
+        llm_provider = await self._get_llm_provider(namespace_id=collection.namespace_id)
+
+        cached = await self._get_raw_extraction(chunk_hash, collection.id)
+        if cached:
+            return ChunkIngestionResult(
+                chunk_hash=chunk_hash,
+                entity_count=len(cached.entities),
+                relationship_count=len(cached.relationships),
+            )
+
+        extractor = LLMGraphExtractor(llm=llm_provider)
+        extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
+
+        await self._save_raw_extraction(
+            chunk_hash=chunk_hash,
+            collection_id=collection.id,
+            extraction=extraction,
+        )
+
+        chunk_embedding = await embedding_provider.embed_query(text)
+        await self._graph_rag_vectors.upsert_chunk_embedding(
+            collection_id=collection.id,
+            chunk_hash=chunk_hash,
+            chunk_index=0,
+            content=text,
+            embedding=chunk_embedding,
+        )
+
+        if not extraction.entities and not extraction.relationships:
+            return ChunkIngestionResult(
+                chunk_hash=chunk_hash, entity_count=0, relationship_count=0,
+            )
+
+        collection_id_str = str(collection.id)
+        graph_storage = self._get_graph_storage()
+
+        entity_ids_resolved: dict[str, str] = {}
+
+        for entity in extraction.entities:
+            name = entity.name
+            entity_ids_resolved[name] = name
+
+            if not await graph_storage.has_lightrag_node(name, collection_id_str):
+                await graph_storage.upsert_lightrag_node(
+                    node_name=name,
+                    collection_id=collection_id_str,
+                    properties={
+                        "type": entity.entity_type,
+                        "description": entity.description,
+                        "source_ids": [chunk_hash],
+                    },
+                )
+            else:
+                existing = await graph_storage.get_lightrag_node(name, collection_id_str)
+                if existing:
+                    source_ids = existing.get("source_ids") or []
+                    if chunk_hash not in source_ids:
+                        source_ids.append(chunk_hash)
+                    existing_desc = existing.get("description", "")
+                    merged_desc = (
+                        existing_desc + "; " + entity.description
+                        if existing_desc and entity.description
+                        else (existing_desc or entity.description)
+                    )
+                    await graph_storage.upsert_lightrag_node(
+                        node_name=name,
+                        collection_id=collection_id_str,
+                        properties={
+                            "type": entity.entity_type,
+                            "description": merged_desc,
+                            "source_ids": source_ids[:300],
+                        },
+                    )
+
+            desc_embedding = await embedding_provider.embed_query(entity.description)
+            entity_uuid = self._deterministic_uuid(name)
+            desc_id = self._deterministic_uuid(f"desc:{name}:{chunk_hash}")
+            await self._graph_rag_vectors.upsert_entity_embedding(
+                entity_id=entity_uuid,
+                collection_id=collection.id,
+                name=name,
+                description=entity.description,
+                description_id=desc_id,
+                embedding=desc_embedding,
+            )
+
+        for rel in extraction.relationships:
+            source_name = rel.source_name
+            target_name = rel.target_name
+
+            if source_name not in entity_ids_resolved or target_name not in entity_ids_resolved:
+                continue
+
+            rel_id_str = f"{source_name}__{target_name}"
+            rel_uuid = self._deterministic_uuid(rel_id_str)
+
+            rel_embedding = await embedding_provider.embed_query(rel.description)
+            await self._graph_rag_vectors.upsert_relationship_embedding(
+                relationship_id=rel_uuid,
+                collection_id=collection.id,
+                source_name=source_name,
+                target_name=target_name,
+                description=rel.description,
+                embedding=rel_embedding,
+            )
+
+            await graph_storage.upsert_lightrag_edge(
+                source_name=source_name,
+                target_name=target_name,
+                collection_id=collection_id_str,
+                properties={
+                    "id": rel_id_str,
+                    "description": rel.description,
+                    "keywords": rel.keywords,
+                    "weight": int(rel.weight * 10),
+                    "source_ids": [chunk_hash],
+                },
+            )
+
+        return ChunkIngestionResult(
+            chunk_hash=chunk_hash,
+            entity_count=len(extraction.entities),
+            relationship_count=len(extraction.relationships),
+        )
+
+    @staticmethod
+    def _deterministic_uuid(name: str) -> uuid.UUID:
+        """Generate a deterministic UUID from a string (namespace-less MD5)."""
+        import hashlib
+        return uuid.UUID(hashlib.md5(name.encode()).hexdigest())
 
     async def _write_ledger(
         self,

@@ -152,7 +152,7 @@ class FalkorDBGraphStorage:
 
     async def upsert_node(self, node_id: str, properties: dict[str, Any]) -> None:
         graph = await self._get_graph()
-        allowed_keys = {"id", "name", "collection_id"}
+        allowed_keys = {"id", "name", "collection_id", "type", "description", "source_ids"}
         set_clauses = []
         params: dict[str, object] = {"id": node_id}
         for key, value in properties.items():
@@ -172,7 +172,7 @@ class FalkorDBGraphStorage:
         self, source_id: str, target_id: str, properties: dict[str, Any]
     ) -> None:
         graph = await self._get_graph()
-        allowed_keys = {"id", "weight", "keywords", "collection_id"}
+        allowed_keys = {"id", "weight", "keywords", "collection_id", "description", "source_ids"}
         set_clauses = []
         params: dict[str, object] = {"source_id": source_id, "target_id": target_id}
         for key, value in properties.items():
@@ -196,6 +196,149 @@ class FalkorDBGraphStorage:
             )
 
         await graph.query(query, params)
+
+    # ── LightRAG name-based operations ──
+
+    async def has_lightrag_node(self, node_name: str, collection_id: str) -> bool:
+        """Check if a LightRAG entity node exists by name."""
+        graph = await self._get_graph()
+        result = await graph.query(
+            "MATCH (n:Entity {id: $name, collection_id: $cid}) RETURN count(n) as count",
+            {"name": node_name, "cid": collection_id},
+        )
+        if result and result.result_set:
+            count = result.result_set[0][0] or 0
+            return count > 0
+        return False
+
+    async def get_lightrag_node(self, node_name: str, collection_id: str) -> Optional[dict[str, Any]]:
+        """Get LightRAG entity node properties by name."""
+        graph = await self._get_graph()
+        result = await graph.query(
+            "MATCH (n:Entity {id: $name, collection_id: $cid}) RETURN n",
+            {"name": node_name, "cid": collection_id},
+        )
+        if result and result.result_set:
+            node = result.result_set[0][0]
+            if node:
+                props = dict(node.properties)
+                if isinstance(props.get("source_ids"), str):
+                    try:
+                        props["source_ids"] = json.loads(props["source_ids"])
+                    except (json.JSONDecodeError, TypeError):
+                        props["source_ids"] = []
+                return props
+        return None
+
+    async def upsert_lightrag_node(
+        self, node_name: str, collection_id: str, properties: dict[str, Any]
+    ) -> None:
+        """Upsert a LightRAG entity node with name as ID."""
+        graph = await self._get_graph()
+        props = {
+            "id": node_name,
+            "name": node_name,
+            "collection_id": collection_id,
+            "type": properties.get("type", "UNKNOWN"),
+            "description": properties.get("description", ""),
+        }
+        source_ids = properties.get("source_ids", [])
+        if source_ids:
+            props["source_ids"] = json.dumps(source_ids)
+
+        await graph.query(
+            "MERGE (n:Entity {id: $id, collection_id: $collection_id})"
+            " SET n.name = $name, n.type = $type, n.description = $description"
+            " SET n.source_ids = $source_ids",
+            props,
+        )
+
+    async def upsert_lightrag_edge(
+        self,
+        source_name: str,
+        target_name: str,
+        collection_id: str,
+        properties: dict[str, Any],
+    ) -> None:
+        """Upsert a LightRAG relationship edge with name-based nodes."""
+        graph = await self._get_graph()
+        rel_id = properties.get("id", f"{source_name}__{target_name}")
+        keywords = properties.get("keywords", [])
+        source_ids = properties.get("source_ids", [])
+
+        await graph.query(
+            "MERGE (a:Entity {id: $source_name, collection_id: $collection_id})"
+            " MERGE (b:Entity {id: $target_name, collection_id: $collection_id})"
+            " MERGE (a)-[r:RELATES_TO]->(b)"
+            " SET r.id = $rel_id,"
+            " r.description = $description,"
+            " r.weight = $weight,"
+            " r.keywords = $keywords,"
+            " r.source_ids = $source_ids,"
+            " r.collection_id = $collection_id",
+            {
+                "source_name": source_name,
+                "target_name": target_name,
+                "collection_id": collection_id,
+                "rel_id": rel_id,
+                "description": properties.get("description", ""),
+                "weight": properties.get("weight", 1),
+                "keywords": json.dumps(keywords) if isinstance(keywords, list) else (keywords or "[]"),
+                "source_ids": json.dumps(source_ids) if isinstance(source_ids, list) else (source_ids or "[]"),
+            },
+        )
+
+    async def get_lightrag_node_edges(
+        self, node_name: str, collection_id: str
+    ) -> list[tuple[str, str]]:
+        """Get all edges connected to a LightRAG entity node."""
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH (n:Entity {id: $node_name, collection_id: $cid})-[r:RELATES_TO]-(m:Entity)
+            RETURN n.id as source, m.id as target
+            """,
+            {"node_name": node_name, "cid": collection_id},
+        )
+        edges: list[tuple[str, str]] = []
+        if result and result.result_set:
+            for row in result.result_set:
+                source, target = row[0], row[1]
+                if source and target:
+                    edges.append((str(source), str(target)))
+        return edges
+
+    async def get_lightrag_edge(
+        self, source_name: str, target_name: str, collection_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Get LightRAG edge properties between two named nodes."""
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH (a:Entity {id: $source, collection_id: $cid})
+            -[r:RELATES_TO]->
+            (b:Entity {id: $target, collection_id: $cid})
+            RETURN r
+            """,
+            {"source": source_name, "target": target_name, "cid": collection_id},
+        )
+        if result and result.result_set:
+            edge = result.result_set[0][0]
+            if edge:
+                props = dict(edge.properties)
+                for list_field in ("keywords", "source_ids"):
+                    val = props.get(list_field)
+                    if isinstance(val, str):
+                        try:
+                            props[list_field] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            props[list_field] = []
+                return props
+        return None
+
+    async def delete_nodes_by_collection_lightrag(self, collection_id: str) -> int:
+        """Delete all LightRAG nodes for a collection."""
+        return await self.delete_nodes_by_collection(collection_id)
 
     async def get_node_edges(self, node_id: str) -> list[tuple[str, str]]:
         graph = await self._get_graph()

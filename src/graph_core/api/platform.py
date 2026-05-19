@@ -69,7 +69,7 @@ async def get_capabilities(
             _to_profile_response(profile).model_dump()
             for profile in llm_profiles
         ],
-        "retrieval_strategies": ["vector", "custom_graph_rag"],
+        "retrieval_strategies": ["vector", "custom_graph_rag", "light_rag"],
         "max_chunk_size": 16000,
     }
 

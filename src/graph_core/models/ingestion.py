@@ -17,7 +17,7 @@ class IngestionRecord(Base):
     collection_id = Column(UUIDType(as_uuid=True), ForeignKey("collections.id", ondelete="CASCADE"), nullable=False, index=True)
     chunk_hash = Column(String(64), nullable=False, index=True)  # SHA-256
 
-    strategy = Column(Enum("vector", "custom_graph_rag", name="ingest_strategy", create_type=True), nullable=False)
+    strategy = Column(Enum("vector", "custom_graph_rag", "light_rag", name="ingest_strategy", create_type=True), nullable=False)
     extraction_model = Column(String(128), nullable=True)
     embedding_model = Column(String(128), nullable=True)
 
