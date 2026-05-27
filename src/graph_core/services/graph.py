@@ -44,6 +44,11 @@ from graph_core.services.graph_rag.extractor import (
 from graph_core.services.sanitizer import TextSanitizer
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.vector_store import VectorStore
+from graph_core.storage.vector_tables import (
+    create_all_tables,
+    drop_all_tables,
+    table_name,
+)
 
 
 @dataclass
@@ -93,6 +98,8 @@ class GraphService:
             ns = await session.get(Namespace, namespace_id)
             if not ns:
                 raise ValueError(f"Namespace {namespace_id} not found")
+
+            dimensions = None
             if embedding_profile_id is not None:
                 profile = await session.get(Profile, embedding_profile_id)
                 if not profile:
@@ -101,6 +108,7 @@ class GraphService:
                     raise ValueError("Embedding profile does not belong to namespace")
                 if profile.kind != "embedding":
                     raise ValueError("Profile kind must be embedding")
+                dimensions = profile.dimensions
 
             collection = Collection(
                 name=name,
@@ -108,11 +116,25 @@ class GraphService:
                 strategy=strategy,
                 embedding_profile_id=embedding_profile_id,
                 default_query_mode=default_query_mode,
+                embedding_dimensions=dimensions,
             )
             session.add(collection)
             await session.commit()
             await session.refresh(collection)
-            return collection
+
+        # Create per-collection vector tables after the collection exists
+        if dimensions is not None:
+            await create_all_tables(collection.id, dimensions)
+
+        return collection
+
+    async def delete_collection(self, collection_id: uuid.UUID) -> None:
+        """Delete a collection and drop its per-collection vector tables."""
+        collection = await self.get_collection(collection_id)
+        await drop_all_tables(collection_id)
+        async with AsyncSessionLocal() as session:
+            await session.delete(collection)
+            await session.commit()
 
     async def list_collections(self, namespace_id: uuid.UUID) -> list[Collection]:
         async with AsyncSessionLocal() as session:
@@ -1093,8 +1115,8 @@ Relationships:
         )
 
         chunk_context, _ = self._build_budgeted_context(
-            [c.content for c in chunks],
-            [c.chunk_hash for c in chunks],
+            [c["content"] for c in chunks],
+            [c["id"] for c in chunks],
             30000,
         )
 
@@ -1190,8 +1212,8 @@ Source Text:
         )
 
         chunk_context, _ = self._build_budgeted_context(
-            [c.content for c in chunks],
-            [c.chunk_hash for c in chunks],
+            [c["content"] for c in chunks],
+            [c["id"] for c in chunks],
             30000,
         )
 
@@ -1322,20 +1344,22 @@ Source Text:
 
     async def _get_chunks_by_hashes(
         self, collection_id: uuid.UUID, chunk_hashes: list[str]
-    ) -> list[Any]:
-        """Retrieve chunk contents from graph_chunk_embeddings by hashes."""
+    ) -> list[dict]:
+        """Retrieve chunk contents from per-collection chunk_embeddings by hashes."""
         if not chunk_hashes:
             return []
 
+        tbl = table_name(collection_id, "chunk_embeddings")
         async with AsyncSessionLocal() as session:
-            from graph_core.models.graph_rag_vectors import GraphChunkEmbedding
+            placeholders = ",".join(f"'{h}'" for h in chunk_hashes)
             result = await session.execute(
-                select(GraphChunkEmbedding).where(
-                    GraphChunkEmbedding.collection_id == collection_id,
-                    GraphChunkEmbedding.chunk_hash.in_(chunk_hashes),
-                ).order_by(GraphChunkEmbedding.chunk_index)
+                text(
+                    f"SELECT id::text, content FROM {tbl} "
+                    f"WHERE chunk_hash IN ({placeholders}) "
+                    f"ORDER BY chunk_index"
+                )
             )
-            return list(result.scalars().all())
+            return [{"id": row[0], "content": row[1]} for row in result]
 
     async def _generate_lightrag_response(
         self, context: str, question: str, llm_provider: LLMProvider
@@ -1621,7 +1645,7 @@ Source Text:
             query_embedding=query_embedding,
             top_k=settings.vector_query_top_k,
         )
-        chunks = [r.content for r in results]
+        chunks = [r["content"] for r in results]
         response = await self._generate_vector_answer(
             question=question,
             chunks=chunks,
@@ -1641,12 +1665,14 @@ Source Text:
             profile = await session.get(Profile, collection.embedding_profile_id)
             if not profile:
                 raise ValueError(f"Embedding profile {collection.embedding_profile_id} not found")
-            api_key = await self._get_profile_api_key(session, profile)
+            api_key, cred_base_url = await self._get_profile_credential_info(session, profile)
+            base_url = profile.base_url or cred_base_url
             return get_embedding_provider(
                 provider_name=profile.provider,
                 model=profile.model,
                 dimensions=profile.dimensions,
                 api_key=api_key,
+                base_url=base_url,
             )
 
     async def _generate_vector_answer(
@@ -1684,15 +1710,16 @@ Source Text:
                 raise ValueError("LLM profile not found in namespace")
             if profile.kind != "llm":
                 raise ValueError("Profile kind must be llm")
-            api_key = await self._get_profile_api_key(session, profile)
+            api_key, cred_base_url = await self._get_profile_credential_info(session, profile)
+            base_url = profile.base_url or cred_base_url
             return get_llm_provider(
-                provider_name=profile.provider, model=profile.model, api_key=api_key,
+                provider_name=profile.provider, model=profile.model, api_key=api_key, base_url=base_url,
             )
 
-    async def _get_profile_api_key(self, session, profile: Profile) -> str | None:
+    async def _get_profile_credential_info(self, session, profile: Profile) -> tuple[str | None, str | None]:
         if profile.credential_id is None:
-            return None
+            return None, None
         credential = await session.get(Credential, profile.credential_id)
         if not credential:
             raise ValueError(f"Credential {profile.credential_id} not found")
-        return self._crypto.decrypt(credential.encrypted_secret)
+        return self._crypto.decrypt(credential.encrypted_secret), credential.base_url

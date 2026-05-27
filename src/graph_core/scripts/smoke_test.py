@@ -98,11 +98,14 @@ async def create_namespace() -> uuid.UUID:
     return ns_id
 
 
-async def register_credential(client, headers, api_key: str) -> str:
+async def register_credential(client, headers, api_key: str, base_url: str | None = None) -> str:
     """Register an OpenAI credential. Returns credential_id."""
+    body = {"provider": "openai", "secret": api_key, "label": "smoke-test"}
+    if base_url:
+        body["base_url"] = base_url
     r = await client.post(
         "/platform/credentials",
-        json={"provider": "openai", "secret": api_key, "label": "smoke-test"},
+        json=body,
         headers=headers,
     )
     if r.status_code != 200:
@@ -112,6 +115,7 @@ async def register_credential(client, headers, api_key: str) -> str:
 
 async def create_profile(client, headers, kind: str, provider: str, model: str,
                          credential_id: str | None, label: str,
+                         base_url: str | None = None,
                          dimensions: int | None = None) -> str:
     """Create an embedding or LLM profile. Returns profile_id."""
     body = {
@@ -122,6 +126,8 @@ async def create_profile(client, headers, kind: str, provider: str, model: str,
     }
     if credential_id:
         body["credential_id"] = credential_id
+    if base_url:
+        body["base_url"] = base_url
     if dimensions:
         body["dimensions"] = dimensions
         body["distance_metric"] = "cosine"
@@ -234,7 +240,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         if has_openai:
             print(f"\n{BOLD}3. Register credential (OpenAI){RESET}")
             try:
-                cred_id = await register_credential(client, headers, args.llm_key)
+                cred_id = await register_credential(client, headers, args.llm_key, args.llm_url)
                 record(True, f"Credential registered: {cred_id}")
             except Exception as e:
                 record(False, f"Failed to register credential: {e}")
@@ -250,6 +256,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
                     model=args.embed_model,
                     credential_id=cred_id,
                     label="smoke-embed-openai",
+                    base_url=args.embed_url,
                     dimensions=args.embed_dimensions,
                 )
             else:
@@ -276,6 +283,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
                     model=args.llm_model,
                     credential_id=cred_id,
                     label="smoke-llm-openai",
+                    base_url=args.llm_url,
                 )
             else:
                 llm_profile_id = await create_profile(

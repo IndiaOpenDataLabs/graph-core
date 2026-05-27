@@ -1,4 +1,4 @@
-"""Graph RAG pgvector storage — vector operations for entities, relationships, centroids, chunks."""
+"""Graph RAG pgvector storage — per-collection vector operations."""
 
 from __future__ import annotations
 
@@ -6,15 +6,18 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 from graph_core.database import AsyncSessionLocal
-from graph_core.models.graph_rag_vectors import (
-    GraphChunkEmbedding,
-    GraphEntityCentroid,
-    GraphEntityEmbedding,
-    GraphRelationshipEmbedding,
+from graph_core.storage.vector_tables import (
+    get_collection_dimensions,
+    table_name,
+    vector_cast,
 )
+
+
+def _embedding_literal(embedding: list[float]) -> str:
+    return "[" + ",".join(str(float(v)) for v in embedding) + "]"
 
 
 @dataclass
@@ -28,15 +31,9 @@ class VectorSearchHit:
 class GraphRAGVectorStore:
     """Pgvector-backed storage for graph RAG vectors.
 
-    Manages 4 collections:
-    - entity_embeddings: entity description embeddings (seed search)
-    - relationship_embeddings: relationship description embeddings (edge scoring)
-    - entity_centroids: centroid embeddings (incremental resolution)
-    - chunk_embeddings: text chunk embeddings (naive retrieval)
+    All tables are per-collection, created at collection creation time
+    with the embedding dimensions from the collection's profile.
     """
-
-    async def _ensure_session(self):
-        return AsyncSessionLocal()
 
     # ── Entity Embeddings ──
 
@@ -49,16 +46,29 @@ class GraphRAGVectorStore:
         description_id: uuid.UUID,
         embedding: list[float],
     ) -> None:
+        tbl = table_name(collection_id, "entity_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        em = _embedding_literal(embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
-            row = GraphEntityEmbedding(
-                entity_id=entity_id,
-                collection_id=collection_id,
-                name=name,
-                description=description,
-                description_id=description_id,
-                embedding=embedding,
+            await session.execute(
+                text(
+                    f"INSERT INTO {tbl} "
+                    f"(entity_id, collection_id, name, description, description_id, embedding) "
+                    f"VALUES (:eid, :cid, :name, :desc, :did, {vc})"
+                ),
+                {
+                    "eid": entity_id,
+                    "cid": collection_id,
+                    "name": name,
+                    "desc": description,
+                    "did": description_id,
+                },
             )
-            session.add(row)
             await session.commit()
 
     async def search_entity_embeddings(
@@ -67,38 +77,43 @@ class GraphRAGVectorStore:
         query_embedding: list[float],
         top_k: int,
     ) -> list[VectorSearchHit]:
+        tbl = table_name(collection_id, "entity_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        em = _embedding_literal(query_embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
-            if session.bind and session.bind.dialect.name == "postgresql":
-                qe = "[" + ",".join(str(float(v)) for v in query_embedding) + "]"
-                result = await session.execute(
-                    text(
-                        """
-                        SELECT id::text, entity_id::text, description_id::text, name, description,
-                               1 - (embedding <=> CAST(:qe AS vector)) as score,
-                               embedding <=> CAST(:qe AS vector) as distance
-                        FROM graph_entity_embeddings
-                        WHERE collection_id = :cid
-                        ORDER BY distance
-                        LIMIT :top_k
-                        """
-                    ),
-                    {"qe": qe, "cid": collection_id, "top_k": top_k},
+            result = await session.execute(
+                text(
+                    f"""
+                    SELECT id::text, entity_id::text, description_id::text, name, description,
+                           1 - (embedding <=> {vc}) as score,
+                           embedding <=> {vc} as distance
+                    FROM {tbl}
+                    WHERE collection_id = :cid
+                    ORDER BY distance
+                    LIMIT :top_k
+                    """
+                ),
+                {"cid": collection_id, "top_k": top_k},
+            )
+            return [
+                VectorSearchHit(
+                    id=row[0],
+                    distance=float(row[6]),
+                    content=row[4],
+                    metadata={
+                        "entity_id": row[1],
+                        "description_id": row[2],
+                        "name": row[3],
+                        "collection_id": str(collection_id),
+                    },
                 )
-                hits = []
-                for row in result:
-                    hits.append(VectorSearchHit(
-                        id=row[0],
-                        distance=float(row[6]),
-                        content=row[4],
-                        metadata={
-                            "entity_id": row[1],
-                            "description_id": row[2],
-                            "name": row[3],
-                            "collection_id": str(collection_id),
-                        },
-                    ))
-                return hits
-            return []
+                for row in result
+            ]
 
     # ── Relationship Embeddings ──
 
@@ -111,16 +126,29 @@ class GraphRAGVectorStore:
         description: str,
         embedding: list[float],
     ) -> None:
+        tbl = table_name(collection_id, "relationship_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        em = _embedding_literal(embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
-            row = GraphRelationshipEmbedding(
-                relationship_id=relationship_id,
-                collection_id=collection_id,
-                source_name=source_name,
-                target_name=target_name,
-                description=description,
-                embedding=embedding,
+            await session.execute(
+                text(
+                    f"INSERT INTO {tbl} "
+                    f"(relationship_id, collection_id, source_name, target_name, description, embedding) "
+                    f"VALUES (:rid, :cid, :sn, :tn, :desc, {vc})"
+                ),
+                {
+                    "rid": relationship_id,
+                    "cid": collection_id,
+                    "sn": source_name,
+                    "tn": target_name,
+                    "desc": description,
+                },
             )
-            session.add(row)
             await session.commit()
 
     async def search_relationship_embeddings(
@@ -130,44 +158,49 @@ class GraphRAGVectorStore:
         top_k: int,
         relationship_id: uuid.UUID | None = None,
     ) -> list[VectorSearchHit]:
-        async with AsyncSessionLocal() as session:
-            if session.bind and session.bind.dialect.name == "postgresql":
-                qe = "[" + ",".join(str(float(v)) for v in query_embedding) + "]"
-                where_extra = ""
-                params = {"qe": qe, "cid": collection_id, "top_k": top_k}
-                if relationship_id:
-                    where_extra = "AND relationship_id = :rel_id"
-                    params["rel_id"] = relationship_id
+        tbl = table_name(collection_id, "relationship_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-                result = await session.execute(
-                    text(
-                        f"""
-                        SELECT id::text, relationship_id::text, source_name, target_name, description,
-                               1 - (embedding <=> CAST(:qe AS vector)) as score,
-                               embedding <=> CAST(:qe AS vector) as distance
-                        FROM graph_relationship_embeddings
-                        WHERE collection_id = :cid {where_extra}
-                        ORDER BY distance
-                        LIMIT :top_k
-                        """
-                    ),
-                    params,
+        em = _embedding_literal(query_embedding)
+        vc = vector_cast(em, dimensions)
+
+        where_extra = ""
+        params: dict = {"cid": collection_id, "top_k": top_k}
+        if relationship_id:
+            where_extra = "AND relationship_id = :rel_id"
+            params["rel_id"] = relationship_id
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    f"""
+                    SELECT id::text, relationship_id::text, source_name, target_name, description,
+                           1 - (embedding <=> {vc}) as score,
+                           embedding <=> {vc} as distance
+                    FROM {tbl}
+                    WHERE collection_id = :cid {where_extra}
+                    ORDER BY distance
+                    LIMIT :top_k
+                    """
+                ),
+                params,
+            )
+            return [
+                VectorSearchHit(
+                    id=row[0],
+                    distance=float(row[6]),
+                    content=row[4],
+                    metadata={
+                        "relationship_id": row[1],
+                        "source_name": row[2],
+                        "target_name": row[3],
+                        "collection_id": str(collection_id),
+                    },
                 )
-                hits = []
-                for row in result:
-                    hits.append(VectorSearchHit(
-                        id=row[0],
-                        distance=float(row[6]),
-                        content=row[4],
-                        metadata={
-                            "relationship_id": row[1],
-                            "source_name": row[2],
-                            "target_name": row[3],
-                            "collection_id": str(collection_id),
-                        },
-                    ))
-                return hits
-            return []
+                for row in result
+            ]
 
     # ── Entity Centroids ──
 
@@ -180,28 +213,52 @@ class GraphRAGVectorStore:
         description_count: int,
         embedding: list[float],
     ) -> None:
+        tbl = table_name(collection_id, "entity_centroids")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        em = _embedding_literal(embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
             existing = await session.execute(
-                select(GraphEntityCentroid).where(
-                    GraphEntityCentroid.entity_id == entity_id
-                )
+                text(f"SELECT id FROM {tbl} WHERE entity_id = :eid"),
+                {"eid": entity_id},
             )
-            existing_row = existing.scalar_one_or_none()
-            if existing_row:
-                existing_row.embedding = embedding
-                existing_row.canonical_name = canonical_name
-                existing_row.primary_type = primary_type
-                existing_row.description_count = description_count
-            else:
-                row = GraphEntityCentroid(
-                    entity_id=entity_id,
-                    collection_id=collection_id,
-                    canonical_name=canonical_name,
-                    primary_type=primary_type,
-                    description_count=description_count,
-                    embedding=embedding,
+            if existing.scalar_one_or_none():
+                await session.execute(
+                    text(
+                        f"UPDATE {tbl} SET "
+                        f"embedding = {vc}, "
+                        f"canonical_name = :cn, "
+                        f"primary_type = :pt, "
+                        f"description_count = :dc "
+                        f"WHERE entity_id = :eid"
+                    ),
+                    {
+                        "cn": canonical_name,
+                        "pt": primary_type,
+                        "dc": description_count,
+                        "eid": entity_id,
+                    },
                 )
-                session.add(row)
+            else:
+                await session.execute(
+                    text(
+                        f"INSERT INTO {tbl} "
+                        f"(entity_id, collection_id, canonical_name, primary_type, "
+                        f"description_count, embedding) "
+                        f"VALUES (:eid, :cid, :cn, :pt, :dc, {vc})"
+                    ),
+                    {
+                        "eid": entity_id,
+                        "cid": collection_id,
+                        "cn": canonical_name,
+                        "pt": primary_type,
+                        "dc": description_count,
+                    },
+                )
             await session.commit()
 
     async def search_entity_centroids(
@@ -210,51 +267,63 @@ class GraphRAGVectorStore:
         query_embedding: list[float],
         top_k: int,
     ) -> list[VectorSearchHit]:
-        async with AsyncSessionLocal() as session:
-            if session.bind and session.bind.dialect.name == "postgresql":
-                qe = "[" + ",".join(str(float(v)) for v in query_embedding) + "]"
-                result = await session.execute(
-                    text(
-                        """
-                        SELECT id::text, entity_id::text, canonical_name, primary_type, description_count,
-                               1 - (embedding <=> CAST(:qe AS vector)) as score,
-                               embedding <=> CAST(:qe AS vector) as distance
-                        FROM graph_entity_centroids
-                        WHERE collection_id = :cid
-                        ORDER BY distance
-                        LIMIT :top_k
-                        """
-                    ),
-                    {"qe": qe, "cid": collection_id, "top_k": top_k},
-                )
-                hits = []
-                for row in result:
-                    hits.append(VectorSearchHit(
-                        id=row[0],
-                        distance=float(row[6]),
-                        content=row[2],
-                        metadata={
-                            "entity_id": row[1],
-                            "canonical_name": row[2],
-                            "primary_type": row[3] or "",
-                            "description_count": row[4],
-                            "collection_id": str(collection_id),
-                        },
-                    ))
-                return hits
-            return []
+        tbl = table_name(collection_id, "entity_centroids")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-    async def get_entity_centroid(
-        self, entity_id: uuid.UUID
-    ) -> list[float] | None:
+        em = _embedding_literal(query_embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(GraphEntityCentroid.embedding).where(
-                    GraphEntityCentroid.entity_id == entity_id
+                text(
+                    f"""
+                    SELECT id::text, entity_id::text, canonical_name, primary_type, description_count,
+                           1 - (embedding <=> {vc}) as score,
+                           embedding <=> {vc} as distance
+                    FROM {tbl}
+                    WHERE collection_id = :cid
+                    ORDER BY distance
+                    LIMIT :top_k
+                    """
+                ),
+                {"cid": collection_id, "top_k": top_k},
+            )
+            return [
+                VectorSearchHit(
+                    id=row[0],
+                    distance=float(row[6]),
+                    content=row[2],
+                    metadata={
+                        "entity_id": row[1],
+                        "canonical_name": row[2],
+                        "primary_type": row[3] or "",
+                        "description_count": row[4],
+                        "collection_id": str(collection_id),
+                    },
                 )
+                for row in result
+            ]
+
+    async def get_entity_centroid(
+        self, entity_id: uuid.UUID, collection_id: uuid.UUID
+    ) -> list[float] | None:
+        tbl = table_name(collection_id, "entity_centroids")
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    f"SELECT embedding::text FROM {tbl} "
+                    f"WHERE entity_id = :eid"
+                ),
+                {"eid": entity_id},
             )
             row = result.one_or_none()
-            return row.embedding if row else None
+            if row is None:
+                return None
+            # Parse the vector text back to list[float]
+            raw = row[0].strip("[]")
+            return [float(v) for v in raw.split(",")]
 
     # ── Chunk Embeddings ──
 
@@ -266,23 +335,38 @@ class GraphRAGVectorStore:
         content: str,
         embedding: list[float],
     ) -> None:
+        tbl = table_name(collection_id, "chunk_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        em = _embedding_literal(embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
             existing = await session.execute(
-                select(GraphChunkEmbedding).where(
-                    GraphChunkEmbedding.collection_id == collection_id,
-                    GraphChunkEmbedding.chunk_hash == chunk_hash,
-                )
+                text(
+                    f"SELECT id FROM {tbl} "
+                    f"WHERE collection_id = :cid AND chunk_hash = :ch"
+                ),
+                {"cid": collection_id, "ch": chunk_hash},
             )
             if existing.scalar_one_or_none():
                 return
-            row = GraphChunkEmbedding(
-                collection_id=collection_id,
-                chunk_hash=chunk_hash,
-                chunk_index=chunk_index,
-                content=content,
-                embedding=embedding,
+
+            await session.execute(
+                text(
+                    f"INSERT INTO {tbl} "
+                    f"(collection_id, chunk_hash, chunk_index, content, embedding) "
+                    f"VALUES (:cid, :ch, :ci, :content, {vc})"
+                ),
+                {
+                    "cid": collection_id,
+                    "ch": chunk_hash,
+                    "ci": chunk_index,
+                    "content": content,
+                },
             )
-            session.add(row)
             await session.commit()
 
     async def search_chunk_embeddings(
@@ -291,34 +375,39 @@ class GraphRAGVectorStore:
         query_embedding: list[float],
         top_k: int,
     ) -> list[VectorSearchHit]:
+        tbl = table_name(collection_id, "chunk_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        em = _embedding_literal(query_embedding)
+        vc = vector_cast(em, dimensions)
+
         async with AsyncSessionLocal() as session:
-            if session.bind and session.bind.dialect.name == "postgresql":
-                qe = "[" + ",".join(str(float(v)) for v in query_embedding) + "]"
-                result = await session.execute(
-                    text(
-                        """
-                        SELECT id::text, chunk_hash, chunk_index, content,
-                               1 - (embedding <=> CAST(:qe AS vector)) as score,
-                               embedding <=> CAST(:qe AS vector) as distance
-                        FROM graph_chunk_embeddings
-                        WHERE collection_id = :cid
-                        ORDER BY distance
-                        LIMIT :top_k
-                        """
-                    ),
-                    {"qe": qe, "cid": collection_id, "top_k": top_k},
+            result = await session.execute(
+                text(
+                    f"""
+                    SELECT id::text, chunk_hash, chunk_index, content,
+                           1 - (embedding <=> {vc}) as score,
+                           embedding <=> {vc} as distance
+                    FROM {tbl}
+                    WHERE collection_id = :cid
+                    ORDER BY distance
+                    LIMIT :top_k
+                    """
+                ),
+                {"cid": collection_id, "top_k": top_k},
+            )
+            return [
+                VectorSearchHit(
+                    id=row[0],
+                    distance=float(row[5]),
+                    content=row[3],
+                    metadata={
+                        "chunk_hash": row[1],
+                        "chunk_index": row[2],
+                        "collection_id": str(collection_id),
+                    },
                 )
-                hits = []
-                for row in result:
-                    hits.append(VectorSearchHit(
-                        id=row[0],
-                        distance=float(row[5]),
-                        content=row[3],
-                        metadata={
-                            "chunk_hash": row[1],
-                            "chunk_index": row[2],
-                            "collection_id": str(collection_id),
-                        },
-                    ))
-                return hits
-            return []
+                for row in result
+            ]

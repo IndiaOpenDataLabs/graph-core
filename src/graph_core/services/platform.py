@@ -21,6 +21,7 @@ class PlatformService:
         provider: str,
         secret: str,
         label: str | None = None,
+        base_url: str | None = None,
     ) -> Credential:
         async with AsyncSessionLocal() as session:
             credential = Credential(
@@ -28,6 +29,7 @@ class PlatformService:
                 provider=provider,
                 label=label,
                 encrypted_secret=self._crypto.encrypt(secret),
+                base_url=base_url,
             )
             session.add(credential)
             await session.commit()
@@ -43,6 +45,7 @@ class PlatformService:
         model: str,
         credential_id: uuid.UUID | None = None,
         label: str | None = None,
+        base_url: str | None = None,
         dimensions: int | None = None,
         distance_metric: str | None = None,
     ) -> Profile:
@@ -59,6 +62,7 @@ class PlatformService:
                 provider=provider,
                 model=model,
                 label=label,
+                base_url=base_url,
                 dimensions=dimensions,
                 distance_metric=distance_metric,
             )

@@ -21,6 +21,9 @@ class Credential(Base):
     # Encrypted secret — never stored plaintext
     encrypted_secret = Column(String(1024), nullable=False)
 
+    # Optional custom API base URL (e.g. for local OpenAI-compatible servers)
+    base_url = Column(String(512), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     namespace = relationship("Namespace", back_populates="credentials")

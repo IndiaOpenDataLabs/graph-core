@@ -22,6 +22,9 @@ class Profile(Base):
     model = Column(String(128), nullable=False)
     label = Column(String(128), nullable=True)
 
+    # Optional custom API base URL (overrides credential base_url)
+    base_url = Column(String(512), nullable=True)
+
     # Embedding-specific fields
     dimensions = Column(Integer, nullable=True)
     distance_metric = Column(String(32), nullable=True)

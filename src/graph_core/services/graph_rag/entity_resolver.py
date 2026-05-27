@@ -355,7 +355,7 @@ class IncrementalEntityResolver:
         n = (entity.description_count or 0) + 1 if entity else 1
 
         # Hebbian learning: new_centroid = (old_centroid * n + new) / (n + 1)
-        old_centroid = await self._vstore.get_entity_centroid(entity_id)
+        old_centroid = await self._vstore.get_entity_centroid(entity_id, self._collection_id)
         if old_centroid:
             new_centroid = [
                 (old_c * n + new_c) / (n + 1)

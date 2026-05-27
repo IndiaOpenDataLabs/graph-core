@@ -99,3 +99,9 @@ seed:                 ## Run seed script (create default embedding/llm profiles)
 
 smoke-test:           ## Run end-to-end smoke test (requires make docker-up; add --llm-key/--embed-key for all strategies)
 	uv run python -m graph_core.scripts.smoke_test $(SMOKE_ARGS)
+
+smoke-test-local:     ## Run smoke test against local LLM/embedding servers
+	uv run python -m graph_core.scripts.smoke_test \
+		--llm-key test-key --llm-url http://host.docker.internal:8080/v1 \
+		--embed-key test-key --embed-url http://host.docker.internal:8002/v1 \
+		--embed-dimensions 4096

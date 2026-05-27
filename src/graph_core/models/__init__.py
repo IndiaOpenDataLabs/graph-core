@@ -6,7 +6,6 @@ from graph_core.models.credential import Credential
 from graph_core.models.profile import Profile
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.ingestion import IngestionRecord
-from graph_core.models.vector_chunk import VectorChunk
 from graph_core.models.chunk import IngestionChunk
 from graph_core.models.graph_rag import (
     GraphEntity,
@@ -17,12 +16,6 @@ from graph_core.models.graph_rag import (
     RelationshipDescription,
     RawChunkExtraction,
 )
-from graph_core.models.graph_rag_vectors import (
-    GraphEntityEmbedding,
-    GraphRelationshipEmbedding,
-    GraphEntityCentroid,
-    GraphChunkEmbedding,
-)
 
 __all__ = [
     "Namespace",
@@ -32,7 +25,6 @@ __all__ = [
     "Job",
     "JobEvent",
     "IngestionRecord",
-    "VectorChunk",
     "IngestionChunk",
     "GraphEntity",
     "EntityDescription",
@@ -41,8 +33,4 @@ __all__ = [
     "GraphRelationship",
     "RelationshipDescription",
     "RawChunkExtraction",
-    "GraphEntityEmbedding",
-    "GraphRelationshipEmbedding",
-    "GraphEntityCentroid",
-    "GraphChunkEmbedding",
 ]

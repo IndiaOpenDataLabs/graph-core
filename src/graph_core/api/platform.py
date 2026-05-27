@@ -14,12 +14,14 @@ class RegisterCredentialRequest(BaseModel):
     provider: str
     secret: str
     label: str | None = None
+    base_url: str | None = None
 
 
 class RegisterCredentialResponse(BaseModel):
     credential_id: str
     provider: str
     label: str | None
+    base_url: str | None = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -28,6 +30,7 @@ class CreateProfileRequest(BaseModel):
     model: str
     credential_id: uuid.UUID | None = None
     label: str | None = None
+    base_url: str | None = None
     dimensions: int | None = None
     distance_metric: str | None = None
 
@@ -39,6 +42,7 @@ class ProfileResponse(BaseModel):
     model: str
     credential_id: str | None
     label: str | None
+    base_url: str | None = None
     dimensions: int | None
     distance_metric: str | None
 
@@ -85,11 +89,13 @@ async def register_cred(
         provider=body.provider,
         secret=body.secret,
         label=body.label,
+        base_url=body.base_url,
     )
     return RegisterCredentialResponse(
         credential_id=str(credential.id),
         provider=credential.provider,
         label=credential.label,
+        base_url=credential.base_url,
     )
 
 
@@ -106,6 +112,7 @@ async def create_profile(
             model=body.model,
             credential_id=body.credential_id,
             label=body.label,
+            base_url=body.base_url,
             dimensions=body.dimensions,
             distance_metric=body.distance_metric,
         )
@@ -144,6 +151,7 @@ def _to_profile_response(profile) -> ProfileResponse:
         model=profile.model,
         credential_id=str(profile.credential_id) if profile.credential_id else None,
         label=profile.label,
+        base_url=profile.base_url,
         dimensions=profile.dimensions,
         distance_metric=profile.distance_metric,
     )
