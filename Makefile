@@ -1,5 +1,6 @@
 .PHONY: help install install-dev dev start worker lint format fix test clean \
-	docker-up docker-down docker-logs docker-clean docker-ps \
+	docker-up docker-up-dev docker-up-all docker-down docker-logs docker-clean docker-ps \
+	docker-build docker-logs-app docker-logs-worker \
 	db-migrate db-revision db-current db-stamp db-downgrade \
 	infra-check seed
 
@@ -84,6 +85,18 @@ docker-ps:            ## List running containers
 
 docker-clean:         ## Stop and remove all containers, volumes, networks
 	docker compose down -v --remove-orphans
+
+docker-build:         ## Build app and worker images
+	docker compose build app worker
+
+docker-up-all:        ## Build + start everything (infra + app + worker)
+	docker compose up -d --build
+
+docker-logs-app:      ## Follow app logs
+	docker compose logs -f app
+
+docker-logs-worker:   ## Follow worker logs
+	docker compose logs -f worker
 
 # ─── Database Migrations (Alembic) ───────────────────────────────────────────
 
