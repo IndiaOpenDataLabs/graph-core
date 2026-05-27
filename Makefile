@@ -2,7 +2,7 @@
 	docker-up docker-down docker-logs docker-clean docker-ps \
 	docker-logs-app docker-logs-worker \
 	db-migrate db-revision db-current db-stamp db-downgrade \
-	infra-check seed
+	infra-check seed smoke-test
 
 # ─── Project ──────────────────────────────────────────────────────────────────
 
@@ -96,3 +96,6 @@ infra-check:          ## Verify all infrastructure services are reachable
 
 seed:                 ## Run seed script (create default embedding/llm profiles)
 	uv run python -m graph_core.scripts.seed
+
+smoke-test:           ## Run end-to-end smoke test against live stack (requires make docker-up)
+	uv run python -m graph_core.scripts.smoke_test
