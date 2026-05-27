@@ -97,5 +97,5 @@ infra-check:          ## Verify all infrastructure services are reachable
 seed:                 ## Run seed script (create default embedding/llm profiles)
 	uv run python -m graph_core.scripts.seed
 
-smoke-test:           ## Run end-to-end smoke test against live stack (requires make docker-up)
-	uv run python -m graph_core.scripts.smoke_test
+smoke-test:           ## Run end-to-end smoke test (requires make docker-up; add --llm-key/--embed-key for all strategies)
+	uv run python -m graph_core.scripts.smoke_test $(SMOKE_ARGS)

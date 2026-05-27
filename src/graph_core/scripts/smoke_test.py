@@ -3,12 +3,19 @@
 Run after `make docker-up` to confirm Postgres, FalkorDB, Redis,
 the app, and the worker are all working together.
 
-Usage:
+Usage (offline — vector strategy only, local providers):
     uv run python -m graph_core.scripts.smoke_test
-    # or
     make smoke-test
+
+Usage (full — all strategies + modes, real LLM/embeddings):
+    uv run python -m graph_core.scripts.smoke_test \
+        --llm-key sk-... --embed-key sk-...
+    uv run python -m graph_core.scripts.smoke_test \
+        --llm-key sk-... --llm-url https://custom.ai/v1 \
+        --embed-key sk-... --embed-url https://custom.ai/v1
 """
 
+import argparse
 import asyncio
 import sys
 import uuid
@@ -18,9 +25,31 @@ import httpx
 BASE_URL = "http://localhost:8000"
 DB_URL = "postgresql://graphcore:graphcore@localhost:5432/graphcore"
 
+# Text used for ingestion — contains entities/relationships for graph strategies
+INGEST_TEXT = (
+    "Krishna teaches Arjuna about dharma and duty on the battlefield of Kurukshetra. "
+    "Arjuna is a great warrior prince of the Pandavas. "
+    "The Bhagavad Gita is a sacred Hindu scripture that records this conversation. "
+    "Dharma represents cosmic order and moral duty in Hindu philosophy."
+)
+
+# Query to test retrieval
+QUERY_TEXT = "What does Krishna teach Arjuna?"
+
+# Keywords expected in a correct response
+EXPECTED_KEYWORDS = ["krishna", "arjuna", "dharma", "duty", "teach"]
+
+# Strategies and their query modes
+STRATEGIES = [
+    {"name": "vector", "modes": ["local"]},
+    {"name": "custom_graph_rag", "modes": ["local"]},
+    {"name": "light_rag", "modes": ["local", "global", "hybrid", "naive", "mix"]},
+]
+
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
+CYAN = "\033[96m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
@@ -33,8 +62,24 @@ def _fail(msg: str) -> None:
     print(f"  {RED}✗{RESET} {msg}")
 
 
+def _skip(msg: str) -> None:
+    print(f"  {YELLOW}⊘{RESET} {msg}")
+
+
 def _info(msg: str) -> None:
-    print(f"  {YELLOW}ℹ{RESET} {msg}")
+    print(f"  {CYAN}ℹ{RESET} {msg}")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Graph Core smoke test")
+    p.add_argument("--llm-key", help="OpenAI (or compatible) API key for LLM")
+    p.add_argument("--llm-url", help="Custom LLM base URL (e.g. https://api.openai.com/v1)")
+    p.add_argument("--llm-model", default="gpt-4o", help="LLM model name (default: gpt-4o)")
+    p.add_argument("--embed-key", help="OpenAI (or compatible) API key for embeddings")
+    p.add_argument("--embed-url", help="Custom embedding base URL")
+    p.add_argument("--embed-model", default="text-embedding-3-large", help="Embedding model (default: text-embedding-3-large)")
+    p.add_argument("--embed-dimensions", type=int, default=3072, help="Embedding dimensions (default: 3072)")
+    return p.parse_args()
 
 
 async def create_namespace() -> uuid.UUID:
@@ -53,9 +98,97 @@ async def create_namespace() -> uuid.UUID:
     return ns_id
 
 
-async def run_smoke_test() -> bool:
+async def register_credential(client, headers, api_key: str) -> str:
+    """Register an OpenAI credential. Returns credential_id."""
+    r = await client.post(
+        "/platform/credentials",
+        json={"provider": "openai", "secret": api_key, "label": "smoke-test"},
+        headers=headers,
+    )
+    if r.status_code != 200:
+        raise ValueError(f"Credential registration failed: {r.text}")
+    return r.json()["credential_id"]
+
+
+async def create_profile(client, headers, kind: str, provider: str, model: str,
+                         credential_id: str | None, label: str,
+                         dimensions: int | None = None) -> str:
+    """Create an embedding or LLM profile. Returns profile_id."""
+    body = {
+        "kind": kind,
+        "provider": provider,
+        "model": model,
+        "label": label,
+    }
+    if credential_id:
+        body["credential_id"] = credential_id
+    if dimensions:
+        body["dimensions"] = dimensions
+        body["distance_metric"] = "cosine"
+
+    r = await client.post("/platform/profiles", json=body, headers=headers)
+    if r.status_code != 200:
+        raise ValueError(f"Profile creation failed ({kind}): {r.text}")
+    return r.json()["profile_id"]
+
+
+async def create_collection(client, headers, name: str, strategy: str,
+                            embed_profile_id: str) -> str:
+    """Create a collection. Returns collection_id."""
+    r = await client.post(
+        "/collections/",
+        json={
+            "name": name,
+            "strategy": strategy,
+            "embedding_profile_id": embed_profile_id,
+        },
+        headers=headers,
+    )
+    if r.status_code != 200:
+        raise ValueError(f"Collection creation failed: {r.text}")
+    return r.json()["id"]
+
+
+async def ingest_chunk(client, headers, collection_id: str, text: str) -> dict:
+    """Ingest a text chunk. Returns response JSON."""
+    r = await client.post(
+        f"/collections/{collection_id}/ingest/chunk",
+        json={"text": text},
+        headers=headers,
+    )
+    if r.status_code != 200:
+        raise ValueError(f"Ingest failed: {r.text}")
+    return r.json()
+
+
+async def query_collection(client, headers, collection_id: str,
+                           question: str, mode: str | None = None) -> dict:
+    """Query a collection. Returns response JSON."""
+    body = {"question": question}
+    if mode:
+        body["mode"] = mode
+    r = await client.post(
+        f"/collections/{collection_id}/query",
+        json=body,
+        headers=headers,
+    )
+    if r.status_code != 200:
+        raise ValueError(f"Query failed: {r.text}")
+    return r.json()
+
+
+def check_response(data: dict, keywords: list[str]) -> bool:
+    """Check if the query response contains any of the expected keywords."""
+    response_text = data.get("response", "").lower()
+    if not response_text:
+        return False
+    return any(kw.lower() in response_text for kw in keywords)
+
+
+async def run_smoke_test(args: argparse.Namespace) -> bool:
     passed = 0
     failed = 0
+    skipped = 0
 
     def record(ok: bool, msg: str):
         nonlocal passed, failed
@@ -66,7 +199,15 @@ async def run_smoke_test() -> bool:
             failed += 1
             _fail(msg)
 
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=30.0) as client:
+    def skip(msg: str):
+        nonlocal skipped
+        skipped += 1
+        _skip(msg)
+
+    has_openai = bool(args.llm_key and args.embed_key)
+    provider_label = "OpenAI" if has_openai else "local"
+
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=120.0) as client:
 
         # ── 1. Health check ──────────────────────────────────────────
         print(f"\n{BOLD}1. Health check{RESET}")
@@ -88,140 +229,69 @@ async def run_smoke_test() -> bool:
 
         headers = {"X-Namespace-ID": str(ns_id)}
 
-        # ── 3. Register credential ───────────────────────────────────
-        print(f"\n{BOLD}3. Register credential{RESET}")
-        try:
-            r = await client.post(
-                "/platform/credentials",
-                json={"provider": "openai", "secret": "sk-smoke-test-fake", "label": "smoke-test"},
-                headers=headers,
-            )
-            if r.status_code == 200:
-                cred_id = r.json()["credential_id"]
+        # ── 3. Register credential (OpenAI only) ─────────────────────
+        cred_id = None
+        if has_openai:
+            print(f"\n{BOLD}3. Register credential (OpenAI){RESET}")
+            try:
+                cred_id = await register_credential(client, headers, args.llm_key)
                 record(True, f"Credential registered: {cred_id}")
-            else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
-        except Exception as e:
-            record(False, f"Failed to register credential: {e}")
+            except Exception as e:
+                record(False, f"Failed to register credential: {e}")
+                return False
 
-        # ── 4. Create embedding profile (local_hash) ─────────────────
-        print(f"\n{BOLD}4. Create embedding profile{RESET}")
+        # ── 4. Create embedding profile ──────────────────────────────
+        print(f"\n{BOLD}4. Create embedding profile ({provider_label}){RESET}")
         try:
-            r = await client.post(
-                "/platform/profiles",
-                json={
-                    "kind": "embedding",
-                    "provider": "local_hash",
-                    "model": "hash-256",
-                    "label": "smoke-embed",
-                    "dimensions": 256,
-                    "distance_metric": "cosine",
-                },
-                headers=headers,
-            )
-            if r.status_code == 200:
-                embed_profile_id = r.json()["profile_id"]
-                record(True, f"Embedding profile created: {embed_profile_id}")
-            else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
-        except Exception as e:
-            record(False, f"Failed to create embedding profile: {e}")
-
-        # ── 5. Create LLM profile (local_echo) ───────────────────────
-        print(f"\n{BOLD}5. Create LLM profile{RESET}")
-        try:
-            r = await client.post(
-                "/platform/profiles",
-                json={
-                    "kind": "llm",
-                    "provider": "local_echo",
-                    "model": "echo-v1",
-                    "label": "smoke-llm",
-                },
-                headers=headers,
-            )
-            if r.status_code == 200:
-                llm_profile_id = r.json()["profile_id"]
-                record(True, f"LLM profile created: {llm_profile_id}")
-            else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
-        except Exception as e:
-            record(False, f"Failed to create LLM profile: {e}")
-
-        # ── 6. Create collection ─────────────────────────────────────
-        print(f"\n{BOLD}6. Create collection{RESET}")
-        try:
-            r = await client.post(
-                "/collections/",
-                json={
-                    "name": "smoke-test-collection",
-                    "strategy": "vector",
-                    "embedding_profile_id": embed_profile_id,
-                },
-                headers=headers,
-            )
-            if r.status_code == 200:
-                coll_id = r.json()["id"]
-                record(True, f"Collection created: {coll_id}")
-            else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
-        except Exception as e:
-            record(False, f"Failed to create collection: {e}")
-
-        # ── 7. Ingest a chunk ────────────────────────────────────────
-        print(f"\n{BOLD}7. Ingest chunk{RESET}")
-        ingest_text = "The quick brown fox jumps over the lazy dog near the riverbank."
-        try:
-            r = await client.post(
-                f"/collections/{coll_id}/ingest/chunk",
-                json={"text": ingest_text},
-                headers=headers,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                record("chunk_hash" in data, f"Chunk ingested (hash: {data.get('chunk_hash', '?')[:12]}...)")
-            else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
-        except Exception as e:
-            record(False, f"Failed to ingest chunk: {e}")
-
-        # ── 8. Query the collection ──────────────────────────────────
-        print(f"\n{BOLD}8. Query collection{RESET}")
-        try:
-            r = await client.post(
-                f"/collections/{coll_id}/query",
-                json={"question": "What animal jumps over the dog?"},
-                headers=headers,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                response_text = data.get("response", "")
-                # local_echo returns the retrieved chunk directly
-                has_context = "fox" in response_text.lower() or "quick brown" in response_text.lower()
-                record(has_context, f"Query returned context (mode={data.get('mode', '?')})")
-                _info(f"Response preview: {response_text[:120]}...")
-            else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
-        except Exception as e:
-            record(False, f"Failed to query collection: {e}")
-
-        # ── 9. List collections ──────────────────────────────────────
-        print(f"\n{BOLD}9. List collections{RESET}")
-        try:
-            r = await client.get("/collections/", headers=headers)
-            if r.status_code == 200:
-                collections = r.json()
-                record(
-                    any(c["name"] == "smoke-test-collection" for c in collections),
-                    f"Found {len(collections)} collection(s)",
+            if has_openai:
+                embed_profile_id = await create_profile(
+                    client, headers,
+                    kind="embedding", provider="openai",
+                    model=args.embed_model,
+                    credential_id=cred_id,
+                    label="smoke-embed-openai",
+                    dimensions=args.embed_dimensions,
                 )
             else:
-                record(False, f"Unexpected status {r.status_code}: {r.text}")
+                embed_profile_id = await create_profile(
+                    client, headers,
+                    kind="embedding", provider="local_hash",
+                    model="hash-256",
+                    credential_id=None,
+                    label="smoke-embed-local",
+                    dimensions=256,
+                )
+            record(True, f"Embedding profile created: {embed_profile_id}")
         except Exception as e:
-            record(False, f"Failed to list collections: {e}")
+            record(False, f"Failed to create embedding profile: {e}")
+            return False
 
-        # ── 10. Check capabilities ───────────────────────────────────
-        print(f"\n{BOLD}10. Platform capabilities{RESET}")
+        # ── 5. Create LLM profile ────────────────────────────────────
+        print(f"\n{BOLD}5. Create LLM profile ({provider_label}){RESET}")
+        try:
+            if has_openai:
+                llm_profile_id = await create_profile(
+                    client, headers,
+                    kind="llm", provider="openai",
+                    model=args.llm_model,
+                    credential_id=cred_id,
+                    label="smoke-llm-openai",
+                )
+            else:
+                llm_profile_id = await create_profile(
+                    client, headers,
+                    kind="llm", provider="local_echo",
+                    model="echo-v1",
+                    credential_id=None,
+                    label="smoke-llm-local",
+                )
+            record(True, f"LLM profile created: {llm_profile_id}")
+        except Exception as e:
+            record(False, f"Failed to create LLM profile: {e}")
+            return False
+
+        # ── 6. Check capabilities ────────────────────────────────────
+        print(f"\n{BOLD}6. Platform capabilities{RESET}")
         try:
             r = await client.get("/platform/capabilities", headers=headers)
             if r.status_code == 200:
@@ -236,19 +306,100 @@ async def run_smoke_test() -> bool:
         except Exception as e:
             record(False, f"Failed to get capabilities: {e}")
 
+        # ── 7. Test each strategy × mode ─────────────────────────────
+        step = 7
+        for strategy_info in STRATEGIES:
+            strategy = strategy_info["name"]
+            modes = strategy_info["modes"]
+
+            # Skip graph strategies without real LLM
+            if strategy != "vector" and not has_openai:
+                print(f"\n{BOLD}{step}. Strategy: {strategy}{RESET}")
+                skip(f"Skipped — requires --llm-key and --embed-key for entity extraction")
+                step += 1
+                continue
+
+            print(f"\n{BOLD}{step}. Strategy: {strategy}{RESET}")
+
+            # Create collection
+            try:
+                coll_name = f"smoke-{strategy}"
+                coll_id = await create_collection(client, headers, coll_name, strategy, embed_profile_id)
+                record(True, f"Collection created: {coll_id}")
+            except Exception as e:
+                record(False, f"Failed to create {strategy} collection: {e}")
+                step += 1
+                continue
+
+            # Ingest
+            try:
+                result = await ingest_chunk(client, headers, coll_id, INGEST_TEXT)
+                entity_count = result.get("entity_count", 0)
+                record(
+                    "chunk_hash" in result,
+                    f"Chunk ingested (entities={entity_count}, hash={result.get('chunk_hash', '?')[:12]}...)",
+                )
+            except Exception as e:
+                record(False, f"Failed to ingest into {strategy}: {e}")
+                step += 1
+                continue
+
+            # Query each mode
+            for mode in modes:
+                mode_label = f"{strategy}/{mode}"
+                try:
+                    data = await query_collection(client, headers, coll_id, QUERY_TEXT, mode=mode)
+                    response_text = data.get("response", "")
+                    ok = check_response(data, EXPECTED_KEYWORDS)
+                    record(ok, f"Query {mode_label} returned relevant context")
+                    if response_text:
+                        _info(f"Response: {response_text[:150]}...")
+                except Exception as e:
+                    record(False, f"Query {mode_label} failed: {e}")
+
+            step += 1
+
+        # ── Final: List collections ──────────────────────────────────
+        print(f"\n{BOLD}{step}. List collections{RESET}")
+        try:
+            r = await client.get("/collections/", headers=headers)
+            if r.status_code == 200:
+                collections = r.json()
+                record(True, f"Found {len(collections)} collection(s)")
+            else:
+                record(False, f"Unexpected status {r.status_code}: {r.text}")
+        except Exception as e:
+            record(False, f"Failed to list collections: {e}")
+
     # ── Summary ──────────────────────────────────────────────────────
-    total = passed + failed
+    total = passed + failed + skipped
     print(f"\n{'='*50}")
-    if failed == 0:
-        print(f"  {GREEN}{BOLD}All {total} checks passed ✓{RESET}")
+    print(f"  Provider: {BOLD}{provider_label}{RESET}")
+    if has_openai:
+        print(f"  LLM: {args.llm_model}{' (' + args.llm_url + ')' if args.llm_url else ''}")
+        print(f"  Embed: {args.embed_model}{' (' + args.embed_url + ')' if args.embed_url else ''}")
+    if failed == 0 and skipped == 0:
+        print(f"  {GREEN}{BOLD}All {passed} checks passed ✓{RESET}")
+    elif failed == 0:
+        print(f"  {GREEN}{BOLD}{passed} passed, {skipped} skipped{RESET}")
     else:
-        print(f"  {RED}{BOLD}{passed}/{total} passed, {failed} failed{RESET}")
+        print(f"  {RED}{BOLD}{passed} passed, {failed} failed, {skipped} skipped{RESET}")
     print(f"{'='*50}\n")
 
     return failed == 0
 
 
-async def main():
+def main():
+    args = parse_args()
+
+    # Validate: graph strategies need both keys
+    if args.llm_key != args.embed_key and (args.llm_key or args.embed_key):
+        # Different keys provided — that's fine, but we need both
+        if not (args.llm_key and args.embed_key):
+            print(f"{RED}Both --llm-key and --embed-key are required for graph strategies.{RESET}")
+            print(f"Pass --help for usage.\n")
+            sys.exit(1)
+
     # Check if asyncpg is available
     try:
         import asyncpg  # noqa: F401
@@ -256,13 +407,21 @@ async def main():
         print(f"{RED}asyncpg is not installed. Run: uv sync --all-groups{RESET}")
         sys.exit(1)
 
+    has_openai = bool(args.llm_key and args.embed_key)
+    provider_label = "OpenAI" if has_openai else "local"
+
     print(f"\n{BOLD}Graph Core Smoke Test{RESET}")
     print(f"Target: {BASE_URL}")
-    print(f"Database: {DB_URL}\n")
+    print(f"Database: {DB_URL}")
+    print(f"Provider: {provider_label}")
+    if has_openai:
+        print(f"LLM model: {args.llm_model}")
+        print(f"Embed model: {args.embed_model}")
+    print()
 
-    ok = await run_smoke_test()
+    ok = asyncio.run(run_smoke_test(args))
     sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
