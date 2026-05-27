@@ -16,72 +16,60 @@ Applications / Clients
 
 ## Starting the Stack
 
+The entire stack (infrastructure + app + worker) runs in Docker. One command starts everything:
+
+```bash
+make docker-up
+```
+
+This builds and starts:
+- **Postgres** with `pgvector` (port 5432)
+- **FalkorDB** (graph DB, port 6379)
+- **Redis** (dramatiq + SSE, port 6380)
+- **App** (FastAPI, port 8000)
+- **Worker** (Dramatiq background jobs)
+
+### Recommended local flow
+
+1. Install dependencies (for migrations, linting, tests):
+
 ```bash
 uv sync --all-groups
-make docker-up-dev
-uv run uvicorn graph_core.main:app --reload
 ```
 
-For background jobs, start the worker in a second terminal:
+2. Start the full stack:
 
 ```bash
-uv run dramatiq graph_core.workers --processes 4 --threads 8
+make docker-up
 ```
 
-Recommended local flow:
-
-1. Install dependencies:
-
-```bash
-uv sync --all-groups
-```
-
-2. Start infrastructure and run migrations:
-
-```bash
-make docker-up-dev
-```
-
-This starts:
-- Postgres with `pgvector`
-- Redis
-- FalkorDB
-
-It then waits for health checks and runs:
-
-```bash
-uv run alembic upgrade head
-```
-
-3. Start the API server:
-
-```bash
-uv run uvicorn graph_core.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-4. Start the worker for async ingestion jobs:
-
-```bash
-uv run dramatiq graph_core.workers --processes 4 --threads 8
-```
-
-5. Verify infra if needed:
+Migrations run automatically on app start. Verify infrastructure if needed:
 
 ```bash
 make infra-check
 ```
 
-Schema note:
-This repo now includes Alembic migrations. For a fresh local setup, `make
-docker-up-dev` starts Postgres, Redis, and FalkorDB, waits for health, and then
-runs `alembic upgrade head`.
+### Useful commands
+
+```bash
+make docker-logs        # Follow all logs
+make docker-logs-app    # Follow app logs
+make docker-logs-worker # Follow worker logs
+make docker-ps          # List running containers
+make docker-down        # Stop all services
+make docker-clean       # Stop and remove all containers, volumes, networks
+```
+
+### Schema note
+
+This repo uses Alembic migrations. They run automatically when the app container starts.
 
 If your local Postgres volume was created before recent schema changes, recreate
 it and rerun migrations:
 
 ```bash
 make docker-clean
-make docker-up-dev
+make docker-up
 ```
 
 ## Concepts
