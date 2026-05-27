@@ -1,6 +1,6 @@
-.PHONY: help install install-dev dev start worker lint format fix test clean \
-	docker-up docker-up-dev docker-up-all docker-down docker-logs docker-clean docker-ps \
-	docker-build docker-logs-app docker-logs-worker \
+.PHONY: help install install-dev lint format fix test clean \
+	docker-up docker-down docker-logs docker-clean docker-ps \
+	docker-logs-app docker-logs-worker \
 	db-migrate db-revision db-current db-stamp db-downgrade \
 	infra-check seed
 
@@ -14,17 +14,6 @@ install:              ## Install dependencies
 
 install-dev:          ## Install dependencies + dev tools (pytest, ruff, mypy, etc.)
 	uv sync --group dev
-
-# ─── Application ──────────────────────────────────────────────────────────────
-
-dev:                  ## Start dev server with reload
-	uv run uvicorn graph_core.main:app --reload --host 0.0.0.0 --port 8000
-
-start:                ## Start production server
-	uv run uvicorn graph_core.main:app --host 0.0.0.0 --port 8000 --workers 4
-
-worker:               ## Start Dramatiq worker (background execution layer)
-	uv run dramatiq graph_core.workers --processes 4 --threads 8
 
 # ─── Quality ──────────────────────────────────────────────────────────────────
 
@@ -53,50 +42,29 @@ clean:                ## Remove build artifacts
 	find . -type d -name '.pytest_cache' -exec rm -rf {} +
 	rm -rf build/ dist/ .coverage htmlcov/
 
-# ─── Docker Infrastructure ───────────────────────────────────────────────────
+# ─── Docker ───────────────────────────────────────────────────────────────────
 ## Services: postgres (pgvector), falkordb (graph db), redis (dramatiq + sse)
 
-docker-up:            ## Start all infrastructure services (postgres, falkordb, redis)
-	docker compose up -d postgres falkordb redis
+docker-up:            ## Build + start everything (infra + app + worker)
+	docker compose up -d --build
 
-docker-up-dev:        ## Start infra + wait for health, then run migrations
-	docker compose up -d postgres falkordb redis
-	@echo "Waiting for services to be healthy..."
-	@sleep 5 && make infra-check
-	@$(MAKE) db-migrate
-
-docker-down:          ## Stop all infrastructure services
+docker-down:          ## Stop all services
 	docker compose down
 
 docker-logs:          ## Follow logs for all services
 	docker compose logs -f
-
-docker-logs-postgres: ## Follow postgres logs
-	docker compose logs -f postgres
-
-docker-logs-falkordb: ## Follow falkordb logs
-	docker compose logs -f falkordb
-
-docker-logs-redis:    ## Follow redis logs
-	docker compose logs -f redis
-
-docker-ps:            ## List running containers
-	docker compose ps
-
-docker-clean:         ## Stop and remove all containers, volumes, networks
-	docker compose down -v --remove-orphans
-
-docker-build:         ## Build app and worker images
-	docker compose build app worker
-
-docker-up-all:        ## Build + start everything (infra + app + worker)
-	docker compose up -d --build
 
 docker-logs-app:      ## Follow app logs
 	docker compose logs -f app
 
 docker-logs-worker:   ## Follow worker logs
 	docker compose logs -f worker
+
+docker-ps:            ## List running containers
+	docker compose ps
+
+docker-clean:         ## Stop and remove all containers, volumes, networks
+	docker compose down -v --remove-orphans
 
 # ─── Database Migrations (Alembic) ───────────────────────────────────────────
 
