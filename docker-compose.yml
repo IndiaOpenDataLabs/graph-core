@@ -1,4 +1,39 @@
 services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
+      REDIS_URL: redis://redis:6379/0
+      FALKORDB_URL: falkordb://falkordb:6379
+      REDIS_SEMAPHORE_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
+      REDIS_URL: redis://redis:6379/0
+      FALKORDB_URL: falkordb://falkordb:6379
+      REDIS_SEMAPHORE_URL: redis://redis:6379/0
+    command: ["dramatiq", "graph_core.workers", "--processes", "4", "--threads", "8"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:pg16
     ports:
