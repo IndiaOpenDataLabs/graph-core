@@ -24,7 +24,7 @@ chunk_status = postgresql.ENUM(
     "completed",
     "failed",
     name="chunk_status",
-    create_type=True,
+    create_type=False,
 )
 
 
