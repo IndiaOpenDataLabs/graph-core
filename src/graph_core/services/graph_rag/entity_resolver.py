@@ -157,6 +157,7 @@ class IncrementalEntityResolver:
             row = result.fetchone()
             if row:
                 entity_id = row[0]
+                await session.commit()
                 await self._add_alias(session, entity_id, normalized_name, source_chunk_hash)
                 await self._add_description_and_update_centroid(
                     session, entity_id, None, description, source_chunk_hash, query_embedding,
@@ -264,6 +265,7 @@ class IncrementalEntityResolver:
             source_chunk_hashes=[source_chunk_hash],
         )
         session.add(desc)
+        await session.commit()
 
         # Write relationship embedding
         embed_text = f"{src_name} -> {tgt_name}: {description}"

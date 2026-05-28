@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -1529,6 +1530,7 @@ Source Text:
         for entity in extraction.entities:
             name = entity.name
             entity_ids_resolved[name] = name
+            entity_uuid = self._deterministic_uuid(collection.id, name)
 
             if not await graph_storage.has_lightrag_node(name, collection_id_str):
                 await graph_storage.upsert_lightrag_node(
@@ -1562,8 +1564,24 @@ Source Text:
                         },
                     )
 
+            # Ensure entity exists in graph_entities for FK constraint
+            async with AsyncSessionLocal() as session:
+                await session.execute(
+                    pg_insert(GraphEntity)
+                    .values(
+                        id=entity_uuid,
+                        canonical_name=name,
+                        primary_type=entity.entity_type,
+                        description_count=0,
+                        collection_id=collection.id,
+                    )
+                    .on_conflict_do_nothing(
+                        constraint="uq_graph_entities_canonical_name_collection_id"
+                    )
+                )
+                await session.commit()
+
             desc_embedding = await embedding_provider.embed_query(entity.description)
-            entity_uuid = self._deterministic_uuid(collection.id, name)
             desc_id = self._deterministic_uuid(collection.id, f"desc:{name}:{chunk_hash}")
             await self._graph_rag_vectors.upsert_entity_embedding(
                 entity_id=entity_uuid,
@@ -1583,6 +1601,24 @@ Source Text:
 
             rel_id_str = f"{source_name}__{target_name}"
             rel_uuid = self._deterministic_uuid(collection.id, rel_id_str)
+            source_entity_uuid = self._deterministic_uuid(collection.id, source_name)
+            target_entity_uuid = self._deterministic_uuid(collection.id, target_name)
+
+            # Ensure relationship exists in graph_relationships for FK constraint
+            async with AsyncSessionLocal() as session:
+                await session.execute(
+                    pg_insert(GraphRelationship)
+                    .values(
+                        id=rel_uuid,
+                        source_entity_id=source_entity_uuid,
+                        target_entity_id=target_entity_uuid,
+                        weight=int(rel.weight * 10),
+                        keywords=rel.keywords,
+                        collection_id=collection.id,
+                    )
+                    .on_conflict_do_nothing(index_elements=["id"])
+                )
+                await session.commit()
 
             rel_embedding = await embedding_provider.embed_query(rel.description)
             await self._graph_rag_vectors.upsert_relationship_embedding(
