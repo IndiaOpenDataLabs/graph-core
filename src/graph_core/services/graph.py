@@ -609,7 +609,7 @@ class GraphService:
             )
         if collection.strategy == "custom_graph_rag":
             return await self._query_graph_rag(
-                question, collection, namespace_id, effective_mode, llm_profile_id=llm_profile_id,
+                question, collection, namespace_id, llm_profile_id=llm_profile_id,
             )
         if collection.strategy == "light_rag":
             return await self._query_lightrag(
@@ -630,7 +630,6 @@ class GraphService:
         question: str,
         collection: Collection,
         namespace_id: uuid.UUID,
-        mode: str,
         llm_profile_id: uuid.UUID | None = None,
     ) -> QueryResult:
         """Full Graph RAG query pipeline with energy-decay DFS traversal.
@@ -901,7 +900,7 @@ Relationships:
                 response=response,
                 entities_used=entities_used,
                 relationships_used=list(dict.fromkeys(relationships_used)),
-                mode=mode,
+                mode="local",
             )
 
     # ── LightRAG Query ──

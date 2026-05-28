@@ -42,7 +42,7 @@ EXPECTED_KEYWORDS = ["krishna", "arjuna", "dharma", "duty", "teach"]
 # Strategies and their query modes
 STRATEGIES = [
     {"name": "vector", "modes": ["local"]},
-    {"name": "custom_graph_rag", "modes": ["local"]},
+    {"name": "custom_graph_rag", "modes": []},
     {"name": "light_rag", "modes": ["local", "global", "hybrid", "naive", "mix"]},
 ]
 
@@ -348,9 +348,10 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
                 step += 1
                 continue
 
-            # Query each mode
-            for mode in modes:
-                mode_label = f"{strategy}/{mode}"
+            # Query each mode (or once with no mode if the strategy doesn't use modes)
+            query_modes = modes if modes else [None]
+            for mode in query_modes:
+                mode_label = f"{strategy}/{mode}" if mode else strategy
                 try:
                     data = await query_collection(client, headers, coll_id, QUERY_TEXT, mode=mode)
                     response_text = data.get("response", "")

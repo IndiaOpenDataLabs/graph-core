@@ -357,6 +357,30 @@ class FalkorDBGraphStorage:
                     edges.append((str(source), str(target)))
         return edges
 
+    async def get_edge(self, source_id: str, target_id: str) -> Optional[dict[str, Any]]:
+        """Get edge properties between two entity IDs."""
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH (a:Entity {id: $source_id})-[r:RELATES_TO]->(b:Entity {id: $target_id})
+            RETURN r
+            """,
+            {"source_id": source_id, "target_id": target_id},
+        )
+        if result and result.result_set:
+            edge = result.result_set[0][0]
+            if edge:
+                props = dict(edge.properties)
+                for list_field in ("keywords", "source_ids"):
+                    val = props.get(list_field)
+                    if isinstance(val, str):
+                        try:
+                            props[list_field] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            props[list_field] = []
+                return props
+        return None
+
     async def get_knowledge_graph(
         self, node_id: str, max_depth: int = 3, max_nodes: int = 100
     ) -> dict[str, Any]:
