@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import uuid
 
@@ -78,7 +79,7 @@ class VectorStore:
                         "ci": chunk["chunk_index"],
                         "content": chunk["content"],
                         "tc": chunk["token_count"],
-                        "meta": chunk.get("metadata"),
+                        "meta": json.dumps(chunk.get("metadata")) if chunk.get("metadata") else None,
                         "emb": _embedding_literal(chunk["embedding"]),
                     },
                 )
