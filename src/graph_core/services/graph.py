@@ -82,7 +82,6 @@ class GraphService:
         )
         self._crypto = CredentialCrypto()
         self._vector_store = VectorStore()
-        self._graph_storage = None
         self._graph_rag_vectors = GraphRAGVectorStore()
 
     # ── Collections ──
@@ -141,9 +140,11 @@ class GraphService:
         return collection
 
     async def delete_collection(self, collection_id: uuid.UUID) -> None:
-        """Delete a collection and drop its per-collection vector tables."""
+        """Delete a collection and drop its per-collection vector tables + FalkorDB graph."""
         collection = await self.get_collection(collection_id)
         await drop_all_tables(collection_id)
+        graph_storage = self._get_graph_storage(collection_id)
+        await graph_storage.drop()
         async with AsyncSessionLocal() as session:
             await session.delete(collection)
             await session.commit()
@@ -380,11 +381,11 @@ class GraphService:
 
     # ── Graph RAG ingestion pipeline ──
 
-    def _get_graph_storage(self):
-        if self._graph_storage is None:
-            from graph_core.storage.graph_storage import FalkorDBGraphStorage
-            self._graph_storage = FalkorDBGraphStorage(settings.falkordb_graph_name)
-        return self._graph_storage
+    def _get_graph_storage(self, collection_id: uuid.UUID):
+        """Return a FalkorDBGraphStorage scoped to the collection's own graph."""
+        from graph_core.storage.graph_storage import FalkorDBGraphStorage
+        graph_name = f"collection_{str(collection_id).replace('-', '')}"
+        return FalkorDBGraphStorage(graph_name)
 
     async def _ingest_graph_chunk(
         self,
@@ -511,7 +512,7 @@ class GraphService:
         unique_nodes = {n["id"]: n for n in nodes_to_upsert}.values()
 
         # Batch upsert to FalkorDB
-        graph_storage = self._get_graph_storage()
+        graph_storage = self._get_graph_storage(collection.id)
         if unique_nodes:
             await graph_storage.upsert_nodes(list(unique_nodes))
         if edges_to_upsert:
@@ -734,7 +735,7 @@ class GraphService:
                     seed_rel_scores[eid] = sim
 
         # Step 4: Energy-decay DFS traversal in FalkorDB
-        graph_storage = self._get_graph_storage()
+        graph_storage = self._get_graph_storage(collection.id)
         visited = set(seed_entity_ids)
         traversed_rel_ids: list[str] = []
         discovered_entity_ids = list(seed_entity_ids)
@@ -1075,7 +1076,7 @@ Relationships:
 
         entities: list[dict[str, Any]] = []
         entity_names: list[str] = []
-        graph_storage = self._get_graph_storage()
+        graph_storage = self._get_graph_storage(collection.id)
         collection_id_str = str(collection.id)
 
         for hit in entity_hits:
@@ -1176,7 +1177,7 @@ Source Text:
 
         relationships: list[dict[str, Any]] = []
         rel_ids: list[str] = []
-        graph_storage = self._get_graph_storage()
+        graph_storage = self._get_graph_storage(collection.id)
         collection_id_str = str(collection.id)
 
         for hit in rel_hits:
@@ -1521,7 +1522,7 @@ Source Text:
             )
 
         collection_id_str = str(collection.id)
-        graph_storage = self._get_graph_storage()
+        graph_storage = self._get_graph_storage(collection.id)
 
         entity_ids_resolved: dict[str, str] = {}
 
