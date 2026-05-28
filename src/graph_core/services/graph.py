@@ -227,8 +227,6 @@ class GraphService:
             await session.commit()
             await session.refresh(job)
 
-        from graph_core.workers.ingestion import run_ingestion
-        run_ingestion.send(str(job.id))
         return DocumentIngestionResult(job_id=job.id, status="pending")
 
     # ── Document pipeline ──
@@ -278,7 +276,7 @@ class GraphService:
     async def _fan_out_chunks(
         self, job_id: uuid.UUID, collection_id: uuid.UUID, chunks: list[str]
     ) -> None:
-        """Create chunk records and enqueue parallel workers."""
+        """Create chunk records. Worker is responsible for enqueuing."""
         async with AsyncSessionLocal() as session:
             for index, chunk_text in enumerate(chunks):
                 chunk = IngestionChunk(
@@ -294,10 +292,6 @@ class GraphService:
                 {"total": len(chunks), "jid": job_id},
             )
             await session.commit()
-
-        from graph_core.workers.ingestion import run_chunk
-        for index in range(len(chunks)):
-            run_chunk.send(str(job_id), index)
 
     async def process_single_chunk(
         self, job_id: str, chunk_index: int

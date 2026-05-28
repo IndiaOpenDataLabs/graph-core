@@ -4,7 +4,10 @@ import logging
 import uuid
 
 import dramatiq
+from sqlalchemy import select
 
+from graph_core.database import AsyncSessionLocal
+from graph_core.models.chunk import IngestionChunk
 from graph_core.services.graph import GraphService
 
 logger = logging.getLogger(__name__)
@@ -21,6 +24,21 @@ async def run_ingestion(job_id: str):
 
     try:
         await service.ingest_document_pipeline(job_uuid)
+
+        # Enqueue pending chunk workers for graph-rag strategies.
+        # The pipeline creates chunk records; this actor enqueues them.
+        async with AsyncSessionLocal() as session:
+            chunks = (
+                await session.execute(
+                    select(IngestionChunk).where(
+                        IngestionChunk.job_id == job_uuid,
+                        IngestionChunk.status == "pending",
+                    )
+                )
+            ).scalars().all()
+            for chunk in chunks:
+                run_chunk.send(str(job_id), chunk.chunk_index)  # type: ignore[attr-defined]
+
         await service.append_job_event(job_uuid, "completed")
     except Exception as e:
         await service.append_job_event(job_uuid, "error", {"error": str(e)})
