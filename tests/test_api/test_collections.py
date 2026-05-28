@@ -31,4 +31,4 @@ async def test_create_collection_missing_namespace(async_client):
         json={"name": "orphan"},
         headers={"X-Namespace-ID": ""},
     )
-    assert resp.status_code == 400  # Missing namespace header
+    assert resp.status_code == 401  # Missing auth

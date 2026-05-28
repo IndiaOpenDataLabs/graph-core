@@ -16,6 +16,7 @@ from graph_core.models.graph_rag import (
     RelationshipDescription,
     RawChunkExtraction,
 )
+from graph_core.models.registered_app import RegisteredApp, AppUserLink
 
 __all__ = [
     "Namespace",
@@ -33,4 +34,6 @@ __all__ = [
     "GraphRelationship",
     "RelationshipDescription",
     "RawChunkExtraction",
+    "RegisteredApp",
+    "AppUserLink",
 ]

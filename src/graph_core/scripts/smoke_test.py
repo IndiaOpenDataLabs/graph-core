@@ -17,6 +17,7 @@ Usage (all strategies + modes, with remote LLM/embeddings):
 
 import argparse
 import asyncio
+import os
 import sys
 import uuid
 
@@ -72,6 +73,7 @@ def _info(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Graph Core smoke test")
+    p.add_argument("--admin-key", default=os.environ.get("PLATFORM_ADMIN_KEY", ""), help="Platform admin key for namespace creation")
     p.add_argument("--llm-key", help="OpenAI (or compatible) API key for LLM")
     p.add_argument("--llm-url", help="Custom LLM base URL (e.g. https://api.openai.com/v1)")
     p.add_argument("--llm-model", default="gpt-4o", help="LLM model name (default: gpt-4o)")
@@ -82,8 +84,22 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def create_namespace() -> uuid.UUID:
-    """Create a namespace directly in Postgres (no API endpoint for this)."""
+async def create_namespace_via_api(client, admin_key: str) -> tuple[uuid.UUID, str]:
+    """Create a namespace via API. Returns (ns_id, api_key)."""
+    ns_name = f"smoke-test-{uuid.uuid4().hex[:8]}"
+    r = await client.post(
+        "/platform/namespaces/",
+        json={"name": ns_name},
+        headers={"Authorization": f"Bearer {admin_key}"},
+    )
+    if r.status_code != 200:
+        raise ValueError(f"Namespace creation failed: {r.text}")
+    data = r.json()
+    return uuid.UUID(data["id"]), data["api_key"]
+
+
+async def create_namespace_direct_db() -> uuid.UUID:
+    """Legacy: create a namespace directly in Postgres (no API key)."""
     import asyncpg
 
     conn = await asyncpg.connect(DB_URL)
@@ -229,14 +245,29 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
 
         # ── 2. Create namespace ──────────────────────────────────────
         print(f"\n{BOLD}2. Create namespace{RESET}")
-        try:
-            ns_id = await create_namespace()
-            record(True, f"Namespace created: {ns_id}")
-        except Exception as e:
-            record(False, f"Failed to create namespace: {e}")
-            return False
+        ns_id = None
+        ns_key = None
+        use_legacy_auth = not args.admin_key
 
-        headers = {"X-Namespace-ID": str(ns_id)}
+        if use_legacy_auth:
+            # Legacy: raw DB creation + X-Namespace-ID header
+            try:
+                ns_id = await create_namespace_direct_db()
+                record(True, f"Namespace created (legacy DB): {ns_id}")
+            except Exception as e:
+                record(False, f"Failed to create namespace: {e}")
+                return False
+            headers = {"X-Namespace-ID": str(ns_id)}
+            _info("Using legacy X-Namespace-ID auth — pass --admin-key for new auth flow")
+        else:
+            # New: API-based creation + namespace API key
+            try:
+                ns_id, ns_key = await create_namespace_via_api(client, args.admin_key)
+                record(True, f"Namespace created: {ns_id} (key: {ns_key[:15]}...)")
+            except Exception as e:
+                record(False, f"Failed to create namespace: {e}")
+                return False
+            headers = {"Authorization": f"Bearer {ns_key}"}
 
         # ── 3. Register credential (OpenAI only) ─────────────────────
         cred_id = None
@@ -405,12 +436,13 @@ def main():
             print(f"Pass --help for usage.\n")
             sys.exit(1)
 
-    # Check if asyncpg is available
-    try:
-        import asyncpg  # noqa: F401
-    except ImportError:
-        print(f"{RED}asyncpg is not installed. Run: uv sync --all-groups{RESET}")
-        sys.exit(1)
+    # Check if asyncpg is available (only needed for legacy auth)
+    if not args.admin_key:
+        try:
+            import asyncpg  # noqa: F401
+        except ImportError:
+            print(f"{RED}asyncpg is not installed. Run: uv sync --all-groups or pass --admin-key{RESET}")
+            sys.exit(1)
 
     has_api = bool(args.llm_key and args.embed_key)
     provider_label = "remote" if has_api else "local"

@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str | None = None
 
+    # Deployment mode: "self_hosted" (default) or "multi_tenant"
+    platform_mode: str = "self_hosted"
+
+    # Admin key for platform management (create namespaces, register apps)
+    # Supports dual-key rotation via platform_admin_key_secondary
+    platform_admin_key: str = ""
+    platform_admin_key_secondary: str = ""
+
     # Defaults for new collections
     default_embedding_provider: str = "local_hash"
     default_embedding_model: str = "hash-256"

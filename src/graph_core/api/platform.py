@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from graph_core.api.dependencies import get_namespace_id
+from graph_core.api.auth import get_namespace_id
 from graph_core.models.collection import Collection
 from graph_core.services.platform import PlatformService
 from graph_core.services.sanitizer import MAX_CHUNK_SIZE

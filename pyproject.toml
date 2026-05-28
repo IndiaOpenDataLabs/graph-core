@@ -21,6 +21,7 @@ dependencies = [
     "tiktoken>=0.8.0",
     "cryptography>=44.0.0",
     "python-multipart>=0.0.18",
+    "passlib[bcrypt]>=1.7.4",
 ]
 
 [project.optional-dependencies]

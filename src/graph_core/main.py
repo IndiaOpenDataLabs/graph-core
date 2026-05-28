@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from graph_core.api import collections, ingest, jobs, platform, query
+from graph_core.api import collections, ingest, jobs, namespaces, platform, query
 from graph_core.database import current_namespace_id
 
 
@@ -31,6 +31,9 @@ async def set_namespace_context(request: Request, call_next):
 
     The contextvar is read by NamespacedAsyncSession.begin() to set the
     Postgres app.current_namespace_id session variable for RLS policies.
+
+    DEPRECATED: New clients should use Authorization: Bearer <ns_key> header.
+    This middleware remains for backward compatibility.
     """
     ns_header = request.headers.get("x-namespace-id")
     if ns_header:
@@ -48,6 +51,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 # Mount routers
+app.include_router(namespaces.router)
 app.include_router(platform.router)
 app.include_router(collections.router)
 app.include_router(ingest.router)
