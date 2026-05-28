@@ -12,12 +12,16 @@ from graph_core.database import AsyncSessionLocal
 from graph_core.storage.vector_tables import (
     get_collection_dimensions,
     table_name,
-    vector_cast,
 )
 
 
 def _embedding_literal(embedding: list[float]) -> str:
     return "[" + ",".join(str(float(v)) for v in embedding) + "]"
+
+
+def _vector_cast_sql(dimensions: int) -> str:
+    """Return the SQL cast suffix for a vector parameter."""
+    return f"::vector({dimensions})"
 
 
 @dataclass
@@ -51,15 +55,14 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
                     f"(entity_id, collection_id, name, description, description_id, embedding) "
-                    f"VALUES (:eid, :cid, :name, :desc, :did, {vc})"
+                    f"VALUES (:eid, :cid, :name, :desc, :did, (:emb){cast})"
                 ),
                 {
                     "eid": entity_id,
@@ -67,6 +70,7 @@ class GraphRAGVectorStore:
                     "name": name,
                     "desc": description,
                     "did": description_id,
+                    "emb": _embedding_literal(embedding),
                 },
             )
             await session.commit()
@@ -82,23 +86,26 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(query_embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
                     SELECT id::text, entity_id::text, description_id::text, name, description,
-                           1 - (embedding <=> {vc}) as score,
-                           embedding <=> {vc} as distance
+                           1 - (embedding <=> (:qemb){cast}) as score,
+                           embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
                     WHERE collection_id = :cid
                     ORDER BY distance
                     LIMIT :top_k
                     """
                 ),
-                {"cid": collection_id, "top_k": top_k},
+                {
+                    "cid": collection_id,
+                    "top_k": top_k,
+                    "qemb": _embedding_literal(query_embedding),
+                },
             )
             return [
                 VectorSearchHit(
@@ -131,15 +138,14 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
                     f"(relationship_id, collection_id, source_name, target_name, description, embedding) "
-                    f"VALUES (:rid, :cid, :sn, :tn, :desc, {vc})"
+                    f"VALUES (:rid, :cid, :sn, :tn, :desc, (:emb){cast})"
                 ),
                 {
                     "rid": relationship_id,
@@ -147,6 +153,7 @@ class GraphRAGVectorStore:
                     "sn": source_name,
                     "tn": target_name,
                     "desc": description,
+                    "emb": _embedding_literal(embedding),
                 },
             )
             await session.commit()
@@ -163,11 +170,14 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(query_embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         where_extra = ""
-        params: dict = {"cid": collection_id, "top_k": top_k}
+        params: dict = {
+            "cid": collection_id,
+            "top_k": top_k,
+            "qemb": _embedding_literal(query_embedding),
+        }
         if relationship_id:
             where_extra = "AND relationship_id = :rel_id"
             params["rel_id"] = relationship_id
@@ -177,8 +187,8 @@ class GraphRAGVectorStore:
                 text(
                     f"""
                     SELECT id::text, relationship_id::text, source_name, target_name, description,
-                           1 - (embedding <=> {vc}) as score,
-                           embedding <=> {vc} as distance
+                           1 - (embedding <=> (:qemb){cast}) as score,
+                           embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
                     WHERE collection_id = :cid {where_extra}
                     ORDER BY distance
@@ -218,8 +228,8 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
+        emb_str = _embedding_literal(embedding)
 
         async with AsyncSessionLocal() as session:
             existing = await session.execute(
@@ -230,7 +240,7 @@ class GraphRAGVectorStore:
                 await session.execute(
                     text(
                         f"UPDATE {tbl} SET "
-                        f"embedding = {vc}, "
+                        f"embedding = (:emb){cast}, "
                         f"canonical_name = :cn, "
                         f"primary_type = :pt, "
                         f"description_count = :dc "
@@ -241,6 +251,7 @@ class GraphRAGVectorStore:
                         "pt": primary_type,
                         "dc": description_count,
                         "eid": entity_id,
+                        "emb": emb_str,
                     },
                 )
             else:
@@ -249,7 +260,7 @@ class GraphRAGVectorStore:
                         f"INSERT INTO {tbl} "
                         f"(entity_id, collection_id, canonical_name, primary_type, "
                         f"description_count, embedding) "
-                        f"VALUES (:eid, :cid, :cn, :pt, :dc, {vc})"
+                        f"VALUES (:eid, :cid, :cn, :pt, :dc, (:emb){cast})"
                     ),
                     {
                         "eid": entity_id,
@@ -257,6 +268,7 @@ class GraphRAGVectorStore:
                         "cn": canonical_name,
                         "pt": primary_type,
                         "dc": description_count,
+                        "emb": emb_str,
                     },
                 )
             await session.commit()
@@ -272,23 +284,26 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(query_embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
                     SELECT id::text, entity_id::text, canonical_name, primary_type, description_count,
-                           1 - (embedding <=> {vc}) as score,
-                           embedding <=> {vc} as distance
+                           1 - (embedding <=> (:qemb){cast}) as score,
+                           embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
                     WHERE collection_id = :cid
                     ORDER BY distance
                     LIMIT :top_k
                     """
                 ),
-                {"cid": collection_id, "top_k": top_k},
+                {
+                    "cid": collection_id,
+                    "top_k": top_k,
+                    "qemb": _embedding_literal(query_embedding),
+                },
             )
             return [
                 VectorSearchHit(
@@ -321,7 +336,6 @@ class GraphRAGVectorStore:
             row = result.one_or_none()
             if row is None:
                 return None
-            # Parse the vector text back to list[float]
             raw = row[0].strip("[]")
             return [float(v) for v in raw.split(",")]
 
@@ -340,8 +354,7 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             existing = await session.execute(
@@ -358,13 +371,14 @@ class GraphRAGVectorStore:
                 text(
                     f"INSERT INTO {tbl} "
                     f"(collection_id, chunk_hash, chunk_index, content, embedding) "
-                    f"VALUES (:cid, :ch, :ci, :content, {vc})"
+                    f"VALUES (:cid, :ch, :ci, :content, (:emb){cast})"
                 ),
                 {
                     "cid": collection_id,
                     "ch": chunk_hash,
                     "ci": chunk_index,
                     "content": content,
+                    "emb": _embedding_literal(embedding),
                 },
             )
             await session.commit()
@@ -380,23 +394,26 @@ class GraphRAGVectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(query_embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
                     SELECT id::text, chunk_hash, chunk_index, content,
-                           1 - (embedding <=> {vc}) as score,
-                           embedding <=> {vc} as distance
+                           1 - (embedding <=> (:qemb){cast}) as score,
+                           embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
                     WHERE collection_id = :cid
                     ORDER BY distance
                     LIMIT :top_k
                     """
                 ),
-                {"cid": collection_id, "top_k": top_k},
+                {
+                    "cid": collection_id,
+                    "top_k": top_k,
+                    "qemb": _embedding_literal(query_embedding),
+                },
             )
             return [
                 VectorSearchHit(

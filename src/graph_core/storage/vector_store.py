@@ -11,7 +11,6 @@ from graph_core.database import AsyncSessionLocal
 from graph_core.storage.vector_tables import (
     get_collection_dimensions,
     table_name,
-    vector_cast,
 )
 
 
@@ -28,6 +27,11 @@ def _embedding_literal(embedding: list[float]) -> str:
     return "[" + ",".join(str(float(v)) for v in embedding) + "]"
 
 
+def _vector_cast_sql(dimensions: int) -> str:
+    """Return the SQL cast suffix for a vector parameter."""
+    return f"::vector({dimensions})"
+
+
 class VectorStore:
     async def upsert_chunks(
         self,
@@ -39,6 +43,8 @@ class VectorStore:
         dimensions = await get_collection_dimensions(collection_id)
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             for chunk in chunks:
@@ -58,15 +64,12 @@ class VectorStore:
                 if existing.scalar_one_or_none() is not None:
                     continue
 
-                em = _embedding_literal(chunk["embedding"])
-                vc = vector_cast(em, dimensions)
-
                 await session.execute(
                     text(
                         f"INSERT INTO {tbl} "
                         f"(namespace_id, collection_id, chunk_hash, chunk_index, "
                         f"content, token_count, metadata_json, embedding) "
-                        f"VALUES (:nsid, :cid, :ch, :ci, :content, :tc, :meta, {vc})"
+                        f"VALUES (:nsid, :cid, :ch, :ci, :content, :tc, :meta, (:emb){cast})"
                     ),
                     {
                         "nsid": namespace_id,
@@ -76,6 +79,7 @@ class VectorStore:
                         "content": chunk["content"],
                         "tc": chunk["token_count"],
                         "meta": chunk.get("metadata"),
+                        "emb": _embedding_literal(chunk["embedding"]),
                     },
                 )
             await session.commit()
@@ -91,22 +95,25 @@ class VectorStore:
         if dimensions is None:
             raise ValueError(f"Collection {collection_id} has no embedding dimensions")
 
-        em = _embedding_literal(query_embedding)
-        vc = vector_cast(em, dimensions)
+        cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
                     SELECT id::text, content, metadata_json,
-                           1 - (embedding <=> {vc}) AS score
+                           1 - (embedding <=> (:qemb){cast}) AS score
                     FROM {tbl}
                     WHERE collection_id = :cid
-                    ORDER BY embedding <=> {vc}
+                    ORDER BY embedding <=> (:qemb){cast}
                     LIMIT :top_k
                     """
                 ),
-                {"cid": collection_id, "top_k": top_k},
+                {
+                    "cid": collection_id,
+                    "top_k": top_k,
+                    "qemb": _embedding_literal(query_embedding),
+                },
             )
             return [
                 {

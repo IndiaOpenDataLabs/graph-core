@@ -19,7 +19,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0005_per_collection_vector_tables"
+revision = "0005_per_collection_vec_tables"
 down_revision = "0004_add_base_url_to_profiles"
 branch_labels = None
 depends_on = None

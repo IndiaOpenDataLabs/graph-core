@@ -178,4 +178,4 @@ async def get_collection_dimensions(collection_id: uuid.UUID) -> int | None:
 
 def vector_cast(literal: str, dimensions: int) -> str:
     """Return the SQL cast expression for a vector literal."""
-    return f"CAST({literal} AS vector({dimensions}))"
+    return f"{literal}::vector({dimensions})"
