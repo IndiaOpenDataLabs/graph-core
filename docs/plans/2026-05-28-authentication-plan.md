@@ -69,16 +69,23 @@ multi-tenant service with app registration, user-scoped tokens, and OAuth.
    POST /oauth/token
    {
      "grant_type": "client_credentials",
-     "client_id": "app_tui_abc123",
-     "client_secret": "secret_xyz...",
-     "user": {"sub": "google:12345", "email": "user@example.com"}
-   }
-   → Short-lived JWT containing namespace_id
+  "client_id": "app_tui_abc123",
+      "client_secret": "secret_xyz...",
+      "user": {"sub": "google:12345", "email": "user@example.com"}
+    }
+    → Short-lived JWT containing namespace_id
 
 4. TUI uses JWT for all requests:
    POST /collections/
    Authorization: Bearer <jwt>
 ```
+
+**Important:** This is not OAuth in the standard sense. The platform is not the
+identity provider — users authenticate externally (e.g., Google in the TUI).
+This endpoint performs **token exchange / identity bridging**: a trusted app
+asserts a user identity, and the platform issues a scoped token. It is closer
+to OIDC token exchange or JWT bearer assertion than to an OAuth authorization
+code flow.
 
 ---
 
@@ -143,20 +150,37 @@ Authorization: Bearer $PLATFORM_ADMIN_KEY
 → {"client_id": "app_tui_abc123", "client_secret": "secret_xyz..."}
 ```
 
-### 4.4 Multi-tenant: User Token Issuance
+### 4.4 Multi-tenant: Token Exchange
+
+The registered app exchanges its client credentials + authenticated user identity
+for a platform access token. This is **token exchange / identity bridging**, not
+an OAuth authorization flow. The platform trusts the registered app to have
+already authenticated the user externally.
 
 ```
-POST /oauth/token
+POST /token/exchange
 {
-  "grant_type": "client_credentials",
   "client_id": "app_tui_abc123",
   "client_secret": "secret_xyz...",
   "user": {"sub": "google:12345", "email": "user@example.com"}
 }
+```
+
+**Trust model:** The platform fully trusts the registered app to have
+authenticated the user. The `user.sub` field is asserted by the app, not verified
+by the platform. This is acceptable because:
+
+- Apps are registered tenants, not public integrations
+- The platform enforces isolation at the namespace boundary via RLS
+- A compromised app secret only exposes that app's own users' namespaces
+
+**Future hardening:** If semi-trusted or public integrations emerge, this can
+evolve to accept signed assertions (OIDC ID tokens, JWT bearer grants) that the
+platform validates against the external identity provider.
 
 Platform:
   a) Validates client_id + secret
-  b) Looks up existing namespace for (app_id, user_sub)
+  b) Looks up existing **default namespace** for (app_id, user_sub)
   c) If none exists, creates one: "user-<google_sub>"
   d) Returns short-lived JWT
 
@@ -166,6 +190,13 @@ Platform:
     "expires_in": 3600,
     "namespace_id": "ns_abc"
   }
+
+**Note on namespace mapping:** The `(app_id, user_sub) → namespace` default
+mapping is a convenience, not a permanent invariant. It provides each user
+a default workspace on first login. Nothing prevents a user from having
+multiple namespaces later (e.g., teams, shared workspaces, multiple projects).
+The `app_user_links` table records the *default* link; additional links can
+be added via `POST /platform/namespaces`.
 ```
 
 ### 4.5 Multi-tenant: Using a User Token
@@ -288,8 +319,8 @@ GET    /admin/apps/{client_id}           Get app details (admin key)
 POST   /admin/apps/{client_id}/rotate    Rotate client_secret (admin key)
 DELETE /admin/apps/{client_id}           Deactivate app (admin key)
 
-# OAuth — token issuance
-POST   /oauth/token                      Exchange client creds for user JWT
+# Token exchange — user token issuance
+POST   /token/exchange                   Exchange client creds + user identity for JWT
 
 # Platform — namespace management
 POST   /platform/namespaces              Create namespace (user JWT, optional)
@@ -332,10 +363,17 @@ GET  /jobs/{id}
 }
 ```
 
-- Algorithm: HS256
+- Algorithm: HS256 (symmetric, simple)
 - Key: `JWT_SECRET` env var
 - TTL: 1 hour (configurable via `JWT_EXPIRATION_SECONDS`)
 - Only the platform signs JWTs (not the consuming app)
+
+**Migration path to asymmetric signing:** HS256 is sufficient initially
+(single platform instance, no external validation). If the platform evolves
+to multi-service, polyglot, or externally-validated deployments, migrate to
+RS256 or EdDSA so services can verify tokens without sharing the signing secret.
+The `get_auth_context` dependency abstracts the algorithm, so migration is
+a config + key change, not a code change.
 
 ---
 
@@ -347,7 +385,7 @@ GET  /jobs/{id}
 | `passlib[bcrypt]>=1.7.4` | Hashing secrets | Both modes |
 | `secrets` | Stdlib, API key generation | Both modes |
 
-No heavy dependencies. No OAuth library — `/oauth/token` is just credential
+No heavy dependencies. No OAuth library — `/token/exchange` is just credential
 validation + JWT issuance.
 
 ---
@@ -358,7 +396,12 @@ validation + JWT issuance.
 
 | Env var | Required | Description |
 |---|---|---|
-| `PLATFORM_ADMIN_KEY` | Yes | Static admin key (operator secret) |
+| `PLATFORM_ADMIN_KEY` | Yes | Primary admin key (operator secret) |
+| `PLATFORM_ADMIN_KEY_SECONDARY` | No | Secondary key for rotation window — both keys accepted |
+
+**Admin key rotation:** Set `PLATFORM_ADMIN_KEY_SECONDARY` to the new key while
+keeping `PLATFORM_ADMIN_KEY` as the old key. Both are accepted. Once all clients
+rotate, swap: move secondary to primary, drop old primary.
 
 ### Self-hosted
 
@@ -382,7 +425,7 @@ validation + JWT issuance.
 
 ## 11. Implementation Phases
 
-### Phase 1: Core auth (both modes)
+### Phase 1: Core auth + admin key rotation (both modes)
 
 New files:
 - `src/graph_core/models/registered_app.py` — `RegisteredApp` + `AppUserLink` models
@@ -393,17 +436,20 @@ New files:
 - `alembic/versions/0008_auth_tables.py` — migration for new tables + namespace columns
 
 Changes:
-- `src/graph_core/config.py` — add `platform_mode`, `platform_admin_key` settings
+- `src/graph_core/config.py` — add `platform_mode`, `platform_admin_key`, `platform_admin_key_secondary` settings
 - `src/graph_core/api/dependencies.py` — deprecate `get_namespace_id`
+
+Admin key rotation: `get_auth_context` accepts both `PLATFORM_ADMIN_KEY` and
+`PLATFORM_ADMIN_KEY_SECONDARY` when both are set. Env-only, no DB state needed.
 
 **This phase covers self-hosted mode fully.** Multi-tenant tables are created
 but unused until Phase 2.
 
-### Phase 2: Multi-tenant (OAuth, app registration, JWT)
+### Phase 2: Multi-tenant (token exchange, app registration, JWT)
 
 New files:
-- `src/graph_core/services/oauth_service.py` — JWT issuance, client validation, namespace bootstrap
-- `src/graph_core/api/oauth.py` — `POST /oauth/token` endpoint
+- `src/graph_core/services/token_service.py` — JWT issuance, client validation, namespace bootstrap
+- `src/graph_core/api/token_exchange.py` — `POST /token/exchange` endpoint
 - `src/graph_core/api/admin.py` — `POST /admin/apps` and other app management endpoints
 
 Changes:
@@ -458,17 +504,48 @@ After deprecation period, option 4 is removed.
 3. **JWT signing key** is separate from credential encryption key
 4. **Short JWT TTL** in multi-tenant limits exposure
 5. **RLS policies** unchanged — namespace isolation enforced at DB level
-6. **Admin key** is env-only, never stored in DB
+6. **Admin key** is env-only, never stored in DB; dual-key rotation supported
 7. **Self-hosted mode** has no network-facing auth — relies on operator securing their deployment
 8. **`client_secret` rotation** supported in multi-tenant
 
+### Trust Model (multi-tenant)
+
+The platform **fully trusts registered apps** to have authenticated users
+before calling `/token/exchange`. The `user.sub` claim is asserted by the app,
+not verified by the platform. This is correct because:
+
+- Apps are registered tenants with vetted credentials
+- The platform enforces isolation at the namespace boundary via RLS
+- A compromised app only exposes its own users' namespaces
+
+If semi-trusted or public integrations emerge, `/token/exchange` can evolve
+to accept signed external assertions (OIDC ID tokens, JWT bearer grants)
+validated against the issuing identity provider.
+
 ---
 
-## 14. Out of Scope
+## 14. Future Considerations
 
-- RBAC within a namespace — owned by consuming app
-- Token revocation before expiry — TTL is short enough; add if needed
-- SAML / enterprise SSO — future phase
-- Rate limiting — future phase
-- Multi-namespace users (one user, multiple namespaces per app) — future phase
-- Hosted mode user portal (self-service app registration) — future phase
+- **RBAC within a namespace** — owned by consuming app
+- **Signed user assertions** — OIDC/JWT bearer exchange for semi-trusted integrations
+- **Asymmetric JWT signing** — RS256/EdDSA for multi-service or external validation
+- **Token revocation before expiry** — TTL is short enough; add if needed
+- **SAML / enterprise SSO** — future phase
+- **Rate limiting** — future phase
+- **Hosted mode user portal** — self-service app registration
+- **Distribution divergence** — self-hosted and multi-tenant may eventually
+  diverge into separate distributions (community/self-hosted vs hosted SaaS)
+  as operational tooling, scaling, and security expectations differ
+
+---
+
+## 15. Design Principles
+
+The strongest property of this design: **auth complexity scales with deployment
+complexity**. A self-hosted user gets admin key + namespace keys with zero OAuth
+or JWT overhead. A multi-tenant deployment gets full app registration, token
+exchange, and user-scoped JWTs.
+
+This preserves the platform boundary: graph-core remains infrastructure (namespace-aware,
+collection-aware, credential-aware), not business-user-aware. The consuming app
+owns users, RBAC, billing, and identity.
