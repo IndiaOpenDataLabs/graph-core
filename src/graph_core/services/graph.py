@@ -70,7 +70,7 @@ class QueryResult:
     response: str
     entities_used: list[str]
     relationships_used: list[str]
-    mode: str
+    mode: str | None = None
 
 
 class GraphService:
@@ -900,7 +900,6 @@ Relationships:
                 response=response,
                 entities_used=entities_used,
                 relationships_used=list(dict.fromkeys(relationships_used)),
-                mode="local",
             )
 
     # ── LightRAG Query ──

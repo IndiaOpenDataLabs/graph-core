@@ -20,7 +20,7 @@ class QueryResponse(BaseModel):
     response: str
     entities_used: list[str]
     relationships_used: list[str]
-    mode: str
+    mode: str | None = None
 
 
 router = APIRouter(tags=["query"])
