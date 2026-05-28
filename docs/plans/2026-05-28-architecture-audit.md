@@ -3,16 +3,27 @@
 > **Date:** 2026-05-28
 > **Reference Plan:** [docs/plans/2026-05-18-architecture-redesign.md](./2026-05-18-architecture-redesign.md)
 > **Base Commit:** `11d5d4c` — refactor: use per-collection FalkorDB graphs instead of single knowledge_graph
+> **Current HEAD:** `ed20f93` — chore: update architecture audit with decomposed module status
+> **Commits Since Base:** 6
+
+| Commit | Description |
+|---|---|
+| `ed20f93` | chore: update architecture audit with decomposed module status |
+| `7d3a1b5` | refactor: decompose 1771-line graph.py into modular submodules |
+| `fdf7f9c` | refactor: invert Dramatiq dependency direction — enforce I4 |
+| `4a7d94c` | feat: enforce collection strategy and embedding_profile immutability at DB level |
+| `1e38044` | feat: add namespace-level RLS policies for defense-in-depth isolation |
+| `6139773` | docs: add architecture redesign consistency audit report |
 
 ---
 
 ## Summary
 
-| Result | Count |
-|---|---|
-| PASS | 27 |
-| PARTIAL | 8 |
-| FAIL | 2 |
+| Result | Previous | Current | Change |
+|---|---|---|---|
+| PASS | 27 | **29** | +2 (I1, I6 now DB-enforced) |
+| PARTIAL | 8 | **6** | -2 (I1, I6 resolved) |
+| FAIL | 2 | **1** | -1 (I6 resolved) |
 
 ---
 
@@ -25,29 +36,46 @@
 | `services/graph_rag/ingestion/chunk_processor.py` | PASS | `src/graph_core/services/graph/ingestion/chunk_processor.py` (626 lines) — exists and is fully decomposed. |
 | `services/graph_rag/ingestion/document_pipeline.py` | PASS | `src/graph_core/services/graph/ingestion/document_pipeline.py` (260 lines) — exists and is fully decomposed. |
 | `services/graph_rag/query/` | PASS | Directory exists at `src/graph_core/services/graph/query/` with `graph_rag.py` (381 lines), `lightrag.py` (612 lines), `vector.py` (141 lines). |
-| `services/graph_rag/storage/` | PARTIAL | Plan expected storage under `services/graph_rag/storage/`. Actual storage is at `src/graph_core/storage/` (sibling to services): `graph_storage.py`, `vector_store.py`, `graph_rag_vectors.py`, `vector_tables.py`, `vector_types.py`. |
-| `api/collections.py` | PASS | `src/graph_core/api/collections.py` — resource-oriented router. |
-| `api/ingest.py` | PASS | `src/graph_core/api/ingest.py` — namespace-scoped endpoints. |
-| `api/query.py` | PASS | `src/graph_core/api/query.py` — namespace-scoped endpoint. |
-| `api/jobs.py` | PASS | `src/graph_core/api/jobs.py` — job status + SSE stub. |
-| `api/platform.py` | PASS | `src/graph_core/api/platform.py` — credentials, profiles, capabilities. |
+| `services/graph_rag/storage/` | PARTIAL | Plan expected storage under `services/graph_rag/storage/`. Actual storage is at `src/graph_core/storage/` (sibling to services): `graph_storage.py` (442), `vector_store.py` (127), `graph_rag_vectors.py` (430), `vector_tables.py` (181), `vector_types.py` (49). |
+| `api/collections.py` | PASS | `src/graph_core/api/collections.py` (74 lines) — resource-oriented router. |
+| `api/ingest.py` | PASS | `src/graph_core/api/ingest.py` (65 lines) — namespace-scoped endpoints. |
+| `api/query.py` | PASS | `src/graph_core/api/query.py` (48 lines) — namespace-scoped endpoint. |
+| `api/jobs.py` | PASS | `src/graph_core/api/jobs.py` (33 lines) — job status + SSE stub. |
+| `api/platform.py` | PASS | `src/graph_core/api/platform.py` (157 lines) — credentials, profiles, capabilities. |
 | `mcp/server.py` | FAIL | `src/graph_core/mcp/` directory does not exist. No MCP server implemented. |
-| `workers/ingestion_worker.py` | PARTIAL | Actual file is `src/graph_core/workers/ingestion.py` (name differs from plan, but functionality matches). |
+| `workers/ingestion_worker.py` | PARTIAL | Actual file is `src/graph_core/workers/ingestion.py` (61 lines; name differs from plan, but functionality matches). |
 
-**Result:** 7 PASS, 4 PARTIAL, 2 FAIL. Key gaps: monolith decomposed from 1771 lines to 2544 total across 8 files (314+626+260+23+381+612+141+23+95); MCP server absent; storage path variance.
+**Result:** 7 PASS, 4 PARTIAL, 2 FAIL. Key gaps: monolith decomposed from 1771 lines to 2867 total across service modules; MCP server absent; storage path variance.
+
+### New Files and Directories Since Base
+
+| File | Lines | Purpose |
+|---|---|---|
+| `services/graph_rag/extractor.py` | 254 | `LLMGraphExtractor` — LLM-based graph extraction with gleaning, MD5-cached results |
+| `services/graph_rag/entity_resolver.py` | 498 | `IncrementalEntityResolver` — 3-tier resolution: alias lookup, embedding centroid search, fuzzy `difflib` matching; Hebbian centroid learning |
+| `services/platform.py` | 85 | `PlatformService` — credential/profile CRUD control-plane |
+| `services/chunking.py` | 37 | `TokenChunker` utility |
+| `services/entity_name_cache.py` | 43 | Entity name cache for fast lookups |
+| `middleware/semaphore.py` | 86 | Distributed Dramatiq semaphore — Redis sorted sets with Lua-based atomic acquire/release, fleet-wide `run_chunk` concurrency limiting |
+| `models/chunk.py` | 51 | `IngestionChunk` model — per-chunk status tracking within document jobs |
+| `models/graph_rag.py` | 243 | Graph RAG models: `GraphEntity`, `EntityDescription`, `EntityAlias`, `EntityType`, `GraphRelationship`, `RelationshipDescription`, `RawChunkExtraction` |
+| `llm/` | 145 | LLM provider interface, factory, OpenAI provider |
+| `embedding/` | 158 | Embedding provider interface, factory, hash provider, OpenAI provider |
+| `scripts/smoke_test.py` | — | Smoke test script |
+| `tests/` | — | 11 test files across `test_services`, `test_api`, `test_workers` |
 
 ---
 
 ## 2. Core Invariants
 
 ### I1: Strategy is per collection, set at creation, never changed
-**PARTIAL**
+**PASS** (upgraded from PARTIAL)
 
 - `Collection.strategy` column exists (`models/collection.py:22`), set at creation
 - Model comment says "immutable after creation" (`models/collection.py:21`)
 - `rag_strategy` enum values: `vector`, `light_rag`, `custom_graph_rag`
-- **Gap:** No DB-level constraint (trigger/check) preventing post-creation updates. Immutability is enforced only by application logic, not at the schema level.
-- **Addition:** `Collection.llm_profile_id` column also exists (`models/collection.py:29`) with same immutability expectation.
+- **RESOLVED:** DB-level constraint now enforced via migration `0007_namespace_rls_policies.py:215-240`. PostgreSQL `BEFORE UPDATE` trigger `trg_collection_immutable_fields` raises exception if `strategy` changes post-creation.
+- **Addition:** `Collection.llm_profile_id` column also exists (`models/collection.py:29`) — explicitly NOT immutable (can be changed post-creation).
 
 ### I2: TextSanitizer exists at `app/services/graph_rag/sanitizer.py`
 **PASS** (with path variance)
@@ -60,13 +88,14 @@
 - **Addition:** Added `chunk_hash` static method for SHA-256 deduplication (`:92-95`).
 
 ### I3: Namespace isolation enforced at platform layer
-**PASS**
+**PASS** (enhanced with RLS)
 
 - `_enforce_namespace` in `services/graph/__init__.py:265-268` raises `PermissionError` on mismatch
 - **Addition:** Namespace enforcement also duplicated in `services/graph/ingestion/chunk_processor.py:126-131` at submodule level.
 - API dependency `get_namespace_id` in `api/dependencies.py:8-14` extracts from `X-Namespace-ID` header
 - All API routes use namespace dependency injection
 - PlatformService validates namespace on credential/profile operations
+- **RESOLVED:** Migration `0007` adds comprehensive Row-Level Security (RLS) policies on 15 tables (credentials, profiles, collections, jobs, ingestion_records, graph_entities, graph_relationships, raw_chunk_extractions, entity_descriptions, entity_aliases, entity_types, relationship_descriptions, job_events, ingestion_chunks). Helper functions `ns_check(uuid)` and `ns_check_via_collection(uuid)` enforce isolation via `app.current_namespace_id` session variable.
 
 ### I4: GraphService has NO transport dependencies
 **PASS**
@@ -83,13 +112,15 @@
 - `ingestion_records` table: `models/ingestion.py:13-34`
 - Job status reads from Postgres (`api/jobs.py:16-21` → `services/graph/__init__.py:217-231`)
 - All writes go to Postgres, SSE is transient only
+- **Addition:** `IngestionChunk` model (`models/chunk.py:13-51`) for per-chunk status tracking within document jobs.
 
 ### I6: Embedding profiles immutable per collection
-**PARTIAL**
+**PASS** (upgraded from PARTIAL)
 
 - `Collection.embedding_profile_id` exists (`models/collection.py:26`)
 - Set at creation, dimensions resolved at creation time (`models/collection.py:33`)
-- **Gap:** Same as I1 — no DB-level constraint preventing post-creation updates. No reindex job type is wired up (the `reindex` enum value exists but no handler).
+- **RESOLVED:** Same DB-level trigger as I1 (`trg_collection_immutable_fields`) now enforces immutability for `embedding_profile_id`.
+- **Gap remains:** No `reindex` job handler is wired up (the `reindex` enum value exists but no handler).
 
 ---
 
@@ -101,6 +132,7 @@
 - `Namespace` model: `models/namespace.py:13-26`
 - All resources scoped to namespace: collections, credentials, profiles, jobs
 - Isolation at namespace, collection, and credential boundaries
+- **Addition:** RLS policies on 15 tables provide defense-in-depth isolation at the database level.
 
 ### 4.2 Embedding/LLM Profiles
 **PASS**
@@ -120,6 +152,7 @@
 - Encryption via `services/crypto.py:11-21` (Fernet-based)
 - Namespace-scoped with unique constraint on `(namespace_id, label)`
 - Profiles reference credentials by ID
+- **Addition:** `Credential` model also has `base_url` column (`models/credential.py:25`).
 
 ### 4.4 Capability Discovery
 **PARTIAL**
@@ -165,6 +198,12 @@
 - `models/ingestion.py:13-34`: All fields present, including `sanitization_flags` (JSON), `entity_count`, `relationship_count`, `strategy`, `source_document_id`
 - **Addition:** Also includes `extraction_model`, `embedding_model` columns for model tracking.
 
+### `ingestion_chunks` table (new)
+**PASS**
+
+- `models/chunk.py:13-51`: `IngestionChunk` model for per-chunk status within document jobs
+- Columns: `id`, `job_id`, `chunk_hash`, `status` (enum: `pending`, `processing`, `completed`, `failed`), `error`, `created_at`, `updated_at`
+
 ---
 
 ## 5. Migration Items (Section 9 Table)
@@ -208,7 +247,7 @@
 
 The codebase has undergone significant decomposition since the audit referenced a monolithic `graph.py` (1771 lines):
 
-### Decomposed Modules (2544 total lines)
+### Decomposed Modules (2867 total lines in service + API)
 
 | File | Lines | Purpose |
 |---|---|---|
@@ -220,10 +259,33 @@ The codebase has undergone significant decomposition since the audit referenced 
 | `services/graph/query/vector.py` | 141 | Pure vector query + answer generation |
 | `services/sanitizer.py` | 95 | Text sanitization with pattern detection |
 | `workers/ingestion.py` | 61 | Dramatiq actors (thin wrappers) |
-| `api/*.py` | ~290 | API routers (collections, ingest, query, jobs, platform) |
+| `api/*.py` | ~370 | API routers (collections, ingest, query, jobs, platform) |
+
+### Storage Layer (1230 total lines)
+
+| File | Lines | Purpose |
+|---|---|---|
+| `storage/graph_storage.py` | 442 | FalkorDB graph storage (nodes, edges, LightRAG ops) |
+| `storage/graph_rag_vectors.py` | 430 | GraphRAG-specific vector storage (entity/relationship/chunk embeddings, centroids) |
+| `storage/vector_tables.py` | 181 | Dynamic per-collection vector table management (create/drop) |
+| `storage/vector_store.py` | 127 | Postgres vector store (per-collection dynamic tables) |
+| `storage/vector_types.py` | 49 | Custom SQLAlchemy types for pgvector |
+
+### New Graph RAG Services (752 total lines)
+
+| File | Lines | Purpose |
+|---|---|---|
+| `services/graph_rag/entity_resolver.py` | 498 | Incremental entity resolution: alias lookup, embedding centroid search, fuzzy matching |
+| `services/graph_rag/extractor.py` | 254 | LLM-based graph extraction with gleaning, MD5-cached results |
 
 ### Dramatiq Violation Fixed
 The previous audit flagged I4 violation: `GraphService` importing Dramatiq actors. This has been **fully resolved** — the old `graph.py` monolith is gone, and Dramatiq imports exist only in `workers/ingestion.py` (the correct direction: workers depend on service, not vice versa).
+
+### DB-Level Immutability Added (migration `0007`)
+The `enforce_collection_immutable_fields()` trigger function and `trg_collection_immutable_fields` trigger on the `collections` table now enforce I1 and I6 at the database level, closing the previous PARTIAL gaps.
+
+### Namespace RLS Policies Added (migration `0007`)
+Comprehensive Row-Level Security policies on 15 tables provide defense-in-depth namespace isolation, supplementing the application-layer enforcement.
 
 ---
 
@@ -231,6 +293,7 @@ The previous audit flagged I4 violation: `GraphService` importing Dramatiq actor
 
 1. **MCP server missing entirely** — The plan designates `app/mcp/server.py` as a new adapter layer wrapping platform APIs. No implementation exists.
 2. **Job SSE streaming is a stub** — `api/jobs.py:27` has a TODO; no Redis pubsub subscription is implemented.
-3. **No DB-level immutability constraints** — I1 and I6 rely on application-layer enforcement only.
+3. **`retrieval_strategies` hardcoded in capabilities** — `api/platform.py:76` returns hardcoded list rather than deriving from configuration.
 4. **API routes lack namespace URL prefixes** — Plan specifies `/namespaces/{ns}/...` routes; implementation uses header-based namespace identification instead.
 5. **Capability endpoint path variance** — Plan specifies root-level `/capabilities`, `/embedding-profiles`, `/llm-profiles`; actual routes are nested under `/platform/`.
+6. **No `reindex` job handler** — The `reindex` enum value exists in `JobType` but no worker handles it.
