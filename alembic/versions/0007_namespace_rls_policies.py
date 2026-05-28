@@ -212,6 +212,33 @@ def upgrade() -> None:
                 USING (ns_check((SELECT j.namespace_id FROM jobs j WHERE j.id = {table}.job_id)))
         """)
 
+    # --- DB-level immutability triggers (I1, I6) ---
+    # strategy and embedding_profile_id on collections are immutable after creation.
+    # llm_profile_id is NOT immutable — it can be changed.
+    op.execute(sa.text("""
+        CREATE OR REPLACE FUNCTION enforce_collection_immutable_fields()
+        RETURNS trigger AS $$
+        BEGIN
+            IF TG_OP = 'UPDATE' THEN
+                IF NEW.strategy IS DISTINCT FROM OLD.strategy THEN
+                    RAISE exception 'collection strategy is immutable after creation';
+                END IF;
+                IF NEW.embedding_profile_id IS DISTINCT FROM OLD.embedding_profile_id THEN
+                    RAISE exception 'collection embedding_profile_id is immutable after creation';
+                END IF;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+    """))
+
+    op.execute(sa.text("""
+        CREATE OR REPLACE TRIGGER trg_collection_immutable_fields
+            BEFORE UPDATE ON collections
+            FOR EACH ROW
+            EXECUTE FUNCTION enforce_collection_immutable_fields();
+    """))
+
 
 def downgrade() -> None:
     # Drop all policies
@@ -233,6 +260,9 @@ def downgrade() -> None:
     for table in all_tables:
         op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
 
+    # Drop immutability trigger and function (I1, I6)
+    op.execute("DROP TRIGGER IF EXISTS trg_collection_immutable_fields ON collections")
+    op.execute("DROP FUNCTION IF EXISTS enforce_collection_immutable_fields()")
     # Drop helper functions
     op.execute("DROP FUNCTION IF EXISTS ns_check(uuid)")
     op.execute("DROP FUNCTION IF EXISTS ns_check_via_collection(uuid)")
