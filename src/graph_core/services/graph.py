@@ -92,6 +92,7 @@ class GraphService:
         namespace_id: uuid.UUID,
         strategy: Literal["vector", "custom_graph_rag", "light_rag"] = "vector",
         embedding_profile_id: uuid.UUID | None = None,
+        llm_profile_id: uuid.UUID | None = None,
         default_query_mode: str | None = None,
     ) -> Collection:
         async with AsyncSessionLocal() as session:
@@ -110,11 +111,21 @@ class GraphService:
                     raise ValueError("Profile kind must be embedding")
                 dimensions = profile.dimensions
 
+            if llm_profile_id is not None:
+                llm_profile = await session.get(Profile, llm_profile_id)
+                if not llm_profile:
+                    raise ValueError(f"LLM profile {llm_profile_id} not found")
+                if llm_profile.namespace_id != namespace_id:
+                    raise ValueError("LLM profile does not belong to namespace")
+                if llm_profile.kind != "llm":
+                    raise ValueError("LLM profile kind must be llm")
+
             collection = Collection(
                 name=name,
                 namespace_id=namespace_id,
                 strategy=strategy,
                 embedding_profile_id=embedding_profile_id,
+                llm_profile_id=llm_profile_id,
                 default_query_mode=default_query_mode,
                 embedding_dimensions=dimensions,
             )
@@ -383,7 +394,7 @@ class GraphService:
     ) -> ChunkIngestionResult:
         """Full Graph RAG pipeline: extract → resolve → store."""
         embedding_provider = await self._get_embedding_provider_for_collection(collection)
-        llm_provider = await self._get_llm_provider(namespace_id=collection.namespace_id)
+        llm_provider = await self._get_llm_provider(namespace_id=collection.namespace_id, llm_profile_id=collection.llm_profile_id)
 
         # Check raw extraction cache
         cached = await self._get_raw_extraction(chunk_hash, collection.id)
@@ -1477,7 +1488,7 @@ Source Text:
         FalkorDB nodes/edges directly.
         """
         embedding_provider = await self._get_embedding_provider_for_collection(collection)
-        llm_provider = await self._get_llm_provider(namespace_id=collection.namespace_id)
+        llm_provider = await self._get_llm_provider(namespace_id=collection.namespace_id, llm_profile_id=collection.llm_profile_id)
 
         cached = await self._get_raw_extraction(chunk_hash, collection.id)
         if cached:

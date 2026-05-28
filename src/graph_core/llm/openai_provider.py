@@ -56,17 +56,27 @@ class OpenAILLMProvider(LLMProvider):
                 yield delta
 
     async def structured_extract(self, prompt: str, schema: dict) -> dict:
-        response = await self._client.responses.create(
-            model=self._model,
-            input=prompt,
-            text={
-                "format": {
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                response_format={
                     "type": "json_schema",
-                    "name": schema.get("title", "schema"),
-                    "schema": schema,
-                }
-            },
-        )
-        if not response.output_text:
+                    "json_schema": {
+                        "name": schema.get("title", "schema"),
+                        "schema": schema,
+                    },
+                },
+            )
+        except Exception:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                response_format={"type": "json"},
+            )
+
+        content = response.choices[0].message.content or ""
+        if not content:
             return {}
-        return json.loads(response.output_text)
+        return json.loads(content)

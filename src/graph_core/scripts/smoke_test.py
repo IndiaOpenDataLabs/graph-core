@@ -7,7 +7,7 @@ Usage (offline — vector strategy only, local providers):
     uv run python -m graph_core.scripts.smoke_test
     make smoke-test
 
-Usage (full — all strategies + modes, real LLM/embeddings):
+Usage (all strategies + modes, with remote LLM/embeddings):
     uv run python -m graph_core.scripts.smoke_test \
         --llm-key sk-... --embed-key sk-...
     uv run python -m graph_core.scripts.smoke_test \
@@ -139,15 +139,18 @@ async def create_profile(client, headers, kind: str, provider: str, model: str,
 
 
 async def create_collection(client, headers, name: str, strategy: str,
-                            embed_profile_id: str) -> str:
+                            embed_profile_id: str, llm_profile_id: str | None = None) -> str:
     """Create a collection. Returns collection_id."""
+    body = {
+        "name": name,
+        "strategy": strategy,
+        "embedding_profile_id": embed_profile_id,
+    }
+    if llm_profile_id:
+        body["llm_profile_id"] = llm_profile_id
     r = await client.post(
         "/collections/",
-        json={
-            "name": name,
-            "strategy": strategy,
-            "embedding_profile_id": embed_profile_id,
-        },
+        json=body,
         headers=headers,
     )
     if r.status_code != 200:
@@ -210,8 +213,8 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         skipped += 1
         _skip(msg)
 
-    has_openai = bool(args.llm_key and args.embed_key)
-    provider_label = "OpenAI" if has_openai else "local"
+    has_api = bool(args.llm_key and args.embed_key)
+    provider_label = "remote" if has_api else "local"
 
     async with httpx.AsyncClient(base_url=BASE_URL, timeout=120.0) as client:
 
@@ -237,7 +240,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
 
         # ── 3. Register credential (OpenAI only) ─────────────────────
         cred_id = None
-        if has_openai:
+        if has_api:
             print(f"\n{BOLD}3. Register credential (OpenAI){RESET}")
             try:
                 cred_id = await register_credential(client, headers, args.llm_key, args.llm_url)
@@ -249,13 +252,13 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         # ── 4. Create embedding profile ──────────────────────────────
         print(f"\n{BOLD}4. Create embedding profile ({provider_label}){RESET}")
         try:
-            if has_openai:
+            if has_api:
                 embed_profile_id = await create_profile(
                     client, headers,
                     kind="embedding", provider="openai",
                     model=args.embed_model,
                     credential_id=cred_id,
-                    label="smoke-embed-openai",
+                    label="smoke-embed-remote",
                     base_url=args.embed_url,
                     dimensions=args.embed_dimensions,
                 )
@@ -276,13 +279,13 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         # ── 5. Create LLM profile ────────────────────────────────────
         print(f"\n{BOLD}5. Create LLM profile ({provider_label}){RESET}")
         try:
-            if has_openai:
+            if has_api:
                 llm_profile_id = await create_profile(
                     client, headers,
                     kind="llm", provider="openai",
                     model=args.llm_model,
                     credential_id=cred_id,
-                    label="smoke-llm-openai",
+                    label="smoke-llm-remote",
                     base_url=args.llm_url,
                 )
             else:
@@ -320,19 +323,12 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
             strategy = strategy_info["name"]
             modes = strategy_info["modes"]
 
-            # Skip graph strategies without real LLM
-            if strategy != "vector" and not has_openai:
-                print(f"\n{BOLD}{step}. Strategy: {strategy}{RESET}")
-                skip(f"Skipped — requires --llm-key and --embed-key for entity extraction")
-                step += 1
-                continue
-
             print(f"\n{BOLD}{step}. Strategy: {strategy}{RESET}")
 
             # Create collection
             try:
                 coll_name = f"smoke-{strategy}"
-                coll_id = await create_collection(client, headers, coll_name, strategy, embed_profile_id)
+                coll_id = await create_collection(client, headers, coll_name, strategy, embed_profile_id, llm_profile_id)
                 record(True, f"Collection created: {coll_id}")
             except Exception as e:
                 record(False, f"Failed to create {strategy} collection: {e}")
@@ -383,7 +379,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
     total = passed + failed + skipped
     print(f"\n{'='*50}")
     print(f"  Provider: {BOLD}{provider_label}{RESET}")
-    if has_openai:
+    if has_api:
         print(f"  LLM: {args.llm_model}{' (' + args.llm_url + ')' if args.llm_url else ''}")
         print(f"  Embed: {args.embed_model}{' (' + args.embed_url + ')' if args.embed_url else ''}")
     if failed == 0 and skipped == 0:
@@ -415,14 +411,14 @@ def main():
         print(f"{RED}asyncpg is not installed. Run: uv sync --all-groups{RESET}")
         sys.exit(1)
 
-    has_openai = bool(args.llm_key and args.embed_key)
-    provider_label = "OpenAI" if has_openai else "local"
+    has_api = bool(args.llm_key and args.embed_key)
+    provider_label = "remote" if has_api else "local"
 
     print(f"\n{BOLD}Graph Core Smoke Test{RESET}")
     print(f"Target: {BASE_URL}")
     print(f"Database: {DB_URL}")
     print(f"Provider: {provider_label}")
-    if has_openai:
+    if has_api:
         print(f"LLM model: {args.llm_model}")
         print(f"Embed model: {args.embed_model}")
     print()

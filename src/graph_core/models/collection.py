@@ -25,6 +25,9 @@ class Collection(Base):
     # Embedding profile: immutable after creation
     embedding_profile_id = Column(UUIDType(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True, index=True)
 
+    # LLM profile: immutable after creation
+    llm_profile_id = Column(UUIDType(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+
     # Resolved embedding dimensions from profile at creation time.
     # Used for dynamic per-collection vector table creation.
     embedding_dimensions = Column(Integer, nullable=True)

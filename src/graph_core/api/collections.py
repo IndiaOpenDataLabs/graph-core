@@ -15,6 +15,7 @@ class CreateCollectionRequest(BaseModel):
     name: str
     strategy: str = "vector"
     embedding_profile_id: uuid.UUID | None = None
+    llm_profile_id: uuid.UUID | None = None
     default_query_mode: str | None = None
 
 
@@ -24,6 +25,7 @@ class CollectionResponse(BaseModel):
     strategy: str
     namespace_id: str
     embedding_profile_id: str | None
+    llm_profile_id: str | None
     default_query_mode: str | None
 
 
@@ -43,6 +45,7 @@ async def create_collection(
             namespace_id=namespace_id,
             strategy=body.strategy,  # type: ignore[arg-type]
             embedding_profile_id=body.embedding_profile_id,
+            llm_profile_id=body.llm_profile_id,
             default_query_mode=body.default_query_mode,
         )
         return _to_response(collection)
@@ -66,5 +69,6 @@ def _to_response(c) -> CollectionResponse:
         strategy=c.strategy,
         namespace_id=str(c.namespace_id),
         embedding_profile_id=str(c.embedding_profile_id) if c.embedding_profile_id else None,
+        llm_profile_id=str(c.llm_profile_id) if c.llm_profile_id else None,
         default_query_mode=c.default_query_mode,
     )
