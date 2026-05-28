@@ -7,7 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from graph_core.api.dependencies import get_namespace_id
+from graph_core.models.collection import Collection
 from graph_core.services.platform import PlatformService
+from graph_core.services.sanitizer import MAX_CHUNK_SIZE
 
 
 class RegisterCredentialRequest(BaseModel):
@@ -73,8 +75,8 @@ async def get_capabilities(
             _to_profile_response(profile).model_dump()
             for profile in llm_profiles
         ],
-        "retrieval_strategies": ["vector", "custom_graph_rag", "light_rag"],
-        "max_chunk_size": 16000,
+        "retrieval_strategies": list(Collection.strategy.type.enum_args),
+        "max_chunk_size": MAX_CHUNK_SIZE,
     }
 
 
