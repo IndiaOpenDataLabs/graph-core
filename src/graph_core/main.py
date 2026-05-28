@@ -1,13 +1,14 @@
 """Graph Core — FastAPI application entry point."""
 
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from graph_core.api import collections, ingest, jobs, platform, query
-from graph_core.config import settings
+from graph_core.database import current_namespace_id
 
 
 @asynccontextmanager
@@ -22,6 +23,23 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def set_namespace_context(request: Request, call_next):
+    """Extract X-Namespace-ID header and set request-scoped contextvar.
+
+    The contextvar is read by NamespacedAsyncSession.begin() to set the
+    Postgres app.current_namespace_id session variable for RLS policies.
+    """
+    ns_header = request.headers.get("x-namespace-id")
+    if ns_header:
+        try:
+            current_namespace_id.set(uuid.UUID(ns_header))
+        except ValueError:
+            pass
+    response = await call_next(request)
+    return response
 
 
 @app.exception_handler(RequestValidationError)
