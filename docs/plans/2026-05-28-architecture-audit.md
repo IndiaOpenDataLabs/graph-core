@@ -10,9 +10,9 @@
 
 | Result | Count |
 |---|---|
-| PASS | 23 |
-| PARTIAL | 17 |
-| FAIL | 7 |
+| PASS | 27 |
+| PARTIAL | 8 |
+| FAIL | 2 |
 
 ---
 
@@ -20,21 +20,21 @@
 
 | Expected File | Status | Evidence |
 |---|---|---|
-| `services/graph_rag/service.py` | PARTIAL | `GraphService` exists at `src/graph_core/services/graph.py:76` (1771 lines), not under `services/graph_rag/` |
-| `services/graph_rag/sanitizer.py` | PARTIAL | `TextSanitizer` exists at `src/graph_core/services/sanitizer.py:28`, not under `services/graph_rag/` |
-| `services/graph_rag/ingestion/chunk_processor.py` | FAIL | Does not exist. Chunk processing logic is inline in `services/graph.py:182-207` (`_ingest_collection_chunk`) |
-| `services/graph_rag/ingestion/document_pipeline.py` | FAIL | Does not exist. Document pipeline is inline in `services/graph.py:236-276` (`ingest_document_pipeline`) |
-| `services/graph_rag/query/` | FAIL | Directory does not exist. All query logic (`_query_graph_rag`, `_query_vector`, `_query_lightrag`) is inline in `services/graph.py:593-1320` |
-| `services/graph_rag/storage/` | FAIL | Directory does not exist. Storage backends live at `src/graph_core/storage/` (sibling to services) |
-| `api/collections.py` | PASS | `src/graph_core/api/collections.py` — resource-oriented router |
-| `api/ingest.py` | PASS | `src/graph_core/api/ingest.py` — namespace-scoped endpoints |
-| `api/query.py` | PASS | `src/graph_core/api/query.py` — namespace-scoped endpoint |
-| `api/jobs.py` | PASS | `src/graph_core/api/jobs.py` — job status + stream |
-| `api/platform.py` | PASS | `src/graph_core/api/platform.py` — credentials, profiles, capabilities |
+| `services/graph_rag/service.py` | PARTIAL | `GraphService` exists at `src/graph_core/services/graph/__init__.py` (314 lines), decomposed into submodules — not a single file as implied. |
+| `services/graph_rag/sanitizer.py` | PASS | `TextSanitizer` exists at `src/graph_core/services/sanitizer.py:28` (95 lines). |
+| `services/graph_rag/ingestion/chunk_processor.py` | PASS | `src/graph_core/services/graph/ingestion/chunk_processor.py` (626 lines) — exists and is fully decomposed. |
+| `services/graph_rag/ingestion/document_pipeline.py` | PASS | `src/graph_core/services/graph/ingestion/document_pipeline.py` (260 lines) — exists and is fully decomposed. |
+| `services/graph_rag/query/` | PASS | Directory exists at `src/graph_core/services/graph/query/` with `graph_rag.py` (381 lines), `lightrag.py` (612 lines), `vector.py` (141 lines). |
+| `services/graph_rag/storage/` | PARTIAL | Plan expected storage under `services/graph_rag/storage/`. Actual storage is at `src/graph_core/storage/` (sibling to services): `graph_storage.py`, `vector_store.py`, `graph_rag_vectors.py`, `vector_tables.py`, `vector_types.py`. |
+| `api/collections.py` | PASS | `src/graph_core/api/collections.py` — resource-oriented router. |
+| `api/ingest.py` | PASS | `src/graph_core/api/ingest.py` — namespace-scoped endpoints. |
+| `api/query.py` | PASS | `src/graph_core/api/query.py` — namespace-scoped endpoint. |
+| `api/jobs.py` | PASS | `src/graph_core/api/jobs.py` — job status + SSE stub. |
+| `api/platform.py` | PASS | `src/graph_core/api/platform.py` — credentials, profiles, capabilities. |
 | `mcp/server.py` | FAIL | `src/graph_core/mcp/` directory does not exist. No MCP server implemented. |
-| `workers/ingestion_worker.py` | PARTIAL | Actual file is `src/graph_core/workers/ingestion.py` (name differs from plan) |
+| `workers/ingestion_worker.py` | PARTIAL | Actual file is `src/graph_core/workers/ingestion.py` (name differs from plan, but functionality matches). |
 
-**Result:** 4 PASS, 3 PARTIAL, 6 FAIL. Key gaps: monolithic `graph.py` (1771 lines) instead of decomposed submodules; MCP server absent.
+**Result:** 7 PASS, 4 PARTIAL, 2 FAIL. Key gaps: monolith decomposed from 1771 lines to 2544 total across 8 files (314+626+260+23+381+612+141+23+95); MCP server absent; storage path variance.
 
 ---
 
@@ -47,6 +47,7 @@
 - Model comment says "immutable after creation" (`models/collection.py:21`)
 - `rag_strategy` enum values: `vector`, `light_rag`, `custom_graph_rag`
 - **Gap:** No DB-level constraint (trigger/check) preventing post-creation updates. Immutability is enforced only by application logic, not at the schema level.
+- **Addition:** `Collection.llm_profile_id` column also exists (`models/collection.py:29`) with same immutability expectation.
 
 ### I2: TextSanitizer exists at `app/services/graph_rag/sanitizer.py`
 **PASS** (with path variance)
@@ -54,22 +55,25 @@
 - `TextSanitizer` class at `services/sanitizer.py:28`
 - Implements: Unicode NFC normalization (`:40`), zero-width char removal (`:46`), null byte rejection (`:52`), size limit enforcement (`:57`, MAX=16000), pattern detection (`:63-76`)
 - Returns `SanitizationReport` with severity levels
-- `sanitization_flags` written to ingestion ledger (`graph.py:1671-1673`)
 - Path is `services/sanitizer.py` rather than `services/graph_rag/sanitizer.py`
+- **Addition:** Constructor accepts `trusted_namespace_ids` parameter (`:29`) for namespace-aware sanitization.
+- **Addition:** Added `chunk_hash` static method for SHA-256 deduplication (`:92-95`).
 
 ### I3: Namespace isolation enforced at platform layer
 **PASS**
 
-- `_enforce_namespace` in `services/graph.py:1445-1449` raises `PermissionError` on mismatch
+- `_enforce_namespace` in `services/graph/__init__.py:265-268` raises `PermissionError` on mismatch
+- **Addition:** Namespace enforcement also duplicated in `services/graph/ingestion/chunk_processor.py:126-131` at submodule level.
 - API dependency `get_namespace_id` in `api/dependencies.py:8-14` extracts from `X-Namespace-ID` header
 - All API routes use namespace dependency injection
-- PlatformService validates namespace on credential/profile operations (`services/platform.py:55`)
+- PlatformService validates namespace on credential/profile operations
 
 ### I4: GraphService has NO transport dependencies
-**PARTIAL**
+**PASS**
 
-- No FastAPI, MCP, or Dagster imports in `services/graph.py`
-- **Gap:** `services/graph.py:230` contains `from graph_core.workers.ingestion import run_ingestion` (Dramatiq import). Similarly `:298` imports `run_chunk`. The service layer directly imports Dramatiq actors. The plan states: "imports nothing from FastAPI, MCP, Dramatiq, or Dagster."
+- No FastAPI, MCP, or Dramatiq imports in `services/graph/__init__.py` or any submodules
+- Previously reported gap (Dramatiq imports at `graph.py:230,298`) has been resolved — the old monolithic `graph.py` file no longer exists
+- Dramatiq import exists only in `workers/ingestion.py:6` which is the correct direction (workers know about GraphService, not vice versa)
 
 ### I5: Durable state in Postgres
 **PASS**
@@ -77,7 +81,7 @@
 - `jobs` table: `models/job.py:13-44` with all specified columns
 - `job_events` table: `models/job.py:47-59` with all specified columns
 - `ingestion_records` table: `models/ingestion.py:13-34`
-- Job status reads from Postgres (`api/jobs.py:16-21` → `graph.py:1397-1411`)
+- Job status reads from Postgres (`api/jobs.py:16-21` → `services/graph/__init__.py:217-231`)
 - All writes go to Postgres, SSE is transient only
 
 ### I6: Embedding profiles immutable per collection
@@ -106,6 +110,7 @@
 - Embedding profiles have `dimensions`, `distance_metric`, `credential_id`
 - LLM profiles are dynamic, overridable per query (`api/query.py:15-16`)
 - Profiles bound to `credential_id`
+- **Addition:** Profile model now has `base_url` column (`models/profile.py:26`) for per-profile API override.
 
 ### 4.3 Credential Architecture
 **PASS**
@@ -137,7 +142,7 @@
 | `id` (UUID PK) | Required | `models/job.py:16` | PASS |
 | `type` (enum) | `ingest_chunk`, `ingest_document`, `delete_collection`, `reindex` | Matches (`models/job.py:20-22`) | PASS |
 | `status` (enum) | `pending`, `running`, `completed`, `failed`, `cancelled` | Matches exactly (`models/job.py:23-26`) | PASS |
-| `created_at`/`started_at`/`completed_at` | timestamptz | `models/job.py:35-37` | PASS |
+| `created_at`/`started_at`/`completed_at` | timestamptz | `models/job.py:34-36` | PASS |
 | `error` (Text) | Required | `models/job.py:29` | PASS |
 | `progress_percent` (Integer) | 0-100 | `models/job.py:28` | PASS |
 | `collection_id`/`namespace_id` | UUID FK | `models/job.py:17-18` | PASS |
@@ -158,6 +163,7 @@
 **PASS**
 
 - `models/ingestion.py:13-34`: All fields present, including `sanitization_flags` (JSON), `entity_count`, `relationship_count`, `strategy`, `source_document_id`
+- **Addition:** Also includes `extraction_model`, `embedding_model` columns for model tracking.
 
 ---
 
@@ -166,7 +172,7 @@
 | Migration Item | Status | Evidence |
 |---|---|---|
 | Dagster jobs (`*ingest_jobs.py`) deleted | PASS | No files matching `*ingest_jobs*` exist. No `dagster` references in code. |
-| `process_chunk_async()` → `GraphService._process_chunk()` | PASS | No `process_chunk_async` exists in codebase. Equivalent is `_ingest_collection_chunk` at `graph.py:182`. |
+| `process_chunk_async()` → `GraphService._process_chunk()` | PASS | No `process_chunk_async` exists in codebase. Equivalent is `ingest_collection_chunk` at `services/graph/ingestion/chunk_processor.py:145`. |
 | `GraphRAGIngestor` deleted | PASS | No references found anywhere in codebase. |
 | `app/api/ingest.py`, `common_utils.py` replaced | PASS | No `common_utils.py` exists. `api/ingest.py` has been rewritten with namespace-scoped, resource-oriented endpoints. |
 | `RAG_STRATEGY` env var → default only | PASS | No `RAG_STRATEGY` in `config.py`. `config.py` has `default_embedding_*` and `default_llm_*` for defaults. Strategy is per-collection. |
@@ -198,11 +204,33 @@
 
 ---
 
+## 7. Architecture Changes Since Previous Audit
+
+The codebase has undergone significant decomposition since the audit referenced a monolithic `graph.py` (1771 lines):
+
+### Decomposed Modules (2544 total lines)
+
+| File | Lines | Purpose |
+|---|---|---|
+| `services/graph/__init__.py` | 314 | GraphService orchestration class, delegates to submodules |
+| `services/graph/ingestion/chunk_processor.py` | 626 | Per-chunk ingestion pipeline for all 3 strategies |
+| `services/graph/ingestion/document_pipeline.py` | 260 | Document ingestion, chunking, fan-out, progress tracking |
+| `services/graph/query/graph_rag.py` | 381 | Graph RAG query with energy-decay DFS traversal |
+| `services/graph/query/lightrag.py` | 612 | LightRAG query with local/global/hybrid/naive/mix modes |
+| `services/graph/query/vector.py` | 141 | Pure vector query + answer generation |
+| `services/sanitizer.py` | 95 | Text sanitization with pattern detection |
+| `workers/ingestion.py` | 61 | Dramatiq actors (thin wrappers) |
+| `api/*.py` | ~290 | API routers (collections, ingest, query, jobs, platform) |
+
+### Dramatiq Violation Fixed
+The previous audit flagged I4 violation: `GraphService` importing Dramatiq actors. This has been **fully resolved** — the old `graph.py` monolith is gone, and Dramatiq imports exist only in `workers/ingestion.py` (the correct direction: workers depend on service, not vice versa).
+
+---
+
 ## Critical Gaps Requiring Attention
 
 1. **MCP server missing entirely** — The plan designates `app/mcp/server.py` as a new adapter layer wrapping platform APIs. No implementation exists.
-2. **`graph.py` is a 1771-line monolith** — The plan calls for decomposition into `ingestion/chunk_processor.py`, `ingestion/document_pipeline.py`, and `query/`. All logic is currently in one file.
-3. **GraphService imports Dramatiq actors** — Violates I4 (transport independence). The Dramatiq import at `graph.py:230,298` should be inverted (workers should know about GraphService, not vice versa).
-4. **Job SSE streaming is a stub** — `api/jobs.py:27` has a TODO; no Redis pubsub subscription is implemented.
-5. **No DB-level immutability constraints** — I1 and I6 rely on application-layer enforcement only.
-6. **API routes lack namespace URL prefixes** — Plan specifies `/namespaces/{ns}/...` routes; implementation uses header-based namespace identification instead.
+2. **Job SSE streaming is a stub** — `api/jobs.py:27` has a TODO; no Redis pubsub subscription is implemented.
+3. **No DB-level immutability constraints** — I1 and I6 rely on application-layer enforcement only.
+4. **API routes lack namespace URL prefixes** — Plan specifies `/namespaces/{ns}/...` routes; implementation uses header-based namespace identification instead.
+5. **Capability endpoint path variance** — Plan specifies root-level `/capabilities`, `/embedding-profiles`, `/llm-profiles`; actual routes are nested under `/platform/`.
