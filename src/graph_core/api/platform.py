@@ -75,7 +75,7 @@ async def get_capabilities(
             _to_profile_response(profile).model_dump()
             for profile in llm_profiles
         ],
-        "retrieval_strategies": list(Collection.strategy.type.enum_args),
+        "retrieval_strategies": list(Collection.strategy.type.enums),
         "max_chunk_size": MAX_CHUNK_SIZE,
     }
 

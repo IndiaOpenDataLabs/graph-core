@@ -6,13 +6,19 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import select
 
+from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job
 from graph_core.models.profile import Profile
-from graph_core.models.vector_chunk import VectorChunk
 from graph_core.services.graph import (
     ChunkIngestionResult,
     DocumentIngestionResult,
 )
+
+
+def _has_pgvector_tables() -> bool:
+    """Check if pgvector tables are available (Postgres, not SQLite)."""
+    from graph_core.database import engine
+    return "postgresql" in engine.url.drivername
 
 
 @pytest.mark.asyncio
@@ -55,6 +61,7 @@ async def test_get_collection_not_found(service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_ingest_chunk_vector(service, test_collection):
     result = await service.ingest_chunk(
         "hello world",
@@ -67,9 +74,9 @@ async def test_ingest_chunk_vector(service, test_collection):
     from graph_core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as session:
-        rows = (await session.execute(select(VectorChunk))).scalars().all()
+        rows = (await session.execute(select(IngestionRecord))).scalars().all()
     assert len(rows) == 1
-    assert rows[0].content == "hello world"
+    assert rows[0].chunk_hash == result.chunk_hash
 
 
 @pytest.mark.asyncio
@@ -84,6 +91,7 @@ async def test_ingest_chunk_namespace_enforcement(service, test_collection, test
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_enqueue_document_ingestion(service, test_collection):
     with patch("graph_core.workers.ingestion.run_ingestion") as mock_worker:
         result = await service.enqueue_document_ingestion(
@@ -97,6 +105,7 @@ async def test_enqueue_document_ingestion(service, test_collection):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_query_respects_mode_override(service, test_collection):
     result = await service.query(
         "what is the meaning?",
@@ -108,6 +117,7 @@ async def test_query_respects_mode_override(service, test_collection):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_query_uses_collection_default(service, test_collection):
     result = await service.query(
         "what is the meaning?",
@@ -119,6 +129,7 @@ async def test_query_uses_collection_default(service, test_collection):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_query_vector_returns_relevant_chunks(service, test_collection):
     await service.ingest_chunk(
         "Krishna teaches Arjuna about duty and devotion.",
@@ -142,6 +153,7 @@ async def test_query_vector_returns_relevant_chunks(service, test_collection):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_collection_embedding_profile_is_used(service, test_namespace):
     from graph_core.database import AsyncSessionLocal
 
@@ -189,6 +201,7 @@ async def test_update_and_get_job(service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_ingest_document_pipeline_processes_stored_payload(
     service, test_collection
 ):
@@ -212,15 +225,16 @@ async def test_ingest_document_pipeline_processes_stored_payload(
     await service.ingest_document_pipeline(job_id)
 
     async with AsyncSessionLocal() as session:
-        vector_rows = (await session.execute(select(VectorChunk))).scalars().all()
+        ingestion_rows = (await session.execute(select(IngestionRecord))).scalars().all()
         refreshed_job = await session.get(Job, job_id)
 
-    assert len(vector_rows) >= 1
+    assert len(ingestion_rows) >= 1
     assert refreshed_job is not None
     assert refreshed_job.progress_percent == 100
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_query_accepts_llm_profile_id(service, test_namespace, test_collection):
     from graph_core.database import AsyncSessionLocal
 

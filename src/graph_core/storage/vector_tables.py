@@ -11,6 +11,8 @@ import uuid
 
 from sqlalchemy import text
 
+from graph_core.database import AsyncSessionLocal, _uuid_for_sql
+
 
 def _safe_id(collection_id: uuid.UUID) -> str:
     """Sanitize collection UUID for use in table names.
@@ -135,7 +137,6 @@ CREATE_SQL_MAP: dict[str, callable] = {
 
 async def create_all_tables(collection_id: uuid.UUID, dimensions: int) -> None:
     """Create all per-collection vector tables."""
-    from graph_core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as session:
         for kind in ALL_KINDS:
@@ -147,7 +148,6 @@ async def create_all_tables(collection_id: uuid.UUID, dimensions: int) -> None:
 
 async def drop_all_tables(collection_id: uuid.UUID) -> None:
     """Drop all per-collection vector tables."""
-    from graph_core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as session:
         for kind in ALL_KINDS:
@@ -162,13 +162,11 @@ async def get_collection_dimensions(collection_id: uuid.UUID) -> int | None:
     We store the resolved embedding dimensions on the collection row
     so storage layers don't need to join the profiles table.
     """
-    from graph_core.database import AsyncSessionLocal
-    from graph_core.models.collection import Collection
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             text("SELECT embedding_dimensions FROM collections WHERE id = :cid"),
-            {"cid": collection_id},
+            {"cid": _uuid_for_sql(collection_id)},
         )
         row = result.one_or_none()
         if row is None:

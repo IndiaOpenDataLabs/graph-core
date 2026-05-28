@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy import text
 
-from graph_core.database import AsyncSessionLocal
+from graph_core.database import AsyncSessionLocal, _uuid_for_sql
 from graph_core.storage.vector_tables import (
     get_collection_dimensions,
     table_name,
@@ -65,11 +65,11 @@ class GraphRAGVectorStore:
                     f"VALUES (:eid, :cid, :name, :desc, :did, (:emb){cast})"
                 ),
                 {
-                    "eid": entity_id,
-                    "cid": collection_id,
+                    "eid": _uuid_for_sql(entity_id),
+                    "cid": _uuid_for_sql(collection_id),
                     "name": name,
                     "desc": description,
-                    "did": description_id,
+                    "did": _uuid_for_sql(description_id),
                     "emb": _embedding_literal(embedding),
                 },
             )
@@ -102,7 +102,7 @@ class GraphRAGVectorStore:
                     """
                 ),
                 {
-                    "cid": collection_id,
+                    "cid": _uuid_for_sql(collection_id),
                     "top_k": top_k,
                     "qemb": _embedding_literal(query_embedding),
                 },
@@ -116,7 +116,7 @@ class GraphRAGVectorStore:
                         "entity_id": row[1],
                         "description_id": row[2],
                         "name": row[3],
-                        "collection_id": str(collection_id),
+                        "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
                 for row in result
@@ -148,8 +148,8 @@ class GraphRAGVectorStore:
                     f"VALUES (:rid, :cid, :sn, :tn, :desc, (:emb){cast})"
                 ),
                 {
-                    "rid": relationship_id,
-                    "cid": collection_id,
+                    "rid": _uuid_for_sql(relationship_id),
+                    "cid": _uuid_for_sql(collection_id),
                     "sn": source_name,
                     "tn": target_name,
                     "desc": description,
@@ -174,13 +174,13 @@ class GraphRAGVectorStore:
 
         where_extra = ""
         params: dict = {
-            "cid": collection_id,
+            "cid": _uuid_for_sql(collection_id),
             "top_k": top_k,
             "qemb": _embedding_literal(query_embedding),
         }
         if relationship_id:
             where_extra = "AND relationship_id = :rel_id"
-            params["rel_id"] = relationship_id
+            params["rel_id"] = _uuid_for_sql(relationship_id)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
@@ -206,7 +206,7 @@ class GraphRAGVectorStore:
                         "relationship_id": row[1],
                         "source_name": row[2],
                         "target_name": row[3],
-                        "collection_id": str(collection_id),
+                        "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
                 for row in result
@@ -234,7 +234,7 @@ class GraphRAGVectorStore:
         async with AsyncSessionLocal() as session:
             existing = await session.execute(
                 text(f"SELECT id FROM {tbl} WHERE entity_id = :eid"),
-                {"eid": entity_id},
+                {"eid": _uuid_for_sql(entity_id)},
             )
             if existing.scalar_one_or_none():
                 await session.execute(
@@ -250,7 +250,7 @@ class GraphRAGVectorStore:
                         "cn": canonical_name,
                         "pt": primary_type,
                         "dc": description_count,
-                        "eid": entity_id,
+                        "eid": _uuid_for_sql(entity_id),
                         "emb": emb_str,
                     },
                 )
@@ -263,8 +263,8 @@ class GraphRAGVectorStore:
                         f"VALUES (:eid, :cid, :cn, :pt, :dc, (:emb){cast})"
                     ),
                     {
-                        "eid": entity_id,
-                        "cid": collection_id,
+                        "eid": _uuid_for_sql(entity_id),
+                        "cid": _uuid_for_sql(collection_id),
                         "cn": canonical_name,
                         "pt": primary_type,
                         "dc": description_count,
@@ -300,7 +300,7 @@ class GraphRAGVectorStore:
                     """
                 ),
                 {
-                    "cid": collection_id,
+                    "cid": _uuid_for_sql(collection_id),
                     "top_k": top_k,
                     "qemb": _embedding_literal(query_embedding),
                 },
@@ -315,7 +315,7 @@ class GraphRAGVectorStore:
                         "canonical_name": row[2],
                         "primary_type": row[3] or "",
                         "description_count": row[4],
-                        "collection_id": str(collection_id),
+                        "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
                 for row in result
@@ -331,7 +331,7 @@ class GraphRAGVectorStore:
                     f"SELECT embedding::text FROM {tbl} "
                     f"WHERE entity_id = :eid"
                 ),
-                {"eid": entity_id},
+                {"eid": _uuid_for_sql(entity_id)},
             )
             row = result.one_or_none()
             if row is None:
@@ -362,7 +362,7 @@ class GraphRAGVectorStore:
                     f"SELECT id FROM {tbl} "
                     f"WHERE collection_id = :cid AND chunk_hash = :ch"
                 ),
-                {"cid": collection_id, "ch": chunk_hash},
+                {"cid": _uuid_for_sql(collection_id), "ch": chunk_hash},
             )
             if existing.scalar_one_or_none():
                 return
@@ -374,7 +374,7 @@ class GraphRAGVectorStore:
                     f"VALUES (:cid, :ch, :ci, :content, (:emb){cast})"
                 ),
                 {
-                    "cid": collection_id,
+                    "cid": _uuid_for_sql(collection_id),
                     "ch": chunk_hash,
                     "ci": chunk_index,
                     "content": content,
@@ -410,7 +410,7 @@ class GraphRAGVectorStore:
                     """
                 ),
                 {
-                    "cid": collection_id,
+                    "cid": _uuid_for_sql(collection_id),
                     "top_k": top_k,
                     "qemb": _embedding_literal(query_embedding),
                 },
@@ -423,7 +423,7 @@ class GraphRAGVectorStore:
                     metadata={
                         "chunk_hash": row[1],
                         "chunk_index": row[2],
-                        "collection_id": str(collection_id),
+                        "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
                 for row in result

@@ -168,7 +168,7 @@ async def fan_out_chunks(
 
         await session.execute(
             text("UPDATE jobs SET chunks_total = :total WHERE id = :jid"),
-            {"total": len(chunks), "jid": job_id},
+            {"total": len(chunks), "jid": str(job_id).replace("-", "")},
         )
         await session.commit()
 
@@ -252,7 +252,7 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
             if total and completed >= total:
                 await session.execute(
                     text("UPDATE jobs SET completed_at = :now WHERE id = :jid AND status = 'completed'"),
-                    {"now": datetime.now(UTC), "jid": job_id},
+                    {"now": datetime.now(UTC), "jid": str(job_id).replace("-", "")},
                 )
                 await session.commit()
             await session.commit()

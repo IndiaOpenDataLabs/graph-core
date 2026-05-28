@@ -6,7 +6,6 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 # Patch config BEFORE any graph_core modules import database.py
 import graph_core.config
@@ -65,6 +64,7 @@ async def test_collection(db_session, test_namespace):
         namespace_id=test_namespace.id,
         name="test-collection",
         strategy="vector",
+        embedding_dimensions=256,
     )
     db_session.add(coll)
     await db_session.commit()
@@ -78,6 +78,7 @@ async def test_graph_rag_collection(db_session, test_namespace):
         namespace_id=test_namespace.id,
         name="graph-rag-collection",
         strategy="custom_graph_rag",
+        embedding_dimensions=256,
     )
     db_session.add(coll)
     await db_session.commit()
@@ -91,6 +92,7 @@ async def test_light_rag_collection(db_session, test_namespace):
         namespace_id=test_namespace.id,
         name="light-rag-collection",
         strategy="light_rag",
+        embedding_dimensions=256,
     )
     db_session.add(coll)
     await db_session.commit()

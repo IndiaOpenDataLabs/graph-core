@@ -5,7 +5,14 @@ from unittest.mock import patch
 import pytest
 
 
+def _has_pgvector_tables() -> bool:
+    """Check if pgvector tables are available (Postgres, not SQLite)."""
+    from graph_core.database import engine
+    return "postgresql" in engine.url.drivername
+
+
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_ingest_chunk(async_client, test_collection):
     resp = await async_client.post(
         f"/collections/{test_collection.id}/ingest/chunk",
@@ -31,6 +38,7 @@ async def test_ingest_document_returns_job_id(async_client, test_collection):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _has_pgvector_tables(), reason="requires Postgres pgvector")
 async def test_ingest_chunk_then_query_returns_vector_context(async_client, test_collection):
     ingest_resp = await async_client.post(
         f"/collections/{test_collection.id}/ingest/chunk",

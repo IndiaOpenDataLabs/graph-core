@@ -8,7 +8,7 @@ import uuid
 
 from sqlalchemy import text
 
-from graph_core.database import AsyncSessionLocal
+from graph_core.database import AsyncSessionLocal, _uuid_for_sql
 from graph_core.storage.vector_tables import (
     get_collection_dimensions,
     table_name,
@@ -57,7 +57,7 @@ class VectorStore:
                         f"AND chunk_index = :ci"
                     ),
                     {
-                        "cid": collection_id,
+                        "cid": _uuid_for_sql(collection_id),
                         "ch": chunk["chunk_hash"],
                         "ci": chunk["chunk_index"],
                     },
@@ -73,8 +73,8 @@ class VectorStore:
                         f"VALUES (:nsid, :cid, :ch, :ci, :content, :tc, :meta, (:emb){cast})"
                     ),
                     {
-                        "nsid": namespace_id,
-                        "cid": collection_id,
+                        "nsid": _uuid_for_sql(namespace_id),
+                        "cid": _uuid_for_sql(collection_id),
                         "ch": chunk["chunk_hash"],
                         "ci": chunk["chunk_index"],
                         "content": chunk["content"],
@@ -111,7 +111,7 @@ class VectorStore:
                     """
                 ),
                 {
-                    "cid": collection_id,
+                    "cid": _uuid_for_sql(collection_id),
                     "top_k": top_k,
                     "qemb": _embedding_literal(query_embedding),
                 },

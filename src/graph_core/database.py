@@ -11,6 +11,15 @@ from sqlalchemy.orm import DeclarativeBase
 from graph_core.config import settings
 
 
+def _uuid_for_sql(val: uuid.UUID) -> str:
+    """Convert UUID to the string format expected by the current DB dialect.
+
+    SQLite stores UUIDs as 32-char hex (no dashes). Postgres UUID type
+    accepts any canonical format. Using .hex works for both.
+    """
+    return val.hex
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -35,7 +44,7 @@ class NamespacedAsyncSession(AsyncSession):
         if ns_id is not None:
             await self.execute(
                 text("SET LOCAL app.current_namespace_id = :nsid"),
-                {"nsid": ns_id},
+                {"nsid": _uuid_for_sql(ns_id)},
             )
 
 
@@ -55,9 +64,9 @@ async def set_namespace_context(session: AsyncSession, namespace_id: uuid.UUID) 
     Must be called inside an active transaction before any query runs.
     """
     await session.execute(
-        text("SET LOCAL app.current_namespace_id = :nsid"),
-        {"nsid": namespace_id},
-    )
+            text("SET LOCAL app.current_namespace_id = :nsid"),
+            {"nsid": _uuid_for_sql(namespace_id)},
+        )
 
 
 async def get_session() -> AsyncSession:
