@@ -4,10 +4,13 @@
 >
 > **Date:** 2026-05-28
 >
-> **Motivation:** Namespaces are user-scoped workspaces. End users create namespaces
-> via their consuming apps (TUI, web client). The platform must verify that every
-> request comes from a registered app acting on behalf of a known user, without
-> the platform becoming an identity provider.
+> **Motivation:** Namespaces are user-scoped workspaces. The platform supports two
+> deployment modes with different auth complexity:
+>
+> - **Self-hosted**: Single operator controls everything. Simple admin-key auth,
+>   namespace-level tokens. No OAuth, no app registration overhead.
+> - **Multi-tenant (hosted)**: Multiple independent consuming apps and users. Full
+>   app registration, user-scoped JWTs, OAuth for admin portal.
 
 ---
 
@@ -15,86 +18,132 @@
 
 The platform currently uses `X-Namespace-ID` header for namespace routing. This is
 identification, not authentication — any client with a valid UUID gains full access.
-We need:
 
-1. **App registration** — consuming apps register with the platform, receive credentials
-2. **Token issuance** — platform issues short-lived user-scoped tokens
-3. **Token validation** — all API requests carry a valid token
-4. **Namespace creation** — apps create namespaces for users via the API, not raw SQL
-5. **Developer identity** — platform operators use Google/GitHub OAuth to manage registered apps
+Additionally, a self-hosted deployment shouldn't require OAuth infrastructure,
+app registration, or JWT complexity. The operator should just set an admin key,
+create namespaces, and use them.
 
 ---
 
-## 2. Identities
+## 2. Two Deployment Modes
 
-Three distinct identities, each with its own authentication mechanism:
+`PLATFORM_MODE` env var selects the auth model. Default: `self_hosted`.
 
-| Identity | Who | Auth mechanism | Purpose |
-|---|---|---|---|
-| **Platform Admin** | You (operator) | `PLATFORM_ADMIN_KEY` env var | Register apps, manage platform |
-| **Registered App** | TUI, web client, MCP server | `client_id` + `client_secret` | Exchange credentials for user tokens |
-| **End User** | Person using the app | Short-lived JWT (issued by platform) | Query, ingest, manage collections |
+### Self-hosted (default)
 
-### Key distinction
-
-- **`client_id` / `client_secret`** identify the *app*. They are used server-to-server
-  to request tokens. The secret never touches end users.
-- **Access token (JWT)** identifies the *user + namespace*. It is used for all
-  user-facing operations. The app holds it on behalf of the logged-in user.
-
----
-
-## 3. Flows
-
-### 3.1 App Registration (one-time, admin only)
+One operator controls the entire platform. No separate "apps" or "users" concept —
+the operator creates namespaces and issues namespace-scoped tokens directly.
 
 ```
-Admin → POST /admin/apps
-        Authorization: Bearer $PLATFORM_ADMIN_KEY
-        {"name": "scripture-tui", "owner_email": "dev@example.com"}
+1. Operator sets PLATFORM_ADMIN_KEY in .env
 
-        → {"client_id": "app_tui_abc123", "client_secret": "secret_xyz..."}
+2. Operator creates a namespace via API:
+   POST /platform/namespaces
+   Authorization: Bearer $PLATFORM_ADMIN_KEY
+   {"name": "my-workspace"}
+   → {"id": "ns_abc", "name": "my-workspace", "api_key": "ns_key_xyz..."}
+
+3. All requests use the namespace's api_key:
+   POST /collections/
+   Authorization: Bearer ns_key_xyz...
 ```
 
-The `client_secret` is returned once. The admin stores it in the app's server config.
+That's it. No app registration, no OAuth, no JWT complexity. The namespace `api_key`
+is a long-lived token that grants access to that namespace only. RLS enforces isolation.
 
-### 3.2 End User Login & Token Issuance
+### Multi-tenant (hosted)
+
+Multiple independent consuming apps, each with their own users. Platform acts as a
+multi-tenant service with app registration, user-scoped tokens, and OAuth.
 
 ```
-1. User opens TUI, logs in via Google OAuth
-   → TUI backend gets Google user info (sub, email, picture)
-   → Platform is NOT involved in this step
+1. Platform admin registers apps:
+   POST /admin/apps
+   Authorization: Bearer $PLATFORM_ADMIN_KEY
+   {"name": "scripture-tui", "owner_email": "dev@example.com"}
+   → {"client_id": "app_tui_abc123", "client_secret": "secret_xyz..."}
 
-2. TUI requests platform token for the user:
+2. End user logs in via Google OAuth in the TUI (platform not involved)
+
+3. TUI requests user-scoped token from platform:
    POST /oauth/token
    {
      "grant_type": "client_credentials",
      "client_id": "app_tui_abc123",
      "client_secret": "secret_xyz...",
-     "user": {
-       "sub": "google:12345",
-       "email": "user@example.com"
-     }
+     "user": {"sub": "google:12345", "email": "user@example.com"}
    }
+   → Short-lived JWT containing namespace_id
 
-   Platform validates client_id + secret, then:
-   a) Looks up existing namespace for (app_id, user_sub)
-   b) If none exists, creates one: "user-<google_sub>"
-   c) Returns short-lived JWT:
-      {
-        "sub": "google:12345",
-        "app_id": "app_tui_abc123",
-        "namespace_id": "ns_abc",
-        "iat": 1716892800,
-        "exp": 1716896400   (1 hour)
-      }
-
-3. TUI uses the JWT for all requests:
+4. TUI uses JWT for all requests:
    POST /collections/
    Authorization: Bearer <jwt>
 ```
 
-### 3.3 Token Refresh
+---
+
+## 3. Identities per Mode
+
+### Self-hosted
+
+| Identity | Auth mechanism | Purpose |
+|---|---|---|
+| **Platform Admin** | `PLATFORM_ADMIN_KEY` env var | Create namespaces, manage platform |
+| **Namespace** | `api_key` (returned on creation) | All queries, ingest, collections |
+
+### Multi-tenant
+
+| Identity | Auth mechanism | Purpose |
+|---|---|---|
+| **Platform Admin** | `PLATFORM_ADMIN_KEY` env var | Register apps, manage platform |
+| **Registered App** | `client_id` + `client_secret` | Exchange credentials for user tokens |
+| **End User** | Short-lived JWT (issued by platform) | Query, ingest, manage collections |
+
+---
+
+## 4. Flows
+
+### 4.1 Self-hosted: Namespace Creation
+
+```
+POST /platform/namespaces
+Authorization: Bearer $PLATFORM_ADMIN_KEY
+{"name": "my-workspace"}
+
+→ {
+    "id": "ns_uuid",
+    "name": "my-workspace",
+    "api_key": "ns_key_<random_32_chars>"
+  }
+```
+
+The `api_key` is returned once on creation. It can be regenerated later via
+`POST /platform/namespaces/{id}/rotate-key`.
+
+### 4.2 Self-hosted: Using a Namespace
+
+```
+# All API calls carry the namespace api_key
+POST /collections/
+Authorization: Bearer ns_key_<random_32_chars>
+{"name": "docs", "strategy": "vector", ...}
+
+POST /collections/{id}/query
+Authorization: Bearer ns_key_<random_32_chars>
+{"question": "What is dharma?"}
+```
+
+### 4.3 Multi-tenant: App Registration
+
+```
+POST /admin/apps
+Authorization: Bearer $PLATFORM_ADMIN_KEY
+{"name": "scripture-tui", "owner_email": "dev@example.com"}
+
+→ {"client_id": "app_tui_abc123", "client_secret": "secret_xyz..."}
+```
+
+### 4.4 Multi-tenant: User Token Issuance
 
 ```
 POST /oauth/token
@@ -102,12 +151,33 @@ POST /oauth/token
   "grant_type": "client_credentials",
   "client_id": "app_tui_abc123",
   "client_secret": "secret_xyz...",
-  "user": { "sub": "google:12345", "email": "user@example.com" }
+  "user": {"sub": "google:12345", "email": "user@example.com"}
 }
-→ New JWT (namespace already exists, no new namespace created)
+
+Platform:
+  a) Validates client_id + secret
+  b) Looks up existing namespace for (app_id, user_sub)
+  c) If none exists, creates one: "user-<google_sub>"
+  d) Returns short-lived JWT
+
+→ {
+    "access_token": "<jwt>",
+    "token_type": "bearer",
+    "expires_in": 3600,
+    "namespace_id": "ns_abc"
+  }
 ```
 
-### 3.4 Admin Developer Login (Google/GitHub OAuth)
+### 4.5 Multi-tenant: Using a User Token
+
+```
+# All API calls carry the user JWT
+POST /collections/
+Authorization: Bearer <jwt>
+{"name": "docs", "strategy": "vector", ...}
+```
+
+### 4.6 Admin Portal Auth (multi-tenant only)
 
 For the admin portal (app management UI):
 
@@ -118,15 +188,25 @@ Admin visits /admin/login → redirected to Google/GitHub OAuth
 → Admin can manage apps via /admin/apps
 ```
 
-This is scoped to the admin portal only. Regular API requests still use JWT.
+Scoped to admin portal only. Regular API requests use tokens as above.
 
 ---
 
-## 4. Data Model
+## 5. Data Model
 
-### New tables
+### Modified: `namespaces`
 
-**`registered_apps`** — registered consuming applications
+| New column | Type | Notes |
+|---|---|---|
+| `api_key_hash` | String(128) (nullable) | bcrypt hash of namespace API key (self-hosted) |
+| `api_key_prefix` | String(8) (nullable) | Display prefix, e.g., "ns_key_a3f" |
+| `owner_app_id` | UUID FK (nullable) | App that owns this namespace (multi-tenant) |
+| `owner_user_sub` | String(256) (nullable) | User who owns this namespace (multi-tenant) |
+| `metadata` | JSONB (nullable) | Extensible per-namespace data |
+
+Existing columns (`id`, `name`, `created_at`) unchanged.
+
+### New: `registered_apps` (multi-tenant only)
 
 | Column | Type | Notes |
 |---|---|---|
@@ -138,7 +218,7 @@ This is scoped to the admin portal only. Regular API requests still use JWT.
 | `active` | Boolean | Soft-delete support |
 | `created_at` | timestamptz | Creation time |
 
-**`app_user_links`** — maps (app, user) → namespace, prevents duplicate namespaces
+### New: `app_user_links` (multi-tenant only)
 
 | Column | Type | Notes |
 |---|---|---|
@@ -149,65 +229,96 @@ This is scoped to the admin portal only. Regular API requests still use JWT.
 
 PK: `(app_id, user_sub)`
 
-**`namespaces`** — modified (add `owner_app_id`, `owner_user_sub`)
+---
 
-| New column | Type | Notes |
-|---|---|---|
-| `owner_app_id` | UUID FK (nullable) | App that created this namespace |
-| `owner_user_sub` | String(256) (nullable) | User who owns this namespace |
-| `metadata` | JSONB (nullable) | Extensible per-namespace data |
+## 6. Auth Dependency
 
-Existing columns (`id`, `name`, `created_at`) unchanged. Backfill nullable for
-existing namespaces.
+Single `get_auth_context` dependency that handles both modes transparently:
+
+```python
+async def get_auth_context(
+    authorization: str = Header(default=None),
+    x_namespace_id: str = Header(default=""),
+) -> AuthContext:
+    """
+    Resolve auth context from request headers.
+
+    Priority:
+    1. Authorization: Bearer <jwt>        → multi-tenant (user token)
+    2. Authorization: Bearer <admin_key>  → self-hosted (admin)
+    3. Authorization: Bearer <ns_key_...> → self-hosted (namespace)
+    4. X-Namespace-ID: <uuid>             → legacy (deprecated, self-hosted only)
+    """
+```
+
+The dependency returns `AuthContext(namespace_id, mode, ...)` and sets the
+`current_namespace_id` contextvar for RLS.
 
 ---
 
-## 5. API Surface
+## 7. API Surface
 
-### New endpoints
-
-```
-# Admin — app management
-POST   /admin/apps                      Register new app (admin key)
-GET    /admin/apps                      List all apps (admin key)
-GET    /admin/apps/{client_id}          Get app details (admin key)
-POST   /admin/apps/{client_id}/rotate   Rotate client_secret (admin key)
-DELETE /admin/apps/{client_id}          Deactivate app (admin key)
-
-# OAuth — token issuance
-POST   /oauth/token                     Exchange client creds for user JWT
-
-# Platform — namespace management (auth: user JWT)
-POST   /platform/namespaces             Create namespace (auto-created by /oauth/token)
-GET    /platform/namespaces/me          Get current namespace info
-```
-
-### Modified endpoints
-
-All existing endpoints currently using `get_namespace_id` (X-Namespace-ID header)
-will switch to `get_auth_context` (Authorization: Bearer JWT):
+### Self-hosted
 
 ```
+POST   /platform/namespaces              Create namespace (admin key) → returns api_key
+GET    /platform/namespaces              List namespaces (admin key)
+GET    /platform/namespaces/me           Get current namespace (namespace key)
+POST   /platform/namespaces/{id}/rotate-key  Regenerate api_key (admin key)
+
+# All existing endpoints — auth via namespace api_key or admin key
 GET  /platform/capabilities
 POST /platform/credentials
 POST /platform/profiles
-GET  /platform/embedding-profiles
-GET  /platform/llm-profiles
 POST /collections/
 GET  /collections/
-GET  /collections/{id}
 POST /collections/{id}/ingest/chunk
 POST /collections/{id}/ingest/document
 POST /collections/{id}/query
 GET  /jobs/{id}
-GET  /jobs/{id}/stream
+```
+
+### Multi-tenant
+
+```
+# Admin — app management
+POST   /admin/apps                       Register new app (admin key)
+GET    /admin/apps                       List all apps (admin key)
+GET    /admin/apps/{client_id}           Get app details (admin key)
+POST   /admin/apps/{client_id}/rotate    Rotate client_secret (admin key)
+DELETE /admin/apps/{client_id}           Deactivate app (admin key)
+
+# OAuth — token issuance
+POST   /oauth/token                      Exchange client creds for user JWT
+
+# Platform — namespace management
+POST   /platform/namespaces              Create namespace (user JWT, optional)
+GET    /platform/namespaces/me           Get current namespace (user JWT)
+
+# All existing endpoints — auth via user JWT
+GET  /platform/capabilities
+POST /platform/credentials
+POST /platform/profiles
+POST /collections/
+GET  /collections/
+POST /collections/{id}/ingest/chunk
+POST /collections/{id}/ingest/document
+POST /collections/{id}/query
+GET  /jobs/{id}
 ```
 
 ---
 
-## 6. JWT Design
+## 8. Token Design
 
-### Structure
+### Self-hosted: Namespace API Key
+
+- Format: `ns_key_<32 random hex chars>`
+- Stored in DB as bcrypt hash (`namespaces.api_key_hash`)
+- Long-lived, no expiration (can be rotated)
+- Scoped to a single namespace
+
+### Multi-tenant: User JWT
 
 ```json
 {
@@ -221,80 +332,86 @@ GET  /jobs/{id}/stream
 }
 ```
 
-### Signing
-
-- Algorithm: HS256 (simple, no PKI needed)
-- Key: `JWT_SECRET` env var on platform (32+ byte random string)
+- Algorithm: HS256
+- Key: `JWT_SECRET` env var
 - TTL: 1 hour (configurable via `JWT_EXPIRATION_SECONDS`)
-- The app doesn't sign JWTs — only the platform does
-
-### Validation dependency
-
-Replaces `get_namespace_id` with `get_auth_context`:
-
-```python
-async def get_auth_context(authorization: str = Header(...)) -> AuthContext:
-    """Validate Bearer JWT, return (namespace_id, app_id, user_sub)."""
-    scheme, token = authorization.split()
-    if scheme != "Bearer":
-        raise HTTPException(401)
-
-    payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
-    current_namespace_id.set(uuid.UUID(payload["namespace_id"]))
-    return AuthContext(
-        namespace_id=uuid.UUID(payload["namespace_id"]),
-        app_id=payload["app_id"],
-        user_sub=payload["sub"],
-    )
-```
+- Only the platform signs JWTs (not the consuming app)
 
 ---
 
-## 7. Dependencies (new packages)
+## 9. Dependencies (new packages)
 
-| Package | Purpose |
-|---|---|
-| `PyJWT>=2.8.0` | JWT signing and validation |
-| `passlib[bcrypt]>=1.7.4` | Hashing `client_secret` |
-| `httpx>=0.28.0` | Already installed, used for Google/GitHub OAuth |
+| Package | Purpose | Used in |
+|---|---|---|
+| `PyJWT>=2.8.0` | JWT signing/validation | Multi-tenant only |
+| `passlib[bcrypt]>=1.7.4` | Hashing secrets | Both modes |
+| `secrets` | Stdlib, API key generation | Both modes |
 
-No new heavy dependencies. No OAuth library needed for the `/oauth/token`
-endpoint — it's just client credential validation + JWT issuance.
-
----
-
-## 8. Configuration (new env vars)
-
-| Env var | Description |
-|---|---|
-| `JWT_SECRET` | 32+ byte secret for signing JWTs |
-| `JWT_EXPIRATION_SECONDS` | Token TTL (default: 3600) |
-| `PLATFORM_ADMIN_KEY` | Static key for admin endpoints (one-time operator secret) |
-| `GOOGLE_OAUTH_CLIENT_ID` | For admin portal Google OAuth (optional) |
-| `GOOGLE_OAUTH_CLIENT_SECRET` | For admin portal Google OAuth (optional) |
-| `GITHUB_OAUTH_CLIENT_ID` | For admin portal GitHub OAuth (optional) |
-| `GITHUB_OAUTH_CLIENT_SECRET` | For admin portal GitHub OAuth (optional) |
+No heavy dependencies. No OAuth library — `/oauth/token` is just credential
+validation + JWT issuance.
 
 ---
 
-## 9. Implementation Phases
+## 10. Configuration
 
-### Phase 1: Core auth infrastructure
+### Common (both modes)
+
+| Env var | Required | Description |
+|---|---|---|
+| `PLATFORM_ADMIN_KEY` | Yes | Static admin key (operator secret) |
+
+### Self-hosted
+
+| Env var | Required | Description |
+|---|---|---|
+| `PLATFORM_MODE` | No | Set to `self_hosted` (default) |
+
+### Multi-tenant
+
+| Env var | Required | Description |
+|---|---|---|
+| `PLATFORM_MODE` | Yes | Set to `multi_tenant` |
+| `JWT_SECRET` | Yes | 32+ byte secret for signing JWTs |
+| `JWT_EXPIRATION_SECONDS` | No | Token TTL (default: 3600) |
+| `GOOGLE_OAUTH_CLIENT_ID` | No | Admin portal Google OAuth |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | No | Admin portal Google OAuth |
+| `GITHUB_OAUTH_CLIENT_ID` | No | Admin portal GitHub OAuth |
+| `GITHUB_OAUTH_CLIENT_SECRET` | No | Admin portal GitHub OAuth |
+
+---
+
+## 11. Implementation Phases
+
+### Phase 1: Core auth (both modes)
 
 New files:
 - `src/graph_core/models/registered_app.py` — `RegisteredApp` + `AppUserLink` models
-- `src/graph_core/services/oauth_service.py` — JWT issuance, client validation, namespace bootstrap
-- `src/graph_core/api/oauth.py` — `POST /oauth/token` endpoint
-- `src/graph_core/api/admin.py` — `POST /admin/apps` endpoint
+- `src/graph_core/models/namespace.py` — add `api_key_hash`, `api_key_prefix`, `owner_app_id`, `owner_user_sub`, `metadata` columns
+- `src/graph_core/services/auth_service.py` — token validation, namespace key management
 - `src/graph_core/api/auth.py` — `get_auth_context` dependency, `AuthContext` dataclass
+- `src/graph_core/api/namespaces.py` — `POST /platform/namespaces`, key rotation
 - `alembic/versions/0008_auth_tables.py` — migration for new tables + namespace columns
 
 Changes:
-- `src/graph_core/models/namespace.py` — add `owner_app_id`, `owner_user_sub`, `metadata` columns
-- `src/graph_core/config.py` — add JWT/admin/OAuth settings
-- `src/graph_core/api/dependencies.py` — deprecate `get_namespace_id`, keep for backward compat
+- `src/graph_core/config.py` — add `platform_mode`, `platform_admin_key` settings
+- `src/graph_core/api/dependencies.py` — deprecate `get_namespace_id`
 
-### Phase 2: Migrate endpoints to JWT
+**This phase covers self-hosted mode fully.** Multi-tenant tables are created
+but unused until Phase 2.
+
+### Phase 2: Multi-tenant (OAuth, app registration, JWT)
+
+New files:
+- `src/graph_core/services/oauth_service.py` — JWT issuance, client validation, namespace bootstrap
+- `src/graph_core/api/oauth.py` — `POST /oauth/token` endpoint
+- `src/graph_core/api/admin.py` — `POST /admin/apps` and other app management endpoints
+
+Changes:
+- `src/graph_core/api/auth.py` — add JWT validation path to `get_auth_context`
+- `src/graph_core/config.py` — add `jwt_secret`, `jwt_expiration_seconds` settings
+- `pyproject.toml` — add `PyJWT`, `passlib[bcrypt]` dependencies
+
+### Phase 3: Migrate endpoints
 
 Changes:
 - `src/graph_core/api/platform.py` — replace `get_namespace_id` with `get_auth_context`
@@ -303,9 +420,7 @@ Changes:
 - `src/graph_core/api/query.py` — same
 - `src/graph_core/api/jobs.py` — same
 
-Add `POST /platform/namespaces` endpoint (optional manual namespace creation).
-
-### Phase 3: Admin portal auth (Google/GitHub OAuth)
+### Phase 4: Admin portal auth (Google/GitHub OAuth)
 
 New files:
 - `src/graph_core/api/admin_auth.py` — Google/GitHub OAuth flow for admin portal
@@ -314,43 +429,46 @@ Changes:
 - `src/graph_core/config.py` — OAuth client credentials
 - `src/graph_core/api/admin.py` — add login/logout/session endpoints
 
-### Phase 4: Cleanup
+### Phase 5: Cleanup
 
 Changes:
-- `src/graph_core/scripts/smoke_test.py` — update to use auth flow
+- `src/graph_core/scripts/smoke_test.py` — update to use self-hosted auth flow
 - `tests/conftest.py` — update fixtures for authenticated requests
 - Remove raw DB namespace creation from test helpers
 - Remove `X-Namespace-ID` header support (deprecation period first)
 
 ---
 
-## 10. Backward Compatibility
+## 12. Backward Compatibility
 
-During Phase 2, `get_auth_context` will accept both:
-- `Authorization: Bearer <jwt>` (new, preferred)
-- `X-Namespace-ID: <uuid>` (legacy, deprecated, logs warning)
+During Phase 3, `get_auth_context` accepts (in priority order):
+1. `Authorization: Bearer <jwt>` — multi-tenant user token
+2. `Authorization: Bearer <admin_key>` — self-hosted admin
+3. `Authorization: Bearer <ns_key_...>` — self-hosted namespace key
+4. `X-Namespace-ID: <uuid>` — legacy, deprecated, logs warning
 
-After deprecation period (1 sprint), legacy header is removed.
-
----
-
-## 11. Security Considerations
-
-1. **Client secret** stored as bcrypt hash — platform staff cannot reverse it
-2. **JWT signing key** is separate from credential encryption key
-3. **Short token TTL** — limits exposure window
-4. **RLS policies** unchanged — they already enforce namespace isolation at DB level
-5. **App-user-namespace mapping** stored in `app_user_links` — prevents namespace hijacking
-6. **`client_secret` rotation** supported — old secret gracefully rejected
-7. **Admin key** is env-only, never stored in DB
+After deprecation period, option 4 is removed.
 
 ---
 
-## 12. Out of Scope
+## 13. Security Considerations
 
-- RBAC within a namespace (e.g., reader/writer roles) — owned by consuming app
+1. **Namespace API key** stored as bcrypt hash — cannot be reversed from DB
+2. **Client secret** (multi-tenant) stored as bcrypt hash — same
+3. **JWT signing key** is separate from credential encryption key
+4. **Short JWT TTL** in multi-tenant limits exposure
+5. **RLS policies** unchanged — namespace isolation enforced at DB level
+6. **Admin key** is env-only, never stored in DB
+7. **Self-hosted mode** has no network-facing auth — relies on operator securing their deployment
+8. **`client_secret` rotation** supported in multi-tenant
+
+---
+
+## 14. Out of Scope
+
+- RBAC within a namespace — owned by consuming app
 - Token revocation before expiry — TTL is short enough; add if needed
-- Refresh token flow — apps re-request tokens with client credentials
 - SAML / enterprise SSO — future phase
 - Rate limiting — future phase
 - Multi-namespace users (one user, multiple namespaces per app) — future phase
+- Hosted mode user portal (self-service app registration) — future phase
