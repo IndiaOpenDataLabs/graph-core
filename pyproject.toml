@@ -32,7 +32,10 @@ graph = [
     "falkordb>=1.0.0",
 ]
 mcp = [
-    "mcp[fastapi]>=1.0.0",
+    "mcp>=1.0.0",
+]
+cli = [
+    "textual>=2.0.0",
 ]
 
 [dependency-groups]
@@ -62,6 +65,10 @@ testpaths = ["tests"]
 [tool.mypy]
 strict = true
 python_version = "3.11"
+
+[project.scripts]
+graph-core-tui = "graph_core.cli.app:main"
+graph-core-mcp = "graph_core.mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
