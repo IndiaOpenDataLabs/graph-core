@@ -80,6 +80,91 @@ make docker-up
 - **Profile** — reusable configuration for embeddings or LLMs
 - **Credential** — encrypted secret reference, bound to namespace
 
+## Clients
+
+The platform supports three ways to connect:
+
+### Terminal UI (TUI)
+
+Interactive terminal application for managing namespaces, collections, queries, ingestion, and jobs.
+
+```bash
+# Install TUI dependencies
+uv sync --extra cli
+
+# Launch
+python -m graph_core.cli
+```
+
+On first launch, the TUI prompts for your platform URL and API key. Once connected, use the key bindings to navigate:
+
+| Key     | Screen        | Description                          |
+|---------|---------------|--------------------------------------|
+| `1`     | Home          | Dashboard overview                   |
+| `2`     | Namespaces    | List/create namespaces (admin key)   |
+| `3`     | Collections   | List/create collections              |
+| `4`     | Query         | Query a collection with NL           |
+| `5`     | Ingest        | Ingest text or files into a collection |
+| `6`     | Jobs          | Track async ingestion jobs           |
+| `c`     | Config        | Change connection settings           |
+| `q`     | Quit          | Exit                                 |
+
+### MCP Server
+
+Exposes all platform operations as MCP tools, compatible with Claude Desktop,
+Claude Code, and any MCP client.
+
+```bash
+# Install MCP dependencies
+uv sync --extra mcp
+
+# Run on stdio transport (for MCP clients)
+python -m graph_core.mcp
+
+# Run on HTTP transport
+python -m graph_core.mcp streamable-http
+```
+
+Configure via environment variables:
+
+| Env Var                  | Description                          |
+|--------------------------|--------------------------------------|
+| `GRAPH_CORE_URL`         | Platform base URL (default: localhost:8000) |
+| `GRAPH_CORE_API_KEY`     | Namespace API key or admin key       |
+| `GRAPH_CORE_ADMIN_KEY`   | Admin key for namespace management   |
+
+**Available tools:**
+
+| Tool                   | Description                        |
+|------------------------|------------------------------------|
+| `create_namespace`     | Create a new namespace (admin)     |
+| `list_namespaces`      | List all namespaces (admin)        |
+| `get_current_namespace`| Get current namespace info         |
+| `rotate_namespace_key` | Rotate a namespace API key (admin) |
+| `create_collection`    | Create a collection                |
+| `list_collections`     | List collections in namespace      |
+| `ingest_chunk`         | Ingest a text chunk (sync)         |
+| `ingest_document`      | Ingest a document (async, returns job_id) |
+| `ingest_file`          | Ingest from a local file path      |
+| `query_collection`     | Query a collection with a question |
+| `get_job_status`       | Check async job status             |
+| `get_capabilities`     | List platform capabilities         |
+
+### Shared HTTP Client (Python)
+
+The `GraphCoreClient` class provides a typed async client for all REST endpoints.
+
+```python
+from graph_core.client import GraphCoreClient
+
+async with GraphCoreClient(
+    base_url="http://localhost:8000",
+    api_key="ns_key_...",
+) as client:
+    collections = await client.list_collections()
+    result = await client.query_collection(collection_id, "What is dharma?")
+```
+
 ## Platform Setup
 
 All control-plane endpoints are namespace-scoped through `X-Namespace-ID`.
