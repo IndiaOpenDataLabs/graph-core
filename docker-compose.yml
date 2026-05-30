@@ -1,6 +1,8 @@
 services:
   app:
     build: .
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     environment:
@@ -19,6 +21,8 @@ services:
 
   worker:
     build: .
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       REDIS_URL: redis://redis:6379/0

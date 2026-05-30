@@ -62,8 +62,7 @@ async def server_lifespan(server: FastMCP):
 
 mcp = FastMCP(
     name="graph-core",
-    version="0.1.0",
-    description="MCP server for the Graph Core knowledge platform",
+    instructions="MCP server for the Graph Core knowledge platform",
     lifespan=server_lifespan,
 )
 
