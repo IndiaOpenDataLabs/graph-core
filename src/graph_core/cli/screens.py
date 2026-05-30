@@ -265,13 +265,8 @@ class HomeScreen(Screen):
         if is_admin:
             os.environ["PLATFORM_ADMIN_KEY"] = api_key
 
-        self.notify("Connected!")
+        self.notify("Connected!", severity="information", timeout=5)
         self._refresh_view()
-
-        if is_admin:
-            self.app.push_screen(NamespacesScreen())
-        else:
-            self.app.push_screen(CollectionsScreen())
 
 
 class NamespacesScreen(Screen):
