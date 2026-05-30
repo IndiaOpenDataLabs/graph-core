@@ -3,7 +3,7 @@
 import secrets
 from dataclasses import dataclass
 
-from passlib.hash import bcrypt
+import bcrypt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,11 +12,11 @@ from graph_core.models.namespace import Namespace
 
 
 def _hash_secret(plain: str) -> str:
-    return bcrypt.hash(plain)
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 
 def _verify_secret(plain: str, hashed: str) -> bool:
-    return bcrypt.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
 def generate_api_key() -> tuple[str, str]:
