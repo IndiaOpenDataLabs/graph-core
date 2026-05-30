@@ -86,27 +86,25 @@ The platform supports three ways to connect:
 
 ### Terminal UI (TUI)
 
-Interactive terminal application for managing namespaces, collections, queries, ingestion, and jobs.
+Interactive terminal application for managing namespaces, collections, queries, ingestion, and jobs. Lives in `clients/graph-core-cli/`.
 
 ```bash
-# Install TUI dependencies
-uv sync --extra cli --extra mcp
-
-# Launch
-python -m graph_core.cli
+cd clients/graph-core-cli
+uv sync
+uv run python -m graph_core_cli
 ```
 
-On first launch, the TUI prompts for your platform URL and API key. Once connected, use the key bindings to navigate:
+On first launch, the TUI prompts for your MCP URL and admin key. Configuration is persisted to `~/.config/graph-core/config.json`. Once connected, use key bindings to navigate:
 
 | Key     | Screen        | Description                          |
 |---------|---------------|--------------------------------------|
-| `1`     | Home          | Dashboard overview                   |
-| `2`     | Namespaces    | List/create namespaces (admin key)   |
-| `3`     | Collections   | List/create collections              |
-| `4`     | Query         | Query a collection with NL           |
-| `5`     | Ingest        | Ingest text or files into a collection |
-| `6`     | Jobs          | Track async ingestion jobs           |
-| `c`     | Config        | Change connection settings           |
+| `h`     | Home          | Dashboard overview                   |
+| `n`     | Namespaces    | List/create namespaces (admin key)   |
+| `l`     | Collections   | List/create collections              |
+| `Shift+Q` | Query       | Query a collection with NL           |
+| `i`     | Ingest        | Ingest text or files into a collection |
+| `j`     | Jobs          | Track async ingestion jobs           |
+| `c`     | Config        | Reconfigure connection               |
 | `q`     | Quit          | Exit                                 |
 
 ### MCP Server

@@ -34,9 +34,7 @@ graph = [
 mcp = [
     "mcp>=1.0.0",
 ]
-cli = [
-    "textual>=2.0.0",
-]
+
 
 [dependency-groups]
 dev = [
@@ -67,7 +65,6 @@ strict = true
 python_version = "3.11"
 
 [project.scripts]
-graph-core-tui = "graph_core.cli.app:main"
 graph-core-mcp = "graph_core.mcp.server:main"
 
 [build-system]

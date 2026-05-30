@@ -1,11 +1,11 @@
-"""Graph Core TUI — terminal interface for the platform."""
+"""Graph Core TUI — terminal client for the platform."""
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header
 
-from graph_core.cli.config import load_config, save_config
-from graph_core.cli.mcp_client import MCPClient
+from graph_core_cli.config import load_config, save_config
+from graph_core_cli.mcp_client import AuthenticatedMCPClient
 
 
 class GraphCoreTUI(App):
@@ -27,7 +27,7 @@ class GraphCoreTUI(App):
     """
 
     def on_mount(self) -> None:
-        from graph_core.cli.screens import HomeScreen, SetupScreen
+        from graph_core_cli.screens import HomeScreen, SetupScreen
 
         persisted = load_config()
         self._config = {
@@ -48,38 +48,31 @@ class GraphCoreTUI(App):
         yield Footer()
 
     async def action_show_home(self) -> None:
-        from graph_core.cli.screens import HomeScreen
-
+        from graph_core_cli.screens import HomeScreen
         self.push_screen(HomeScreen())
 
     async def action_show_config(self) -> None:
-        from graph_core.cli.screens import HomeScreen
-
+        from graph_core_cli.screens import HomeScreen
         self.push_screen(HomeScreen())
 
     async def action_show_namespaces(self) -> None:
-        from graph_core.cli.screens import NamespacesScreen
-
+        from graph_core_cli.screens import NamespacesScreen
         self.push_screen(NamespacesScreen())
 
     async def action_show_collections(self) -> None:
-        from graph_core.cli.screens import CollectionsScreen
-
+        from graph_core_cli.screens import CollectionsScreen
         self.push_screen(CollectionsScreen())
 
     async def action_show_query(self) -> None:
-        from graph_core.cli.screens import QueryScreen
-
+        from graph_core_cli.screens import QueryScreen
         self.push_screen(QueryScreen())
 
     async def action_show_ingest(self) -> None:
-        from graph_core.cli.screens import IngestScreen
-
+        from graph_core_cli.screens import IngestScreen
         self.push_screen(IngestScreen())
 
     async def action_show_jobs(self) -> None:
-        from graph_core.cli.screens import JobsScreen
-
+        from graph_core_cli.screens import JobsScreen
         self.push_screen(JobsScreen())
 
     @property
@@ -94,9 +87,10 @@ class GraphCoreTUI(App):
         save_config(value)
 
     @property
-    def mcp_client(self) -> MCPClient:
+    def mcp_client(self) -> AuthenticatedMCPClient:
         mcp_url = self.config.get("mcp_url", "http://localhost:8001/mcp/")
-        return MCPClient(mcp_url)
+        api_key = self.config.get("api_key", "")
+        return AuthenticatedMCPClient(mcp_url, api_key)
 
 
 async def main() -> None:

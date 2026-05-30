@@ -1,0 +1,18 @@
+[project]
+name = "graph-core-cli"
+version = "0.1.0"
+description = "Terminal UI client for Graph Core platform"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=2.0.0",
+    "mcp>=1.0.0",
+    "httpx>=0.28.0",
+]
+
+[project.scripts]
+graph-core-tui = "graph_core_cli.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

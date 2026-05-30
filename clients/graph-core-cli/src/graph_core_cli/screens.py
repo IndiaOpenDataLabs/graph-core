@@ -180,8 +180,7 @@ class SetupScreen(Screen):
         }
 
         self.notify("Configuration saved!", severity="information", timeout=3)
-        from graph_core.cli.screens import HomeScreen
-
+        from graph_core_cli.screens import HomeScreen
         self.app.push_screen(HomeScreen())
 
 
@@ -261,13 +260,13 @@ class HomeScreen(Screen):
             Container(
                 Label("Actions:", id="nav-title"),
                 Button(
-                    "📋 Namespaces - Manage namespaces (admin only)",
+                    "Namespaces - Manage namespaces (admin only)",
                     id="nav-namespaces",
                 ),
-                Button("📁 Collections - Manage collections", id="nav-collections"),
-                Button("🔍 Query - Query a collection", id="nav-query"),
-                Button("📥 Ingest - Add data to a collection", id="nav-ingest"),
-                Button("📊 Jobs - View ingestion job status", id="nav-jobs"),
+                Button("Collections - Manage collections", id="nav-collections"),
+                Button("Query - Query a collection", id="nav-query"),
+                Button("Ingest - Add data to a collection", id="nav-ingest"),
+                Button("Jobs - View ingestion job status", id="nav-jobs"),
                 id="nav",
             ),
             id="dashboard",

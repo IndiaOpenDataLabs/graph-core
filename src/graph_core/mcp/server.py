@@ -1,10 +1,16 @@
-"""MCP server for Graph Core — exposes platform operations as tools."""
+"""MCP server for Graph Core — exposes platform operations as tools.
+
+Auth flow:
+1. Client sends Authorization: Bearer <key> on every MCP HTTP request
+2. Server extracts the key from ctx.request_context.request.headers
+3. Server passes the key to GraphCoreClient which forwards it to FastAPI
+"""
 
 import asyncio
 import os
 from contextlib import asynccontextmanager
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from graph_core.client import GraphCoreAPIError, GraphCoreClient
 
@@ -13,41 +19,39 @@ def _get_base_url() -> str:
     return os.getenv("GRAPH_CORE_URL", "http://localhost:8000").rstrip("/")
 
 
-def _get_admin_key() -> str | None:
-    return os.getenv("PLATFORM_ADMIN_KEY")
+def _extract_api_key(ctx: Context) -> str:
+    """Extract the API key from the incoming HTTP request's Authorization header."""
+    try:
+        request = ctx.request_context.request
+        if request is None:
+            raise GraphCoreAPIError("No request context available")
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            return auth_header[7:]
+        raise GraphCoreAPIError("Authorization header requires Bearer scheme")
+    except AttributeError:
+        # Fallback for non-HTTP transports or testing
+        env_key = os.getenv("PLATFORM_ADMIN_KEY") or os.getenv("GRAPH_CORE_API_KEY")
+        if env_key:
+            return env_key
+        raise GraphCoreAPIError(
+            "No Authorization header found. Pass 'Authorization: Bearer <key>' with your MCP request."
+        )
 
 
-def _get_api_key() -> str | None:
-    return os.getenv("GRAPH_CORE_API_KEY")
+_client_cache: dict[str, GraphCoreClient] = {}
 
 
-# Module-level client caches keyed by auth mode
-_clients: dict[str, GraphCoreClient] = {}
-
-
-async def get_client(admin: bool = False) -> GraphCoreClient:
-    """Get or create a cached client for the given auth mode."""
-    key = "admin" if admin else "namespace"
-    if key not in _clients:
-        if admin:
-            api_key = _get_admin_key()
-            if not api_key:
-                raise GraphCoreAPIError(
-                    "PLATFORM_ADMIN_KEY env var required for admin tools"
-                )
-            _clients[key] = GraphCoreClient(
-                base_url=_get_base_url(), api_key=api_key, is_admin=True
-            )
-        else:
-            api_key = _get_api_key() or _get_admin_key()
-            if not api_key:
-                raise GraphCoreAPIError(
-                    "GRAPH_CORE_API_KEY or GRAPH_CORE_ADMIN_KEY env var required"
-                )
-            _clients[key] = GraphCoreClient(
-                base_url=_get_base_url(), api_key=api_key, is_admin=admin
-            )
-    return _clients[key]
+async def get_client(api_key: str, admin: bool = False) -> GraphCoreClient:
+    """Get or create a cached client for the given api key."""
+    cache_key = f"{'admin' if admin else 'ns'}:{api_key[:10]}"
+    if cache_key not in _client_cache:
+        _client_cache[cache_key] = GraphCoreClient(
+            base_url=_get_base_url(),
+            api_key=api_key,
+            is_admin=admin,
+        )
+    return _client_cache[cache_key]
 
 
 @asynccontextmanager
@@ -55,9 +59,9 @@ async def server_lifespan(server: FastMCP):
     try:
         yield
     finally:
-        for client in _clients.values():
+        for client in _client_cache.values():
             await client.close()
-        _clients.clear()
+        _client_cache.clear()
 
 
 mcp = FastMCP(
@@ -72,13 +76,14 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def create_namespace(name: str) -> str:
-    """Create a new namespace. Requires GRAPH_CORE_ADMIN_KEY.
+async def create_namespace(name: str, ctx: Context) -> str:
+    """Create a new namespace. Requires admin key.
 
     Args:
         name: Human-readable namespace name (must be unique).
     """
-    client = await get_client(admin=True)
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key, admin=True)
     result = await client.create_namespace(name)
     return (
         f"Created namespace:\n"
@@ -90,9 +95,10 @@ async def create_namespace(name: str) -> str:
 
 
 @mcp.tool()
-async def list_namespaces() -> str:
-    """List all namespaces. Requires GRAPH_CORE_ADMIN_KEY."""
-    client = await get_client(admin=True)
+async def list_namespaces(ctx: Context) -> str:
+    """List all namespaces. Requires admin key."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key, admin=True)
     namespaces = await client.list_namespaces()
     if not namespaces:
         return "No namespaces found."
@@ -104,21 +110,23 @@ async def list_namespaces() -> str:
 
 
 @mcp.tool()
-async def get_current_namespace() -> str:
+async def get_current_namespace(ctx: Context) -> str:
     """Get info about the current authenticated namespace."""
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     ns = await client.get_namespace_me()
     return f"Namespace: {ns['id']} | {ns['name']}"
 
 
 @mcp.tool()
-async def rotate_namespace_key(namespace_id: str) -> str:
-    """Rotate a namespace's API key. Requires GRAPH_CORE_ADMIN_KEY.
+async def rotate_namespace_key(namespace_id: str, ctx: Context) -> str:
+    """Rotate a namespace's API key. Requires admin key.
 
     Args:
         namespace_id: The UUID of the namespace.
     """
-    client = await get_client(admin=True)
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key, admin=True)
     result = await client.rotate_namespace_key(namespace_id)
     return f"New api_key: {result['api_key']}\nSave it — it won't be shown again."
 
@@ -129,7 +137,8 @@ async def rotate_namespace_key(namespace_id: str) -> str:
 @mcp.tool()
 async def create_collection(
     name: str,
-    strategy: str = "vector",
+    strategy: str,
+    ctx: Context,
 ) -> str:
     """Create a new collection in the current namespace.
 
@@ -137,7 +146,8 @@ async def create_collection(
         name: Collection name (unique within namespace).
         strategy: Retrieval strategy: 'vector', 'light_rag', or 'custom_graph_rag'.
     """
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     result = await client.create_collection(name=name, strategy=strategy)
     return (
         f"Created collection:\n"
@@ -148,9 +158,10 @@ async def create_collection(
 
 
 @mcp.tool()
-async def list_collections() -> str:
+async def list_collections(ctx: Context) -> str:
     """List all collections in the current namespace."""
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     collections = await client.list_collections()
     if not collections:
         return "No collections found."
@@ -164,7 +175,7 @@ async def list_collections() -> str:
 
 
 @mcp.tool()
-async def ingest_chunk(collection_id: str, text: str) -> str:
+async def ingest_chunk(collection_id: str, text: str, ctx: Context) -> str:
     """Ingest a text chunk directly into a collection.
 
     For large documents, use ingest_document instead (it runs async with a job).
@@ -173,7 +184,8 @@ async def ingest_chunk(collection_id: str, text: str) -> str:
         collection_id: The UUID of the target collection.
         text: The text content to ingest.
     """
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     result = await client.ingest_chunk(collection_id, text)
     return (
         f"Ingested chunk:\n"
@@ -184,7 +196,7 @@ async def ingest_chunk(collection_id: str, text: str) -> str:
 
 
 @mcp.tool()
-async def ingest_document(collection_id: str, text: str) -> str:
+async def ingest_document(collection_id: str, text: str, ctx: Context) -> str:
     """Ingest a full document into a collection (async, returns job_id).
 
     For large documents, the platform will chunk and process in the background.
@@ -193,7 +205,8 @@ async def ingest_document(collection_id: str, text: str) -> str:
         collection_id: The UUID of the target collection.
         text: The full document text.
     """
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     result = await client.ingest_document(collection_id, text)
     return (
         f"Document ingestion started:\n"
@@ -204,7 +217,7 @@ async def ingest_document(collection_id: str, text: str) -> str:
 
 
 @mcp.tool()
-async def ingest_file(collection_id: str, file_path: str) -> str:
+async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> str:
     """Read a local file and ingest its contents into a collection.
 
     Args:
@@ -212,13 +225,21 @@ async def ingest_file(collection_id: str, file_path: str) -> str:
         file_path: Absolute path to the text file.
     """
     loop = asyncio.get_event_loop()
-    content = await loop.run_in_executor(None, _read_file, file_path)
-    return await ingest_document(collection_id, content)
 
+    def _read(path: str) -> str:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
 
-def _read_file(path: str) -> str:
-    with open(path, encoding="utf-8") as f:
-        return f.read()
+    content = await loop.run_in_executor(None, _read, file_path)
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    result = await client.ingest_document(collection_id, content)
+    return (
+        f"Document ingestion started:\n"
+        f"  job_id: {result['job_id']}\n"
+        f"  status: {result['status']}\n\n"
+        f"Track with get_job_status('{result['job_id']}')"
+    )
 
 
 # -- Query tools ------------------------------------------------------------
@@ -228,7 +249,8 @@ def _read_file(path: str) -> str:
 async def query_collection(
     collection_id: str,
     question: str,
-    mode: str | None = None,
+    mode: str | None,
+    ctx: Context,
 ) -> str:
     """Query a collection with a natural language question.
 
@@ -236,9 +258,10 @@ async def query_collection(
         collection_id: The UUID of the collection to query.
         question: The natural language question.
         mode: Query mode for light_rag: 'local', 'global', 'hybrid', 'naive', 'mix'.
-               Leave empty for default.
+                Leave empty for default.
     """
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     result = await client.query_collection(collection_id, question, mode=mode)
     lines = [result["response"]]
     if result.get("entities_used"):
@@ -254,13 +277,14 @@ async def query_collection(
 
 
 @mcp.tool()
-async def get_job_status(job_id: str) -> str:
+async def get_job_status(job_id: str, ctx: Context) -> str:
     """Check the status of an async ingestion job.
 
     Args:
         job_id: The UUID of the job.
     """
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     job = await client.get_job(job_id)
     lines = [
         f"Job: {job.get('id', job_id)}",
@@ -281,9 +305,10 @@ async def get_job_status(job_id: str) -> str:
 
 
 @mcp.tool()
-async def get_capabilities() -> str:
+async def get_capabilities(ctx: Context) -> str:
     """Get available capabilities: embedding profiles, LLM profiles, strategies."""
-    client = await get_client()
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
     caps = await client.get_capabilities()
     lines = ["Platform Capabilities:"]
     for key, value in caps.items():

@@ -6,12 +6,12 @@ A terminal UI for managing the Graph Core platform, built with [Textual](https:/
 
 ```bash
 # Install CLI extras
-uv sync --extra cli --extra mcp
+uv sync
 
 # Launch
 make tui
 # or
-python -m graph_core.cli
+python -m graph_core_cli
 # or
 graph-core-tui
 ```
