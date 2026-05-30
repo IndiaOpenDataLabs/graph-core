@@ -290,9 +290,14 @@ async def get_capabilities() -> str:
     return "\n".join(lines)
 
 
+def mcp_server_app() -> object:
+    """Create the StreamableHTTP ASGI app for mounting in FastAPI."""
+    return mcp.streamable_http_app(json_response=True)
+
+
 def main() -> None:
     """CLI entry point for the MCP server."""
     import sys
 
-    transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+    transport = sys.argv[1] if len(sys.argv) > 1 else "streamable-http"
     mcp.run(transport=transport)
