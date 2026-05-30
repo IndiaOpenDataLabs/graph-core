@@ -18,7 +18,7 @@ class Namespace(Base):
 
     # Auth: self-hosted namespace API key
     api_key_hash = Column(String(128), nullable=True)
-    api_key_prefix = Column(String(8), nullable=True)
+    api_key_prefix = Column(String(16), nullable=True)
 
     # Auth: multi-tenant ownership tracking
     owner_app_id = Column(UUIDType(as_uuid=True), ForeignKey("registered_apps.id", ondelete="SET NULL"), nullable=True)

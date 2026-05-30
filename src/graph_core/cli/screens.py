@@ -322,7 +322,7 @@ class NamespacesScreen(Screen):
     BINDINGS = [
         ("a", "create_namespace", "Create"),
         ("r", "refresh", "Refresh"),
-        ("escape", "pop_screen", "Back"),
+        ("escape", "app.pop_screen", "Back"),
     ]
 
     def compose(self) -> None:
@@ -478,7 +478,7 @@ class CollectionsScreen(Screen):
     BINDINGS = [
         ("a", "create_collection", "Create"),
         ("r", "refresh", "Refresh"),
-        ("escape", "pop_screen", "Back"),
+        ("escape", "app.pop_screen", "Back"),
     ]
 
     STRATEGIES = [
@@ -604,7 +604,7 @@ class QueryScreen(Screen):
     """
 
     BINDINGS = [
-        ("escape", "pop_screen", "Back"),
+        ("escape", "app.pop_screen", "Back"),
     ]
 
     def compose(self) -> None:
@@ -731,7 +731,7 @@ class IngestScreen(Screen):
     """
 
     BINDINGS = [
-        ("escape", "pop_screen", "Back"),
+        ("escape", "app.pop_screen", "Back"),
     ]
 
     def compose(self) -> None:
@@ -859,7 +859,7 @@ class JobsScreen(Screen):
 
     BINDINGS = [
         ("r", "refresh", "Refresh"),
-        ("escape", "pop_screen", "Back"),
+        ("escape", "app.pop_screen", "Back"),
     ]
 
     def compose(self) -> None:
