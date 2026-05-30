@@ -20,23 +20,42 @@ def _get_base_url() -> str:
 
 
 def _extract_api_key(ctx: Context) -> str:
-    """Extract the API key from the incoming HTTP request's Authorization header."""
+    """Extract the API key from the incoming MCP request.
+
+    Checks in order:
+    1. MCP protocol meta ({"api_key": "..."}) — most reliable
+    2. Authorization: Bearer <key> header
+    3. X-API-Key header
+    4. Environment variables (fallback for testing)
+    """
+    # 1. MCP protocol metadata (passed through call_tool meta param)
+    try:
+        meta = ctx.request_context.meta
+        if meta and getattr(meta, "api_key", None):
+            return meta.api_key
+    except AttributeError:
+        pass
+
+    # 2. HTTP request headers
     try:
         request = ctx.request_context.request
-        if request is None:
-            raise GraphCoreAPIError("No request context available")
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            return auth_header[7:]
-        raise GraphCoreAPIError("Authorization header requires Bearer scheme")
+        if request is not None:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                return auth_header[7:]
+            api_key = request.headers.get("x-api-key", "")
+            if api_key:
+                return api_key
     except AttributeError:
-        # Fallback for non-HTTP transports or testing
-        env_key = os.getenv("PLATFORM_ADMIN_KEY") or os.getenv("GRAPH_CORE_API_KEY")
-        if env_key:
-            return env_key
-        raise GraphCoreAPIError(
-            "No Authorization header found. Pass 'Authorization: Bearer <key>' with your MCP request."
-        )
+        pass
+
+    # 3. Fallback for non-HTTP transports or testing
+    env_key = os.getenv("PLATFORM_ADMIN_KEY") or os.getenv("GRAPH_CORE_API_KEY")
+    if env_key:
+        return env_key
+    raise GraphCoreAPIError(
+        "No API key found in request metadata or headers."
+    )
 
 
 _client_cache: dict[str, GraphCoreClient] = {}

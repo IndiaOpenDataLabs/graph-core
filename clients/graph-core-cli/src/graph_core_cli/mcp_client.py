@@ -1,8 +1,7 @@
-"""MCP client with auth header support.
+"""MCP client with auth support.
 
-Sends Authorization: Bearer <key> on every HTTP request through the
-streamable HTTP transport, so the MCP server can extract credentials
-from the incoming request instead of relying on env vars.
+Passes the API key through MCP protocol metadata on every tool call,
+so the MCP server can extract it reliably regardless of transport.
 """
 
 import httpx
@@ -11,7 +10,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 class AuthenticatedMCPClient:
-    """MCP client that passes auth headers on every request."""
+    """MCP client that passes API key via protocol metadata."""
 
     def __init__(self, mcp_url: str, api_key: str) -> None:
         self.mcp_url = mcp_url if mcp_url.endswith("/") else mcp_url + "/"
@@ -62,7 +61,11 @@ class AuthenticatedMCPClient:
     async def call(self, tool_name: str, arguments: dict | None = None) -> str:
         if self._session is None:
             raise RuntimeError("Not connected; call connect() first")
-        result = await self._session.call_tool(tool_name, arguments=arguments or {})
+        result = await self._session.call_tool(
+            tool_name,
+            arguments=arguments or {},
+            meta={"api_key": self._api_key},
+        )
         parts: list[str] = []
         for block in result.content:
             if isinstance(block, types.TextContent):
