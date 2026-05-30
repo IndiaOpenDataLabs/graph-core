@@ -270,6 +270,11 @@ class HomeScreen(Screen):
         self.notify("Connected!")
         self._refresh_view()
 
+        if is_admin:
+            self.app.push_screen(NamespacesScreen())
+        else:
+            self.app.push_screen(CollectionsScreen())
+
 
 class NamespacesScreen(Screen):
     """Manage namespaces."""
