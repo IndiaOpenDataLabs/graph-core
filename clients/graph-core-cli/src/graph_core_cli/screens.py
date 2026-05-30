@@ -511,9 +511,9 @@ class CollectionsScreen(Screen):
     ]
 
     STRATEGIES = [
-        ("vector", "Vector"),
-        ("light_rag", "Light RAG"),
-        ("custom_graph_rag", "Graph RAG"),
+        ("Vector", "vector"),
+        ("Light RAG", "light_rag"),
+        ("Graph RAG", "custom_graph_rag"),
     ]
 
     def compose(self) -> None:
@@ -521,7 +521,7 @@ class CollectionsScreen(Screen):
         yield DataTable(id="collection-table")
         yield Container(
             Input(placeholder="Collection name", id="col-name-input"),
-            Select(self.STRATEGIES, value=("vector", "Vector"), id="col-strategy"),
+            Select(self.STRATEGIES, value="vector", id="col-strategy"),
             Button("Create", id="col-create-btn", variant="primary"),
             Button("Cancel", id="col-cancel-btn"),
             id="create-form",
@@ -567,7 +567,7 @@ class CollectionsScreen(Screen):
     async def _create_collection(self) -> None:
         name = self.query_one("#col-name-input", Input).value.strip()
         strategy_select = self.query_one("#col-strategy", Select)
-        strategy = strategy_select.value[0] if strategy_select.value else "vector"
+        strategy = strategy_select.value or "vector"
         if not name:
             self.notify("Name is required", severity="error")
             return
@@ -641,18 +641,18 @@ class QueryScreen(Screen):
         yield Label("Query Collection  |  esc=Back", id="header")
         yield Container(
             Label("Collection: "),
-            Select([(None, "(select collection)")], allow_blank=True, id="collection-select"),
+            Select([("(select collection)", "")], allow_blank=True, id="collection-select"),
             Label("  Mode: "),
             Select(
                 [
-                    ("", "default"),
+                    ("default", ""),
                     ("local", "local"),
                     ("global", "global"),
                     ("hybrid", "hybrid"),
                     ("naive", "naive"),
                     ("mix", "mix"),
                 ],
-                value=("", "default"),
+                value="",
                 id="query-mode",
             ),
             Button("Query", id="query-btn", variant="primary"),
@@ -674,13 +674,13 @@ class QueryScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [("", "(select collection)")] + [
-                (c["id"], f"{c['name']} ({c['strategy']})") for c in collections
+            options = [("(select collection)", "")] + [
+                (f"{c['name']} ({c['strategy']})", c["id"]) for c in collections
             ]
             self.query_one("#collection-select", Select).options = options
             if collections:
                 sel = self.query_one("#collection-select", Select)
-                sel.value = (collections[0]["id"], f"{collections[0]['name']} ({collections[0]['strategy']})")
+                sel.value = collections[0]["id"]
         except Exception as e:
             self.notify(str(e), severity="error")
 
@@ -690,10 +690,8 @@ class QueryScreen(Screen):
             self.run_worker(self._run_query(), exclusive=True, group="action")
 
     async def _run_query(self) -> None:
-        coll_select = self.query_one("#collection-select", Select).value
-        collection_id = coll_select[0] if coll_select else ""
-        mode_select = self.query_one("#query-mode", Select).value
-        mode = mode_select[0] if mode_select else ""
+        collection_id = self.query_one("#collection-select", Select).value
+        mode = self.query_one("#query-mode", Select).value
         query_text = self.query_one("#query-text", TextArea)
         results = self.query_one("#results", RichLog)
 
@@ -770,10 +768,10 @@ class IngestScreen(Screen):
         yield Label("Ingest  |  esc=Back", id="header")
         yield Container(
             Label("Collection: "),
-            Select([("", "(select)")], allow_blank=True, id="collection-select"),
+            Select([("(select)", "")], allow_blank=True, id="collection-select"),
             Label("  Method: "),
             Select(
-                [("doc", "Document (async)"), ("chunk", "Chunk (sync)")],
+                [("Document (async)", "doc"), ("Chunk (sync)", "chunk")],
                 value="doc",
                 id="ingest-method",
             ),
@@ -801,11 +799,11 @@ class IngestScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [("", "(select)")] + [(c["id"], c["name"]) for c in collections]
+            options = [("(select)", "")] + [(c["name"], c["id"]) for c in collections]
             self.query_one("#collection-select", Select).options = options
             if collections:
                 sel = self.query_one("#collection-select", Select)
-                sel.value = (collections[0]["id"], collections[0]["name"])
+                sel.value = collections[0]["id"]
         except Exception as e:
             self.notify(str(e), severity="error")
 
@@ -815,10 +813,8 @@ class IngestScreen(Screen):
             self.run_worker(self._do_ingest(), exclusive=True, group="action")
 
     async def _do_ingest(self) -> None:
-        coll_select = self.query_one("#collection-select", Select).value
-        collection_id = coll_select[0] if coll_select else ""
-        method_select = self.query_one("#ingest-method", Select).value
-        method = method_select[0] if method_select else "doc"
+        collection_id = self.query_one("#collection-select", Select).value
+        method = self.query_one("#ingest-method", Select).value
         status = self.query_one("#status", Label)
 
         if not collection_id:
