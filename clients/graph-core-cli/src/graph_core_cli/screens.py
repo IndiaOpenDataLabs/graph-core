@@ -647,7 +647,7 @@ class QueryScreen(Screen):
         yield Label("Query Collection  |  esc=Back", id="header")
         yield Container(
             Label("Collection: "),
-            Select([], value=Select.BLANK, allow_blank=True, id="collection-select"),
+            Select([(None, "(select collection)")], allow_blank=True, id="collection-select"),
             Label("  Mode: "),
             Select(
                 [
@@ -680,7 +680,7 @@ class QueryScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [(Select.BLANK, "(select collection)")] + [
+            options = [("", "(select collection)")] + [
                 (c["id"], f"{c['name']} ({c['strategy']})") for c in collections
             ]
             self.query_one("#collection-select", Select).options = options
@@ -774,7 +774,7 @@ class IngestScreen(Screen):
         yield Label("Ingest  |  esc=Back", id="header")
         yield Container(
             Label("Collection: "),
-            Select([], value=Select.BLANK, allow_blank=True, id="collection-select"),
+            Select([("", "(select)")], allow_blank=True, id="collection-select"),
             Label("  Method: "),
             Select(
                 [("doc", "Document (async)"), ("chunk", "Chunk (sync)")],
@@ -805,7 +805,7 @@ class IngestScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [(Select.BLANK, "(select)")] + [(c["id"], c["name"]) for c in collections]
+            options = [("", "(select)")] + [(c["id"], c["name"]) for c in collections]
             self.query_one("#collection-select", Select).options = options
             if collections:
                 sel = self.query_one("#collection-select", Select)
