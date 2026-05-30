@@ -70,137 +70,8 @@ def extract_status(text: str) -> str:
 # -- Screens -----------------------------------------------------------------
 
 
-class ConfigScreen(Screen):
-    """Initial configuration screen."""
-
-    CSS = """
-    ConfigScreen {
-        align: center middle;
-    }
-
-    #config-box {
-        width: 60;
-        border: round $accent;
-        padding: 2;
-        background: $boost;
-    }
-
-    #config-box Label {
-        width: 100%;
-    }
-
-    #config-box Label.margin-top {
-        margin-top: 1;
-    }
-
-    Input {
-        width: 100%;
-    }
-
-    Horizontal {
-        dock: bottom;
-        margin: 1 0;
-    }
-
-    Button {
-        width: 10;
-    }
-
-    #title {
-        text-align: center;
-        color: $accent;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-    """
-
-    def compose(self) -> None:
-        base_url = os.getenv("GRAPH_CORE_URL", "http://localhost:8000")
-        yield Container(
-            Label("Graph Core Configuration", id="title"),
-            Label("Base URL:"),
-            Input(
-                placeholder="http://localhost:8000",
-                id="base-url",
-                value=base_url,
-            ),
-            Label("MCP URL:", classes="margin-top"),
-            Input(
-                placeholder="http://localhost:8000/mcp",
-                id="mcp-url",
-                value=os.getenv("MCP_URL", f"{base_url}/mcp"),
-            ),
-            Label("API Key (namespace or admin):", classes="margin-top"),
-            Input(
-                placeholder="ns_key_xxxx or admin key",
-                id="api-key",
-                password=True,
-                value=os.getenv("GRAPH_CORE_API_KEY", ""),
-            ),
-            Label("Auth mode:", classes="margin-top"),
-            RadioSet(
-                RadioButton("namespace", id="mode-namespace"),
-                RadioButton("admin", id="mode-admin"),
-                id="auth-mode",
-            ),
-            Horizontal(
-                Button("Connect", id="connect", variant="primary"),
-                Button("Skip (connect later)", id="skip"),
-            ),
-            id="config-box",
-        )
-
-    def on_mount(self) -> None:
-        self.query_one("#auth-mode").value = "namespace"
-
-    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
-        key_input = self.query_one("#api-key", Input)
-        if event.value == "admin":
-            key_input.placeholder = "admin key"
-            if not key_input.value:
-                key_input.value = os.getenv("PLATFORM_ADMIN_KEY", "")
-        else:
-            key_input.placeholder = "ns_key_xxxx"
-            if not key_input.value:
-                key_input.value = os.getenv("GRAPH_CORE_API_KEY", "")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "connect":
-            self._save_and_connect()
-        elif event.button.id == "skip":
-            self.app.pop_screen()
-
-    def _save_and_connect(self) -> None:
-        base_url = self.query_one("#base-url", Input).value.strip()
-        mcp_url = self.query_one("#mcp-url", Input).value.strip()
-        api_key = self.query_one("#api-key", Input).value.strip()
-        is_admin = self.query_one("#auth-mode", RadioSet).value == "admin"
-
-        if not api_key:
-            self.notify("API key is required", severity="error")
-            return
-
-        self.app.config = {
-            "base_url": base_url or "http://localhost:8000",
-            "mcp_url": mcp_url or f"{base_url or 'http://localhost:8000'}/mcp",
-            "api_key": api_key,
-            "is_admin": is_admin,
-            "namespace_id": "",
-            "namespace_name": "",
-        }
-
-        os.environ["GRAPH_CORE_URL"] = self.app.config["base_url"]
-        os.environ["GRAPH_CORE_API_KEY"] = api_key
-        os.environ["MCP_URL"] = self.app.config["mcp_url"]
-        if is_admin:
-            os.environ["PLATFORM_ADMIN_KEY"] = api_key
-
-        self.app.pop_screen()
-        self.app.notify("Connected!")
-
-
 class HomeScreen(Screen):
-    """Dashboard home screen."""
+    """Dashboard home screen with inline config and navigation."""
 
     CSS = """
     HomeScreen {
@@ -210,8 +81,9 @@ class HomeScreen(Screen):
     #dashboard {
         width: 70;
         height: auto;
+        max-height: 100%;
         border: round $accent;
-        padding: 2;
+        padding: 1 2;
     }
 
     #title {
@@ -223,34 +95,162 @@ class HomeScreen(Screen):
     #info {
         margin-top: 1;
     }
+
+    #config-section {
+        margin-top: 1;
+        padding-top: 1;
+        border-top: solid $accent-darken-2;
+    }
+
+    #config-section Label {
+        width: 100%;
+    }
+
+    #config-section Label.margin-top {
+        margin-top: 1;
+    }
+
+    #config-section Input {
+        width: 100%;
+    }
+
+    #nav {
+        margin-top: 1;
+        height: auto;
+    }
+
+    #nav Button {
+        width: 1fr;
+        margin: 0 1;
+    }
+
+    #actions {
+        margin-top: 1;
+        height: auto;
+    }
+
+    #actions Button {
+        margin: 0 1;
+    }
     """
 
+    BINDINGS = [
+        ("escape", "app.pop_screen", "Back"),
+    ]
+
     def compose(self) -> None:
+        mcp_url = os.getenv("MCP_URL", "http://localhost:8000/mcp")
         yield Container(
             Label("Graph Core Terminal", id="title"),
             Label("", id="info"),
+            Container(
+                Label("Connection Setup:"),
+                Label("MCP URL:"),
+                Input(
+                    placeholder="http://localhost:8000/mcp",
+                    id="home-mcp-url",
+                    value=mcp_url,
+                ),
+                Label("API Key:", classes="margin-top"),
+                Input(
+                    placeholder="ns_key_xxxx or admin key",
+                    id="home-api-key",
+                    password=True,
+                    value=os.getenv("GRAPH_CORE_API_KEY", ""),
+                ),
+                Label("Auth mode:", classes="margin-top"),
+                RadioSet(
+                    RadioButton("namespace", id="home-mode-namespace"),
+                    RadioButton("admin", id="home-mode-admin"),
+                    id="home-auth-mode",
+                ),
+                Horizontal(
+                    Button("Connect", id="home-connect", variant="primary"),
+                    id="actions",
+                ),
+                id="config-section",
+            ),
+            Horizontal(
+                Button("Namespaces", id="nav-namespaces"),
+                Button("Collections", id="nav-collections"),
+                Button("Query", id="nav-query"),
+                Button("Ingest", id="nav-ingest"),
+                Button("Jobs", id="nav-jobs"),
+                id="nav",
+            ),
             id="dashboard",
         )
 
     async def on_mount(self) -> None:
+        self._refresh_view()
+
+    def _refresh_view(self) -> None:
         cfg = self.app.config
         info = self.query_one("#info", Label)
+        config_section = self.query_one("#config-section", Container)
 
         if not cfg.get("api_key"):
-            info.update("Not configured. Press c to set up connection.")
+            config_section.display = True
+            info.update("Status: Not connected")
+        else:
+            config_section.display = False
+            parts = [
+                "Status: Connected",
+                f"MCP: {cfg.get('mcp_url', 'http://localhost:8000/mcp')}",
+                f"Mode: {'Admin' if cfg['is_admin'] else 'Namespace'}",
+            ]
+            if cfg.get("namespace_name"):
+                ns_name = cfg["namespace_name"]
+                ns_id = cfg["namespace_id"]
+                parts.append(f"Namespace: {ns_name} ({ns_id})")
+            else:
+                parts.append("Namespace: (not selected)")
+            info.update("\n".join(parts))
+
+    @on(Button.Pressed)
+    def handle_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "home-connect":
+            self._save_and_connect()
             return
 
-        parts = [
-            f"Server: {cfg['base_url']}",
-            f"MCP: {cfg.get('mcp_url', cfg['base_url'] + '/mcp')}",
-            f"Mode: {'Admin' if cfg['is_admin'] else 'Namespace'}",
-        ]
-        if cfg.get("namespace_name"):
-            parts.append(f"Namespace: {cfg['namespace_name']} ({cfg['namespace_id']})")
-        else:
-            parts.append("Namespace: (not selected)")
+        screen_map = {
+            "nav-namespaces": NamespacesScreen,
+            "nav-collections": CollectionsScreen,
+            "nav-query": QueryScreen,
+            "nav-ingest": IngestScreen,
+            "nav-jobs": JobsScreen,
+        }
+        screen_cls = screen_map.get(event.button.id)
+        if screen_cls:
+            self.app.push_screen(screen_cls())
 
-        info.update("\n".join(parts))
+    def _save_and_connect(self) -> None:
+        mcp_url = self.query_one("#home-mcp-url", Input).value.strip()
+        api_key = self.query_one("#home-api-key", Input).value.strip()
+        is_admin = self.query_one("#home-auth-mode", RadioSet).value == "admin"
+
+        if not api_key:
+            self.notify("API key is required", severity="error")
+            return
+
+        if not mcp_url:
+            mcp_url = "http://localhost:8000/mcp"
+
+        self.app.config = {
+            "mcp_url": mcp_url,
+            "api_key": api_key,
+            "is_admin": is_admin,
+            "namespace_id": "",
+            "namespace_name": "",
+        }
+
+        os.environ["MCP_URL"] = mcp_url
+        os.environ["GRAPH_CORE_API_KEY"] = api_key
+        if is_admin:
+            os.environ["PLATFORM_ADMIN_KEY"] = api_key
+
+        self.notify("Connected!")
+        self._refresh_view()
 
 
 class NamespacesScreen(Screen):

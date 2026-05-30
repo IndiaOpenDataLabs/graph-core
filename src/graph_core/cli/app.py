@@ -11,7 +11,13 @@ class GraphCoreTUI(App):
     """Terminal UI for the Graph Core platform."""
 
     BINDINGS = [
+        Binding("h", "show_home", "Home", priority=True),
         Binding("c", "show_config", "Config", priority=True),
+        Binding("n", "show_namespaces", "Namespaces", priority=True),
+        Binding("l", "show_collections", "Collections", priority=True),
+        Binding("shift+q", "show_query", "Query", priority=True),
+        Binding("i", "show_ingest", "Ingest", priority=True),
+        Binding("j", "show_jobs", "Jobs", priority=True),
         Binding("q", "quit", "Quit", priority=True),
     ]
 
@@ -20,24 +26,53 @@ class GraphCoreTUI(App):
     """
 
     def on_mount(self) -> None:
-        if not self.config.get("api_key"):
-            from graph_core.cli.screens import ConfigScreen
+        from graph_core.cli.screens import HomeScreen
 
-            self.push_screen(ConfigScreen())
+        self.push_screen(HomeScreen())
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
 
-    async def action_show_config(self) -> None:
-        from graph_core.cli.screens import ConfigScreen
+    async def action_show_home(self) -> None:
+        from graph_core.cli.screens import HomeScreen
 
-        self.push_screen(ConfigScreen())
+        self.push_screen(HomeScreen())
+
+    async def action_show_config(self) -> None:
+        from graph_core.cli.screens import HomeScreen
+
+        self.push_screen(HomeScreen())
+
+    async def action_show_namespaces(self) -> None:
+        from graph_core.cli.screens import NamespacesScreen
+
+        self.push_screen(NamespacesScreen())
+
+    async def action_show_collections(self) -> None:
+        from graph_core.cli.screens import CollectionsScreen
+
+        self.push_screen(CollectionsScreen())
+
+    async def action_show_query(self) -> None:
+        from graph_core.cli.screens import QueryScreen
+
+        self.push_screen(QueryScreen())
+
+    async def action_show_ingest(self) -> None:
+        from graph_core.cli.screens import IngestScreen
+
+        self.push_screen(IngestScreen())
+
+    async def action_show_jobs(self) -> None:
+        from graph_core.cli.screens import JobsScreen
+
+        self.push_screen(JobsScreen())
 
     @property
     def config(self) -> dict:
         if not hasattr(self, "_config"):
-            self._config = {"base_url": "", "api_key": "", "is_admin": False}
+            self._config = {"mcp_url": "", "api_key": "", "is_admin": False}
         return self._config
 
     @config.setter
@@ -46,7 +81,7 @@ class GraphCoreTUI(App):
 
     @property
     def mcp_client(self) -> MCPClient:
-        mcp_url = self.config.get("mcp_url", f"{self.config['base_url']}/mcp")
+        mcp_url = self.config.get("mcp_url", "http://localhost:8000/mcp")
         return MCPClient(mcp_url)
 
 
