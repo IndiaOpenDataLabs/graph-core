@@ -114,6 +114,11 @@ class HomeScreen(Screen):
         width: 100%;
     }
 
+    #home-connect {
+        margin-top: 1;
+        width: 100%;
+    }
+
     #nav {
         margin-top: 1;
         height: auto;
@@ -121,15 +126,6 @@ class HomeScreen(Screen):
 
     #nav Button {
         width: 1fr;
-        margin: 0 1;
-    }
-
-    #actions {
-        margin-top: 1;
-        height: auto;
-    }
-
-    #actions Button {
         margin: 0 1;
     }
     """
@@ -164,12 +160,9 @@ class HomeScreen(Screen):
                     password=True,
                     value=os.getenv("GRAPH_CORE_API_KEY", ""),
                 ),
-                Horizontal(
-                    Button("Connect", id="home-connect", variant="primary"),
-                    id="actions",
-                ),
                 id="config-section",
             ),
+            Button("Connect", id="home-connect", variant="primary"),
             Horizontal(
                 Button("Namespaces", id="nav-namespaces"),
                 Button("Collections", id="nav-collections"),
@@ -204,12 +197,18 @@ class HomeScreen(Screen):
         cfg = self.app.config
         info = self.query_one("#info", Label)
         config_section = self.query_one("#config-section", Container)
+        connect_button = self.query_one("#home-connect", Button)
+        nav_section = self.query_one("#nav", Horizontal)
 
         if not cfg.get("api_key"):
             config_section.display = True
+            connect_button.display = True
+            nav_section.display = False
             info.update("Status: Not connected")
         else:
             config_section.display = False
+            connect_button.display = False
+            nav_section.display = True
             parts = [
                 "Status: Connected",
                 f"MCP: {cfg.get('mcp_url', 'http://localhost:8000/mcp')}",
