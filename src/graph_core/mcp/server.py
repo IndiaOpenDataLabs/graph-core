@@ -64,6 +64,7 @@ mcp = FastMCP(
     name="graph-core",
     instructions="MCP server for the Graph Core knowledge platform",
     lifespan=server_lifespan,
+    streamable_http_path="/",
 )
 
 
