@@ -2,7 +2,7 @@
 	docker-up docker-down docker-logs docker-clean docker-ps \
 	docker-logs-app docker-logs-worker \
 	db-migrate db-revision db-current db-stamp db-downgrade \
-	infra-check seed smoke-test
+	infra-check seed smoke-test tui
 
 # ─── Project ──────────────────────────────────────────────────────────────────
 
@@ -105,3 +105,6 @@ smoke-test-local:     ## Run smoke test against local LLM/embedding servers
 		--llm-key test-key --llm-url http://host.docker.internal:8080/v1 \
 		--embed-key test-key --embed-url http://host.docker.internal:8002/v1 \
 		--embed-dimensions 4096
+
+tui:                  ## Run the terminal UI client
+	uv run python -m graph_core.cli
