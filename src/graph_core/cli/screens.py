@@ -151,18 +151,18 @@ class HomeScreen(Screen):
                     id="home-mcp-url",
                     value=mcp_url,
                 ),
-                Label("API Key:", classes="margin-top"),
-                Input(
-                    placeholder="ns_key_xxxx or admin key",
-                    id="home-api-key",
-                    password=True,
-                    value=os.getenv("GRAPH_CORE_API_KEY", ""),
-                ),
                 Label("Auth mode:", classes="margin-top"),
                 RadioSet(
                     RadioButton("namespace", id="home-mode-namespace"),
                     RadioButton("admin", id="home-mode-admin"),
                     id="home-auth-mode",
+                ),
+                Label("Namespace API Key:", id="key-label", classes="margin-top"),
+                Input(
+                    placeholder="ns_key_xxxx",
+                    id="home-api-key",
+                    password=True,
+                    value=os.getenv("GRAPH_CORE_API_KEY", ""),
                 ),
                 Horizontal(
                     Button("Connect", id="home-connect", variant="primary"),
@@ -182,7 +182,21 @@ class HomeScreen(Screen):
         )
 
     async def on_mount(self) -> None:
+        self.query_one("#home-auth-mode").value = "namespace"
         self._refresh_view()
+
+    @on(RadioSet.Changed, "#home-auth-mode")
+    def on_auth_mode_changed(self, event: RadioSet.Changed) -> None:
+        key_input = self.query_one("#home-api-key", Input)
+        key_label = self.query_one("#key-label", Label)
+        if event.value == "admin":
+            key_label.update("Platform Admin Key:")
+            key_input.placeholder = "e.g. graph-core-admin-key-dev"
+            key_input.value = os.getenv("PLATFORM_ADMIN_KEY", "")
+        else:
+            key_label.update("Namespace API Key:")
+            key_input.placeholder = "ns_key_xxxx"
+            key_input.value = os.getenv("GRAPH_CORE_API_KEY", "")
 
     def _refresh_view(self) -> None:
         cfg = self.app.config
