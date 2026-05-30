@@ -1,6 +1,7 @@
-"""TUI screens for Graph Core."""
+"""TUI screens for Graph Core — communicates via MCP tools."""
 
 import os
+import re
 
 from textual import on
 from textual.containers import Container, Horizontal
@@ -16,7 +17,56 @@ from textual.widgets import (
     TextArea,
 )
 
-from graph_core.client import GraphCoreAPIError, GraphCoreClient
+# -- Response parsers --------------------------------------------------------
+
+
+def parse_namespaces(text: str) -> list[dict]:
+    items = []
+    for m in re.finditer(r"^  - ([^|]+)\| (.+)$", text, re.MULTILINE):
+        parts = m.group(2).split()
+        items.append({"id": m.group(1).strip(), "name": parts[0] if parts else ""})
+    return items
+
+
+def parse_collections(text: str) -> list[dict]:
+    items = []
+    for m in re.finditer(r"^  - ([^|]+)\| (.+?) \((.+?)\)$", text, re.MULTILINE):
+        items.append({
+            "id": m.group(1).strip(),
+            "name": m.group(2).strip(),
+            "strategy": m.group(3).strip(),
+        })
+    return items
+
+
+def parse_key_value(text: str) -> dict:
+    result = {}
+    for m in re.finditer(r"^  ([\w_]+):\s*(.+)$", text, re.MULTILINE):
+        result[m.group(1).strip()] = m.group(2).strip()
+    return result
+
+
+def extract_id(text: str) -> str:
+    m = re.search(r"id:\s*([^\s\n]+)", text)
+    return m.group(1) if m else ""
+
+
+def extract_name(text: str) -> str:
+    m = re.search(r"name:\s*([^\s\n]+)", text)
+    return m.group(1) if m else ""
+
+
+def extract_job_id(text: str) -> str:
+    m = re.search(r"job_id:\s*([^\s\n]+)", text)
+    return m.group(1) if m else ""
+
+
+def extract_status(text: str) -> str:
+    m = re.search(r"status:\s*([^\s\n]+)", text)
+    return m.group(1) if m else ""
+
+
+# -- Screens -----------------------------------------------------------------
 
 
 class ConfigScreen(Screen):
@@ -60,13 +110,20 @@ class ConfigScreen(Screen):
     """
 
     def compose(self) -> None:
+        base_url = os.getenv("GRAPH_CORE_URL", "http://localhost:8000")
         yield Container(
             Label("Graph Core Configuration", id="title"),
             Label("Base URL:"),
             Input(
                 placeholder="http://localhost:8000",
                 id="base-url",
-                value=os.getenv("GRAPH_CORE_URL", "http://localhost:8000"),
+                value=base_url,
+            ),
+            Label("MCP URL:", margin=(1, 0, 0, 0)),
+            Input(
+                placeholder="http://localhost:8000/mcp",
+                id="mcp-url",
+                value=os.getenv("MCP_URL", f"{base_url}/mcp"),
             ),
             Label("API Key (namespace or admin):", margin=(1, 0, 0, 0)),
             Input(
@@ -110,6 +167,7 @@ class ConfigScreen(Screen):
 
     def _save_and_connect(self) -> None:
         base_url = self.query_one("#base-url", Input).value.strip()
+        mcp_url = self.query_one("#mcp-url", Input).value.strip()
         api_key = self.query_one("#api-key", Input).value.strip()
         is_admin = self.query_one("#auth-mode", RadioSet).value == "admin"
 
@@ -119,6 +177,7 @@ class ConfigScreen(Screen):
 
         self.app.config = {
             "base_url": base_url or "http://localhost:8000",
+            "mcp_url": mcp_url or f"{base_url or 'http://localhost:8000'}/mcp",
             "api_key": api_key,
             "is_admin": is_admin,
             "namespace_id": "",
@@ -127,6 +186,7 @@ class ConfigScreen(Screen):
 
         os.environ["GRAPH_CORE_URL"] = self.app.config["base_url"]
         os.environ["GRAPH_CORE_API_KEY"] = api_key
+        os.environ["MCP_URL"] = self.app.config["mcp_url"]
         if is_admin:
             os.environ["PLATFORM_ADMIN_KEY"] = api_key
 
@@ -177,6 +237,7 @@ class HomeScreen(Screen):
 
         parts = [
             f"Server: {cfg['base_url']}",
+            f"MCP: {cfg.get('mcp_url', cfg['base_url'] + '/mcp')}",
             f"Mode: {'Admin' if cfg['is_admin'] else 'Namespace'}",
         ]
         if cfg.get("namespace_name"):
@@ -256,33 +317,25 @@ class NamespacesScreen(Screen):
         await self._load_namespaces()
 
     async def _load_namespaces(self) -> None:
-        try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["is_admin"]
-                and self.app.config.get("api_key")
-                or self.app.config.get("api_key"),
-                is_admin=self.app.config.get("is_admin", False),
-            )
-            if not self.app.config.get("is_admin"):
-                self.notify("Admin key required to list namespaces", severity="warning")
-                return
+        if not self.app.config.get("is_admin"):
+            self.notify("Admin key required to list namespaces", severity="warning")
+            return
 
-            namespaces = await client.list_namespaces()
+        try:
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                text = await client.call("list_namespaces")
+                namespaces = parse_namespaces(text)
+            finally:
+                await client.disconnect()
+
             table = self.query_one("#namespace-table", DataTable)
             table.clear()
-            table.add_columns("ID", "Name", "Key Prefix", "Created")
+            table.add_columns("ID", "Name")
             for ns in namespaces:
-                table.add_row(
-                    str(ns["id"])[:8],
-                    ns["name"],
-                    ns.get("api_key_prefix") or "-",
-                    str(ns.get("created_at", "-"))[:19]
-                    if ns.get("created_at")
-                    else "-",
-                )
-            await client.close()
-        except GraphCoreAPIError as e:
+                table.add_row(ns["id"][:8] if ns["id"] else "", ns["name"])
+        except Exception as e:
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
@@ -299,20 +352,22 @@ class NamespacesScreen(Screen):
             return
 
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-                is_admin=True,
-            )
-            result = await client.create_namespace(name)
-            await client.close()
-            self.notify(f"Created namespace: {result['name']}")
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                text = await client.call("create_namespace", {"name": name})
+                ns_id = extract_id(text)
+                ns_name = extract_name(text)
+            finally:
+                await client.disconnect()
+
+            self.notify(f"Created namespace: {ns_name or name}")
             self.query_one("#ns-name-input", Input).value = ""
-            self.app.config["namespace_id"] = result["id"]
-            self.app.config["namespace_name"] = result["name"]
+            self.app.config["namespace_id"] = ns_id
+            self.app.config["namespace_name"] = ns_name or name
             self.query_one("#create-form", Container).remove_class("visible")
             await self._load_namespaces()
-        except GraphCoreAPIError as e:
+        except Exception as e:
             self.notify(str(e), severity="error")
 
 
@@ -392,18 +447,21 @@ class CollectionsScreen(Screen):
 
     async def _load_collections(self) -> None:
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            collections = await client.list_collections()
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                text = await client.call("list_collections")
+                collections = parse_collections(text)
+            finally:
+                await client.disconnect()
+
             table = self.query_one("#collection-table", DataTable)
             table.clear()
             table.add_columns("ID", "Name", "Strategy")
             for col in collections:
-                table.add_row(str(col["id"])[:8], col["name"], col["strategy"])
-            await client.close()
-        except GraphCoreAPIError as e:
+                cid = col["id"][:8] if col["id"] else ""
+                table.add_row(cid, col["name"], col["strategy"])
+        except Exception as e:
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
@@ -421,22 +479,25 @@ class CollectionsScreen(Screen):
             return
 
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            result = await client.create_collection(name=name, strategy=strategy)
-            await client.close()
-            self.notify(f"Created collection: {result['name']}")
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                args = {"name": name, "strategy": strategy}
+                text = await client.call("create_collection", args)
+                col_name = extract_name(text)
+            finally:
+                await client.disconnect()
+
+            self.notify(f"Created collection: {col_name or name}")
             self.query_one("#col-name-input", Input).value = ""
             self.query_one("#create-form", Container).remove_class("visible")
             await self._load_collections()
-        except GraphCoreAPIError as e:
+        except Exception as e:
             self.notify(str(e), severity="error")
 
 
 class QueryScreen(Screen):
-    """Query a collection."""
+    """Query a collection via MCP."""
 
     CSS = """
     QueryScreen {
@@ -507,21 +568,22 @@ class QueryScreen(Screen):
 
     async def _load_collections(self) -> None:
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            collections = await client.list_collections()
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                text = await client.call("list_collections")
+                collections = parse_collections(text)
+            finally:
+                await client.disconnect()
+
             options = [("", "(select collection)")] + [
                 (c["id"], f"{c['name']} ({c['strategy']})") for c in collections
             ]
             self.query_one("#collection-select", Select).options = options
             if collections:
-                self.query_one("#collection-select", Select).value = collections[0][
-                    "id"
-                ]
-            await client.close()
-        except GraphCoreAPIError as e:
+                sel = self.query_one("#collection-select", Select)
+                sel.value = collections[0]["id"]
+        except Exception as e:
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
@@ -546,22 +608,24 @@ class QueryScreen(Screen):
 
         results.write(f"Querying: {question}\n")
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            result = await client.query_collection(
-                collection_id, question, mode=mode or None
-            )
-            await client.close()
-            results.write("\n" + str(result) + "\n\n")
-        except GraphCoreAPIError as e:
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                args = {"collection_id": collection_id, "question": question}
+                if mode:
+                    args["mode"] = mode
+                text = await client.call("query_collection", args)
+            finally:
+                await client.disconnect()
+
+            results.write("\n" + text + "\n\n")
+        except Exception as e:
             results.write(f"\nError: {e}\n")
             self.notify(str(e), severity="error")
 
 
 class IngestScreen(Screen):
-    """Ingest text or files into a collection."""
+    """Ingest text or files into a collection via MCP."""
 
     CSS = """
     IngestScreen {
@@ -629,19 +693,20 @@ class IngestScreen(Screen):
 
     async def _load_collections(self) -> None:
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            collections = await client.list_collections()
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                text = await client.call("list_collections")
+                collections = parse_collections(text)
+            finally:
+                await client.disconnect()
+
             options = [("", "(select)")] + [(c["id"], c["name"]) for c in collections]
             self.query_one("#collection-select", Select).options = options
             if collections:
-                self.query_one("#collection-select", Select).value = collections[0][
-                    "id"
-                ]
-            await client.close()
-        except GraphCoreAPIError as e:
+                sel = self.query_one("#collection-select", Select)
+                sel.value = collections[0]["id"]
+        except Exception as e:
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
@@ -658,7 +723,6 @@ class IngestScreen(Screen):
             self.notify("Select a collection", severity="warning")
             return
 
-        # Get text from file or textarea
         file_path = self.query_one("#file-path", Input).value.strip()
         if file_path and os.path.isfile(file_path):
             with open(file_path) as f:
@@ -672,31 +736,32 @@ class IngestScreen(Screen):
 
         status.update("Ingesting...")
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            if method == "doc":
-                result = await client.ingest_document(collection_id, text)
-                status.update(
-                    f"Job started: {result['job_id']} (status: {result['status']})"
-                )
-                self.notify(f"Ingestion job: {result['job_id']}")
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                if method == "doc":
+                    tool_name = "ingest_document"
+                else:
+                    tool_name = "ingest_chunk"
+                args = {"collection_id": collection_id, "text": text}
+                mcptext = await client.call(tool_name, args)
+            finally:
+                await client.disconnect()
+
+            job_id = extract_job_id(mcptext)
+            mc_status = extract_status(mcptext)
+            if job_id:
+                status.update(f"Job started: {job_id} (status: {mc_status})")
+                self.notify(f"Ingestion job: {job_id}")
             else:
-                result = await client.ingest_chunk(collection_id, text)
-                status.update(
-                    f"Chunk ingested (hash: {result.get('chunk_hash', '?')}, "
-                    f"entities: {result.get('entity_count', 0)}, "
-                    f"rels: {result.get('relationship_count', 0)})"
-                )
-            await client.close()
-        except GraphCoreAPIError as e:
+                status.update(f"Chunk ingested: {mcptext[:80]}...")
+        except Exception as e:
             status.update(f"Error: {e}")
             self.notify(str(e), severity="error")
 
 
 class JobsScreen(Screen):
-    """Track ingestion jobs."""
+    """Track ingestion jobs via MCP."""
 
     CSS = """
     JobsScreen {
@@ -740,7 +805,7 @@ class JobsScreen(Screen):
         )
 
     async def action_refresh(self) -> None:
-        pass  # No auto list endpoint; user enters job ID
+        pass
 
     @on(Button.Pressed)
     async def handle_check(self, event: Button.Pressed) -> None:
@@ -754,28 +819,23 @@ class JobsScreen(Screen):
             return
 
         try:
-            client = GraphCoreClient(
-                base_url=self.app.config["base_url"],
-                api_key=self.app.config["api_key"],
-            )
-            job = await client.get_job(job_id)
-            await client.close()
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                text = await client.call("get_job_status", {"job_id": job_id})
+            finally:
+                await client.disconnect()
 
+            job_data = parse_key_value(text)
             table = self.query_one("#job-table", DataTable)
             table.clear()
             table.add_columns("Field", "Value")
-            for key in (
-                "id",
-                "job_type",
-                "status",
-                "progress_percent",
-                "chunks_completed",
-                "chunks_total",
-                "error",
-            ):
-                table.add_row(key, str(job.get(key, "-")))
-            for key in ("created_at", "started_at", "completed_at"):
-                val = job.get(key)
-                table.add_row(key, str(val)[:19] if val else "-")
-        except GraphCoreAPIError as e:
+            for key in ("type", "status", "progress", "chunks", "error"):
+                table.add_row(key, job_data.get(key, "-"))
+
+            first_line = text.split("\n")[0]
+            m = re.search(r"Job:\s*(.+)", first_line)
+            if m:
+                table.add_row("id", m.group(1).strip())
+        except Exception as e:
             self.notify(str(e), severity="error")

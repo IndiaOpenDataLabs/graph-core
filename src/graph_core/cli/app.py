@@ -4,6 +4,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header
 
+from graph_core.cli.mcp_client import MCPClient
+
 
 class GraphCoreTUI(App):
     """Terminal UI for the Graph Core platform."""
@@ -42,6 +44,12 @@ class GraphCoreTUI(App):
     def config(self, value: dict) -> None:
         self._config = value
 
+    @property
+    def mcp_client(self) -> MCPClient:
+        mcp_url = self.config.get("mcp_url", f"{self.config['base_url']}/mcp")
+        return MCPClient(mcp_url)
 
-def main() -> None:
-    GraphCoreTUI().run()
+
+async def main() -> None:
+    app = GraphCoreTUI()
+    app.run()
