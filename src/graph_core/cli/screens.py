@@ -336,7 +336,7 @@ class NamespacesScreen(Screen):
         )
 
     async def on_mount(self) -> None:
-        await self._load_namespaces()
+        self.run_worker(self._load_namespaces(), exclusive=True, group="load")
 
     async def action_create_namespace(self) -> None:
         form = self.query_one("#create-form", Container)
@@ -344,7 +344,7 @@ class NamespacesScreen(Screen):
         self.query_one("#ns-name-input", Input).focus()
 
     async def action_refresh(self) -> None:
-        await self._load_namespaces()
+        self.run_worker(self._load_namespaces(), exclusive=True, group="load")
 
     async def _load_namespaces(self) -> None:
         if not self.app.config.get("is_admin"):
@@ -465,7 +465,7 @@ class CollectionsScreen(Screen):
         )
 
     async def on_mount(self) -> None:
-        await self._load_collections()
+        self.run_worker(self._load_collections(), exclusive=True, group="load")
 
     async def action_create_collection(self) -> None:
         form = self.query_one("#create-form", Container)
@@ -473,7 +473,7 @@ class CollectionsScreen(Screen):
         self.query_one("#col-name-input", Input).focus()
 
     async def action_refresh(self) -> None:
-        await self._load_collections()
+        self.run_worker(self._load_collections(), exclusive=True, group="load")
 
     async def _load_collections(self) -> None:
         try:
@@ -594,7 +594,7 @@ class QueryScreen(Screen):
         yield RichLog(id="results", wrap=True)
 
     async def on_mount(self) -> None:
-        await self._load_collections()
+        self.run_worker(self._load_collections(), exclusive=True, group="load")
 
     async def _load_collections(self) -> None:
         try:
@@ -719,7 +719,7 @@ class IngestScreen(Screen):
         yield Label("Ready.", id="status")
 
     async def on_mount(self) -> None:
-        await self._load_collections()
+        self.run_worker(self._load_collections(), exclusive=True, group="load")
 
     async def _load_collections(self) -> None:
         try:
