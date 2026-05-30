@@ -365,8 +365,24 @@ class NamespacesScreen(Screen):
             table.add_columns("ID", "Name")
             for ns in namespaces:
                 table.add_row(ns["id"][:8] if ns["id"] else "", ns["name"])
+            if not namespaces:
+                self.notify("No namespaces found", severity="information")
         except Exception as e:
-            self.notify(str(e), severity="error")
+            error_msg = str(e)
+            if "405" in error_msg or "Method Not Allowed" in error_msg:
+                self.notify(
+                    "MCP server not available. Run 'make server' first.",
+                    severity="error",
+                    timeout=10,
+                )
+            elif "Connection refused" in error_msg or "connect" in error_msg.lower():
+                self.notify(
+                    "Cannot connect to server. Run 'make server' first.",
+                    severity="error",
+                    timeout=10,
+                )
+            else:
+                self.notify(f"Failed to load namespaces: {error_msg}", severity="error")
 
     @on(Button.Pressed)
     def handle_button(self, event: Button.Pressed) -> None:
@@ -381,6 +397,7 @@ class NamespacesScreen(Screen):
             self.notify("Name is required", severity="error")
             return
 
+        self.notify(f"Creating namespace '{name}'...", severity="information")
         try:
             client = self.app.mcp_client
             await client.connect()
@@ -391,14 +408,31 @@ class NamespacesScreen(Screen):
             finally:
                 await client.disconnect()
 
-            self.notify(f"Created namespace: {ns_name or name}")
+            self.notify(f"Created namespace: {ns_name or name}", severity="information")
             self.query_one("#ns-name-input", Input).value = ""
             self.app.config["namespace_id"] = ns_id
             self.app.config["namespace_name"] = ns_name or name
             self.query_one("#create-form", Container).remove_class("visible")
-            await self._load_namespaces()
+            self.run_worker(self._load_namespaces(), exclusive=True, group="load")
         except Exception as e:
-            self.notify(str(e), severity="error")
+            error_msg = str(e)
+            if "405" in error_msg or "Method Not Allowed" in error_msg:
+                self.notify(
+                    "MCP server not available. Run 'make server' first.",
+                    severity="error",
+                    timeout=10,
+                )
+            elif "Connection refused" in error_msg or "connect" in error_msg.lower():
+                self.notify(
+                    "Cannot connect to server. Run 'make server' first.",
+                    severity="error",
+                    timeout=10,
+                )
+            else:
+                self.notify(
+                    f"Failed to create namespace: {error_msg}",
+                    severity="error",
+                )
 
 
 class CollectionsScreen(Screen):
@@ -508,6 +542,7 @@ class CollectionsScreen(Screen):
             self.notify("Name is required", severity="error")
             return
 
+        self.notify(f"Creating collection '{name}'...", severity="information")
         try:
             client = self.app.mcp_client
             await client.connect()
@@ -518,12 +553,15 @@ class CollectionsScreen(Screen):
             finally:
                 await client.disconnect()
 
-            self.notify(f"Created collection: {col_name or name}")
+            self.notify(
+                f"Created collection: {col_name or name}",
+                severity="information",
+            )
             self.query_one("#col-name-input", Input).value = ""
             self.query_one("#create-form", Container).remove_class("visible")
-            await self._load_collections()
+            self.run_worker(self._load_collections(), exclusive=True, group="load")
         except Exception as e:
-            self.notify(str(e), severity="error")
+            self.notify(f"Failed to create collection: {e}", severity="error")
 
 
 class QueryScreen(Screen):
