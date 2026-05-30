@@ -140,7 +140,7 @@ class HomeScreen(Screen):
     ]
 
     def compose(self) -> None:
-        mcp_url = os.getenv("MCP_URL", "http://localhost:8000/mcp")
+        mcp_url = os.getenv("MCP_URL", "http://localhost:8001/mcp/")
         yield Container(
             Label("Graph Core Terminal", id="title"),
             Label("", id="info"),
@@ -148,7 +148,7 @@ class HomeScreen(Screen):
                 Label("Connection Setup:"),
                 Label("MCP URL:"),
                 Input(
-                    placeholder="http://localhost:8000/mcp",
+                    placeholder="http://localhost:8001/mcp/",
                     id="home-mcp-url",
                     value=mcp_url,
                 ),
@@ -220,7 +220,7 @@ class HomeScreen(Screen):
             nav_section.display = True
             parts = [
                 "Status: Connected",
-                f"MCP: {cfg.get('mcp_url', 'http://localhost:8000/mcp')}",
+                f"MCP: {cfg.get('mcp_url', 'http://localhost:8001/mcp/')}",
                 f"Mode: {'Admin' if cfg['is_admin'] else 'Namespace'}",
             ]
             if cfg.get("namespace_name"):
@@ -259,7 +259,7 @@ class HomeScreen(Screen):
             return
 
         if not mcp_url:
-            mcp_url = "http://localhost:8000/mcp"
+            mcp_url = "http://localhost:8001/mcp/"
 
         self.app.config = {
             "mcp_url": mcp_url,

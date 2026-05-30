@@ -12,7 +12,7 @@ class MCPClient:
     """Thin wrapper around ClientSession + streamable_http_client."""
 
     def __init__(self, mcp_url: str) -> None:
-        self.mcp_url = mcp_url
+        self.mcp_url = mcp_url if mcp_url.endswith("/") else mcp_url + "/"
         self._session: ClientSession | None = None
         self._transport_ctx = None
 

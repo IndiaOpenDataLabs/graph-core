@@ -81,7 +81,7 @@ class GraphCoreTUI(App):
 
     @property
     def mcp_client(self) -> MCPClient:
-        mcp_url = self.config.get("mcp_url", "http://localhost:8000/mcp")
+        mcp_url = self.config.get("mcp_url", "http://localhost:8001/mcp/")
         return MCPClient(mcp_url)
 
 
