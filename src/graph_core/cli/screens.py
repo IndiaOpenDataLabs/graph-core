@@ -182,14 +182,16 @@ class HomeScreen(Screen):
         )
 
     async def on_mount(self) -> None:
-        self.query_one("#home-auth-mode").value = "namespace"
+        ns_button = self.query_one("#home-mode-namespace", RadioButton)
+        ns_button.value = True
         self._refresh_view()
 
     @on(RadioSet.Changed, "#home-auth-mode")
     def on_auth_mode_changed(self, event: RadioSet.Changed) -> None:
         key_input = self.query_one("#home-api-key", Input)
         key_label = self.query_one("#key-label", Label)
-        if event.value == "admin":
+        is_admin = event.pressed.id == "home-mode-admin"
+        if is_admin:
             key_label.update("Platform Admin Key:")
             key_input.placeholder = "e.g. graph-core-admin-key-dev"
             key_input.value = os.getenv("PLATFORM_ADMIN_KEY", "")
@@ -241,7 +243,9 @@ class HomeScreen(Screen):
     def _save_and_connect(self) -> None:
         mcp_url = self.query_one("#home-mcp-url", Input).value.strip()
         api_key = self.query_one("#home-api-key", Input).value.strip()
-        is_admin = self.query_one("#home-auth-mode", RadioSet).value == "admin"
+        radio_set = self.query_one("#home-auth-mode", RadioSet)
+        pressed = radio_set.pressed_button
+        is_admin = pressed.id == "home-mode-admin" if pressed else False
 
         if not api_key:
             self.notify("API key is required", severity="error")
