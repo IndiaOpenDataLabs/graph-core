@@ -292,7 +292,7 @@ async def get_capabilities() -> str:
 
 def mcp_server_app() -> object:
     """Create the StreamableHTTP ASGI app for mounting in FastAPI."""
-    return mcp.streamable_http_app(json_response=True)
+    return mcp.streamable_http_app()
 
 
 def main() -> None:

@@ -60,7 +60,7 @@ app.include_router(collections.router)
 app.include_router(ingest.router)
 app.include_router(jobs.router)
 app.include_router(query.router)
-app.mount("/mcp", mcp_server.streamable_http_app(json_response=True))
+app.mount("/mcp", mcp_server.streamable_http_app())
 
 
 @app.get("/health")
