@@ -521,7 +521,7 @@ class CollectionsScreen(Screen):
         yield DataTable(id="collection-table")
         yield Container(
             Input(placeholder="Collection name", id="col-name-input"),
-            Select(self.STRATEGIES, value="vector", id="col-strategy"),
+            Select(self.STRATEGIES, value=("vector", "Vector"), id="col-strategy"),
             Button("Create", id="col-create-btn", variant="primary"),
             Button("Cancel", id="col-cancel-btn"),
             id="create-form",
@@ -567,7 +567,7 @@ class CollectionsScreen(Screen):
     async def _create_collection(self) -> None:
         name = self.query_one("#col-name-input", Input).value.strip()
         strategy_select = self.query_one("#col-strategy", Select)
-        strategy = strategy_select.value or "vector"
+        strategy = strategy_select.value[0] if strategy_select.value else "vector"
         if not name:
             self.notify("Name is required", severity="error")
             return
@@ -680,7 +680,7 @@ class QueryScreen(Screen):
             self.query_one("#collection-select", Select).options = options
             if collections:
                 sel = self.query_one("#collection-select", Select)
-                sel.value = collections[0]["id"]
+                sel.value = (collections[0]["id"], f"{collections[0]['name']} ({collections[0]['strategy']})")
         except Exception as e:
             self.notify(str(e), severity="error")
 
@@ -690,8 +690,10 @@ class QueryScreen(Screen):
             self.run_worker(self._run_query(), exclusive=True, group="action")
 
     async def _run_query(self) -> None:
-        collection_id = self.query_one("#collection-select", Select).value
-        mode = self.query_one("#query-mode", Select).value[0]
+        coll_select = self.query_one("#collection-select", Select).value
+        collection_id = coll_select[0] if coll_select else ""
+        mode_select = self.query_one("#query-mode", Select).value
+        mode = mode_select[0] if mode_select else ""
         query_text = self.query_one("#query-text", TextArea)
         results = self.query_one("#results", RichLog)
 
@@ -803,7 +805,7 @@ class IngestScreen(Screen):
             self.query_one("#collection-select", Select).options = options
             if collections:
                 sel = self.query_one("#collection-select", Select)
-                sel.value = collections[0]["id"]
+                sel.value = (collections[0]["id"], collections[0]["name"])
         except Exception as e:
             self.notify(str(e), severity="error")
 
@@ -813,8 +815,10 @@ class IngestScreen(Screen):
             self.run_worker(self._do_ingest(), exclusive=True, group="action")
 
     async def _do_ingest(self) -> None:
-        collection_id = self.query_one("#collection-select", Select).value
-        method = self.query_one("#ingest-method", Select).value
+        coll_select = self.query_one("#collection-select", Select).value
+        collection_id = coll_select[0] if coll_select else ""
+        method_select = self.query_one("#ingest-method", Select).value
+        method = method_select[0] if method_select else "doc"
         status = self.query_one("#status", Label)
 
         if not collection_id:
