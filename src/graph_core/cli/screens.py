@@ -4,7 +4,7 @@ import os
 import re
 
 from textual import on
-from textual.containers import Container, Horizontal
+from textual.containers import Container
 from textual.screen import Screen
 from textual.widgets import (
     Button,
@@ -124,9 +124,14 @@ class HomeScreen(Screen):
         height: auto;
     }
 
+    #nav-title {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+
     #nav Button {
-        width: 1fr;
-        margin: 0 1;
+        width: 100%;
+        margin: 0 0 1 0;
     }
     """
 
@@ -163,12 +168,16 @@ class HomeScreen(Screen):
                 id="config-section",
             ),
             Button("Connect", id="home-connect", variant="primary"),
-            Horizontal(
-                Button("Namespaces", id="nav-namespaces"),
-                Button("Collections", id="nav-collections"),
-                Button("Query", id="nav-query"),
-                Button("Ingest", id="nav-ingest"),
-                Button("Jobs", id="nav-jobs"),
+            Container(
+                Label("Actions:", id="nav-title"),
+                Button(
+                    "📋 Namespaces - Manage namespaces (admin only)",
+                    id="nav-namespaces",
+                ),
+                Button("📁 Collections - Manage collections", id="nav-collections"),
+                Button("🔍 Query - Query a collection", id="nav-query"),
+                Button("📥 Ingest - Add data to a collection", id="nav-ingest"),
+                Button("📊 Jobs - View ingestion job status", id="nav-jobs"),
                 id="nav",
             ),
             id="dashboard",
@@ -198,7 +207,7 @@ class HomeScreen(Screen):
         info = self.query_one("#info", Label)
         config_section = self.query_one("#config-section", Container)
         connect_button = self.query_one("#home-connect", Button)
-        nav_section = self.query_one("#nav", Horizontal)
+        nav_section = self.query_one("#nav", Container)
 
         if not cfg.get("api_key"):
             config_section.display = True
