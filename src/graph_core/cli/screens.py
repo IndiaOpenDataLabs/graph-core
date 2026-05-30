@@ -242,9 +242,8 @@ class HomeScreen(Screen):
     def _save_and_connect(self) -> None:
         mcp_url = self.query_one("#home-mcp-url", Input).value.strip()
         api_key = self.query_one("#home-api-key", Input).value.strip()
-        radio_set = self.query_one("#home-auth-mode", RadioSet)
-        pressed = radio_set.pressed_button
-        is_admin = pressed.id == "home-mode-admin" if pressed else False
+        admin_button = self.query_one("#home-mode-admin", RadioButton)
+        is_admin = admin_button.value
 
         if not api_key:
             self.notify("API key is required", severity="error")
