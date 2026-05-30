@@ -11,6 +11,7 @@ from textual.widgets import (
     DataTable,
     Input,
     Label,
+    RadioButton,
     RadioSet,
     RichLog,
     Select,
@@ -88,6 +89,10 @@ class ConfigScreen(Screen):
         width: 100%;
     }
 
+    #config-box Label.margin-top {
+        margin-top: 1;
+    }
+
     Input {
         width: 100%;
     }
@@ -119,23 +124,23 @@ class ConfigScreen(Screen):
                 id="base-url",
                 value=base_url,
             ),
-            Label("MCP URL:", margin=(1, 0, 0, 0)),
+            Label("MCP URL:", classes="margin-top"),
             Input(
                 placeholder="http://localhost:8000/mcp",
                 id="mcp-url",
                 value=os.getenv("MCP_URL", f"{base_url}/mcp"),
             ),
-            Label("API Key (namespace or admin):", margin=(1, 0, 0, 0)),
+            Label("API Key (namespace or admin):", classes="margin-top"),
             Input(
                 placeholder="ns_key_xxxx or admin key",
                 id="api-key",
                 password=True,
                 value=os.getenv("GRAPH_CORE_API_KEY", ""),
             ),
-            Label("Auth mode:", margin=(1, 0, 0, 0)),
+            Label("Auth mode:", classes="margin-top"),
             RadioSet(
-                RadioSet.Radio("namespace", id="mode-namespace"),
-                RadioSet.Radio("admin", id="mode-admin"),
+                RadioButton("namespace", id="mode-namespace"),
+                RadioButton("admin", id="mode-admin"),
                 id="auth-mode",
             ),
             Horizontal(

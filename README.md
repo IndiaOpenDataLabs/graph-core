@@ -90,7 +90,7 @@ Interactive terminal application for managing namespaces, collections, queries, 
 
 ```bash
 # Install TUI dependencies
-uv sync --extra cli
+uv sync --extra cli --extra mcp
 
 # Launch
 python -m graph_core.cli
