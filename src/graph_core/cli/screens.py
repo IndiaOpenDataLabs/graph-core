@@ -369,9 +369,9 @@ class NamespacesScreen(Screen):
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
-    async def handle_button(self, event: Button.Pressed) -> None:
+    def handle_button(self, event: Button.Pressed) -> None:
         if event.button.id == "ns-create-btn":
-            await self._create_namespace()
+            self.run_worker(self._create_namespace(), exclusive=True, group="action")
         elif event.button.id == "ns-cancel-btn":
             self.query_one("#create-form", Container).remove_class("visible")
 
@@ -495,9 +495,9 @@ class CollectionsScreen(Screen):
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
-    async def handle_button(self, event: Button.Pressed) -> None:
+    def handle_button(self, event: Button.Pressed) -> None:
         if event.button.id == "col-create-btn":
-            await self._create_collection()
+            self.run_worker(self._create_collection(), exclusive=True, group="action")
         elif event.button.id == "col-cancel-btn":
             self.query_one("#create-form", Container).remove_class("visible")
 
@@ -617,9 +617,9 @@ class QueryScreen(Screen):
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
-    async def handle_query(self, event: Button.Pressed) -> None:
+    def handle_query(self, event: Button.Pressed) -> None:
         if event.button.id == "query-btn":
-            await self._run_query()
+            self.run_worker(self._run_query(), exclusive=True, group="action")
 
     async def _run_query(self) -> None:
         collection_id = self.query_one("#collection-select", Select).value
@@ -740,9 +740,9 @@ class IngestScreen(Screen):
             self.notify(str(e), severity="error")
 
     @on(Button.Pressed)
-    async def handle_ingest(self, event: Button.Pressed) -> None:
+    def handle_ingest(self, event: Button.Pressed) -> None:
         if event.button.id == "ingest-btn":
-            await self._do_ingest()
+            self.run_worker(self._do_ingest(), exclusive=True, group="action")
 
     async def _do_ingest(self) -> None:
         collection_id = self.query_one("#collection-select", Select).value
@@ -838,9 +838,9 @@ class JobsScreen(Screen):
         pass
 
     @on(Button.Pressed)
-    async def handle_check(self, event: Button.Pressed) -> None:
+    def handle_check(self, event: Button.Pressed) -> None:
         if event.button.id == "check-job-btn":
-            await self._check_job()
+            self.run_worker(self._check_job(), exclusive=True, group="action")
 
     async def _check_job(self) -> None:
         job_id = self.query_one("#job-id-input", Input).value.strip()
