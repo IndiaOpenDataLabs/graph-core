@@ -521,7 +521,7 @@ class CollectionsScreen(Screen):
         yield DataTable(id="collection-table")
         yield Container(
             Input(placeholder="Collection name", id="col-name-input"),
-            Select(self.STRATEGIES, allow_blank=True, id="col-strategy"),
+            Select(self.STRATEGIES, value="vector", id="col-strategy"),
             Button("Create", id="col-create-btn", variant="primary"),
             Button("Cancel", id="col-cancel-btn"),
             id="create-form",
@@ -567,13 +567,7 @@ class CollectionsScreen(Screen):
     async def _create_collection(self) -> None:
         name = self.query_one("#col-name-input", Input).value.strip()
         strategy_select = self.query_one("#col-strategy", Select)
-        strategy_raw = strategy_select.value
-        if strategy_raw == strategy_select.NULL or not strategy_raw:
-            strategy = "vector"
-        elif isinstance(strategy_raw, tuple):
-            strategy = strategy_raw[0]
-        else:
-            strategy = strategy_raw
+        strategy = strategy_select.value or "vector"
         if not name:
             self.notify("Name is required", severity="error")
             return
