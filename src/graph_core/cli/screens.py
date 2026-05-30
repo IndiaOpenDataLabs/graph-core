@@ -96,7 +96,7 @@ class ConfigScreen(Screen):
         if event.value == "admin":
             key_input.placeholder = "admin key"
             if not key_input.value:
-                key_input.value = os.getenv("GRAPH_CORE_ADMIN_KEY", "")
+                key_input.value = os.getenv("PLATFORM_ADMIN_KEY", "")
         else:
             key_input.placeholder = "ns_key_xxxx"
             if not key_input.value:
@@ -128,7 +128,7 @@ class ConfigScreen(Screen):
         os.environ["GRAPH_CORE_URL"] = self.app.config["base_url"]
         os.environ["GRAPH_CORE_API_KEY"] = api_key
         if is_admin:
-            os.environ["GRAPH_CORE_ADMIN_KEY"] = api_key
+            os.environ["PLATFORM_ADMIN_KEY"] = api_key
 
         self.app.pop_screen()
         self.app.notify("Connected!")

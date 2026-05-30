@@ -73,7 +73,7 @@ def _info(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Graph Core smoke test")
-    p.add_argument("--admin-key", default=os.environ.get("ADMIN_KEY", ""), help="Platform admin key for namespace creation")
+    p.add_argument("--admin-key", default=os.environ.get("PLATFORM_ADMIN_KEY", ""), help="Platform admin key for namespace creation")
     p.add_argument("--llm-key", help="OpenAI (or compatible) API key for LLM")
     p.add_argument("--llm-url", help="Custom LLM base URL (e.g. https://api.openai.com/v1)")
     p.add_argument("--llm-model", default="gpt-4o", help="LLM model name (default: gpt-4o)")

@@ -4,6 +4,7 @@ import secrets
 from dataclasses import dataclass
 
 import bcrypt
+from hmac import compare_digest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,10 +31,13 @@ def generate_api_key() -> tuple[str, str]:
 
 
 def is_admin_key(key: str) -> bool:
-    """Check if a key matches the primary or secondary admin key."""
-    if key and _verify_secret(key, settings.platform_admin_key):
+    """Check if a key matches the primary or secondary admin key.
+
+    Admin keys are plain-text env vars — constant-time comparison, no hashing.
+    """
+    if key and settings.platform_admin_key and compare_digest(key, settings.platform_admin_key):
         return True
-    if settings.platform_admin_key_secondary and _verify_secret(key, settings.platform_admin_key_secondary):
+    if key and settings.platform_admin_key_secondary and compare_digest(key, settings.platform_admin_key_secondary):
         return True
     return False
 

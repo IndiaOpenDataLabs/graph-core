@@ -22,7 +22,7 @@ class GraphCoreClient:
             base_url or os.getenv("GRAPH_CORE_URL") or "http://localhost:8000"
         ).rstrip("/")
         key = api_key or (
-            os.getenv("GRAPH_CORE_ADMIN_KEY")
+            os.getenv("PLATFORM_ADMIN_KEY")
             if is_admin
             else os.getenv("GRAPH_CORE_API_KEY")
         )

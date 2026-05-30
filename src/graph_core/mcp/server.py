@@ -14,7 +14,7 @@ def _get_base_url() -> str:
 
 
 def _get_admin_key() -> str | None:
-    return os.getenv("GRAPH_CORE_ADMIN_KEY")
+    return os.getenv("PLATFORM_ADMIN_KEY")
 
 
 def _get_api_key() -> str | None:
@@ -33,7 +33,7 @@ async def get_client(admin: bool = False) -> GraphCoreClient:
             api_key = _get_admin_key()
             if not api_key:
                 raise GraphCoreAPIError(
-                    "GRAPH_CORE_ADMIN_KEY env var required for admin tools"
+                    "PLATFORM_ADMIN_KEY env var required for admin tools"
                 )
             _clients[key] = GraphCoreClient(
                 base_url=_get_base_url(), api_key=api_key, is_admin=True
