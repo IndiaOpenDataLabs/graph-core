@@ -20,7 +20,15 @@ class MCPClient:
         transport = streamable_http_client(self.mcp_url)
         self._transport_ctx = transport
         streams = await transport.__aenter__()
-        read_stream, write_stream = streams
+        if len(streams) == 2:
+            read_stream, write_stream = streams
+        elif len(streams) == 3:
+            read_stream, write_stream, _ = streams
+        else:
+            raise RuntimeError(
+                f"Unexpected stream count: {len(streams)}. "
+                f"Check MCP library version compatibility."
+            )
         self._session = ClientSession(read_stream, write_stream)
         await self._session.__aenter__()
         await self._session.initialize()
