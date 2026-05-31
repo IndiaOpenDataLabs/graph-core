@@ -108,6 +108,3 @@ smoke-test-local:     ## Run smoke test against local LLM/embedding servers
 
 tui:                  ## Run the terminal UI client
 	cd clients/graph-core-cli && uv run python -m graph_core_cli
-
-server:               ## Start the FastAPI server with MCP endpoint
-	uv run uvicorn graph_core.main:app --host 0.0.0.0 --port 8000 --reload

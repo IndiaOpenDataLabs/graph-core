@@ -11,8 +11,6 @@ from textual.widgets import (
     DataTable,
     Input,
     Label,
-    RadioButton,
-    RadioSet,
     RichLog,
     Select,
     TextArea,
@@ -54,6 +52,11 @@ def extract_id(text: str) -> str:
 
 def extract_name(text: str) -> str:
     m = re.search(r"name:\s*([^\s\n]+)", text)
+    return m.group(1) if m else ""
+
+
+def extract_api_key(text: str) -> str:
+    m = re.search(r"api_key:\s*([^\s\n]+)", text)
     return m.group(1) if m else ""
 
 
@@ -130,7 +133,10 @@ class SetupScreen(Screen):
         mcp_url = os.getenv("MCP_URL", "http://localhost:8001/mcp/")
         yield Container(
             Label("Graph Core — First-Time Setup", id="setup-title"),
-            Label("Configure your connection. This is saved for future sessions.", id="setup-desc"),
+            Label(
+                "Configure your connection. This is saved for future sessions.",
+                id="setup-desc",
+            ),
             Label("", id="spacer"),
             Label("MCP URL:"),
             Input(
@@ -138,12 +144,15 @@ class SetupScreen(Screen):
                 id="setup-mcp-url",
                 value=mcp_url,
             ),
-            Label("Platform Admin Key:", classes="margin-top"),
+            Label("API Key:", classes="margin-top"),
             Input(
-                placeholder="e.g. graph-core-admin-key-dev",
+                placeholder="Admin key or namespace key",
                 id="setup-api-key",
                 password=True,
-                value=os.getenv("PLATFORM_ADMIN_KEY", ""),
+                value=(
+                    os.getenv("PLATFORM_ADMIN_KEY", "")
+                    or os.getenv("GRAPH_CORE_API_KEY", "")
+                ),
             ),
             Button("Save & Connect", id="setup-connect", variant="primary"),
             Label("", id="setup-error"),
@@ -164,17 +173,22 @@ class SetupScreen(Screen):
 
         if not api_key:
             err = self.query_one("#setup-error", Label)
-            err.update("Admin key is required.")
+            err.update("API key is required.")
             err.add_class("visible")
             return
 
         if not mcp_url:
             mcp_url = "http://localhost:8001/mcp/"
 
+        is_namespace_key = api_key.startswith("ns_key_")
+
         self.app.config = {
             "mcp_url": mcp_url,
             "api_key": api_key,
-            "is_admin": True,
+            "admin_api_key": "" if is_namespace_key else api_key,
+            "namespace_api_key": api_key if is_namespace_key else "",
+            "active_api_key_kind": "namespace" if is_namespace_key else "admin",
+            "is_admin": not is_namespace_key,
             "namespace_id": "",
             "namespace_name": "",
         }
@@ -281,7 +295,11 @@ class HomeScreen(Screen):
         parts = [
             "Status: Connected",
             f"MCP: {cfg.get('mcp_url', 'http://localhost:8001/mcp/')}",
-            f"Mode: {'Admin' if cfg.get('is_admin') else 'Namespace'}",
+            (
+                "Mode: Namespace"
+                if cfg.get("active_api_key_kind") == "namespace"
+                else "Mode: Admin"
+            ),
         ]
         if cfg.get("namespace_name"):
             parts.append(f"Namespace: {cfg['namespace_name']} ({cfg['namespace_id']})")
@@ -376,12 +394,12 @@ class NamespacesScreen(Screen):
         self.run_worker(self._load_namespaces(), exclusive=True, group="load")
 
     async def _load_namespaces(self) -> None:
-        if not self.app.config.get("is_admin"):
+        if not self.app.admin_api_key:
             self.notify("Admin key required to list namespaces", severity="warning")
             return
 
         try:
-            client = self.app.mcp_client
+            client = self.app.mcp_client_for_key(self.app.admin_api_key)
             await client.connect()
             try:
                 text = await client.call("list_namespaces")
@@ -400,13 +418,13 @@ class NamespacesScreen(Screen):
             error_msg = str(e)
             if "405" in error_msg or "Method Not Allowed" in error_msg:
                 self.notify(
-                    "MCP server not available. Run 'make server' first.",
+                    "MCP server not available. Run 'make docker-up' first.",
                     severity="error",
                     timeout=10,
                 )
             elif "Connection refused" in error_msg or "connect" in error_msg.lower():
                 self.notify(
-                    "Cannot connect to server. Run 'make server' first.",
+                    "Cannot connect to server. Run 'make docker-up' first.",
                     severity="error",
                     timeout=10,
                 )
@@ -428,32 +446,45 @@ class NamespacesScreen(Screen):
 
         self.notify(f"Creating namespace '{name}'...", severity="information")
         try:
-            client = self.app.mcp_client
+            client = self.app.mcp_client_for_key(self.app.admin_api_key)
             await client.connect()
             try:
                 text = await client.call("create_namespace", {"name": name})
                 ns_id = extract_id(text)
                 ns_name = extract_name(text)
+                ns_api_key = extract_api_key(text)
             finally:
                 await client.disconnect()
 
             self.notify(f"Created namespace: {ns_name or name}", severity="information")
             self.query_one("#ns-name-input", Input).value = ""
-            self.app.config["namespace_id"] = ns_id
-            self.app.config["namespace_name"] = ns_name or name
+            active_key_kind = (
+                "namespace"
+                if ns_api_key
+                else self.app.config.get("active_api_key_kind", "admin")
+            )
+            is_admin = False if ns_api_key else self.app.config.get("is_admin", False)
+            self.app.config = {
+                **self.app.config,
+                "namespace_id": ns_id,
+                "namespace_name": ns_name or name,
+                "namespace_api_key": ns_api_key or self.app.namespace_api_key,
+                "active_api_key_kind": active_key_kind,
+                "is_admin": is_admin,
+            }
             self.query_one("#create-form", Container).remove_class("visible")
             self.run_worker(self._load_namespaces(), exclusive=True, group="load")
         except Exception as e:
             error_msg = str(e)
             if "405" in error_msg or "Method Not Allowed" in error_msg:
                 self.notify(
-                    "MCP server not available. Run 'make server' first.",
+                    "MCP server not available. Run 'make docker-up' first.",
                     severity="error",
                     timeout=10,
                 )
             elif "Connection refused" in error_msg or "connect" in error_msg.lower():
                 self.notify(
-                    "Cannot connect to server. Run 'make server' first.",
+                    "Cannot connect to server. Run 'make docker-up' first.",
                     severity="error",
                     timeout=10,
                 )
@@ -641,7 +672,11 @@ class QueryScreen(Screen):
         yield Label("Query Collection  |  esc=Back", id="header")
         yield Container(
             Label("Collection: "),
-            Select([("(select collection)", "")], allow_blank=True, id="collection-select"),
+            Select(
+                [("(select collection)", "")],
+                allow_blank=True,
+                id="collection-select",
+            ),
             Label("  Mode: "),
             Select(
                 [
