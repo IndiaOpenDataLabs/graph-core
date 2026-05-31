@@ -1,11 +1,12 @@
 """LLM providers for OpenAI and offline local fallback."""
 
-from collections.abc import AsyncIterator
 import json
+from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
 from graph_core.llm.interface import LLMProvider
+from graph_core.provider_semaphore import llm_call_slot
 
 
 class LocalEchoLLMProvider(LLMProvider):
@@ -38,43 +39,46 @@ class OpenAILLMProvider(LLMProvider):
         self._model = model
 
     async def chat(self, messages: list[dict]) -> str:
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-        )
+        async with llm_call_slot():
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+            )
         return response.choices[0].message.content or ""
 
     async def chat_stream(self, messages: list[dict]) -> AsyncIterator[str]:
-        stream = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            stream=True,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+        async with llm_call_slot():
+            stream = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
 
     async def structured_extract(self, prompt: str, schema: dict) -> dict:
         messages = [{"role": "user", "content": prompt}]
-        try:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema.get("title", "schema"),
-                        "schema": schema,
+        async with llm_call_slot():
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema.get("title", "schema"),
+                            "schema": schema,
+                        },
                     },
-                },
-            )
-        except Exception:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                response_format={"type": "json"},
-            )
+                )
+            except Exception:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    response_format={"type": "json"},
+                )
 
         content = response.choices[0].message.content or ""
         if not content:

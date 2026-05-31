@@ -3,6 +3,7 @@
 from openai import AsyncOpenAI
 
 from graph_core.embedding.interface import EmbeddingProvider
+from graph_core.provider_semaphore import embedding_call_slot
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
@@ -19,19 +20,21 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._dimensions = dimensions
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        response = await self._client.embeddings.create(
-            model=self._model,
-            input=texts,
-            dimensions=self._dimensions,
-        )
+        async with embedding_call_slot():
+            response = await self._client.embeddings.create(
+                model=self._model,
+                input=texts,
+                dimensions=self._dimensions,
+            )
         return [list(item.embedding) for item in response.data]
 
     async def embed_query(self, text: str) -> list[float]:
-        response = await self._client.embeddings.create(
-            model=self._model,
-            input=[text],
-            dimensions=self._dimensions,
-        )
+        async with embedding_call_slot():
+            response = await self._client.embeddings.create(
+                model=self._model,
+                input=[text],
+                dimensions=self._dimensions,
+            )
         return list(response.data[0].embedding)
 
     @property

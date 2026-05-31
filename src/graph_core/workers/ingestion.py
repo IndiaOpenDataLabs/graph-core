@@ -6,6 +6,7 @@ import uuid
 import dramatiq
 from sqlalchemy import select
 
+from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.chunk import IngestionChunk
 from graph_core.services.graph import GraphService
@@ -13,7 +14,11 @@ from graph_core.services.graph import GraphService
 logger = logging.getLogger(__name__)
 
 
-@dramatiq.actor(max_retries=3, max_age=3600000)
+@dramatiq.actor(
+    max_retries=3,
+    max_age=3600000,
+    time_limit=float("inf"),
+)
 async def run_ingestion(job_id: str):
     """Parent actor — dispatches chunk workers for graph RAG collections."""
     service = GraphService()
@@ -46,7 +51,11 @@ async def run_ingestion(job_id: str):
         raise
 
 
-@dramatiq.actor(max_retries=3, max_age=1800000)
+@dramatiq.actor(
+    max_retries=3,
+    max_age=1800000,
+    time_limit=settings.ingest_chunk_time_limit_ms,
+)
 async def run_chunk(job_id: str, chunk_index: int):
     """Child actor — processes a single chunk with full Graph RAG pipeline."""
     service = GraphService()
@@ -54,7 +63,12 @@ async def run_chunk(job_id: str, chunk_index: int):
     try:
         await service.process_single_chunk(job_id, chunk_index)
     except Exception as e:
-        logger.error("run_chunk failed: job=%s chunk=%d error=%s", job_id, chunk_index, e)
+        logger.error(
+            "run_chunk failed: job=%s chunk=%d error=%s",
+            job_id,
+            chunk_index,
+            e,
+        )
         await service.update_chunk_status(
             uuid.UUID(job_id), chunk_index, "failed", error=str(e)
         )

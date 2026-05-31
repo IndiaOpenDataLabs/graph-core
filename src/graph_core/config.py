@@ -8,6 +8,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     falkordb_url: str = "falkordb://localhost:6379"
     redis_semaphore_url: str = "redis://localhost:6380/0"
+    llm_max_concurrent_calls: int = 1
+    embedding_max_concurrent_calls: int = 10
+    provider_semaphore_lease_seconds: int = 1800
+    provider_semaphore_poll_interval_ms: int = 100
+    ingest_chunk_time_limit_ms: int = 1800000
 
     # Encryption key for credential storage (32 bytes, base64 or hex encoded)
     credential_encryption_key: str = ""
