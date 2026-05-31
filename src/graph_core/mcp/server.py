@@ -157,22 +157,36 @@ async def rotate_namespace_key(namespace_id: str, ctx: Context) -> str:
 async def create_collection(
     name: str,
     strategy: str,
+    embedding_profile_id: str,
     ctx: Context,
+    llm_profile_id: str | None = None,
+    default_query_mode: str | None = None,
 ) -> str:
     """Create a new collection in the current namespace.
 
     Args:
         name: Collection name (unique within namespace).
         strategy: Retrieval strategy: 'vector', 'light_rag', or 'custom_graph_rag'.
+        embedding_profile_id: Required embedding profile UUID.
+        llm_profile_id: Optional LLM profile UUID.
+        default_query_mode: Optional default query mode.
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.create_collection(name=name, strategy=strategy)
+    result = await client.create_collection(
+        name=name,
+        strategy=strategy,
+        embedding_profile_id=embedding_profile_id,
+        llm_profile_id=llm_profile_id,
+        default_query_mode=default_query_mode,
+    )
     return (
         f"Created collection:\n"
         f"  id: {result['id']}\n"
         f"  name: {result['name']}\n"
-        f"  strategy: {result['strategy']}"
+        f"  strategy: {result['strategy']}\n"
+        f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
+        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}"
     )
 
 
@@ -321,6 +335,131 @@ async def get_job_status(job_id: str, ctx: Context) -> str:
 
 
 # -- Platform tools ---------------------------------------------------------
+
+
+@mcp.tool()
+async def create_embedding_profile(
+    provider: str,
+    model: str,
+    secret: str,
+    ctx: Context,
+    label: str | None = None,
+    base_url: str | None = None,
+    dimensions: int | None = None,
+    distance_metric: str | None = None,
+) -> str:
+    """Create an embedding profile in the current namespace.
+
+    Args:
+        provider: Provider name, e.g. 'openai'.
+        model: Embedding model identifier.
+        secret: Provider API key or token.
+        label: Optional human-readable label.
+        base_url: Optional custom API base URL.
+        dimensions: Optional embedding dimensions.
+        distance_metric: Optional distance metric.
+    """
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    credential = await client.register_credential(
+        provider=provider,
+        secret=secret,
+        label=label,
+        base_url=base_url,
+    )
+    profile = await client.create_profile(
+        kind="embedding",
+        provider=provider,
+        model=model,
+        credential_id=credential["credential_id"],
+        label=label,
+        base_url=base_url,
+        dimensions=dimensions,
+        distance_metric=distance_metric,
+    )
+    return (
+        f"Created embedding profile:\n"
+        f"  profile_id: {profile['profile_id']}\n"
+        f"  label: {profile.get('label') or '-'}\n"
+        f"  provider: {profile['provider']}\n"
+        f"  model: {profile['model']}\n"
+        f"  dimensions: {profile.get('dimensions') or '-'}"
+    )
+
+
+@mcp.tool()
+async def create_llm_profile(
+    provider: str,
+    model: str,
+    secret: str,
+    ctx: Context,
+    label: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Create an LLM profile in the current namespace.
+
+    Args:
+        provider: Provider name, e.g. 'openai'.
+        model: LLM model identifier.
+        secret: Provider API key or token.
+        label: Optional human-readable label.
+        base_url: Optional custom API base URL.
+    """
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    credential = await client.register_credential(
+        provider=provider,
+        secret=secret,
+        label=label,
+        base_url=base_url,
+    )
+    profile = await client.create_profile(
+        kind="llm",
+        provider=provider,
+        model=model,
+        credential_id=credential["credential_id"],
+        label=label,
+        base_url=base_url,
+    )
+    return (
+        f"Created llm profile:\n"
+        f"  profile_id: {profile['profile_id']}\n"
+        f"  label: {profile.get('label') or '-'}\n"
+        f"  provider: {profile['provider']}\n"
+        f"  model: {profile['model']}"
+    )
+
+
+def _format_profile_list(title: str, profiles: list[dict]) -> str:
+    if not profiles:
+        return f"No {title.lower()} found."
+    lines = [f"{title}:"]
+    for profile in profiles:
+        label = profile.get("label") or "-"
+        model = profile.get("model") or "-"
+        provider = profile.get("provider") or "-"
+        lines.append(
+            f"  - {profile['profile_id']} | {label} | {provider} | {model}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def list_embedding_profiles(ctx: Context) -> str:
+    """List embedding profiles in the current namespace."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    profiles = await client.list_embedding_profiles()
+    return _format_profile_list("Embedding Profiles", profiles)
+
+
+@mcp.tool()
+async def list_llm_profiles(ctx: Context) -> str:
+    """List LLM profiles in the current namespace."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    profiles = await client.list_llm_profiles()
+    return _format_profile_list("LLM Profiles", profiles)
 
 
 @mcp.tool()

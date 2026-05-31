@@ -45,6 +45,24 @@ def parse_key_value(text: str) -> dict:
     return result
 
 
+def parse_profiles(text: str, kind: str) -> list[dict]:
+    items = []
+    for m in re.finditer(
+        r"^  - ([^|]+)\| ([^|]+)\| ([^|]+)\| (.+)$",
+        text,
+        re.MULTILINE,
+    ):
+        label = m.group(2).strip()
+        items.append({
+            "kind": kind,
+            "profile_id": m.group(1).strip(),
+            "label": "" if label == "-" else label,
+            "provider": m.group(3).strip(),
+            "model": m.group(4).strip(),
+        })
+    return items
+
+
 def extract_id(text: str) -> str:
     m = re.search(r"id:\s*([^\s\n]+)", text)
     return m.group(1) if m else ""
@@ -277,6 +295,10 @@ class HomeScreen(Screen):
                     "Namespaces - Manage namespaces (admin only)",
                     id="nav-namespaces",
                 ),
+                Button(
+                    "Profiles - Manage embedding and LLM profiles",
+                    id="nav-profiles",
+                ),
                 Button("Collections - Manage collections", id="nav-collections"),
                 Button("Query - Query a collection", id="nav-query"),
                 Button("Ingest - Add data to a collection", id="nav-ingest"),
@@ -319,6 +341,7 @@ class HomeScreen(Screen):
 
         screen_map = {
             "nav-namespaces": NamespacesScreen,
+            "nav-profiles": ProfilesScreen,
             "nav-collections": CollectionsScreen,
             "nav-query": QueryScreen,
             "nav-ingest": IngestScreen,
@@ -499,6 +522,216 @@ class NamespacesScreen(Screen):
                 )
 
 
+class ProfilesScreen(Screen):
+    """Manage embedding and LLM profiles."""
+
+    CSS = """
+    ProfilesScreen {
+        layout: grid;
+        grid-size: 1;
+        grid-rows: auto 1fr auto;
+    }
+
+    #header {
+        padding: 1;
+        background: $boost;
+        color: $accent;
+    }
+
+    #profiles-table {
+        height: 1fr;
+    }
+
+    #create-form {
+        display: none;
+        padding: 1;
+        background: $surface;
+        border: round $accent;
+        height: auto;
+    }
+
+    #create-form.visible {
+        display: block;
+    }
+
+    #create-form Input {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    #create-form Select {
+        width: 100%;
+        margin-bottom: 1;
+    }
+    """
+
+    PROFILE_KINDS = [
+        ("Embedding", "embedding"),
+        ("LLM", "llm"),
+    ]
+    DISTANCE_METRICS = [
+        ("Cosine", "cosine"),
+        ("L2", "l2"),
+        ("Inner Product", "ip"),
+    ]
+
+    BINDINGS = [
+        ("a", "create_profile", "Create"),
+        ("r", "refresh", "Refresh"),
+        ("escape", "app.pop_screen", "Back"),
+    ]
+
+    def compose(self) -> None:
+        yield Label("Profiles  |  a=Create  r=Refresh  esc=Back", id="header")
+        yield DataTable(id="profiles-table")
+        yield Container(
+            Select(self.PROFILE_KINDS, value="embedding", id="profile-kind"),
+            Input(placeholder="Label", id="profile-label-input"),
+            Input(placeholder="Provider (e.g. openai)", id="profile-provider-input"),
+            Input(placeholder="Model", id="profile-model-input"),
+            Input(
+                placeholder="Secret / API key",
+                id="profile-secret-input",
+                password=True,
+            ),
+            Input(placeholder="Base URL (optional)", id="profile-base-url-input"),
+            Input(
+                placeholder="Dimensions (embedding only)",
+                id="profile-dimensions-input",
+            ),
+            Select(
+                self.DISTANCE_METRICS,
+                value="cosine",
+                id="profile-distance-metric",
+            ),
+            Button("Create", id="profile-create-btn", variant="primary"),
+            Button("Cancel", id="profile-cancel-btn"),
+            id="create-form",
+        )
+
+    async def on_mount(self) -> None:
+        self.run_worker(self._load_profiles(), exclusive=True, group="load")
+
+    async def action_create_profile(self) -> None:
+        form = self.query_one("#create-form", Container)
+        form.add_class("visible")
+        self.query_one("#profile-provider-input", Input).focus()
+
+    async def action_refresh(self) -> None:
+        self.run_worker(self._load_profiles(), exclusive=True, group="load")
+
+    async def _load_profiles(self) -> None:
+        try:
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                embedding_text = await client.call("list_embedding_profiles")
+                llm_text = await client.call("list_llm_profiles")
+            finally:
+                await client.disconnect()
+
+            profiles = parse_profiles(embedding_text, "embedding") + parse_profiles(
+                llm_text, "llm"
+            )
+            table = self.query_one("#profiles-table", DataTable)
+            table.clear()
+            table.add_columns("Kind", "ID", "Label", "Provider", "Model")
+            for profile in profiles:
+                label = profile["label"] or "-"
+                table.add_row(
+                    profile["kind"],
+                    profile["profile_id"][:8],
+                    label,
+                    profile["provider"],
+                    profile["model"],
+                )
+            if not profiles:
+                self.notify("No profiles found", severity="information")
+        except Exception as e:
+            self.notify(f"Failed to load profiles: {e}", severity="error")
+
+    @on(Button.Pressed)
+    def handle_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "profile-create-btn":
+            self.run_worker(self._create_profile(), exclusive=True, group="action")
+        elif event.button.id == "profile-cancel-btn":
+            self.query_one("#create-form", Container).remove_class("visible")
+
+    async def _create_profile(self) -> None:
+        kind = self.query_one("#profile-kind", Select).value or "embedding"
+        label = self.query_one("#profile-label-input", Input).value.strip()
+        provider = self.query_one("#profile-provider-input", Input).value.strip()
+        model = self.query_one("#profile-model-input", Input).value.strip()
+        secret = self.query_one("#profile-secret-input", Input).value.strip()
+        base_url = self.query_one("#profile-base-url-input", Input).value.strip()
+        dimensions_text = self.query_one(
+            "#profile-dimensions-input",
+            Input,
+        ).value.strip()
+        distance_metric = self.query_one("#profile-distance-metric", Select).value
+
+        if not provider or not model:
+            self.notify("Provider and model are required", severity="error")
+            return
+
+        dimensions = None
+        if kind == "embedding" and dimensions_text:
+            try:
+                dimensions = int(dimensions_text)
+            except ValueError:
+                self.notify("Dimensions must be an integer", severity="error")
+                return
+
+        try:
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                if kind == "embedding":
+                    args = {
+                        "provider": provider,
+                        "model": model,
+                        "secret": secret,
+                    }
+                    if label:
+                        args["label"] = label
+                    if base_url:
+                        args["base_url"] = base_url
+                    if dimensions is not None:
+                        args["dimensions"] = dimensions
+                    if distance_metric:
+                        args["distance_metric"] = distance_metric
+                    result = await client.call("create_embedding_profile", args)
+                else:
+                    args = {
+                        "provider": provider,
+                        "model": model,
+                        "secret": secret,
+                    }
+                    if label:
+                        args["label"] = label
+                    if base_url:
+                        args["base_url"] = base_url
+                    result = await client.call("create_llm_profile", args)
+            finally:
+                await client.disconnect()
+
+            created_name = extract_name(result) or label or model
+            self.notify(f"Created profile: {created_name}", severity="information")
+            for widget_id in (
+                "#profile-label-input",
+                "#profile-provider-input",
+                "#profile-model-input",
+                "#profile-secret-input",
+                "#profile-base-url-input",
+                "#profile-dimensions-input",
+            ):
+                self.query_one(widget_id, Input).value = ""
+            self.query_one("#create-form", Container).remove_class("visible")
+            self.run_worker(self._load_profiles(), exclusive=True, group="load")
+        except Exception as e:
+            self.notify(f"Failed to create profile: {e}", severity="error")
+
+
 class CollectionsScreen(Screen):
     """Manage collections in current namespace."""
 
@@ -531,11 +764,11 @@ class CollectionsScreen(Screen):
     }
 
     Input {
-        width: 60%;
+        width: 100%;
     }
 
     Select {
-        width: 20%;
+        width: 100%;
     }
     """
 
@@ -550,19 +783,44 @@ class CollectionsScreen(Screen):
         ("Light RAG", "light_rag"),
         ("Graph RAG", "custom_graph_rag"),
     ]
+    QUERY_MODES = [
+        ("Use default", ""),
+        ("local", "local"),
+        ("global", "global"),
+        ("hybrid", "hybrid"),
+        ("naive", "naive"),
+        ("mix", "mix"),
+    ]
 
     def compose(self) -> None:
         yield Label("Collections  |  a=Create  r=Refresh  esc=Back", id="header")
         yield DataTable(id="collection-table")
         yield Container(
+            Label("Collection Name:"),
             Input(placeholder="Collection name", id="col-name-input"),
+            Label("Strategy:"),
             Select(self.STRATEGIES, value="vector", id="col-strategy"),
+            Label("Embedding Profile:"),
+            Select(
+                [("(select embedding profile)", "")],
+                allow_blank=True,
+                id="col-embedding-profile",
+            ),
+            Label("LLM Profile (optional):"),
+            Select(
+                [("(no llm profile)", "")],
+                allow_blank=True,
+                id="col-llm-profile",
+            ),
+            Label("Default Query Mode (optional):"),
+            Select(self.QUERY_MODES, value="", id="col-query-mode"),
             Button("Create", id="col-create-btn", variant="primary"),
             Button("Cancel", id="col-cancel-btn"),
             id="create-form",
         )
 
     async def on_mount(self) -> None:
+        self.run_worker(self._load_profile_options(), exclusive=True, group="profiles")
         self.run_worker(self._load_collections(), exclusive=True, group="load")
 
     async def action_create_collection(self) -> None:
@@ -571,7 +829,48 @@ class CollectionsScreen(Screen):
         self.query_one("#col-name-input", Input).focus()
 
     async def action_refresh(self) -> None:
+        self.run_worker(self._load_profile_options(), exclusive=True, group="profiles")
         self.run_worker(self._load_collections(), exclusive=True, group="load")
+
+    async def _load_profile_options(self) -> None:
+        try:
+            client = self.app.mcp_client
+            await client.connect()
+            try:
+                embedding_text = await client.call("list_embedding_profiles")
+                llm_text = await client.call("list_llm_profiles")
+            finally:
+                await client.disconnect()
+
+            embedding_profiles = parse_profiles(embedding_text, "embedding")
+            llm_profiles = parse_profiles(llm_text, "llm")
+            embedding_select = self.query_one("#col-embedding-profile", Select)
+            llm_select = self.query_one("#col-llm-profile", Select)
+            embedding_select.set_options([
+                (
+                    profile["label"] or profile["model"],
+                    profile["profile_id"],
+                )
+                for profile in embedding_profiles
+            ])
+            llm_select.set_options([
+                (
+                    profile["label"] or profile["model"],
+                    profile["profile_id"],
+                )
+                for profile in llm_profiles
+            ])
+            if embedding_profiles:
+                embedding_select.value = embedding_profiles[0]["profile_id"]
+            else:
+                self.notify(
+                    "Create an embedding profile before creating a collection.",
+                    severity="warning",
+                )
+            if llm_profiles:
+                llm_select.clear()
+        except Exception as e:
+            self.notify(f"Failed to load profiles: {e}", severity="error")
 
     async def _load_collections(self) -> None:
         try:
@@ -603,8 +902,14 @@ class CollectionsScreen(Screen):
         name = self.query_one("#col-name-input", Input).value.strip()
         strategy_select = self.query_one("#col-strategy", Select)
         strategy = strategy_select.value or "vector"
+        embedding_profile_id = self.query_one("#col-embedding-profile", Select).value
+        llm_profile_id = self.query_one("#col-llm-profile", Select).value
+        default_query_mode = self.query_one("#col-query-mode", Select).value
         if not name:
             self.notify("Name is required", severity="error")
+            return
+        if not embedding_profile_id:
+            self.notify("Embedding profile is required", severity="error")
             return
 
         self.notify(f"Creating collection '{name}'...", severity="information")
@@ -612,7 +917,15 @@ class CollectionsScreen(Screen):
             client = self.app.mcp_client
             await client.connect()
             try:
-                args = {"name": name, "strategy": strategy}
+                args = {
+                    "name": name,
+                    "strategy": strategy,
+                    "embedding_profile_id": embedding_profile_id,
+                }
+                if llm_profile_id:
+                    args["llm_profile_id"] = llm_profile_id
+                if default_query_mode:
+                    args["default_query_mode"] = default_query_mode
                 text = await client.call("create_collection", args)
                 col_name = extract_name(text)
             finally:

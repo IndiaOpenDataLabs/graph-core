@@ -16,6 +16,12 @@ from graph_core.models.collection import Collection
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
+from graph_core.services.graph.ingestion import (
+    deterministic_uuid,
+    fan_out_chunks,
+    get_graph_storage,
+    increment_chunk_counter,
+)
 from graph_core.services.graph.ingestion.chunk_processor import (
     ChunkIngestionResult,
     ingest_collection_chunk,
@@ -28,6 +34,11 @@ from graph_core.services.graph.ingestion.document_pipeline import (
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     update_chunk_status as _update_chunk_status,
+)
+from graph_core.services.graph.query import (
+    extract_keywords,
+    fallback_keywords,
+    generate_vector_answer,
 )
 from graph_core.services.graph.query.graph_rag import graph_rag_query
 from graph_core.services.graph.query.lightrag import lightrag_query
@@ -68,16 +79,18 @@ class GraphService:
             if not ns:
                 raise ValueError(f"Namespace {namespace_id} not found")
 
+            if embedding_profile_id is None:
+                raise ValueError("Embedding profile is required to create a collection")
+
             dimensions = None
-            if embedding_profile_id is not None:
-                profile = await session.get(Profile, embedding_profile_id)
-                if not profile:
-                    raise ValueError(f"Embedding profile {embedding_profile_id} not found")
-                if profile.namespace_id != namespace_id:
-                    raise ValueError("Embedding profile does not belong to namespace")
-                if profile.kind != "embedding":
-                    raise ValueError("Profile kind must be embedding")
-                dimensions = profile.dimensions
+            profile = await session.get(Profile, embedding_profile_id)
+            if not profile:
+                raise ValueError(f"Embedding profile {embedding_profile_id} not found")
+            if profile.namespace_id != namespace_id:
+                raise ValueError("Embedding profile does not belong to namespace")
+            if profile.kind != "embedding":
+                raise ValueError("Profile kind must be embedding")
+            dimensions = profile.dimensions
 
             if llm_profile_id is not None:
                 llm_profile = await session.get(Profile, llm_profile_id)
@@ -227,7 +240,9 @@ class GraphService:
                 "error": job.error,
                 "created_at": job.created_at.isoformat() if job.created_at else None,
                 "started_at": job.started_at.isoformat() if job.started_at else None,
-                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "completed_at": (
+                    job.completed_at.isoformat() if job.completed_at else None
+                ),
             }
 
     async def update_job_status(
@@ -265,31 +280,9 @@ class GraphService:
     def _enforce_namespace(self, collection: Collection, namespace_id: uuid.UUID):
         if collection.namespace_id != namespace_id:
             raise PermissionError(
-                f"Collection {collection.id} does not belong to namespace {namespace_id}"
+                f"Collection {collection.id} does not belong to namespace "
+                f"{namespace_id}"
             )
-
-
-# Re-export submodule convenience functions
-from graph_core.services.graph.ingestion import (  # noqa: E402
-    deterministic_uuid,
-    fan_out_chunks,
-    get_graph_storage,
-    increment_chunk_counter,
-)
-from graph_core.services.graph.query import (
-    extract_keywords,
-    fallback_keywords,
-    generate_vector_answer,
-)
-from graph_core.services.graph.query import (  # noqa: E402
-    graph_rag_query as graph_rag_query,
-)
-from graph_core.services.graph.query import (
-    lightrag_query as lightrag_query,
-)
-from graph_core.services.graph.query import (
-    vector_query as vector_query,
-)
 
 __all__ = [
     "GraphService",

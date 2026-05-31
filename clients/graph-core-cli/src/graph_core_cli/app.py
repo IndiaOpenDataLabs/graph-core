@@ -15,6 +15,7 @@ class GraphCoreTUI(App):
         Binding("h", "show_home", "Home", priority=True),
         Binding("c", "show_config", "Config", priority=True),
         Binding("n", "show_namespaces", "Namespaces", priority=True),
+        Binding("p", "show_profiles", "Profiles", priority=True),
         Binding("l", "show_collections", "Collections", priority=True),
         Binding("shift+q", "show_query", "Query", priority=True),
         Binding("i", "show_ingest", "Ingest", priority=True),
@@ -65,6 +66,10 @@ class GraphCoreTUI(App):
     async def action_show_collections(self) -> None:
         from graph_core_cli.screens import CollectionsScreen
         self.push_screen(CollectionsScreen())
+
+    async def action_show_profiles(self) -> None:
+        from graph_core_cli.screens import ProfilesScreen
+        self.push_screen(ProfilesScreen())
 
     async def action_show_query(self) -> None:
         from graph_core_cli.screens import QueryScreen
