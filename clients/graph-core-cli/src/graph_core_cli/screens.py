@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 from textual import events, on
 from textual.containers import Container
 from textual.css.query import NoMatches
@@ -1318,7 +1319,7 @@ class ConsoleScreen(Screen):
             call_args["mode"] = str(flags["mode"])
         self._start_query_progress(collection["name"])
         try:
-            result = await self._call("query_collection", call_args)
+            result = await self._query_via_rest(call_args)
         finally:
             self._stop_query_progress()
         self._write(result)
@@ -1363,6 +1364,57 @@ class ConsoleScreen(Screen):
         finally:
             await client.disconnect()
         return result
+
+    async def _query_via_rest(self, arguments: dict[str, str]) -> str:
+        api_key = self.app.active_api_key
+        if not api_key:
+            raise ValueError("No API key available for this command.")
+
+        base_url = self.app.config.get("mcp_url", "http://localhost:8001/mcp/")
+        if base_url.endswith("/mcp/"):
+            base_url = base_url[:-5]
+        elif base_url.endswith("/mcp"):
+            base_url = base_url[:-4]
+        base_url = base_url.rstrip("/")
+
+        collection_id = arguments["collection_id"]
+        body: dict[str, str] = {"question": arguments["question"]}
+        if "mode" in arguments:
+            body["mode"] = arguments["mode"]
+
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {api_key}"},
+            follow_redirects=True,
+            timeout=180.0,
+        ) as client:
+            response = await client.post(
+                f"{base_url}/collections/{collection_id}/query",
+                json=body,
+            )
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
+            raise ValueError(
+                f"Query failed: POST {response.request.url} -> "
+                f"{response.status_code}: {detail}"
+            ) from None
+
+        result = response.json()
+        lines = [result.get("response", "")]
+        if result.get("entities_used"):
+            lines.append(f"\nEntities used: {', '.join(result['entities_used'])}")
+        if result.get("relationships_used"):
+            lines.append(
+                f"Relationships: {', '.join(result['relationships_used'])}"
+            )
+        if result.get("mode"):
+            lines.append(f"Mode: {result['mode']}")
+        return "\n".join(lines)
 
     async def _list_profiles(self, kind: str) -> list[dict]:
         if kind == "embedding":
