@@ -2,7 +2,7 @@
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Footer, Header
+from textual.widgets import Footer
 
 from graph_core_cli.config import load_config, save_config
 from graph_core_cli.mcp_client import AuthenticatedMCPClient
@@ -12,14 +12,6 @@ class GraphCoreTUI(App):
     """Terminal UI for the Graph Core platform."""
 
     BINDINGS = [
-        Binding("h", "show_home", "Home", priority=True),
-        Binding("c", "show_config", "Config", priority=True),
-        Binding("n", "show_namespaces", "Namespaces", priority=True),
-        Binding("p", "show_profiles", "Profiles", priority=True),
-        Binding("l", "show_collections", "Collections", priority=True),
-        Binding("shift+q", "show_query", "Query", priority=True),
-        Binding("i", "show_ingest", "Ingest", priority=True),
-        Binding("j", "show_jobs", "Jobs", priority=True),
         Binding("q", "quit", "Quit", priority=True),
     ]
 
@@ -28,7 +20,7 @@ class GraphCoreTUI(App):
     """
 
     def on_mount(self) -> None:
-        from graph_core_cli.screens import HomeScreen, SetupScreen
+        from graph_core_cli.screens import ConsoleScreen, SetupScreen
 
         persisted = load_config()
         self._config = {
@@ -43,45 +35,12 @@ class GraphCoreTUI(App):
         }
 
         if self.active_api_key:
-            self.push_screen(HomeScreen())
+            self.push_screen(ConsoleScreen())
         else:
             self.push_screen(SetupScreen())
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Footer()
-
-    async def action_show_home(self) -> None:
-        from graph_core_cli.screens import HomeScreen
-        self.push_screen(HomeScreen())
-
-    async def action_show_config(self) -> None:
-        from graph_core_cli.screens import HomeScreen
-        self.push_screen(HomeScreen())
-
-    async def action_show_namespaces(self) -> None:
-        from graph_core_cli.screens import NamespacesScreen
-        self.push_screen(NamespacesScreen())
-
-    async def action_show_collections(self) -> None:
-        from graph_core_cli.screens import CollectionsScreen
-        self.push_screen(CollectionsScreen())
-
-    async def action_show_profiles(self) -> None:
-        from graph_core_cli.screens import ProfilesScreen
-        self.push_screen(ProfilesScreen())
-
-    async def action_show_query(self) -> None:
-        from graph_core_cli.screens import QueryScreen
-        self.push_screen(QueryScreen())
-
-    async def action_show_ingest(self) -> None:
-        from graph_core_cli.screens import IngestScreen
-        self.push_screen(IngestScreen())
-
-    async def action_show_jobs(self) -> None:
-        from graph_core_cli.screens import JobsScreen
-        self.push_screen(JobsScreen())
 
     @property
     def config(self) -> dict:
