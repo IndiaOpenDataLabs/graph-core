@@ -89,17 +89,20 @@ The platform supports three ways to connect:
 Interactive terminal application for managing namespaces, collections, queries, ingestion, and jobs. Lives in `clients/graph-core-cli/`.
 
 ```bash
+make docker-up
+
 cd clients/graph-core-cli
 uv sync
 uv run python -m graph_core_cli
 ```
 
-On first launch, the TUI prompts for your MCP URL and admin key. Configuration is persisted to `~/.config/graph-core/config.json`. Once connected, use key bindings to navigate:
+The TUI talks to the MCP server exposed by the Docker stack at `http://localhost:8001/mcp/`. On first launch, it prompts for your MCP URL and API key. Configuration is persisted to `~/.config/graph-core/config.json`. Once connected, use key bindings to navigate:
 
 | Key     | Screen        | Description                          |
 |---------|---------------|--------------------------------------|
 | `h`     | Home          | Dashboard overview                   |
 | `n`     | Namespaces    | List/create namespaces (admin key)   |
+| `p`     | Profiles      | Create/list embedding and LLM profiles |
 | `l`     | Collections   | List/create collections              |
 | `Shift+Q` | Query       | Query a collection with NL           |
 | `i`     | Ingest        | Ingest text or files into a collection |
@@ -113,15 +116,10 @@ Exposes all platform operations as MCP tools, compatible with Claude Desktop,
 Claude Code, and any MCP client.
 
 ```bash
-# Install MCP dependencies
-uv sync --extra mcp
-
-# Run on stdio transport (for MCP clients)
-python -m graph_core.mcp
-
-# Run on HTTP transport
-python -m graph_core.mcp streamable-http
+make docker-up
 ```
+
+The MCP server is part of the full Docker stack and is exposed over streamable HTTP at `http://localhost:8001/mcp/`. You do not need to run a separate `make server` target.
 
 Configure via environment variables:
 
@@ -139,6 +137,10 @@ Configure via environment variables:
 | `list_namespaces`      | List all namespaces (admin)        |
 | `get_current_namespace`| Get current namespace info         |
 | `rotate_namespace_key` | Rotate a namespace API key (admin) |
+| `create_embedding_profile` | Create an embedding profile     |
+| `create_llm_profile`   | Create an LLM profile              |
+| `list_embedding_profiles` | List embedding profiles         |
+| `list_llm_profiles`    | List LLM profiles                  |
 | `create_collection`    | Create a collection                |
 | `list_collections`     | List collections in namespace      |
 | `ingest_chunk`         | Ingest a text chunk (sync)         |

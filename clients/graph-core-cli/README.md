@@ -5,23 +5,27 @@ A terminal UI for managing the Graph Core platform, built with [Textual](https:/
 ## Quick Start
 
 ```bash
+make docker-up
+
+cd clients/graph-core-cli
+
 # Install CLI extras
 uv sync
 
 # Launch
-make tui
-# or
-python -m graph_core_cli
+uv run python -m graph_core_cli
 # or
 graph-core-tui
 ```
+
+The CLI expects the full stack to be running and connects to the MCP endpoint exposed by Docker at `http://localhost:8001/mcp/`.
 
 ## First-Time Setup
 
 On first launch, the TUI shows a setup screen asking for:
 
 - **MCP URL** — defaults to `http://localhost:8001/mcp/`
-- **Platform Admin Key** — the `PLATFORM_ADMIN_KEY` from your environment
+- **API Key** — use the platform admin key for namespace management, or a namespace key for namespace-scoped operations
 
 Your configuration is persisted to `~/.config/graph-core/config.json`. Subsequent launches skip setup and go straight to the home dashboard. Reconfigure anytime from the home screen's "Reconfigure" button.
 
@@ -34,7 +38,10 @@ Dashboard showing connection status, active namespace, and navigation to all oth
 List and create namespaces. Press `a` to create, `r` to refresh.
 
 ### Collections
-List and create collections within the current namespace. Choose strategy: `vector`, `light_rag`, or `custom_graph_rag`. Press `a` to create, `r` to refresh.
+List and create collections within the current namespace. Choose strategy: `vector`, `light_rag`, or `custom_graph_rag`, and attach the required embedding profile plus an optional LLM profile. Press `a` to create, `r` to refresh.
+
+### Profiles
+Create and list embedding and LLM profiles before creating collections. Press `a` to create a new profile, `r` to refresh.
 
 ### Query
 Select a collection, pick a query mode (`local`, `global`, `hybrid`, `naive`, `mix`), and type your question. Results appear in a scrollable log.
@@ -54,6 +61,7 @@ Check the status of ingestion jobs by entering their UUID.
 | `h` | Home |
 | `c` | Config (Home) |
 | `n` | Namespaces |
+| `p` | Profiles |
 | `l` | Collections |
 | `Shift+Q` | Query |
 | `i` | Ingest |
