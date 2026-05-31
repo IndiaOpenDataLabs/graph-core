@@ -9,7 +9,7 @@ from pathlib import Path
 from textual import events, on
 from textual.containers import Container
 from textual.screen import Screen
-from textual.widgets import Button, Input, Label, RichLog, Select, Static
+from textual.widgets import Button, Input, Label, Select, Static, TextArea
 
 
 def parse_namespaces(text: str) -> list[dict]:
@@ -640,6 +640,7 @@ class ConsoleScreen(Screen):
         border: round $accent;
         margin: 0 1;
         padding: 0 1;
+        scrollbar-size-vertical: 1;
     }
 
     #command-panel {
@@ -765,11 +766,23 @@ class ConsoleScreen(Screen):
         self._suggestion_index = 0
         self._file_cache: list[str] = []
         self._last_job_id = ""
+        self._output_buffer = ""
 
     def compose(self):
-        yield Label("Graph Core CLI  |  Slash commands only  |  q=Quit", id="title")
+        yield Label(
+            "Graph Core CLI  |  Slash commands only  |  q=Quit  |  Ctrl+Shift+C=Copy",
+            id="title",
+        )
         yield Label("", id="context")
-        yield RichLog(id="output", wrap=True, highlight=True, markup=False)
+        yield TextArea(
+            "",
+            id="output",
+            read_only=True,
+            show_line_numbers=False,
+            show_cursor=False,
+            soft_wrap=True,
+            highlight_cursor_line=False,
+        )
         yield Container(
             Label("Command", id="command-label"),
             Input(placeholder="/help", id="command"),
@@ -779,8 +792,7 @@ class ConsoleScreen(Screen):
 
     def on_mount(self) -> None:
         self._refresh_context()
-        output = self.query_one("#output", RichLog)
-        output.write("Use /help to see available commands.\n")
+        self._write("Use /help to see available commands.")
         self.call_after_refresh(self._focus_command)
         self._file_cache = self._collect_files()
 
@@ -788,6 +800,11 @@ class ConsoleScreen(Screen):
         self.call_after_refresh(self._focus_command)
 
     def on_key(self, event: events.Key) -> None:
+        if event.key == "ctrl+shift+c":
+            self._copy_output_selection()
+            event.prevent_default()
+            event.stop()
+            return
         command_input = self.query_one("#command", Input)
         if event.is_printable and self.focused is not command_input:
             command_input.focus()
@@ -801,21 +818,19 @@ class ConsoleScreen(Screen):
             event.prevent_default()
             event.stop()
         elif event.key == "up":
-            if self._suggestions:
-                self._move_suggestion(-1)
-                event.prevent_default()
-                event.stop()
-                return
             self._history_move(-1)
             event.prevent_default()
             event.stop()
         elif event.key == "down":
-            if self._suggestions:
-                self._move_suggestion(1)
-                event.prevent_default()
-                event.stop()
-                return
             self._history_move(1)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "ctrl+p":
+            self._move_suggestion(-1)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "ctrl+n":
+            self._move_suggestion(1)
             event.prevent_default()
             event.stop()
 
@@ -851,7 +866,7 @@ class ConsoleScreen(Screen):
                 self.app.exit()
                 return
             if command == "/clear":
-                self.query_one("#output", RichLog).clear()
+                self._clear_output()
                 return
             if command == "/status":
                 await self._command_status()
@@ -1410,9 +1425,13 @@ class ConsoleScreen(Screen):
         input_widget = self.query_one("#command", Input)
         if self._history_index == len(self._history):
             input_widget.value = ""
+            input_widget.cursor_position = 0
+            self._focus_command()
+            self._update_suggestions(input_widget.value)
             return
         input_widget.value = self._history[self._history_index]
         input_widget.cursor_position = len(input_widget.value)
+        self._focus_command()
         self._update_suggestions(input_widget.value)
 
     def _refresh_context(self) -> None:
@@ -1431,10 +1450,34 @@ class ConsoleScreen(Screen):
         )
 
     def _write(self, text: str) -> None:
-        self.query_one("#output", RichLog).write(text + "\n")
+        self._append_output(text)
 
     def _write_error(self, text: str) -> None:
-        self.query_one("#output", RichLog).write(f"Error: {text}\n")
+        self._append_output(f"Error: {text}")
+
+    def _append_output(self, text: str) -> None:
+        if self._output_buffer:
+            self._output_buffer = f"{self._output_buffer}\n{text}"
+        else:
+            self._output_buffer = text
+        output = self.query_one("#output", TextArea)
+        output.load_text(self._output_buffer)
+        lines = self._output_buffer.split("\n")
+        output.move_cursor((len(lines) - 1, len(lines[-1])), center=False)
+
+    def _clear_output(self) -> None:
+        self._output_buffer = ""
+        output = self.query_one("#output", TextArea)
+        output.load_text("")
+
+    def _copy_output_selection(self) -> None:
+        output = self.query_one("#output", TextArea)
+        text = output.selected_text or self._output_buffer
+        if not text:
+            self.notify("Nothing to copy.", severity="warning")
+            return
+        self.app.copy_to_clipboard(text)
+        self.notify("Copied output to clipboard.")
 
     def _resolve_job_id(self, token: str) -> str:
         if token == "last":
