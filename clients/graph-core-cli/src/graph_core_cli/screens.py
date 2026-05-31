@@ -285,19 +285,9 @@ class ConsoleScreen(Screen):
         output = self.query_one("#output", RichLog)
         output.write("Use /help to see available commands.\n")
         self.call_after_refresh(self._focus_command)
-        self.run_worker(
-            self._hydrate_namespace_context(),
-            exclusive=True,
-            group="context",
-        )
 
     def on_screen_resume(self) -> None:
         self.call_after_refresh(self._focus_command)
-        self.run_worker(
-            self._hydrate_namespace_context(),
-            exclusive=True,
-            group="context",
-        )
 
     def on_key(self, event: events.Key) -> None:
         command_input = self.query_one("#command", Input)
