@@ -8,7 +8,7 @@ from pathlib import Path
 from textual import events, on
 from textual.containers import Container
 from textual.screen import Screen
-from textual.widgets import Input, Label, RichLog, Static
+from textual.widgets import Button, Input, Label, RichLog, Select, Static
 
 
 def parse_namespaces(text: str) -> list[dict]:
@@ -186,6 +186,415 @@ class SetupScreen(Screen):
         self.app.push_screen(ConsoleScreen())
 
 
+class ConfirmScreen(Screen):
+    """Simple yes/no confirmation modal."""
+
+    CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+
+    #confirm-card {
+        width: 72;
+        height: auto;
+        border: round $accent;
+        padding: 1 2;
+    }
+
+    #confirm-title {
+        color: $accent;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #confirm-message {
+        margin-bottom: 1;
+    }
+
+    #confirm-actions {
+        height: auto;
+    }
+
+    #confirm-actions Button {
+        margin-right: 1;
+    }
+    """
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__()
+        self._title = title
+        self._message = message
+
+    def compose(self):
+        yield Container(
+            Label(self._title, id="confirm-title"),
+            Label(self._message, id="confirm-message"),
+            Container(
+                Button("Confirm", id="confirm-ok", variant="error"),
+                Button("Cancel", id="confirm-cancel"),
+                id="confirm-actions",
+            ),
+            id="confirm-card",
+        )
+
+    @on(Button.Pressed)
+    def handle_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-ok":
+            self.dismiss(True)
+            return
+        self.dismiss(False)
+
+
+class ProfileCreateScreen(Screen):
+    """Guided profile creation form."""
+
+    CSS = """
+    ProfileCreateScreen {
+        align: center middle;
+    }
+
+    #profile-card {
+        width: 84;
+        height: auto;
+        border: round $accent;
+        padding: 1 2;
+    }
+
+    #profile-title {
+        color: $accent;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #profile-card Label {
+        margin-top: 1;
+    }
+
+    #profile-card Input, #profile-card Select {
+        width: 100%;
+    }
+
+    #profile-actions {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #profile-actions Button {
+        margin-right: 1;
+    }
+    """
+
+    PROFILE_KINDS = [
+        ("Embedding", "embedding"),
+        ("LLM", "llm"),
+    ]
+    DISTANCE_METRICS = [
+        ("Cosine", "cosine"),
+        ("L2", "l2"),
+        ("Inner Product", "ip"),
+    ]
+
+    def compose(self):
+        yield Container(
+            Label("Create Profile", id="profile-title"),
+            Label("Kind"),
+            Select(self.PROFILE_KINDS, value="embedding", id="profile-kind"),
+            Label("Provider"),
+            Input(placeholder="openai", id="profile-provider"),
+            Label("Model"),
+            Input(placeholder="text-embedding-3-large", id="profile-model"),
+            Label("Secret"),
+            Input(placeholder="API key", password=True, id="profile-secret"),
+            Label("Base URL"),
+            Input(
+                placeholder="http://host.docker.internal:8002/v1",
+                id="profile-base-url",
+            ),
+            Label("Dimensions (embedding only)"),
+            Input(placeholder="4096", id="profile-dimensions"),
+            Label("Distance Metric (embedding only)"),
+            Select(
+                self.DISTANCE_METRICS,
+                value="cosine",
+                id="profile-distance-metric",
+            ),
+            Label("Label (optional)"),
+            Input(placeholder="local-embed", id="profile-label"),
+            Container(
+                Button("Create", id="profile-submit", variant="primary"),
+                Button("Cancel", id="profile-cancel"),
+                id="profile-actions",
+            ),
+            id="profile-card",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#profile-provider", Input).focus()
+
+    @on(Button.Pressed)
+    def handle_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "profile-submit":
+            self.run_worker(self._submit(), exclusive=True, group="submit")
+            return
+        self.dismiss(None)
+
+    async def _submit(self) -> None:
+        kind = self.query_one("#profile-kind", Select).value or "embedding"
+        provider = self.query_one("#profile-provider", Input).value.strip()
+        model = self.query_one("#profile-model", Input).value.strip()
+        secret = self.query_one("#profile-secret", Input).value.strip()
+        base_url = self.query_one("#profile-base-url", Input).value.strip()
+        label = self.query_one("#profile-label", Input).value.strip()
+        dimensions = self.query_one("#profile-dimensions", Input).value.strip()
+        distance_metric = self.query_one(
+            "#profile-distance-metric",
+            Select,
+        ).value
+
+        if not provider or not model or not secret:
+            self.notify("Provider, model, and secret are required.", severity="error")
+            return
+
+        args: dict[str, str | int] = {
+            "provider": provider,
+            "model": model,
+            "secret": secret,
+        }
+        if label:
+            args["label"] = label
+        if base_url:
+            args["base_url"] = base_url
+
+        tool_name = "create_llm_profile"
+        if kind == "embedding":
+            if not dimensions:
+                self.notify(
+                    "Dimensions are required for embedding profiles.",
+                    severity="error",
+                )
+                return
+            try:
+                args["dimensions"] = int(dimensions)
+            except ValueError:
+                self.notify("Dimensions must be an integer.", severity="error")
+                return
+            if distance_metric:
+                args["distance_metric"] = str(distance_metric)
+            tool_name = "create_embedding_profile"
+
+        client = self.app.mcp_client_for_key(self.app.active_api_key)
+        await client.connect()
+        try:
+            result = await client.call(tool_name, args)
+        finally:
+            await client.disconnect()
+        self.dismiss(result)
+
+
+class CollectionFormScreen(Screen):
+    """Guided collection create/edit form."""
+
+    CSS = """
+    CollectionFormScreen {
+        align: center middle;
+    }
+
+    #collection-card {
+        width: 84;
+        height: auto;
+        border: round $accent;
+        padding: 1 2;
+    }
+
+    #collection-title {
+        color: $accent;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #collection-card Label {
+        margin-top: 1;
+    }
+
+    #collection-card Input, #collection-card Select {
+        width: 100%;
+    }
+
+    #collection-actions {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #collection-actions Button {
+        margin-right: 1;
+    }
+    """
+
+    STRATEGIES = [
+        ("vector", "vector"),
+        ("light_rag", "light_rag"),
+        ("custom_graph_rag", "custom_graph_rag"),
+    ]
+    QUERY_MODES = [
+        ("(leave unchanged / none)", ""),
+        ("local", "local"),
+        ("global", "global"),
+        ("hybrid", "hybrid"),
+        ("naive", "naive"),
+        ("mix", "mix"),
+    ]
+
+    def __init__(self, mode: str, collection: dict | None = None) -> None:
+        super().__init__()
+        self._mode = mode
+        self._collection = collection or {}
+
+    def compose(self):
+        title = "Create Collection" if self._mode == "create" else "Edit Collection"
+        yield Container(
+            Label(title, id="collection-title"),
+            Label("Name"),
+            Input(
+                value=self._collection.get("name", ""),
+                placeholder="coll1",
+                id="collection-name",
+            ),
+            Label("Strategy"),
+            Select(
+                self.STRATEGIES,
+                value=self._collection.get("strategy", "vector"),
+                id="collection-strategy",
+            ),
+            Label("Embedding Profile"),
+            Select(
+                [("(select embedding profile)", "")],
+                allow_blank=True,
+                id="collection-embedding-profile",
+            ),
+            Label("LLM Profile (optional)"),
+            Select(
+                [("(none)", "")],
+                allow_blank=True,
+                id="collection-llm-profile",
+            ),
+            Label("Default Query Mode"),
+            Select(
+                self.QUERY_MODES,
+                value="",
+                allow_blank=True,
+                id="collection-query-mode",
+            ),
+            Container(
+                Button(
+                    "Save" if self._mode == "edit" else "Create",
+                    id="collection-submit",
+                    variant="primary",
+                ),
+                Button("Cancel", id="collection-cancel"),
+                id="collection-actions",
+            ),
+            id="collection-card",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#collection-name", Input).focus()
+        self.run_worker(self._load_profiles(), exclusive=True, group="profiles")
+
+    @on(Button.Pressed)
+    def handle_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "collection-submit":
+            self.run_worker(self._submit(), exclusive=True, group="submit")
+            return
+        self.dismiss(None)
+
+    async def _load_profiles(self) -> None:
+        client = self.app.mcp_client_for_key(self.app.active_api_key)
+        await client.connect()
+        try:
+            embedding_text = await client.call("list_embedding_profiles")
+            llm_text = await client.call("list_llm_profiles")
+        finally:
+            await client.disconnect()
+
+        embedding_profiles = parse_profiles(embedding_text, "embedding")
+        llm_profiles = parse_profiles(llm_text, "llm")
+        embedding_select = self.query_one("#collection-embedding-profile", Select)
+        llm_select = self.query_one("#collection-llm-profile", Select)
+
+        embedding_select.set_options([
+            (
+                profile["label"] or profile["model"],
+                profile["profile_id"],
+            )
+            for profile in embedding_profiles
+        ])
+        llm_select.set_options(
+            [("(none)", "")]
+            + [
+                (
+                    profile["label"] or profile["model"],
+                    profile["profile_id"],
+                )
+                for profile in llm_profiles
+            ]
+        )
+
+        if self._mode == "create" and embedding_profiles:
+            embedding_select.value = embedding_profiles[0]["profile_id"]
+
+    async def _submit(self) -> None:
+        name = self.query_one("#collection-name", Input).value.strip()
+        strategy = self.query_one("#collection-strategy", Select).value or "vector"
+        embedding_profile_id = self.query_one(
+            "#collection-embedding-profile",
+            Select,
+        ).value
+        llm_profile_id = self.query_one("#collection-llm-profile", Select).value
+        default_query_mode = self.query_one(
+            "#collection-query-mode",
+            Select,
+        ).value
+
+        if not name:
+            self.notify("Collection name is required.", severity="error")
+            return
+
+        client = self.app.mcp_client_for_key(self.app.active_api_key)
+        await client.connect()
+        try:
+            if self._mode == "create":
+                if not embedding_profile_id:
+                    self.notify("Embedding profile is required.", severity="error")
+                    return
+                args: dict[str, str] = {
+                    "name": name,
+                    "strategy": str(strategy),
+                    "embedding_profile_id": str(embedding_profile_id),
+                }
+                if llm_profile_id:
+                    args["llm_profile_id"] = str(llm_profile_id)
+                if default_query_mode:
+                    args["default_query_mode"] = str(default_query_mode)
+                result = await client.call("create_collection", args)
+            else:
+                args = {
+                    "collection_id": str(self._collection["id"]),
+                    "name": name,
+                    "strategy": str(strategy),
+                }
+                if embedding_profile_id:
+                    args["embedding_profile_id"] = str(embedding_profile_id)
+                if llm_profile_id:
+                    args["llm_profile_id"] = str(llm_profile_id)
+                if default_query_mode:
+                    args["default_query_mode"] = str(default_query_mode)
+                result = await client.call("update_collection", args)
+        finally:
+            await client.disconnect()
+
+        self.dismiss(result)
+
+
 class ConsoleScreen(Screen):
     """Single-screen slash-command console."""
 
@@ -277,6 +686,49 @@ class ConsoleScreen(Screen):
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
         "/query COLLECTION \"question\" [--mode MODE]": "Query a collection.",
         "/jobs show JOB_ID": "Show job status.",
+    }
+    COMMAND_INSERT_TEXT = {
+        "/help": "/help ",
+        "/status": "/status",
+        "/clear": "/clear",
+        "/quit": "/quit",
+        "/exit": "/exit",
+        "/config show": "/config show",
+        "/config set-url URL": "/config set-url ",
+        "/auth set-key KEY [--kind admin|namespace|auto]": "/auth set-key ",
+        "/auth use admin|namespace": "/auth use ",
+        "/namespace list": "/namespace list",
+        "/namespace create NAME": "/namespace create ",
+        "/namespace current": "/namespace current",
+        "/namespace rotate-key ID_OR_NAME": "/namespace rotate-key ",
+        "/profile list [embedding|llm]": "/profile list ",
+        (
+            "/profile create embedding|llm --provider P --model M --secret S "
+            "[--label L] [--base-url U] [--dimensions N] "
+            "[--distance-metric cosine]"
+        ): "/profile create",
+        "/collection list": "/collection list",
+        (
+            "/collection create NAME --strategy vector|light_rag|custom_graph_rag "
+            "--embedding-profile ID_OR_LABEL [--llm-profile ID_OR_LABEL] "
+            "[--default-query-mode local|global|hybrid|naive|mix]"
+        ): "/collection create",
+        (
+            "/collection edit COLLECTION [--name NAME] "
+            "[--strategy vector|light_rag|custom_graph_rag] "
+            "[--embedding-profile ID_OR_LABEL] [--llm-profile ID_OR_LABEL] "
+            "[--clear-llm-profile] [--default-query-mode MODE] "
+            "[--clear-default-query-mode]"
+        ): "/collection edit ",
+        "/collection delete COLLECTION": "/collection delete <collection>",
+        "/ingest chunk COLLECTION \"text\"": "/ingest chunk <collection> \"<text>\"",
+        (
+            "/ingest file COLLECTION /path/to/file.txt"
+        ): "/ingest file <collection> @<path>",
+        (
+            "/query COLLECTION \"question\" [--mode MODE]"
+        ): "/query <collection> \"<question>\"",
+        "/jobs show JOB_ID": "/jobs show <job_id>",
     }
     STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
     QUERY_MODES = ["local", "global", "hybrid", "naive", "mix"]
@@ -555,6 +1007,12 @@ class ConsoleScreen(Screen):
                 self._write(f"{embedding}\n\n{llm}")
                 return
             raise ValueError("Usage: /profile list [embedding|llm]")
+        if action == "create" and len(args) == 1:
+            self.app.push_screen(
+                ProfileCreateScreen(),
+                self._handle_modal_result,
+            )
+            return
         if action == "create" and len(args) >= 2:
             kind = args[1]
             positional, flags = parse_flag_args(args[2:])
@@ -591,6 +1049,12 @@ class ConsoleScreen(Screen):
         if action == "list":
             self._write(await self._call("list_collections"))
             return
+        if action == "create" and len(args) == 1:
+            self.app.push_screen(
+                CollectionFormScreen("create"),
+                self._handle_modal_result,
+            )
+            return
         if action == "create" and len(args) >= 2:
             name = args[1]
             _, flags = parse_flag_args(args[2:])
@@ -621,6 +1085,13 @@ class ConsoleScreen(Screen):
             if isinstance(flags.get("default_query_mode"), str):
                 call_args["default_query_mode"] = str(flags["default_query_mode"])
             self._write(await self._call("create_collection", call_args))
+            return
+        if action == "edit" and len(args) == 2:
+            collection = await self._resolve_collection(args[1])
+            self.app.push_screen(
+                CollectionFormScreen("edit", collection),
+                self._handle_modal_result,
+            )
             return
         if action == "edit" and len(args) >= 2:
             target = args[1]
@@ -659,11 +1130,16 @@ class ConsoleScreen(Screen):
             return
         if action == "delete" and len(args) >= 2:
             collection = await self._resolve_collection(args[1])
-            self._write(
-                await self._call(
-                    "delete_collection",
-                    {"collection_id": collection["id"]},
-                )
+            self.app.push_screen(
+                ConfirmScreen(
+                    "Delete Collection",
+                    f"Delete collection '{collection['name']}'?",
+                ),
+                lambda confirmed: self.run_worker(
+                    self._handle_collection_delete_confirm(confirmed, collection),
+                    exclusive=True,
+                    group="delete",
+                ),
             )
             return
         raise ValueError(
@@ -913,8 +1389,43 @@ class ConsoleScreen(Screen):
     def _write_error(self, text: str) -> None:
         self.query_one("#output", RichLog).write(f"Error: {text}\n")
 
+    def _handle_modal_result(self, result: str | None) -> None:
+        if result:
+            self._write(result)
+
+    async def _handle_collection_delete_confirm(
+        self,
+        confirmed: bool | None,
+        collection: dict,
+    ) -> None:
+        if not confirmed:
+            return
+        self._write(
+            await self._call(
+                "delete_collection",
+                {"collection_id": collection["id"]},
+            )
+        )
+
     def _focus_command(self) -> None:
         self.query_one("#command", Input).focus()
+
+    def _set_command_input(
+        self,
+        value: str,
+        *,
+        preserve_placeholder: bool = True,
+    ) -> None:
+        input_widget = self.query_one("#command", Input)
+        input_widget.value = value
+        cursor_position = len(value)
+        if preserve_placeholder:
+            placeholder_index = value.find("<")
+            if placeholder_index >= 0:
+                cursor_position = placeholder_index
+        input_widget.cursor_position = cursor_position
+        self._focus_command()
+        self._update_suggestions(input_widget.value)
 
     def _update_suggestions(self, value: str) -> None:
         suggestions: list[tuple[str, str]] = []
@@ -982,10 +1493,8 @@ class ConsoleScreen(Screen):
         input_widget = self.query_one("#command", Input)
         current = input_widget.value
         if current.startswith("/") and " " not in current:
-            input_widget.value = value
-            input_widget.cursor_position = len(value)
-            self._focus_command()
-            self._update_suggestions(input_widget.value)
+            inserted = self.COMMAND_INSERT_TEXT.get(value, value)
+            self._set_command_input(inserted)
             return
 
         if "--strategy " in current:
@@ -1013,10 +1522,7 @@ class ConsoleScreen(Screen):
         if start < 0:
             return
         new_value = f"{current[:start]}{value}"
-        input_widget.value = new_value
-        input_widget.cursor_position = len(new_value)
-        self._focus_command()
-        self._update_suggestions(input_widget.value)
+        self._set_command_input(new_value, preserve_placeholder=False)
 
     def _extract_file_token(self, value: str) -> str | None:
         match = re.search(r"(^|\s)(@[^\s]*)$", value)
