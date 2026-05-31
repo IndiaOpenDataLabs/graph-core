@@ -388,6 +388,10 @@ class NamespacesScreen(Screen):
         display: block;
     }
 
+    #embedding-profile-fields.hidden {
+        display: none;
+    }
+
     Input {
         width: 100%;
     }
@@ -600,14 +604,17 @@ class ProfilesScreen(Screen):
                 ),
                 id="profile-base-url-input",
             ),
-            Input(
-                placeholder="Dimensions (embedding only)",
-                id="profile-dimensions-input",
-            ),
-            Select(
-                self.DISTANCE_METRICS,
-                value="cosine",
-                id="profile-distance-metric",
+            Container(
+                Input(
+                    placeholder="Dimensions (embedding only)",
+                    id="profile-dimensions-input",
+                ),
+                Select(
+                    self.DISTANCE_METRICS,
+                    value="cosine",
+                    id="profile-distance-metric",
+                ),
+                id="embedding-profile-fields",
             ),
             Button("Create", id="profile-create-btn", variant="primary"),
             Button("Cancel", id="profile-cancel-btn"),
@@ -615,11 +622,17 @@ class ProfilesScreen(Screen):
         )
 
     async def on_mount(self) -> None:
+        self._sync_profile_form()
         self.run_worker(self._load_profiles(), exclusive=True, group="load")
+
+    @on(Select.Changed, "#profile-kind")
+    def handle_profile_kind_changed(self, _: Select.Changed) -> None:
+        self._sync_profile_form()
 
     async def action_create_profile(self) -> None:
         form = self.query_one("#create-form", Container)
         form.add_class("visible")
+        self._sync_profile_form()
         self.query_one("#profile-provider-input", Input).focus()
 
     async def action_refresh(self) -> None:
@@ -661,6 +674,17 @@ class ProfilesScreen(Screen):
             self.run_worker(self._create_profile(), exclusive=True, group="action")
         elif event.button.id == "profile-cancel-btn":
             self.query_one("#create-form", Container).remove_class("visible")
+
+    def _sync_profile_form(self) -> None:
+        kind = self.query_one("#profile-kind", Select).value or "embedding"
+        embedding_fields = self.query_one("#embedding-profile-fields", Container)
+        if kind == "embedding":
+            embedding_fields.remove_class("hidden")
+            return
+
+        self.query_one("#profile-dimensions-input", Input).value = ""
+        self.query_one("#profile-distance-metric", Select).value = "cosine"
+        embedding_fields.add_class("hidden")
 
     async def _create_profile(self) -> None:
         kind = self.query_one("#profile-kind", Select).value or "embedding"
@@ -864,13 +888,16 @@ class CollectionsScreen(Screen):
                 )
                 for profile in embedding_profiles
             ])
-            llm_select.set_options([
-                (
-                    profile["label"] or profile["model"],
-                    profile["profile_id"],
-                )
-                for profile in llm_profiles
-            ])
+            llm_select.set_options(
+                [("(no llm profile)", "")]
+                + [
+                    (
+                        profile["label"] or profile["model"],
+                        profile["profile_id"],
+                    )
+                    for profile in llm_profiles
+                ]
+            )
             if embedding_profiles:
                 embedding_select.value = embedding_profiles[0]["profile_id"]
             else:
@@ -878,8 +905,7 @@ class CollectionsScreen(Screen):
                     "Create an embedding profile before creating a collection.",
                     severity="warning",
                 )
-            if llm_profiles:
-                llm_select.clear()
+            llm_select.value = ""
         except Exception as e:
             self.notify(f"Failed to load profiles: {e}", severity="error")
 
