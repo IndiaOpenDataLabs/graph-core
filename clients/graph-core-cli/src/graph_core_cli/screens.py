@@ -1542,11 +1542,13 @@ class ConsoleScreen(Screen):
         output.load_text(self._output_buffer)
         lines = self._output_buffer.split("\n")
         output.move_cursor((len(lines) - 1, len(lines[-1])), center=False)
+        self.call_after_refresh(output.scroll_end, animate=False)
 
     def _clear_output(self) -> None:
         self._output_buffer = ""
         output = self.query_one("#output", TextArea)
         output.load_text("")
+        self.call_after_refresh(output.scroll_end, animate=False)
 
     def _copy_output_selection(self) -> None:
         output = self.query_one("#output", TextArea)
