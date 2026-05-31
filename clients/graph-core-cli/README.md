@@ -1,6 +1,6 @@
-# Graph Core TUI
+# Graph Core CLI
 
-A terminal UI for managing the Graph Core platform, built with [Textual](https://textual.textualize.io/). Communicates with the backend exclusively via the MCP (Model Context Protocol) protocol.
+Terminal client for Graph Core, built with [Textual](https://textual.textualize.io/). The CLI talks only to the MCP server exposed by the Docker stack.
 
 ## Quick Start
 
@@ -8,72 +8,150 @@ A terminal UI for managing the Graph Core platform, built with [Textual](https:/
 make docker-up
 
 cd clients/graph-core-cli
-
-# Install CLI extras
 uv sync
-
-# Launch
 uv run python -m graph_core_cli
-# or
-graph-core-tui
 ```
 
-The CLI expects the full stack to be running and connects to the MCP endpoint exposed by Docker at `http://localhost:8001/mcp/`.
+The default MCP endpoint is `http://localhost:8001/mcp/`.
 
-## First-Time Setup
+## First Run
 
-On first launch, the TUI shows a setup screen asking for:
+On first launch, the CLI asks for:
 
-- **MCP URL** — defaults to `http://localhost:8001/mcp/`
-- **API Key** — use the platform admin key for namespace management, or a namespace key for namespace-scoped operations
+- `MCP URL`
+- `API Key`
 
-Your configuration is persisted to `~/.config/graph-core/config.json`. Subsequent launches skip setup and go straight to the home dashboard. Reconfigure anytime from the home screen's "Reconfigure" button.
+Use:
+- the platform admin key for namespace management
+- a namespace key for namespace-scoped operations
 
-## Screens
+Config is stored in `~/.config/graph-core/config.json`.
 
-### Home
-Dashboard showing connection status, active namespace, and navigation to all other screens.
+## Interaction Model
 
-### Namespaces *(admin only)*
-List and create namespaces. Press `a` to create, `r` to refresh.
+The current UI is a hybrid:
 
-### Collections
-List and create collections within the current namespace. Choose strategy: `vector`, `light_rag`, or `custom_graph_rag`, and attach the required embedding profile plus an optional LLM profile. Press `a` to create, `r` to refresh.
+- a slash-command console for navigation and power-user flows
+- guided modal forms for structured create/edit/delete tasks
+- autocomplete for slash commands
+- `@` file completion for file ingestion
+
+Keyboard behavior:
+
+- `Tab`: accept current autocomplete suggestion
+- `Up` / `Down`: cycle suggestions, otherwise command history
+- `q`, `/quit`, `/exit`: quit
+
+## Main Commands
+
+### Status and Config
+
+- `/help`
+- `/status`
+- `/config show`
+- `/config set-url <url>`
+- `/auth set-key <key> [--kind admin|namespace|auto]`
+- `/auth use admin`
+- `/auth use namespace`
+
+### Namespaces
+
+- `/namespace list`
+- `/namespace create <name>`
+- `/namespace current`
+- `/namespace rotate-key <id-or-name>`
 
 ### Profiles
-Create and list embedding and LLM profiles before creating collections. Press `a` to create a new profile, `r` to refresh.
+
+- `/profile list`
+- `/profile list embedding`
+- `/profile list llm`
+- `/profile create`
+
+`/profile create` opens a guided form for:
+- kind
+- provider
+- model
+- secret
+- base URL
+- dimensions
+- distance metric
+- label
+
+### Collections
+
+- `/collection list`
+- `/collection create`
+- `/collection edit <collection>`
+- `/collection delete <collection>`
+
+The create/edit flows open guided forms with:
+- name
+- strategy
+- embedding profile
+- optional LLM profile
+- optional default query mode
+
+Supported strategies:
+- `vector`
+- `light_rag`
+- `custom_graph_rag`
+
+Supported default query modes:
+- `local`
+- `global`
+- `hybrid`
+- `naive`
+- `mix`
+
+### Ingestion
+
+- `/ingest chunk <collection> "<text>"`
+- `/ingest file <collection> @<path>`
+
+Notes:
+- `chunk` is synchronous
+- `file` is asynchronous and returns a `job_id`
+- `@` triggers file autocomplete in the repo/workspace
 
 ### Query
-Select a collection, pick a query mode (`local`, `global`, `hybrid`, `naive`, `mix`), and type your question. Results appear in a scrollable log.
 
-### Ingest
-Paste text or provide a file path to ingest into a collection. Two methods:
-- **Document (async)** — spawns a background job
-- **Chunk (sync)** — processes immediately
+- `/query <collection> "<question>"`
+- `/query <collection> "<question>" --mode local`
 
 ### Jobs
-Check the status of ingestion jobs by entering their UUID.
 
-## Key Bindings
+- `/jobs list`
+- `/jobs list --limit 50`
+- `/jobs show <job_id>`
+- `/jobs show last`
+- `/jobs watch <job_id>`
+- `/jobs watch last`
 
-| Key | Action |
-|-----|--------|
-| `h` | Home |
-| `c` | Config (Home) |
-| `n` | Namespaces |
-| `p` | Profiles |
-| `l` | Collections |
-| `Shift+Q` | Query |
-| `i` | Ingest |
-| `j` | Jobs |
-| `q` | Quit |
-| `Esc` | Back (within a screen) |
+`/jobs watch` polls once per second and stops when the job reaches `completed`, `failed`, or `cancelled`.
+
+## Autocomplete
+
+Typing `/` suggests commands.
+
+Typing `@` suggests files from the workspace. This is especially useful for:
+
+```text
+/ingest file coll1 @docs/large-document.txt
+```
+
+Autocomplete is intentionally lightweight today:
+
+- command suggestions after `/`
+- strategy suggestions after `--strategy`
+- query mode suggestions after `--default-query-mode`
+- file suggestions after `@`
 
 ## Architecture
 
-```
-graph-core-tui  →  MCP (streamable HTTP)  →  FastMCP server  →  FastAPI backend
-   (Textual)       (mcp SDK)                (port 8001)         (port 8000)
+```text
+graph-core-cli  ->  MCP (streamable HTTP)  ->  FastMCP server  ->  FastAPI backend
+   (Textual)          (mcp SDK)                (port 8001)         (port 8000)
 ```
 
-The TUI never talks to the FastAPI REST API directly. Every action is an MCP tool call. See `PATTERNS.md` for how to add new screens and actions.
+The CLI does not call the FastAPI API directly. All operations go through MCP tools.
