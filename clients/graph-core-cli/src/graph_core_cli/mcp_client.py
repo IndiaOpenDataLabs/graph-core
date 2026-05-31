@@ -4,6 +4,9 @@ Passes the API key through MCP protocol metadata on every tool call,
 so the MCP server can extract it reliably regardless of transport.
 """
 
+import asyncio
+import contextlib
+
 import httpx
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
@@ -49,13 +52,22 @@ class AuthenticatedMCPClient:
 
     async def disconnect(self) -> None:
         if self._session:
-            await self._session.__aexit__(None, None, None)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    self._session.__aexit__(None, None, None),
+                    timeout=2.0,
+                )
             self._session = None
         if self._transport_ctx:
-            await self._transport_ctx.__aexit__(None, None, None)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    self._transport_ctx.__aexit__(None, None, None),
+                    timeout=2.0,
+                )
             self._transport_ctx = None
         if self._http_client:
-            await self._http_client.aclose()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._http_client.aclose(), timeout=2.0)
             self._http_client = None
 
     async def call(self, tool_name: str, arguments: dict | None = None) -> str:

@@ -345,7 +345,7 @@ async def graph_rag_query(
 
         rel_context_parts.sort(key=lambda x: x[0], reverse=True)
 
-        # Step 7: Build context and call LLM
+        # Step 7: Build context
         entity_context = "\n".join(entity_context_parts)
         rel_context = "\n".join(text for _, text in rel_context_parts)
 
@@ -355,31 +355,31 @@ Entities:
 Relationships:
 {rel_context or "(none)"}"""
 
-        llm_provider = await _resolve_llm_provider(
-            namespace_id=namespace_id, llm_profile_id=llm_profile_id,
-        )
-        if isinstance(llm_provider, LocalEchoLLMProvider):
-            response = entity_context or rel_context or "No relevant context found."
-        else:
-            response = await llm_provider.chat([
-                {
-                    "role": "system",
-                    "content": (
-                        "Use the context below to answer the question. "
-                        "Draw on the entities and relationships to reason through your answer - "
-                        "explain, connect, and illuminate rather than just report. "
-                        "Write in natural prose. If the context is insufficient for part of the "
-                        "question, acknowledge it briefly without making it the focus."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"{context}\n\nQuestion: {question}",
-                },
-            ])
+    llm_provider = await _resolve_llm_provider(
+        namespace_id=namespace_id, llm_profile_id=llm_profile_id,
+    )
+    if isinstance(llm_provider, LocalEchoLLMProvider):
+        response = entity_context or rel_context or "No relevant context found."
+    else:
+        response = await llm_provider.chat([
+            {
+                "role": "system",
+                "content": (
+                    "Use the context below to answer the question. "
+                    "Draw on the entities and relationships to reason through your answer - "
+                    "explain, connect, and illuminate rather than just report. "
+                    "Write in natural prose. If the context is insufficient for part of the "
+                    "question, acknowledge it briefly without making it the focus."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"{context}\n\nQuestion: {question}",
+            },
+        ])
 
-        return QueryResult(
-            response=response,
-            entities_used=entities_used,
-            relationships_used=list(dict.fromkeys(relationships_used)),
-        )
+    return QueryResult(
+        response=response,
+        entities_used=entities_used,
+        relationships_used=list(dict.fromkeys(relationships_used)),
+    )

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from textual import events, on
 from textual.containers import Container
+from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import Button, Input, Label, Select, Static, TextArea
 
@@ -816,6 +817,8 @@ class ConsoleScreen(Screen):
         self._file_cache: list[str] = []
         self._last_job_id = ""
         self._output_buffer = ""
+        self._query_started_at: float | None = None
+        self._query_progress_task: asyncio.Task | None = None
 
     def compose(self):
         yield Label(
@@ -971,6 +974,8 @@ class ConsoleScreen(Screen):
                 return
 
             self._write_error(f"Unknown command: {command}")
+        except asyncio.CancelledError:
+            return
         except Exception as exc:
             self._write_error(str(exc))
         finally:
@@ -1311,7 +1316,12 @@ class ConsoleScreen(Screen):
         call_args = {"collection_id": collection["id"], "question": question}
         if isinstance(flags.get("mode"), str) and flags["mode"]:
             call_args["mode"] = str(flags["mode"])
-        self._write(await self._call("query_collection", call_args))
+        self._start_query_progress(collection["name"])
+        try:
+            result = await self._call("query_collection", call_args)
+        finally:
+            self._stop_query_progress()
+        self._write(result)
 
     async def _command_jobs(self, args: list[str]) -> None:
         if not args or args[0] == "list":
@@ -1347,10 +1357,12 @@ class ConsoleScreen(Screen):
             raise ValueError("No API key available for this command.")
         client = self.app.mcp_client_for_key(api_key)
         await client.connect()
+        result = ""
         try:
-            return await client.call(tool_name, arguments or {})
+            result = await client.call(tool_name, arguments or {})
         finally:
             await client.disconnect()
+        return result
 
     async def _list_profiles(self, kind: str) -> list[dict]:
         if kind == "embedding":
@@ -1523,9 +1535,17 @@ class ConsoleScreen(Screen):
             ) or "(not selected)"
         else:
             namespace = "(admin context)"
-        self.query_one("#context", Label).update(
-            f"mcp={cfg.get('mcp_url', '')}  key={key_kind}  namespace={namespace}"
-        )
+        query_suffix = ""
+        if self._query_started_at is not None:
+            elapsed = int(asyncio.get_running_loop().time() - self._query_started_at)
+            query_suffix = f"  query=running {elapsed}s"
+        try:
+            self.query_one("#context", Label).update(
+                f"mcp={cfg.get('mcp_url', '')}  key={key_kind}  namespace={namespace}"
+                f"{query_suffix}"
+            )
+        except NoMatches:
+            return
 
     def _write(self, text: str) -> None:
         self._append_output(text)
@@ -1538,7 +1558,10 @@ class ConsoleScreen(Screen):
             self._output_buffer = f"{self._output_buffer}\n{text}"
         else:
             self._output_buffer = text
-        output = self.query_one("#output", TextArea)
+        try:
+            output = self.query_one("#output", TextArea)
+        except NoMatches:
+            return
         output.load_text(self._output_buffer)
         lines = self._output_buffer.split("\n")
         output.move_cursor((len(lines) - 1, len(lines[-1])), center=False)
@@ -1546,7 +1569,10 @@ class ConsoleScreen(Screen):
 
     def _clear_output(self) -> None:
         self._output_buffer = ""
-        output = self.query_one("#output", TextArea)
+        try:
+            output = self.query_one("#output", TextArea)
+        except NoMatches:
+            return
         output.load_text("")
         self.call_after_refresh(output.scroll_end, animate=False)
 
@@ -1606,6 +1632,33 @@ class ConsoleScreen(Screen):
             return
 
         self.app.copy_to_clipboard(text)
+
+    def _start_query_progress(self, collection_name: str) -> None:
+        self._stop_query_progress(write_completion=False)
+        self._query_started_at = asyncio.get_running_loop().time()
+        self._write(f"Query running against {collection_name}...")
+        self._refresh_context()
+        self._query_progress_task = asyncio.create_task(self._query_progress_loop())
+
+    def _stop_query_progress(self, *, write_completion: bool = True) -> None:
+        if self._query_progress_task is not None:
+            self._query_progress_task.cancel()
+            self._query_progress_task = None
+        if self._query_started_at is None:
+            return
+        elapsed = asyncio.get_running_loop().time() - self._query_started_at
+        self._query_started_at = None
+        self._refresh_context()
+        if write_completion:
+            self._write(f"Query completed in {elapsed:.1f}s.")
+
+    async def _query_progress_loop(self) -> None:
+        try:
+            while self._query_started_at is not None:
+                await asyncio.sleep(1)
+                self._refresh_context()
+        except asyncio.CancelledError:
+            return
 
     def _resolve_job_id(self, token: str) -> str:
         if token == "last":
