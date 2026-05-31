@@ -1,62 +1,96 @@
-# TUI Development Patterns
+# CLI Development Patterns
 
-Patterns every developer should know when editing the Graph Core TUI client.
+Patterns every developer should know when editing the Graph Core CLI client.
 
 ## Package Location
 
-The TUI lives in `clients/graph-core-cli/` — a separate package from the backend. It communicates with the backend exclusively via the MCP (Model Context Protocol) protocol with proper auth headers.
+The CLI lives in `clients/graph-core-cli/` as a separate package from the backend.
+It talks to the backend only through MCP over HTTP with bearer auth.
 
-```
+```text
 graph-core/
-├── src/graph_core/           # Backend (FastAPI + MCP server)
-├── clients/graph-core-cli/   # TUI client (this package)
+├── src/graph_core/           # Backend (FastAPI + MCP server + workers)
+├── clients/graph-core-cli/   # Textual CLI client
 │   ├── src/graph_core_cli/
-│   │   ├── app.py            # Textual App + global bindings
-│   │   ├── screens.py        # All TUI screens
+│   │   ├── app.py            # Textual App bootstrap
+│   │   ├── screens.py        # Console + guided modal flows
 │   │   ├── config.py         # Persistent config (~/.config/graph-core/)
 │   │   └── mcp_client.py     # Authenticated MCP client wrapper
-│   ├── pyproject.toml        # Standalone package
+│   ├── pyproject.toml
 │   ├── README.md
-│   └── PATTERNS.md           # This file
+│   └── PATTERNS.md
 ```
 
-## Auth Flow
+## Current UX Model
 
-```
-TUI Client  →  Authorization: Bearer <key>  →  MCP Server  →  Bearer <key>  →  FastAPI
-  (httpx)       (on every HTTP request)        (extracts       (GraphCoreClient   (validates
-                via streamable_http              from request)      sends it)          token)
-```
+This is no longer a multi-screen CRUD TUI.
 
-The client sends `Authorization: Bearer <key>` on every MCP HTTP request via `httpx.AsyncClient`. The MCP server extracts the key from `ctx.request_context.request.headers` and passes it to `GraphCoreClient`. This works across machines.
+The current client is a keyboard-first slash-command console:
+- `SetupScreen` handles first-run MCP URL and API key setup
+- `ConsoleScreen` is the main surface
+- guided modal flows are used only for structured operations such as:
+  - profile creation
+  - collection creation/edit
+  - delete confirmation
+
+The console is intentionally closer to `opencode` than to a traditional form-heavy TUI:
+- slash commands for navigation and actions
+- autocomplete and history
+- terminal-native text selection
+- minimal mouse dependence
 
 ## Entry Points
 
 | Command | File | Function |
 |---------|------|----------|
-| `python -m graph_core_cli` | `__main__.py` | `GraphCoreTUI().run()` |
+| `python -m graph_core_cli` | `__main__.py` | `main()` |
 | `graph-core-tui` | `app.py` | `main()` |
-| `make tui` | `Makefile` | runs from `clients/graph-core-cli/` |
+| `make tui` | root `Makefile` | runs from `clients/graph-core-cli/` |
 
 ## Startup Flow
 
 1. `GraphCoreTUI.on_mount()` loads persisted config from `~/.config/graph-core/config.json`
-2. If `api_key` is set → pushes `HomeScreen`
-3. If no key → pushes `SetupScreen` (first-time only)
-4. Config setter (`app.config = ...`) auto-saves to disk
+2. If an active API key exists, it pushes `ConsoleScreen`
+3. If not, it pushes `SetupScreen`
+4. Config writes go through `self.app.config = ...`, which auto-saves
 
 ## Config Persistence
 
-- **Module**: `config.py`
-- **File**: `~/.config/graph-core/config.json`
-- **Keys**: `mcp_url`, `api_key`, `is_admin`, `namespace_id`, `namespace_name`
+- Module: `config.py`
+- File: `~/.config/graph-core/config.json`
+- Current keys:
+  - `mcp_url`
+  - `api_key`
+  - `admin_api_key`
+  - `namespace_api_key`
+  - `active_api_key_kind`
+  - `is_admin`
+  - `namespace_id`
+  - `namespace_name`
 
-## MCP Client
+Important behavior:
+- admin and namespace keys are persisted separately
+- namespace context shown in the UI is local client state until refreshed/verified
+- admin mode clears displayed namespace context
 
-The `AuthenticatedMCPClient` in `mcp_client.py` wraps the MCP SDK's `streamable_http_client` with an `httpx.AsyncClient` that injects the `Authorization: Bearer <key>` header on every request.
+## Auth Flow
+
+```text
+CLI  →  Authorization: Bearer <key>  →  MCP Server  →  GraphCoreClient  →  FastAPI
+```
+
+The client sends `Authorization: Bearer <key>` on every MCP HTTP request via
+`httpx.AsyncClient`. The MCP server extracts the key from
+`ctx.request_context.request.headers` and uses it when calling the backend API.
+
+## MCP Client Pattern
+
+`AuthenticatedMCPClient` in `mcp_client.py` wraps the MCP SDK streamable HTTP client.
+
+Use this pattern for all direct MCP calls:
 
 ```python
-client = self.app.mcp_client  # AuthenticatedMCPClient
+client = self.app.mcp_client_for_key(self.app.active_api_key)
 await client.connect()
 try:
     text = await client.call("tool_name", args)
@@ -64,79 +98,205 @@ finally:
     await client.disconnect()
 ```
 
-## Screen Anatomy
+Rules:
+- always `connect()` / `disconnect()` in `try/finally`
+- never keep long-lived MCP sessions inside the screen
+- prefer `self._call(...)` helpers inside `ConsoleScreen` where possible
 
-Every screen in `screens.py` follows the same pattern:
+## Console Anatomy
+
+`ConsoleScreen` in `screens.py` is the primary app surface.
+
+Main widgets:
+- `#context` shows MCP URL, active key kind, and namespace context
+- `#output` is a read-only `TextArea`
+- `#command` is the prompt input
+- `#suggestions` renders autocomplete results
+
+Key interaction patterns:
+- `/` starts command discovery
+- `Tab` accepts the highlighted suggestion
+- `Up` / `Down`:
+  - navigate suggestions while typing and suggestions are visible
+  - otherwise navigate command history
+- `Ctrl+C` clears the current command input
+- `/quit` or `q` exits
+
+## Copy and Selection
+
+The app runs with `mouse=False` in `app.py`.
+
+That is deliberate:
+- terminal-native selection works more reliably this way
+- it matches the general `opencode` pattern of letting the terminal own selection
+
+In-app copy fallbacks:
+- `/copy`
+- `Ctrl+Y`
+- `y` when the output pane is focused
+
+On macOS, the app writes to the real clipboard with `pbcopy`, not just Textual's
+clipboard hook.
+
+## Command Handling
+
+All slash commands are dispatched from `ConsoleScreen._execute_command()`.
+
+Current top-level commands:
+- `/help`
+- `/status`
+- `/copy`
+- `/clear`
+- `/quit`
+- `/config ...`
+- `/auth ...`
+- `/namespace ...`
+- `/profile ...`
+- `/collection ...`
+- `/ingest ...`
+- `/query ...`
+- `/jobs ...`
+
+Guideline:
+- keep command dispatch centralized
+- prefer small `_command_*` methods for each domain
+- keep parsing logic local to the command handler unless reused broadly
+
+## Modal Flow Pattern
+
+Structured create/edit flows live as separate `Screen` classes in `screens.py`:
+- `ProfileCreateScreen`
+- `CollectionFormScreen`
+- `ConfirmScreen`
+
+Use modal flows when:
+- the command has too many fields for a good slash-only experience
+- there are enum or profile selection choices
+- the flow benefits from validation before the MCP call
+
+Use slash-only when:
+- the command is short and repeatable
+- it is power-user oriented
+
+Pattern:
 
 ```python
-class MyScreen(Screen):
-    CSS = """..."""          # Textual CSS (inline string)
-    BINDINGS = [...]         # screen-local key bindings
-
-    def compose(self) -> None:
-        yield Label(...)
-        yield DataTable(...)
-
-    async def on_mount(self) -> None:
-        self.run_worker(self._load_data(), exclusive=True, group="load")
-
-    async def _load_data(self) -> None:
-        client = self.app.mcp_client
-        await client.connect()
-        try:
-            text = await client.call("tool_name", args)
-        finally:
-            await client.disconnect()
-        # update widgets
+self.app.push_screen(
+    SomeFormScreen(...),
+    self._handle_modal_result,
+)
 ```
-
-### Key conventions:
-- **Styling**: Inline `CSS` string on the class
-- **Async work**: Always wrap MCP calls in `self.run_worker(coro, exclusive=True, group="load"|"action")`
-- **MCP client**: Access via `self.app.mcp_client`. Connect → call → disconnect.
-- **Navigation**: `self.app.push_screen(ScreenClass())` to push, `esc` to pop
-
-## Adding a New Screen
-
-1. Define the `Screen` subclass in `screens.py`
-2. Add a `BINDING` in `GraphCoreTUI.BINDINGS` in `app.py`
-3. Add a corresponding `action_show_*` method in `app.py`
-4. (Optional) Add a button on `HomeScreen`'s nav section
 
 ## Parsing MCP Responses
 
-MCP tools return formatted text strings, not JSON. The TUI parses them with regex helpers in `screens.py`:
+MCP tools still return formatted text, not JSON, so the CLI parses them with regex helpers.
 
-| Helper | Purpose |
-|--------|---------|
-| `parse_namespaces(text)` | List of namespaces |
-| `parse_collections(text)` | List of collections |
-| `parse_key_value(text)` | Generic key: value pairs |
-| `extract_id(text)` | First `id: <uuid>` match |
-| `extract_name(text)` | First `name: <string>` match |
-| `extract_job_id(text)` | First `job_id: <uuid>` match |
-| `extract_status(text)` | First `status: <value>` match |
+Important helpers in `screens.py`:
+- `parse_namespaces(text)`
+- `parse_collections(text)`
+- `parse_profiles(text, kind)`
+- `parse_jobs(text)`
+- `extract_id(text)`
+- `extract_name(text)`
+- `extract_api_key(text)`
+- `extract_job_id(text)`
 
-## Worker Groups
+If you change MCP response formatting in the backend, update these parsers immediately.
 
-- **`group="load"`** — data loading. Only one load runs at a time.
-- **`group="action"`** — user actions. Only one action runs at a time.
+## File Ingest Pattern
 
-## Lazy Imports
+`/ingest file ...` reads the file locally in the CLI and sends the file contents to MCP.
 
-Screen classes are imported inside action methods, not at module level. Avoids circular imports and reduces startup cost.
+This is intentional:
+- the backend runs in Docker
+- host file paths are not meaningful inside the container
+
+Do not revert this to passing raw file paths through to the backend.
+
+## Job Tracking Pattern
+
+Async file/document ingestion returns a `job_id`.
+
+The CLI supports:
+- `/jobs list`
+- `/jobs show <job_id>`
+- `/jobs watch <job_id>`
+- `last` alias after `/ingest file ...`
+
+`ConsoleScreen` keeps `_last_job_id` so recent ingestion flows can do:
+- `/jobs show last`
+- `/jobs watch last`
+
+## Profile and Collection Patterns
+
+Profiles now support concurrency tuning for OpenAI-compatible providers:
+- `max_concurrent_calls`
+
+Important backend behavior:
+- concurrency is profile-scoped when set
+- fallback comes from global env defaults when unset
+- Redis semaphore keys are per profile, not just per provider type
+
+CLI implications:
+- guided profile creation must expose `max_concurrent_calls`
+- profile list parsing must tolerate additional formatted fields
+
+Collections:
+- must use an embedding profile
+- may optionally use an LLM profile
+
+## Provider Concurrency Patterns
+
+The backend throttles OpenAI-compatible provider calls with Redis-backed semaphores.
+
+Design rules:
+- semaphore scope must be keyed by profile ID when a profile is known
+- global env defaults are only fallbacks
+- local hash embedding and local echo LLM should remain unaffected
+
+Do not implement concurrency caps only at the worker level. The throttle belongs at
+the provider-call layer so it works across processes and containers.
+
+## Worker and Time-Limit Patterns
+
+Current ingestion worker behavior:
+- `run_ingestion` has no time limit
+- `run_chunk` uses `INGEST_CHUNK_TIME_LIMIT_MS`
+
+Reason:
+- local LLM-backed chunk processing can legitimately take minutes
+- the parent document-ingestion actor should not be killed by a blanket limit
+
+If you touch worker execution:
+- preserve the no-limit parent actor behavior
+- keep chunk timeouts configurable
+- remember that timeout failures should not leave chunk rows stuck forever in
+  `processing`
 
 ## Testing
 
+Useful checks from the repo root:
+
 ```bash
-# From the project root
-cd clients/graph-core-cli && uv sync && uv run python -m graph_core_cli
+uv run ruff check clients/graph-core-cli/src/graph_core_cli
+uv run python -m compileall clients/graph-core-cli/src/graph_core_cli
+cd clients/graph-core-cli && uv run python -m graph_core_cli
+```
+
+When backend profile or worker behavior changes, also test from the repo root:
+
+```bash
+uv run ruff check src
+uv run python -m compileall src
 ```
 
 ## Common Pitfalls
 
-- **Forgetting `await client.disconnect()`** — always use `try/finally`
-- **Blocking the TUI** — never `await` an MCP call directly in an event handler
-- **Hardcoding URLs** — use `self.app.mcp_client` which reads from config
-- **Not handling empty responses** — MCP tools can return empty strings
-- **Widget IDs** — every widget you interact with programmatically needs a unique `id`
+- Forgetting `await client.disconnect()` after MCP calls
+- Reintroducing mouse-heavy UI in a keyboard-first console
+- Assuming right-click copy can be owned by the app
+- Changing MCP response text without updating CLI parsers
+- Passing host file paths to Docker instead of reading files locally in the CLI
+- Using one global provider semaphore for all profiles
+- Confusing namespace key state in config with verified backend namespace state
+- Adding background MCP workers on mount/resume that make shutdown brittle
