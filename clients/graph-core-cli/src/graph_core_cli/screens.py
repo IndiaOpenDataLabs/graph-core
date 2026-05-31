@@ -3,11 +3,12 @@
 import os
 import re
 import shlex
+from pathlib import Path
 
 from textual import events, on
 from textual.containers import Container
 from textual.screen import Screen
-from textual.widgets import Input, Label, RichLog
+from textual.widgets import Input, Label, RichLog, Static
 
 
 def parse_namespaces(text: str) -> list[dict]:
@@ -216,7 +217,7 @@ class ConsoleScreen(Screen):
     #command-panel {
         margin: 0 1 1 1;
         border: round $accent;
-        height: 5;
+        height: 8;
         padding: 0 1;
     }
 
@@ -230,6 +231,11 @@ class ConsoleScreen(Screen):
         width: 100%;
         height: 3;
         border: none;
+    }
+
+    #suggestions {
+        height: 3;
+        color: $text-muted;
     }
     """
 
@@ -269,6 +275,9 @@ class ConsoleScreen(Screen):
         self._history: list[str] = []
         self._history_index = 0
         self._namespace_verified = False
+        self._suggestions: list[tuple[str, str]] = []
+        self._suggestion_index = 0
+        self._file_cache: list[str] = []
 
     def compose(self):
         yield Label("Graph Core CLI  |  Slash commands only  |  q=Quit", id="title")
@@ -277,6 +286,7 @@ class ConsoleScreen(Screen):
         yield Container(
             Label("Command", id="command-label"),
             Input(placeholder="/help", id="command"),
+            Static("", id="suggestions"),
             id="command-panel",
         )
 
@@ -285,6 +295,7 @@ class ConsoleScreen(Screen):
         output = self.query_one("#output", RichLog)
         output.write("Use /help to see available commands.\n")
         self.call_after_refresh(self._focus_command)
+        self._file_cache = self._collect_files()
 
     def on_screen_resume(self) -> None:
         self.call_after_refresh(self._focus_command)
@@ -298,12 +309,28 @@ class ConsoleScreen(Screen):
             return
         if self.focused is not command_input:
             return
-        if event.key == "up":
+        if event.key == "tab":
+            self._accept_suggestion()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up":
+            if self._suggestions:
+                self._move_suggestion(-1)
+                event.prevent_default()
+                event.stop()
+                return
             self._history_move(-1)
             event.prevent_default()
+            event.stop()
         elif event.key == "down":
+            if self._suggestions:
+                self._move_suggestion(1)
+                event.prevent_default()
+                event.stop()
+                return
             self._history_move(1)
             event.prevent_default()
+            event.stop()
 
     @on(Input.Submitted, "#command")
     def handle_command_submit(self, event: Input.Submitted) -> None:
@@ -317,6 +344,10 @@ class ConsoleScreen(Screen):
         self._history_index = len(self._history)
         self._write(f"> {raw}")
         self.run_worker(self._execute_command(raw), exclusive=True, group="command")
+
+    @on(Input.Changed, "#command")
+    def handle_command_changed(self, event: Input.Changed) -> None:
+        self._update_suggestions(event.value)
 
     async def _execute_command(self, raw: str) -> None:
         try:
@@ -588,7 +619,7 @@ class ConsoleScreen(Screen):
             )
         action = args[0]
         collection = await self._resolve_collection(args[1])
-        payload = " ".join(args[2:])
+        payload = self._normalize_file_reference(" ".join(args[2:]))
         if action == "chunk":
             self._write(
                 await self._call(
@@ -800,6 +831,7 @@ class ConsoleScreen(Screen):
             return
         input_widget.value = self._history[self._history_index]
         input_widget.cursor_position = len(input_widget.value)
+        self._update_suggestions(input_widget.value)
 
     def _refresh_context(self) -> None:
         cfg = self.app.config
@@ -824,3 +856,106 @@ class ConsoleScreen(Screen):
 
     def _focus_command(self) -> None:
         self.query_one("#command", Input).focus()
+
+    def _update_suggestions(self, value: str) -> None:
+        suggestions: list[tuple[str, str]] = []
+        if value.startswith("/") and " " not in value:
+            prefix = value
+            suggestions = [
+                (command, description)
+                for command, description in self.COMMAND_HELP.items()
+                if command.startswith(prefix)
+            ]
+        else:
+            file_token = self._extract_file_token(value)
+            if file_token is not None:
+                needle = file_token[1:].lower()
+                matches = [
+                    path for path in self._file_cache
+                    if needle in path.lower()
+                ][:8]
+                suggestions = [
+                    (f"@{path}", "file")
+                    for path in matches
+                ]
+
+        self._suggestions = suggestions
+        self._suggestion_index = 0
+        self._render_suggestions()
+
+    def _render_suggestions(self) -> None:
+        widget = self.query_one("#suggestions", Static)
+        if not self._suggestions:
+            widget.update("")
+            return
+        lines = []
+        for index, (value, description) in enumerate(self._suggestions[:5]):
+            prefix = "> " if index == self._suggestion_index else "  "
+            lines.append(f"{prefix}{value}  {description}")
+        widget.update("\n".join(lines))
+
+    def _move_suggestion(self, delta: int) -> None:
+        if not self._suggestions:
+            return
+        self._suggestion_index = (
+            self._suggestion_index + delta
+        ) % len(self._suggestions)
+        self._render_suggestions()
+
+    def _accept_suggestion(self) -> None:
+        if not self._suggestions:
+            return
+        value, _ = self._suggestions[self._suggestion_index]
+        input_widget = self.query_one("#command", Input)
+        current = input_widget.value
+        if current.startswith("/") and " " not in current:
+            input_widget.value = value
+            input_widget.cursor_position = len(value)
+            self._focus_command()
+            self._update_suggestions(input_widget.value)
+            return
+
+        file_token = self._extract_file_token(current)
+        if file_token is None:
+            return
+        start = current.rfind(file_token)
+        if start < 0:
+            return
+        new_value = f"{current[:start]}{value}"
+        input_widget.value = new_value
+        input_widget.cursor_position = len(new_value)
+        self._focus_command()
+        self._update_suggestions(input_widget.value)
+
+    def _extract_file_token(self, value: str) -> str | None:
+        match = re.search(r"(^|\s)(@[^\s]*)$", value)
+        if not match:
+            return None
+        token = match.group(2)
+        return token if token.startswith("@") else None
+
+    def _normalize_file_reference(self, value: str) -> str:
+        return value[1:] if value.startswith("@") else value
+
+    def _collect_files(self) -> list[str]:
+        root = Path.cwd()
+        excluded = {".git", ".venv", "node_modules", "__pycache__"}
+        results: list[str] = []
+        for current_root, dirs, files in os.walk(root):
+            dirs[:] = [
+                directory
+                for directory in dirs
+                if directory not in excluded
+                and not directory.startswith(".mypy_cache")
+            ]
+            for filename in files:
+                if filename.endswith((".pyc", ".pyo")):
+                    continue
+                full_path = Path(current_root) / filename
+                try:
+                    results.append(str(full_path.relative_to(root)))
+                except ValueError:
+                    continue
+                if len(results) >= 2000:
+                    return results
+        return results
