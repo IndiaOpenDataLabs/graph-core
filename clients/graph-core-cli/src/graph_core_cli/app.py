@@ -43,7 +43,7 @@ class GraphCoreTUI(App):
             self.push_screen(SetupScreen())
 
     def compose(self) -> ComposeResult:
-        return
+        yield from ()
 
     @property
     def config(self) -> dict:
