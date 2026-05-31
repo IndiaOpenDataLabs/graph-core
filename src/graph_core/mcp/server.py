@@ -282,8 +282,8 @@ async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> str:
 async def query_collection(
     collection_id: str,
     question: str,
-    mode: str | None,
     ctx: Context,
+    mode: str | None = None,
 ) -> str:
     """Query a collection with a natural language question.
 
