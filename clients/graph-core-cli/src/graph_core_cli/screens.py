@@ -3,7 +3,7 @@
 import os
 import re
 
-from textual import on
+from textual import events, on
 from textual.containers import Container
 from textual.screen import Screen
 from textual.widgets import (
@@ -287,6 +287,10 @@ class HomeScreen(Screen):
         )
 
     def on_mount(self) -> None:
+        self._refresh_view()
+
+    @on(events.ScreenResume)
+    def refresh_on_resume(self) -> None:
         self._refresh_view()
 
     def _refresh_view(self) -> None:
@@ -763,7 +767,7 @@ class IngestScreen(Screen):
     CSS = """
     IngestScreen {
         layout: grid;
-        grid-rows: auto auto 1fr auto;
+        grid-rows: auto auto 1fr auto auto;
     }
 
     #header {
@@ -774,11 +778,31 @@ class IngestScreen(Screen):
 
     #controls {
         padding: 1;
+        layout: vertical;
+        height: auto;
+    }
+
+    #controls-top {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #controls-bottom {
+        height: auto;
     }
 
     #text-area {
         height: 1fr;
         border: round $accent;
+    }
+
+    #actions {
+        padding: 1;
+        align: center middle;
+    }
+
+    #actions Button {
+        width: 24;
     }
 
     #status {
@@ -787,11 +811,11 @@ class IngestScreen(Screen):
     }
 
     Select {
-        width: 30%;
+        width: 40%;
     }
 
     Input {
-        width: 30%;
+        width: 1fr;
     }
     """
 
@@ -802,22 +826,32 @@ class IngestScreen(Screen):
     def compose(self) -> None:
         yield Label("Ingest  |  esc=Back", id="header")
         yield Container(
-            Label("Collection: "),
-            Select([("(select)", "")], allow_blank=True, id="collection-select"),
-            Label("  Method: "),
-            Select(
-                [("Document (async)", "doc"), ("Chunk (sync)", "chunk")],
-                value="doc",
-                id="ingest-method",
+            Container(
+                Label("Collection: "),
+                Select([("(select)", "")], allow_blank=True, id="collection-select"),
+                Label("  Method: "),
+                Select(
+                    [("Document (async)", "doc"), ("Chunk (sync)", "chunk")],
+                    value="doc",
+                    id="ingest-method",
+                ),
+                id="controls-top",
             ),
-            Input(placeholder="File path (optional)", id="file-path"),
-            Button("Ingest", id="ingest-btn", variant="primary"),
+            Container(
+                Label("File path (optional): "),
+                Input(placeholder="/path/to/file.txt", id="file-path"),
+                id="controls-bottom",
+            ),
             id="controls",
         )
         yield TextArea(
             "Paste text here or provide a file path above.",
             language="plaintext",
             id="text-area",
+        )
+        yield Container(
+            Button("Ingest", id="ingest-btn", variant="primary"),
+            id="actions",
         )
         yield Label("Ready.", id="status")
 
@@ -834,7 +868,9 @@ class IngestScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [("(select)", "")] + [(c["name"], c["id"]) for c in collections]
+            options = [("(select)", "")] + [
+                (f"{c['name']} ({c['strategy']})", c["id"]) for c in collections
+            ]
             self.query_one("#collection-select", Select).options = options
             if collections:
                 sel = self.query_one("#collection-select", Select)
