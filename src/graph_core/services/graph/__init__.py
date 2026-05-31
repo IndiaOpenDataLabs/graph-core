@@ -9,7 +9,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.collection import Collection
@@ -182,14 +182,16 @@ class GraphService:
             return collection
 
     async def delete_collection(self, collection_id: uuid.UUID) -> None:
-        collection = await self.get_collection(collection_id)
+        await self.get_collection(collection_id)
         await drop_all_tables(collection_id)
         from graph_core.storage.graph_storage import FalkorDBGraphStorage
         graph_name = f"collection_{str(collection_id).replace('-', '')}"
         graph_storage = FalkorDBGraphStorage(graph_name)
         await graph_storage.drop()
         async with AsyncSessionLocal() as session:
-            await session.delete(collection)
+            await session.execute(
+                delete(Collection).where(Collection.id == collection_id)
+            )
             await session.commit()
 
     async def list_collections(self, namespace_id: uuid.UUID) -> list[Collection]:
