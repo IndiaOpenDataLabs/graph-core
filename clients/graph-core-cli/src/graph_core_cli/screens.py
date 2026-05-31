@@ -4,6 +4,9 @@ import asyncio
 import os
 import re
 import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from textual import events, on
@@ -1497,8 +1500,56 @@ class ConsoleScreen(Screen):
         if not text:
             self.notify("Nothing to copy.", severity="warning")
             return
-        self.app.copy_to_clipboard(text)
+        self._copy_text_to_clipboard(text)
         self.notify("Copied output to clipboard.")
+
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["pbcopy"],
+                input=text,
+                text=True,
+                check=True,
+            )
+            return
+
+        if sys.platform.startswith("win"):
+            subprocess.run(
+                ["clip"],
+                input=text,
+                text=True,
+                check=True,
+            )
+            return
+
+        if shutil.which("wl-copy"):
+            subprocess.run(
+                ["wl-copy"],
+                input=text,
+                text=True,
+                check=True,
+            )
+            return
+
+        if shutil.which("xclip"):
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text,
+                text=True,
+                check=True,
+            )
+            return
+
+        if shutil.which("xsel"):
+            subprocess.run(
+                ["xsel", "--clipboard", "--input"],
+                input=text,
+                text=True,
+                check=True,
+            )
+            return
+
+        self.app.copy_to_clipboard(text)
 
     def _resolve_job_id(self, token: str) -> str:
         if token == "last":
