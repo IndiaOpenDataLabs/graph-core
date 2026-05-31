@@ -847,7 +847,13 @@ class ConsoleScreen(Screen):
             return
         if self.focused is not command_input:
             return
-        if event.key == "tab":
+        if event.key == "ctrl+c":
+            command_input.value = ""
+            command_input.cursor_position = 0
+            self._update_suggestions("")
+            event.prevent_default()
+            event.stop()
+        elif event.key == "tab":
             self._accept_suggestion()
             event.prevent_default()
             event.stop()
