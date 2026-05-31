@@ -298,6 +298,10 @@ class ProfileCreateScreen(Screen):
         width: 100%;
     }
 
+    #profile-embedding-fields {
+        height: auto;
+    }
+
     #profile-embedding-fields.hidden {
         display: none;
     }
