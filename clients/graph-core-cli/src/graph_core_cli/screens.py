@@ -296,6 +296,10 @@ class ProfileCreateScreen(Screen):
         width: 100%;
     }
 
+    #profile-embedding-fields.hidden {
+        display: none;
+    }
+
     #profile-actions {
         height: auto;
         margin-top: 1;
@@ -332,13 +336,16 @@ class ProfileCreateScreen(Screen):
                 placeholder="http://host.docker.internal:8002/v1",
                 id="profile-base-url",
             ),
-            Label("Dimensions (embedding only)"),
-            Input(placeholder="4096", id="profile-dimensions"),
-            Label("Distance Metric (embedding only)"),
-            Select(
-                self.DISTANCE_METRICS,
-                value="cosine",
-                id="profile-distance-metric",
+            Container(
+                Label("Dimensions"),
+                Input(placeholder="4096", id="profile-dimensions"),
+                Label("Distance Metric"),
+                Select(
+                    self.DISTANCE_METRICS,
+                    value="cosine",
+                    id="profile-distance-metric",
+                ),
+                id="profile-embedding-fields",
             ),
             Label("Label (optional)"),
             Input(placeholder="local-embed", id="profile-label"),
@@ -352,6 +359,7 @@ class ProfileCreateScreen(Screen):
 
     def on_mount(self) -> None:
         self.query_one("#profile-provider", Input).focus()
+        self._update_profile_kind_fields("embedding")
 
     @on(Button.Pressed)
     def handle_button(self, event: Button.Pressed) -> None:
@@ -359,6 +367,10 @@ class ProfileCreateScreen(Screen):
             self.run_worker(self._submit(), exclusive=True, group="submit")
             return
         self.dismiss(None)
+
+    @on(Select.Changed, "#profile-kind")
+    def handle_profile_kind_changed(self, event: Select.Changed) -> None:
+        self._update_profile_kind_fields(str(event.value or "embedding"))
 
     async def _submit(self) -> None:
         kind = self.query_one("#profile-kind", Select).value or "embedding"
@@ -411,6 +423,17 @@ class ProfileCreateScreen(Screen):
         finally:
             await client.disconnect()
         self.dismiss(result)
+
+    def _update_profile_kind_fields(self, kind: str) -> None:
+        embedding_fields = self.query_one("#profile-embedding-fields", Container)
+        dimensions = self.query_one("#profile-dimensions", Input)
+        distance_metric = self.query_one("#profile-distance-metric", Select)
+        if kind == "embedding":
+            embedding_fields.remove_class("hidden")
+            return
+        embedding_fields.add_class("hidden")
+        dimensions.value = ""
+        distance_metric.value = "cosine"
 
 
 class CollectionFormScreen(Screen):
