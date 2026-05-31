@@ -594,7 +594,12 @@ class ProfilesScreen(Screen):
                 id="profile-secret-input",
                 password=True,
             ),
-            Input(placeholder="Base URL (optional)", id="profile-base-url-input"),
+            Input(
+                placeholder=(
+                    "Base URL (optional, use host.docker.internal for local servers)"
+                ),
+                id="profile-base-url-input",
+            ),
             Input(
                 placeholder="Dimensions (embedding only)",
                 id="profile-dimensions-input",
@@ -673,6 +678,12 @@ class ProfilesScreen(Screen):
         if not provider or not model:
             self.notify("Provider and model are required", severity="error")
             return
+
+        if "localhost" in base_url or "127.0.0.1" in base_url:
+            self.notify(
+                "Local model servers should use host.docker.internal, not localhost.",
+                severity="warning",
+            )
 
         dimensions = None
         if kind == "embedding" and dimensions_text:

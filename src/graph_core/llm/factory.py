@@ -3,6 +3,7 @@
 from graph_core.config import settings
 from graph_core.llm.interface import LLMProvider
 from graph_core.llm.openai_provider import LocalEchoLLMProvider, OpenAILLMProvider
+from graph_core.provider_base_url import normalize_provider_base_url
 
 
 def get_llm_provider(
@@ -24,7 +25,9 @@ def get_llm_provider(
         return OpenAILLMProvider(
             api_key=effective_api_key,
             model=model,
-            base_url=base_url or settings.openai_base_url,
+            base_url=normalize_provider_base_url(
+                base_url or settings.openai_base_url
+            ),
         )
 
     raise ValueError(f"Unsupported llm provider: {provider_name}")

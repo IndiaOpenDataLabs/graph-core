@@ -3,6 +3,8 @@ services:
     build: .
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8001:8000"
     environment:
@@ -23,6 +25,8 @@ services:
     build: .
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       REDIS_URL: redis://redis:6379/0

@@ -4,6 +4,7 @@ from graph_core.config import settings
 from graph_core.embedding.hash_provider import HashEmbeddingProvider
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.embedding.openai_provider import OpenAIEmbeddingProvider
+from graph_core.provider_base_url import normalize_provider_base_url
 
 
 def get_embedding_provider(
@@ -28,7 +29,9 @@ def get_embedding_provider(
             api_key=effective_api_key,
             model=model,
             dimensions=dimensions,
-            base_url=base_url or settings.openai_base_url,
+            base_url=normalize_provider_base_url(
+                base_url or settings.openai_base_url
+            ),
         )
 
     raise ValueError(f"Unsupported embedding provider: {provider_name}")

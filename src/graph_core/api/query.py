@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from graph_core.api.auth import get_namespace_id
+from graph_core.api.provider_errors import raise_provider_http_error
 from graph_core.services.graph import GraphService
 
 
@@ -46,3 +47,6 @@ async def query_collection(
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise_provider_http_error(e)
+        raise
