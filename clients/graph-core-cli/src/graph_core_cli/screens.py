@@ -671,6 +671,7 @@ class ConsoleScreen(Screen):
     COMMAND_HELP = {
         "/help": "Show command help.",
         "/status": "Show current auth and namespace context.",
+        "/copy": "Copy selected output, or the full output if nothing is selected.",
         "/clear": "Clear console output.",
         "/quit": "Exit the CLI.",
         "/exit": "Exit the CLI.",
@@ -712,6 +713,7 @@ class ConsoleScreen(Screen):
     COMMAND_INSERT_TEXT = {
         "/help": "/help ",
         "/status": "/status",
+        "/copy": "/copy",
         "/clear": "/clear",
         "/quit": "/quit",
         "/exit": "/exit",
@@ -770,7 +772,7 @@ class ConsoleScreen(Screen):
 
     def compose(self):
         yield Label(
-            "Graph Core CLI  |  Slash commands only  |  q=Quit  |  Ctrl+Shift+C=Copy",
+            "Graph Core CLI  |  Slash commands only  |  q=Quit  |  /copy or y=Copy",
             id="title",
         )
         yield Label("", id="context")
@@ -800,7 +802,13 @@ class ConsoleScreen(Screen):
         self.call_after_refresh(self._focus_command)
 
     def on_key(self, event: events.Key) -> None:
-        if event.key == "ctrl+shift+c":
+        output = self.query_one("#output", TextArea)
+        if event.key in {"ctrl+shift+c", "ctrl+y"}:
+            self._copy_output_selection()
+            event.prevent_default()
+            event.stop()
+            return
+        if self.focused is output and event.key == "y":
             self._copy_output_selection()
             event.prevent_default()
             event.stop()
@@ -818,10 +826,20 @@ class ConsoleScreen(Screen):
             event.prevent_default()
             event.stop()
         elif event.key == "up":
+            if self._should_navigate_suggestions(command_input.value):
+                self._move_suggestion(-1)
+                event.prevent_default()
+                event.stop()
+                return
             self._history_move(-1)
             event.prevent_default()
             event.stop()
         elif event.key == "down":
+            if self._should_navigate_suggestions(command_input.value):
+                self._move_suggestion(1)
+                event.prevent_default()
+                event.stop()
+                return
             self._history_move(1)
             event.prevent_default()
             event.stop()
@@ -864,6 +882,9 @@ class ConsoleScreen(Screen):
                 return
             if command in {"/quit", "/exit"}:
                 self.app.exit()
+                return
+            if command == "/copy":
+                self._copy_output_selection()
                 return
             if command == "/clear":
                 self._clear_output()
@@ -1523,6 +1544,9 @@ class ConsoleScreen(Screen):
 
     def _focus_command(self) -> None:
         self.query_one("#command", Input).focus()
+
+    def _should_navigate_suggestions(self, value: str) -> bool:
+        return bool(value.strip()) and bool(self._suggestions)
 
     def _set_command_input(
         self,

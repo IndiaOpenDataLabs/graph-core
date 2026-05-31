@@ -95,4 +95,4 @@ class GraphCoreTUI(App):
 
 async def main() -> None:
     app = GraphCoreTUI()
-    app.run()
+    app.run(mouse=False)
