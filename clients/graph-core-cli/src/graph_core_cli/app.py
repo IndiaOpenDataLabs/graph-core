@@ -2,7 +2,6 @@
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Footer
 
 from graph_core_cli.config import load_config, save_config
 from graph_core_cli.mcp_client import AuthenticatedMCPClient
@@ -33,6 +32,10 @@ class GraphCoreTUI(App):
             "namespace_id": persisted.get("namespace_id", ""),
             "namespace_name": persisted.get("namespace_name", ""),
         }
+        if self._config.get("active_api_key_kind") == "admin":
+            self._config["namespace_id"] = ""
+            self._config["namespace_name"] = ""
+            save_config(self._config)
 
         if self.active_api_key:
             self.push_screen(ConsoleScreen())
@@ -40,7 +43,7 @@ class GraphCoreTUI(App):
             self.push_screen(SetupScreen())
 
     def compose(self) -> ComposeResult:
-        yield Footer()
+        return
 
     @property
     def config(self) -> dict:

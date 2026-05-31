@@ -192,7 +192,7 @@ class ConsoleScreen(Screen):
     ConsoleScreen {
         layout: grid;
         grid-size: 1;
-        grid-rows: auto auto 1fr auto;
+        grid-rows: auto auto 1fr auto auto;
     }
 
     #title {
@@ -214,7 +214,14 @@ class ConsoleScreen(Screen):
     }
 
     #command {
-        margin: 1;
+        margin: 0 1 1 1;
+        border: round $accent;
+    }
+
+    #command-label {
+        padding: 1 1 0 1;
+        color: $accent;
+        text-style: bold;
     }
     """
 
@@ -256,6 +263,7 @@ class ConsoleScreen(Screen):
         yield Label("Graph Core CLI  |  Slash commands only  |  q=Quit", id="title")
         yield Label("", id="context")
         yield RichLog(id="output", wrap=True, highlight=True, markup=False)
+        yield Label("Command", id="command-label")
         yield Input(placeholder="/help", id="command")
 
     def on_mount(self) -> None:
@@ -336,12 +344,15 @@ class ConsoleScreen(Screen):
 
     async def _command_status(self) -> None:
         cfg = self.app.config
+        namespace = "(admin context)"
+        if cfg.get("active_api_key_kind") == "namespace":
+            namespace = cfg.get("namespace_name") or "(not selected)"
         lines = [
             f"MCP URL: {cfg.get('mcp_url', '')}",
             f"Active key: {cfg.get('active_api_key_kind', 'admin')}",
-            f"Namespace: {cfg.get('namespace_name') or '(not selected)'}",
+            f"Namespace: {namespace}",
         ]
-        if cfg.get("namespace_id"):
+        if cfg.get("active_api_key_kind") == "namespace" and cfg.get("namespace_id"):
             lines.append(f"Namespace ID: {cfg['namespace_id']}")
         self._write("\n".join(lines))
 
@@ -623,6 +634,8 @@ class ConsoleScreen(Screen):
         cfg = dict(self.app.config)
         if effective_kind == "admin":
             cfg["admin_api_key"] = key
+            cfg["namespace_id"] = ""
+            cfg["namespace_name"] = ""
         else:
             cfg["namespace_api_key"] = key
         cfg["active_api_key_kind"] = effective_kind
@@ -719,8 +732,11 @@ class ConsoleScreen(Screen):
 
     def _refresh_context(self) -> None:
         cfg = self.app.config
-        namespace = cfg.get("namespace_name") or "(not selected)"
         key_kind = cfg.get("active_api_key_kind", "admin")
+        if key_kind == "namespace":
+            namespace = cfg.get("namespace_name") or "(not selected)"
+        else:
+            namespace = "(admin context)"
         self.query_one("#context", Label).update(
             f"mcp={cfg.get('mcp_url', '')}  key={key_kind}  namespace={namespace}"
         )
