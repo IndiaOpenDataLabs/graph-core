@@ -192,7 +192,7 @@ class ConsoleScreen(Screen):
     ConsoleScreen {
         layout: grid;
         grid-size: 1;
-        grid-rows: auto auto 1fr auto auto;
+        grid-rows: auto auto 1fr auto;
     }
 
     #title {
@@ -213,15 +213,23 @@ class ConsoleScreen(Screen):
         padding: 0 1;
     }
 
-    #command {
+    #command-panel {
         margin: 0 1 1 1;
         border: round $accent;
+        height: 5;
+        padding: 0 1;
     }
 
     #command-label {
-        padding: 1 1 0 1;
+        padding: 0;
         color: $accent;
         text-style: bold;
+    }
+
+    #command {
+        width: 100%;
+        height: 3;
+        border: none;
     }
     """
 
@@ -229,6 +237,8 @@ class ConsoleScreen(Screen):
         "/help": "Show command help.",
         "/status": "Show current auth and namespace context.",
         "/clear": "Clear console output.",
+        "/quit": "Exit the CLI.",
+        "/exit": "Exit the CLI.",
         "/config show": "Show saved MCP URL and key mode.",
         "/config set-url URL": "Update MCP URL.",
         "/auth set-key KEY [--kind admin|namespace|auto]": "Save and switch API key.",
@@ -258,22 +268,45 @@ class ConsoleScreen(Screen):
         super().__init__()
         self._history: list[str] = []
         self._history_index = 0
+        self._namespace_verified = False
 
     def compose(self):
         yield Label("Graph Core CLI  |  Slash commands only  |  q=Quit", id="title")
         yield Label("", id="context")
         yield RichLog(id="output", wrap=True, highlight=True, markup=False)
-        yield Label("Command", id="command-label")
-        yield Input(placeholder="/help", id="command")
+        yield Container(
+            Label("Command", id="command-label"),
+            Input(placeholder="/help", id="command"),
+            id="command-panel",
+        )
 
     def on_mount(self) -> None:
         self._refresh_context()
         output = self.query_one("#output", RichLog)
         output.write("Use /help to see available commands.\n")
-        self.query_one("#command", Input).focus()
+        self.call_after_refresh(self._focus_command)
+        self.run_worker(
+            self._hydrate_namespace_context(),
+            exclusive=True,
+            group="context",
+        )
+
+    def on_screen_resume(self) -> None:
+        self.call_after_refresh(self._focus_command)
+        self.run_worker(
+            self._hydrate_namespace_context(),
+            exclusive=True,
+            group="context",
+        )
 
     def on_key(self, event: events.Key) -> None:
-        if self.focused is not self.query_one("#command", Input):
+        command_input = self.query_one("#command", Input)
+        if event.is_printable and self.focused is not command_input:
+            command_input.focus()
+            command_input.insert_text_at_cursor(event.character)
+            event.prevent_default()
+            return
+        if self.focused is not command_input:
             return
         if event.key == "up":
             self._history_move(-1)
@@ -286,6 +319,7 @@ class ConsoleScreen(Screen):
     def handle_command_submit(self, event: Input.Submitted) -> None:
         raw = event.value.strip()
         event.input.value = ""
+        self._focus_command()
         if not raw:
             return
 
@@ -304,6 +338,9 @@ class ConsoleScreen(Screen):
             command = parts[0]
             if command == "/help":
                 self._show_help(parts[1:] if len(parts) > 1 else [])
+                return
+            if command in {"/quit", "/exit"}:
+                self.app.exit()
                 return
             if command == "/clear":
                 self.query_one("#output", RichLog).clear()
@@ -343,16 +380,25 @@ class ConsoleScreen(Screen):
             self._refresh_context()
 
     async def _command_status(self) -> None:
+        await self._hydrate_namespace_context()
         cfg = self.app.config
         namespace = "(admin context)"
         if cfg.get("active_api_key_kind") == "namespace":
-            namespace = cfg.get("namespace_name") or "(not selected)"
+            namespace = (
+                cfg.get("namespace_name")
+                if self._namespace_verified
+                else "(unverified namespace key)"
+            ) or "(not selected)"
         lines = [
             f"MCP URL: {cfg.get('mcp_url', '')}",
             f"Active key: {cfg.get('active_api_key_kind', 'admin')}",
             f"Namespace: {namespace}",
         ]
-        if cfg.get("active_api_key_kind") == "namespace" and cfg.get("namespace_id"):
+        if (
+            cfg.get("active_api_key_kind") == "namespace"
+            and self._namespace_verified
+            and cfg.get("namespace_id")
+        ):
             lines.append(f"Namespace ID: {cfg['namespace_id']}")
         self._write("\n".join(lines))
 
@@ -616,6 +662,39 @@ class ConsoleScreen(Screen):
             return parse_profiles(text, "embedding")
         return parse_profiles(await self._call("list_llm_profiles"), "llm")
 
+    async def _hydrate_namespace_context(self) -> None:
+        cfg = dict(self.app.config)
+        if cfg.get("active_api_key_kind") != "namespace":
+            self._namespace_verified = False
+            if cfg.get("namespace_id") or cfg.get("namespace_name"):
+                cfg["namespace_id"] = ""
+                cfg["namespace_name"] = ""
+                self.app.config = cfg
+            self._refresh_context()
+            return
+
+        try:
+            text = await self._call("get_current_namespace")
+        except Exception:
+            self._namespace_verified = False
+            if cfg.get("namespace_id") or cfg.get("namespace_name"):
+                cfg["namespace_id"] = ""
+                cfg["namespace_name"] = ""
+                self.app.config = cfg
+                self._write_error(
+                    "Saved namespace context is stale; cleared local namespace state."
+                )
+            self._refresh_context()
+            return
+
+        match = re.search(r"Namespace:\s*([^\s]+)\s*\|\s*(.+)$", text)
+        if match:
+            self._namespace_verified = True
+            cfg["namespace_id"] = match.group(1).strip()
+            cfg["namespace_name"] = match.group(2).strip()
+            self.app.config = cfg
+        self._refresh_context()
+
     async def _resolve_collection(self, target: str) -> dict:
         collections = parse_collections(await self._call("list_collections"))
         return self._resolve_entity(
@@ -636,8 +715,10 @@ class ConsoleScreen(Screen):
             cfg["admin_api_key"] = key
             cfg["namespace_id"] = ""
             cfg["namespace_name"] = ""
+            self._namespace_verified = False
         else:
             cfg["namespace_api_key"] = key
+            self._namespace_verified = False
         cfg["active_api_key_kind"] = effective_kind
         self.app.config = cfg
         self._write(f"Saved {effective_kind} key and switched to it.")
@@ -734,7 +815,11 @@ class ConsoleScreen(Screen):
         cfg = self.app.config
         key_kind = cfg.get("active_api_key_kind", "admin")
         if key_kind == "namespace":
-            namespace = cfg.get("namespace_name") or "(not selected)"
+            namespace = (
+                cfg.get("namespace_name")
+                if self._namespace_verified
+                else "(unverified namespace key)"
+            ) or "(not selected)"
         else:
             namespace = "(admin context)"
         self.query_one("#context", Label).update(
@@ -746,3 +831,6 @@ class ConsoleScreen(Screen):
 
     def _write_error(self, text: str) -> None:
         self.query_one("#output", RichLog).write(f"Error: {text}\n")
+
+    def _focus_command(self) -> None:
+        self.query_one("#command", Input).focus()
