@@ -86,7 +86,8 @@ async def enqueue_document_ingestion_job(
             raise ValueError(f"Collection {collection_id} not found")
         if collection.namespace_id != namespace_id:
             raise ValueError(
-                f"Collection {collection_id} does not belong to namespace {namespace_id}"
+                f"Collection {collection_id} does not belong to namespace "
+                f"{namespace_id}"
             )
 
         job = Job(
@@ -204,10 +205,15 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
 
     await update_chunk_status(job_uuid, chunk_index, "completed")
 
-    progress = await increment_chunk_counter(job_uuid)
+    await increment_chunk_counter(job_uuid)
     await _append_job_event(
-        job_uuid, "chunk_completed",
-        {"chunk_index": chunk_index, "entity_count": result.entity_count, "relationship_count": result.relationship_count},
+        job_uuid,
+        "chunk_completed",
+        {
+            "chunk_index": chunk_index,
+            "entity_count": result.entity_count,
+            "relationship_count": result.relationship_count,
+        },
     )
 
 
@@ -239,8 +245,13 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
         result = await session.execute(
             text(
                 "UPDATE jobs SET chunks_completed = chunks_completed + 1, "
-                "progress_percent = CAST(((chunks_completed + 1)::float / NULLIF(chunks_total, 0) * 100) AS integer), "
-                "status = CASE WHEN chunks_completed + 1 >= chunks_total THEN 'completed' ELSE 'running' END "
+                "progress_percent = CAST("
+                "((chunks_completed + 1)::float / NULLIF(chunks_total, 0) * 100) "
+                "AS integer), "
+                "status = CASE "
+                "WHEN chunks_completed + 1 >= chunks_total "
+                "THEN CAST('completed' AS job_status) "
+                "ELSE CAST('running' AS job_status) END "
                 "WHERE id = :jid "
                 "RETURNING chunks_completed, chunks_total, status"
             ),
@@ -251,7 +262,10 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
             completed, total, status = row
             if total and completed >= total:
                 await session.execute(
-                    text("UPDATE jobs SET completed_at = :now WHERE id = :jid AND status = 'completed'"),
+                    text(
+                        "UPDATE jobs SET completed_at = :now "
+                        "WHERE id = :jid AND status = 'completed'"
+                    ),
                     {"now": datetime.now(UTC), "jid": str(job_id).replace("-", "")},
                 )
                 await session.commit()
