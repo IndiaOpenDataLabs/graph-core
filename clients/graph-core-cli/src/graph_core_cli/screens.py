@@ -713,12 +713,12 @@ class QueryScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [("(select collection)", "")] + [
+            options = [
                 (f"{c['name']} ({c['strategy']})", c["id"]) for c in collections
             ]
-            self.query_one("#collection-select", Select).options = options
+            sel = self.query_one("#collection-select", Select)
+            sel.set_options(options)
             if collections:
-                sel = self.query_one("#collection-select", Select)
                 sel.value = collections[0]["id"]
         except Exception as e:
             self.notify(str(e), severity="error")
@@ -767,7 +767,7 @@ class IngestScreen(Screen):
     CSS = """
     IngestScreen {
         layout: grid;
-        grid-rows: auto auto 1fr auto auto;
+        grid-rows: auto auto 12 auto auto;
     }
 
     #header {
@@ -792,8 +792,19 @@ class IngestScreen(Screen):
     }
 
     #text-area {
-        height: 1fr;
+        width: 100%;
+        height: 100%;
+        border: none;
+    }
+
+    #text-panel {
+        height: 12;
         border: round $accent;
+        padding: 0 1;
+    }
+
+    #text-panel Label {
+        margin-top: 0;
     }
 
     #actions {
@@ -844,10 +855,14 @@ class IngestScreen(Screen):
             ),
             id="controls",
         )
-        yield TextArea(
-            "Paste text here or provide a file path above.",
-            language="plaintext",
-            id="text-area",
+        yield Container(
+            Label("Enter text to ingest:"),
+            TextArea(
+                "Paste text here or provide a file path above.",
+                language="plaintext",
+                id="text-area",
+            ),
+            id="text-panel",
         )
         yield Container(
             Button("Ingest", id="ingest-btn", variant="primary"),
@@ -868,12 +883,12 @@ class IngestScreen(Screen):
             finally:
                 await client.disconnect()
 
-            options = [("(select)", "")] + [
+            options = [
                 (f"{c['name']} ({c['strategy']})", c["id"]) for c in collections
             ]
-            self.query_one("#collection-select", Select).options = options
+            sel = self.query_one("#collection-select", Select)
+            sel.set_options(options)
             if collections:
-                sel = self.query_one("#collection-select", Select)
                 sel.value = collections[0]["id"]
         except Exception as e:
             self.notify(str(e), severity="error")
