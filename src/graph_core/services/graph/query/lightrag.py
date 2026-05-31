@@ -58,6 +58,8 @@ async def _resolve_embedding_provider(collection: Collection) -> EmbeddingProvid
             dimensions=profile.dimensions,
             api_key=api_key,
             base_url=base_url,
+            profile_id=str(profile.id),
+            max_concurrent_calls=profile.max_concurrent_calls,
         )
 
 
@@ -81,6 +83,8 @@ async def _resolve_llm_provider(
             model=profile.model,
             api_key=api_key,
             base_url=base_url,
+            profile_id=str(profile.id),
+            max_concurrent_calls=profile.max_concurrent_calls,
         )
 
 

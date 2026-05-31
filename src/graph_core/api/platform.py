@@ -35,6 +35,7 @@ class CreateProfileRequest(BaseModel):
     base_url: str | None = None
     dimensions: int | None = None
     distance_metric: str | None = None
+    max_concurrent_calls: int | None = None
 
 
 class ProfileResponse(BaseModel):
@@ -47,6 +48,7 @@ class ProfileResponse(BaseModel):
     base_url: str | None = None
     dimensions: int | None
     distance_metric: str | None
+    max_concurrent_calls: int | None
 
 
 router = APIRouter(prefix="/platform", tags=["platform"])
@@ -117,6 +119,7 @@ async def create_profile(
             base_url=body.base_url,
             dimensions=body.dimensions,
             distance_metric=body.distance_metric,
+            max_concurrent_calls=body.max_concurrent_calls,
         )
         return _to_profile_response(profile)
     except ValueError as exc:
@@ -156,4 +159,5 @@ def _to_profile_response(profile) -> ProfileResponse:
         base_url=profile.base_url,
         dimensions=profile.dimensions,
         distance_metric=profile.distance_metric,
+        max_concurrent_calls=profile.max_concurrent_calls,
     )

@@ -49,6 +49,7 @@ class PlatformService:
         base_url: str | None = None,
         dimensions: int | None = None,
         distance_metric: str | None = None,
+        max_concurrent_calls: int | None = None,
     ) -> Profile:
         async with AsyncSessionLocal() as session:
             if credential_id is not None:
@@ -62,6 +63,8 @@ class PlatformService:
                         "Embedding profiles require dimensions."
                     )
                 distance_metric = distance_metric or settings.default_distance_metric
+            if max_concurrent_calls is not None and max_concurrent_calls < 1:
+                raise ValueError("max_concurrent_calls must be >= 1")
 
             profile = Profile(
                 namespace_id=namespace_id,
@@ -73,6 +76,7 @@ class PlatformService:
                 base_url=base_url,
                 dimensions=dimensions,
                 distance_metric=distance_metric,
+                max_concurrent_calls=max_concurrent_calls,
             )
             session.add(profile)
             await session.commit()

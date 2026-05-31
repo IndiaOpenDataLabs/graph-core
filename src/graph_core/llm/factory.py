@@ -12,6 +12,8 @@ def get_llm_provider(
     model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
+    profile_id: str | None = None,
+    max_concurrent_calls: int | None = None,
 ) -> LLMProvider:
     provider_name = provider_name or settings.default_llm_provider
     model = model or settings.default_llm_model
@@ -28,6 +30,8 @@ def get_llm_provider(
             base_url=normalize_provider_base_url(
                 base_url or settings.openai_base_url
             ),
+            profile_id=profile_id,
+            max_concurrent_calls=max_concurrent_calls,
         )
 
     raise ValueError(f"Unsupported llm provider: {provider_name}")

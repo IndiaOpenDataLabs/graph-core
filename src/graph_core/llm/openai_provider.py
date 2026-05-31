@@ -34,12 +34,19 @@ class OpenAILLMProvider(LLMProvider):
         api_key: str,
         model: str,
         base_url: str | None = None,
+        profile_id: str | None = None,
+        max_concurrent_calls: int | None = None,
     ):
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._model = model
+        self._profile_id = profile_id
+        self._max_concurrent_calls = max_concurrent_calls
 
     async def chat(self, messages: list[dict]) -> str:
-        async with llm_call_slot():
+        async with llm_call_slot(
+            scope=self._profile_id,
+            max_concurrent_calls=self._max_concurrent_calls,
+        ):
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
@@ -47,7 +54,10 @@ class OpenAILLMProvider(LLMProvider):
         return response.choices[0].message.content or ""
 
     async def chat_stream(self, messages: list[dict]) -> AsyncIterator[str]:
-        async with llm_call_slot():
+        async with llm_call_slot(
+            scope=self._profile_id,
+            max_concurrent_calls=self._max_concurrent_calls,
+        ):
             stream = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
@@ -60,7 +70,10 @@ class OpenAILLMProvider(LLMProvider):
 
     async def structured_extract(self, prompt: str, schema: dict) -> dict:
         messages = [{"role": "user", "content": prompt}]
-        async with llm_call_slot():
+        async with llm_call_slot(
+            scope=self._profile_id,
+            max_concurrent_calls=self._max_concurrent_calls,
+        ):
             try:
                 response = await self._client.chat.completions.create(
                     model=self._model,

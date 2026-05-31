@@ -415,6 +415,7 @@ async def create_embedding_profile(
     base_url: str | None = None,
     dimensions: int | None = None,
     distance_metric: str | None = None,
+    max_concurrent_calls: int | None = None,
 ) -> str:
     """Create an embedding profile in the current namespace.
 
@@ -444,6 +445,7 @@ async def create_embedding_profile(
         base_url=base_url,
         dimensions=dimensions,
         distance_metric=distance_metric,
+        max_concurrent_calls=max_concurrent_calls,
     )
     return (
         f"Created embedding profile:\n"
@@ -451,7 +453,8 @@ async def create_embedding_profile(
         f"  label: {profile.get('label') or '-'}\n"
         f"  provider: {profile['provider']}\n"
         f"  model: {profile['model']}\n"
-        f"  dimensions: {profile.get('dimensions') or '-'}"
+        f"  dimensions: {profile.get('dimensions') or '-'}\n"
+        f"  max_concurrent_calls: {profile.get('max_concurrent_calls') or '-'}"
     )
 
 
@@ -463,6 +466,7 @@ async def create_llm_profile(
     ctx: Context,
     label: str | None = None,
     base_url: str | None = None,
+    max_concurrent_calls: int | None = None,
 ) -> str:
     """Create an LLM profile in the current namespace.
 
@@ -488,13 +492,15 @@ async def create_llm_profile(
         credential_id=credential["credential_id"],
         label=label,
         base_url=base_url,
+        max_concurrent_calls=max_concurrent_calls,
     )
     return (
         f"Created llm profile:\n"
         f"  profile_id: {profile['profile_id']}\n"
         f"  label: {profile.get('label') or '-'}\n"
         f"  provider: {profile['provider']}\n"
-        f"  model: {profile['model']}"
+        f"  model: {profile['model']}\n"
+        f"  max_concurrent_calls: {profile.get('max_concurrent_calls') or '-'}"
     )
 
 
@@ -506,8 +512,10 @@ def _format_profile_list(title: str, profiles: list[dict]) -> str:
         label = profile.get("label") or "-"
         model = profile.get("model") or "-"
         provider = profile.get("provider") or "-"
+        limit = profile.get("max_concurrent_calls")
         lines.append(
-            f"  - {profile['profile_id']} | {label} | {provider} | {model}"
+            f"  - {profile['profile_id']} | {label} | {provider} | {model} | "
+            f"max_concurrent_calls={limit if limit is not None else '-'}"
         )
     return "\n".join(lines)
 

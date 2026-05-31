@@ -211,6 +211,7 @@ class GraphCoreClient:
         base_url: str | None = None,
         dimensions: int | None = None,
         distance_metric: str | None = None,
+        max_concurrent_calls: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"kind": kind, "provider": provider, "model": model}
         if credential_id:
@@ -223,6 +224,8 @@ class GraphCoreClient:
             body["dimensions"] = dimensions
         if distance_metric:
             body["distance_metric"] = distance_metric
+        if max_concurrent_calls is not None:
+            body["max_concurrent_calls"] = max_concurrent_calls
         return await self._request("POST", "/platform/profiles", json=body)
 
     async def list_embedding_profiles(self) -> list[dict[str, Any]]:

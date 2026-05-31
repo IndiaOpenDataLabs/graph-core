@@ -40,17 +40,19 @@ def parse_collections(text: str) -> list[dict]:
 def parse_profiles(text: str, kind: str) -> list[dict]:
     items = []
     for match in re.finditer(
-        r"^  - ([^|]+)\| ([^|]+)\| ([^|]+)\| (.+)$",
+        r"^  - ([^|]+)\| ([^|]+)\| ([^|]+)\| ([^|]+)\| max_concurrent_calls=(.+)$",
         text,
         re.MULTILINE,
     ):
         label = match.group(2).strip()
+        limit = match.group(5).strip()
         items.append({
             "kind": kind,
             "profile_id": match.group(1).strip(),
             "label": "" if label == "-" else label,
             "provider": match.group(3).strip(),
             "model": match.group(4).strip(),
+            "max_concurrent_calls": None if limit == "-" else int(limit),
         })
     return items
 
@@ -347,6 +349,8 @@ class ProfileCreateScreen(Screen):
                 ),
                 id="profile-embedding-fields",
             ),
+            Label("Max Concurrent Calls (optional)"),
+            Input(placeholder="1", id="profile-max-concurrent-calls"),
             Label("Label (optional)"),
             Input(placeholder="local-embed", id="profile-label"),
             Container(
@@ -380,6 +384,10 @@ class ProfileCreateScreen(Screen):
         base_url = self.query_one("#profile-base-url", Input).value.strip()
         label = self.query_one("#profile-label", Input).value.strip()
         dimensions = self.query_one("#profile-dimensions", Input).value.strip()
+        max_concurrent_calls = self.query_one(
+            "#profile-max-concurrent-calls",
+            Input,
+        ).value.strip()
         distance_metric = self.query_one(
             "#profile-distance-metric",
             Select,
@@ -398,6 +406,15 @@ class ProfileCreateScreen(Screen):
             args["label"] = label
         if base_url:
             args["base_url"] = base_url
+        if max_concurrent_calls:
+            try:
+                args["max_concurrent_calls"] = int(max_concurrent_calls)
+            except ValueError:
+                self.notify(
+                    "Max concurrent calls must be an integer.",
+                    severity="error",
+                )
+                return
 
         tool_name = "create_llm_profile"
         if kind == "embedding":
@@ -713,7 +730,7 @@ class ConsoleScreen(Screen):
         (
             "/profile create embedding|llm --provider P --model M --secret S "
             "[--label L] [--base-url U] [--dimensions N] "
-            "[--distance-metric cosine]"
+            "[--distance-metric cosine] [--max-concurrent-calls N]"
         ): "Create a profile.",
         "/collection list": "List collections in the active namespace.",
         (
@@ -755,7 +772,7 @@ class ConsoleScreen(Screen):
         (
             "/profile create embedding|llm --provider P --model M --secret S "
             "[--label L] [--base-url U] [--dimensions N] "
-            "[--distance-metric cosine]"
+            "[--distance-metric cosine] [--max-concurrent-calls N]"
         ): "/profile create",
         "/collection list": "/collection list",
         (
@@ -1119,6 +1136,10 @@ class ConsoleScreen(Screen):
             }
             self._copy_optional_flag(flags, call_args, "label")
             self._copy_optional_flag(flags, call_args, "base_url")
+            if "max_concurrent_calls" in flags:
+                call_args["max_concurrent_calls"] = int(
+                    str(flags["max_concurrent_calls"])
+                )
             if kind == "embedding":
                 self._copy_optional_flag(flags, call_args, "distance_metric")
                 if "dimensions" in flags:
