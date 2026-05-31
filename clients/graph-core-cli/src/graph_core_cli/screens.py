@@ -1,5 +1,6 @@
 """Slash-command console screens for Graph Core."""
 
+import asyncio
 import os
 import re
 import shlex
@@ -69,6 +70,24 @@ def extract_api_key(text: str) -> str:
 def extract_job_id(text: str) -> str:
     match = re.search(r"job_id:\s*([^\s\n]+)", text)
     return match.group(1) if match else ""
+
+
+def parse_jobs(text: str) -> list[dict]:
+    items = []
+    for match in re.finditer(
+        r"^  - ([^|]+)\| ([^|]+)\| ([^|]+)\| ([^%\n]+)%(?: \| chunks (\d+)/(\d+))?$",
+        text,
+        re.MULTILINE,
+    ):
+        items.append({
+            "id": match.group(1).strip(),
+            "type": match.group(2).strip(),
+            "status": match.group(3).strip(),
+            "progress_percent": int(match.group(4).strip()),
+            "chunks_completed": int(match.group(5)) if match.group(5) else None,
+            "chunks_total": int(match.group(6)) if match.group(6) else None,
+        })
+    return items
 
 
 def parse_flag_args(tokens: list[str]) -> tuple[list[str], dict[str, str | bool]]:
@@ -685,7 +704,9 @@ class ConsoleScreen(Screen):
         "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
         "/query COLLECTION \"question\" [--mode MODE]": "Query a collection.",
+        "/jobs list [--limit N]": "List recent jobs.",
         "/jobs show JOB_ID": "Show job status.",
+        "/jobs watch JOB_ID": "Poll a job until it finishes.",
     }
     COMMAND_INSERT_TEXT = {
         "/help": "/help ",
@@ -728,7 +749,9 @@ class ConsoleScreen(Screen):
         (
             "/query COLLECTION \"question\" [--mode MODE]"
         ): "/query <collection> \"<question>\"",
+        "/jobs list [--limit N]": "/jobs list",
         "/jobs show JOB_ID": "/jobs show <job_id>",
+        "/jobs watch JOB_ID": "/jobs watch <job_id>",
     }
     STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
     QUERY_MODES = ["local", "global", "hybrid", "naive", "mix"]
@@ -741,6 +764,7 @@ class ConsoleScreen(Screen):
         self._suggestions: list[tuple[str, str]] = []
         self._suggestion_index = 0
         self._file_cache: list[str] = []
+        self._last_job_id = ""
 
     def compose(self):
         yield Label("Graph Core CLI  |  Slash commands only  |  q=Quit", id="title")
@@ -1164,12 +1188,14 @@ class ConsoleScreen(Screen):
             )
             return
         if action == "file":
-            self._write(
-                await self._call(
-                    "ingest_file",
-                    {"collection_id": collection["id"], "file_path": payload},
-                )
+            result = await self._call(
+                "ingest_file",
+                {"collection_id": collection["id"], "file_path": payload},
             )
+            job_id = extract_job_id(result)
+            if job_id:
+                self._last_job_id = job_id
+            self._write(result)
             return
         raise ValueError(
             "Usage: /ingest chunk COLLECTION \"text\" | "
@@ -1190,10 +1216,26 @@ class ConsoleScreen(Screen):
         self._write(await self._call("query_collection", call_args))
 
     async def _command_jobs(self, args: list[str]) -> None:
-        if len(args) >= 2 and args[0] == "show":
-            self._write(await self._call("get_job_status", {"job_id": args[1]}))
+        if not args or args[0] == "list":
+            limit = 20
+            if len(args) > 1:
+                _, flags = parse_flag_args(args[1:])
+                if isinstance(flags.get("limit"), str):
+                    limit = int(str(flags["limit"]))
+            self._write(await self._call("list_jobs", {"limit": limit}))
             return
-        raise ValueError("Usage: /jobs show JOB_ID")
+        if len(args) >= 2 and args[0] == "show":
+            job_id = self._resolve_job_id(args[1])
+            self._write(await self._call("get_job_status", {"job_id": job_id}))
+            return
+        if len(args) >= 2 and args[0] == "watch":
+            job_id = self._resolve_job_id(args[1])
+            await self._watch_job(job_id)
+            return
+        raise ValueError(
+            "Usage: /jobs list [--limit N] | "
+            "/jobs show JOB_ID | /jobs watch JOB_ID"
+        )
 
     async def _call(
         self,
@@ -1388,6 +1430,30 @@ class ConsoleScreen(Screen):
 
     def _write_error(self, text: str) -> None:
         self.query_one("#output", RichLog).write(f"Error: {text}\n")
+
+    def _resolve_job_id(self, token: str) -> str:
+        if token == "last":
+            if not self._last_job_id:
+                raise ValueError("No recent job recorded.")
+            return self._last_job_id
+        return token
+
+    async def _watch_job(self, job_id: str) -> None:
+        self._write(f"Watching job {job_id}...")
+        last_snapshot = ""
+        for _ in range(120):
+            status_text = await self._call("get_job_status", {"job_id": job_id})
+            if status_text != last_snapshot:
+                self._write(status_text)
+                last_snapshot = status_text
+            if (
+                "status: completed" in status_text
+                or "status: failed" in status_text
+                or "status: cancelled" in status_text
+            ):
+                return
+            await asyncio.sleep(1)
+        self._write("Stopped watching after 120 seconds.")
 
     def _handle_modal_result(self, result: str | None) -> None:
         if result:

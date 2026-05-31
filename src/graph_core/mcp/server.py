@@ -378,6 +378,30 @@ async def get_job_status(job_id: str, ctx: Context) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def list_jobs(ctx: Context, limit: int = 20) -> str:
+    """List recent jobs in the current namespace."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    jobs = await client.list_jobs(limit=limit)
+    if not jobs:
+        return "No jobs found."
+    lines = ["Jobs:"]
+    for job in jobs:
+        chunks = ""
+        if job.get("chunks_total"):
+            chunks = (
+                f" | chunks {job.get('chunks_completed', 0)}/"
+                f"{job['chunks_total']}"
+            )
+        lines.append(
+            f"  - {job['id']} | {job.get('type', 'N/A')} | "
+            f"{job.get('status', 'unknown')} | "
+            f"{job.get('progress_percent', 0)}%{chunks}"
+        )
+    return "\n".join(lines)
+
+
 # -- Platform tools ---------------------------------------------------------
 
 

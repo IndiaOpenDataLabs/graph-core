@@ -305,7 +305,42 @@ class GraphService:
                 "completed_at": (
                     job.completed_at.isoformat() if job.completed_at else None
                 ),
+                "chunks_total": job.chunks_total,
+                "chunks_completed": job.chunks_completed,
             }
+
+    async def list_jobs(
+        self,
+        namespace_id: uuid.UUID,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Job)
+                .where(Job.namespace_id == namespace_id)
+                .order_by(Job.created_at.desc())
+                .limit(limit)
+            )
+            jobs = list(result.scalars().all())
+            return [
+                {
+                    "id": str(job.id),
+                    "type": job.job_type,
+                    "status": job.status,
+                    "progress_percent": job.progress_percent,
+                    "chunks_total": job.chunks_total,
+                    "chunks_completed": job.chunks_completed,
+                    "collection_id": (
+                        str(job.collection_id) if job.collection_id else None
+                    ),
+                    "created_at": (
+                        job.created_at.isoformat() if job.created_at else None
+                    ),
+                    "error": job.error,
+                }
+                for job in jobs
+            ]
 
     async def update_job_status(
         self,

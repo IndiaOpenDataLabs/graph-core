@@ -1,15 +1,25 @@
 """FastAPI router — job status and SSE streaming."""
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from graph_core.api.auth import get_namespace_id
 from graph_core.services.graph import GraphService
-
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 service = GraphService()
+
+
+@router.get("/")
+async def list_jobs(
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[dict]:
+    """List recent jobs for the current namespace."""
+    return await service.list_jobs(namespace_id, limit=limit)
 
 
 @router.get("/{job_id}")
