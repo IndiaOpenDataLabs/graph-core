@@ -4,12 +4,12 @@ import logging
 import uuid
 
 import dramatiq
-from sqlalchemy import select
 
 from graph_core.config import settings
-from graph_core.database import AsyncSessionLocal
-from graph_core.models.chunk import IngestionChunk
 from graph_core.services.graph import GraphService
+from graph_core.services.graph.ingestion.document_pipeline import (
+    dispatch_pending_chunks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,22 +29,8 @@ async def run_ingestion(job_id: str):
 
     try:
         await service.ingest_document_pipeline(job_uuid)
-
-        # Enqueue pending chunk workers for graph-rag strategies.
-        # The pipeline creates chunk records; this actor enqueues them.
-        async with AsyncSessionLocal() as session:
-            chunks = (
-                await session.execute(
-                    select(IngestionChunk).where(
-                        IngestionChunk.job_id == job_uuid,
-                        IngestionChunk.status == "pending",
-                    )
-                )
-            ).scalars().all()
-            for chunk in chunks:
-                run_chunk.send(str(job_id), chunk.chunk_index)  # type: ignore[attr-defined]
-
-        await service.append_job_event(job_uuid, "completed")
+        await dispatch_pending_chunks(job_uuid)
+        await service.append_job_event(job_uuid, "chunks_dispatched")
     except Exception as e:
         await service.append_job_event(job_uuid, "error", {"error": str(e)})
         await service.update_job_status(job_uuid, "failed", error=str(e))
@@ -69,7 +55,7 @@ async def run_chunk(job_id: str, chunk_index: int):
             chunk_index,
             e,
         )
-        await service.update_chunk_status(
-            uuid.UUID(job_id), chunk_index, "failed", error=str(e)
-        )
+        job_uuid = uuid.UUID(job_id)
+        await service.update_chunk_status(job_uuid, chunk_index, "failed", error=str(e))
+        await dispatch_pending_chunks(job_uuid, slots=1)
         raise

@@ -8,6 +8,7 @@ from graph_core.services.graph.ingestion.chunk_processor import (
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     DocumentIngestionResult,
+    dispatch_pending_chunks,
     enqueue_document_ingestion_job,
     fan_out_chunks,
     increment_chunk_counter,
@@ -21,6 +22,7 @@ __all__ = [
     "DocumentIngestionResult",
     "ingest_collection_chunk",
     "ingest_document_pipeline",
+    "dispatch_pending_chunks",
     "fan_out_chunks",
     "process_single_chunk",
     "update_chunk_status",

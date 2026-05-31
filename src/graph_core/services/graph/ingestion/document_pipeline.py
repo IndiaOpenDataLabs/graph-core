@@ -8,13 +8,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.job import Job, JobEvent
+from graph_core.models.profile import Profile
 from graph_core.services.chunking import TokenChunker
 from graph_core.services.graph.ingestion.chunk_processor import ingest_collection_chunk
 
@@ -174,6 +175,101 @@ async def fan_out_chunks(
         await session.commit()
 
 
+def _resolve_chunk_dispatch_limit(
+    collection: Collection,
+    embedding_profile: Profile | None,
+    llm_profile: Profile | None,
+) -> int:
+    limits = []
+
+    if embedding_profile and embedding_profile.max_concurrent_calls:
+        limits.append(embedding_profile.max_concurrent_calls)
+    elif collection.embedding_profile_id is not None:
+        limits.append(settings.embedding_max_concurrent_calls)
+
+    if llm_profile and llm_profile.max_concurrent_calls:
+        limits.append(llm_profile.max_concurrent_calls)
+    elif collection.llm_profile_id is not None:
+        limits.append(settings.llm_max_concurrent_calls)
+
+    if not limits:
+        return 1
+
+    return max(1, min(limits))
+
+
+async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -> int:
+    """Reserve and enqueue the next bounded window of pending chunks."""
+    async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_id)
+        if not job or not job.collection_id:
+            return 0
+
+        collection = await session.get(Collection, job.collection_id)
+        if not collection:
+            return 0
+
+        embedding_profile = None
+        if collection.embedding_profile_id is not None:
+            embedding_profile = await session.get(
+                Profile,
+                collection.embedding_profile_id,
+            )
+
+        llm_profile = None
+        if collection.llm_profile_id is not None:
+            llm_profile = await session.get(Profile, collection.llm_profile_id)
+
+        dispatch_limit = _resolve_chunk_dispatch_limit(
+            collection,
+            embedding_profile,
+            llm_profile,
+        )
+
+        active_count = await session.scalar(
+            select(func.count())
+            .select_from(IngestionChunk)
+            .where(
+                IngestionChunk.job_id == job_id,
+                IngestionChunk.status == "processing",
+            )
+        )
+        available = dispatch_limit - int(active_count or 0)
+        if slots is not None:
+            available = min(available, slots)
+        if available <= 0:
+            return 0
+
+        pending_chunks = (
+            await session.execute(
+                select(IngestionChunk)
+                .where(
+                    IngestionChunk.job_id == job_id,
+                    IngestionChunk.status == "pending",
+                )
+                .order_by(IngestionChunk.chunk_index)
+                .limit(available)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+
+        if not pending_chunks:
+            return 0
+
+        for chunk in pending_chunks:
+            chunk.status = "processing"  # type: ignore[assignment]
+
+        await session.commit()
+        dispatch_indices = [chunk.chunk_index for chunk in pending_chunks]
+
+    from graph_core.workers.ingestion import run_chunk
+
+    for chunk_index in dispatch_indices:
+        run_chunk.send(str(job_id), chunk_index)  # type: ignore[attr-defined]
+
+    return len(dispatch_indices)
+
+
 # ── Single-chunk processing ──
 
 
@@ -189,8 +285,6 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
             )
         )
         chunk = chunk.scalar_one()
-        chunk.status = "processing"  # type: ignore[assignment]
-        await session.commit()
 
         job = await session.get(Job, job_uuid)
         collection = await session.get(Collection, job.collection_id)
@@ -215,6 +309,7 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
             "relationship_count": result.relationship_count,
         },
     )
+    await dispatch_pending_chunks(job_uuid, slots=1)
 
 
 # ── Chunk status tracking ──
