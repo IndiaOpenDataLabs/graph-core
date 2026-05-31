@@ -153,7 +153,7 @@ class GraphCoreClient:
 
     async def ingest_document(self, collection_id: str, text: str) -> dict[str, Any]:
         return await self._request(
-            "POST", f"/collections/{collection_id}/ingest/document", json={"text": text}
+            "POST", f"/collections/{collection_id}/ingest/doc", json={"text": text}
         )
 
     # -- Query --------------------------------------------------------------

@@ -1188,9 +1188,14 @@ class ConsoleScreen(Screen):
             )
             return
         if action == "file":
+            file_path = Path(self._normalize_file_reference(payload)).expanduser()
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"Unable to read file: {file_path} ({exc})") from exc
             result = await self._call(
-                "ingest_file",
-                {"collection_id": collection["id"], "file_path": payload},
+                "ingest_document",
+                {"collection_id": collection["id"], "text": content},
             )
             job_id = extract_job_id(result)
             if job_id:
