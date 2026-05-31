@@ -204,6 +204,50 @@ async def list_collections(ctx: Context) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def update_collection(
+    collection_id: str,
+    ctx: Context,
+    name: str | None = None,
+    strategy: str | None = None,
+    embedding_profile_id: str | None = None,
+    llm_profile_id: str | None = None,
+    default_query_mode: str | None = None,
+    clear_llm_profile: bool = False,
+    clear_default_query_mode: bool = False,
+) -> str:
+    """Update a collection in the current namespace."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    result = await client.update_collection(
+        collection_id=collection_id,
+        name=name,
+        strategy=strategy,
+        embedding_profile_id=embedding_profile_id,
+        llm_profile_id=llm_profile_id,
+        default_query_mode=default_query_mode,
+        clear_llm_profile=clear_llm_profile,
+        clear_default_query_mode=clear_default_query_mode,
+    )
+    return (
+        f"Updated collection:\n"
+        f"  id: {result['id']}\n"
+        f"  name: {result['name']}\n"
+        f"  strategy: {result['strategy']}\n"
+        f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
+        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}"
+    )
+
+
+@mcp.tool()
+async def delete_collection(collection_id: str, ctx: Context) -> str:
+    """Delete a collection in the current namespace."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    result = await client.delete_collection(collection_id)
+    return f"Deleted collection {result.get('id', collection_id)}"
+
+
 # -- Ingestion tools --------------------------------------------------------
 
 

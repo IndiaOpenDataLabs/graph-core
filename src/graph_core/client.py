@@ -108,6 +108,42 @@ class GraphCoreClient:
     async def list_collections(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/collections/")
 
+    async def update_collection(
+        self,
+        collection_id: str,
+        *,
+        name: str | None = None,
+        strategy: str | None = None,
+        embedding_profile_id: str | None = None,
+        llm_profile_id: str | None = None,
+        default_query_mode: str | None = None,
+        clear_llm_profile: bool = False,
+        clear_default_query_mode: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if strategy is not None:
+            body["strategy"] = strategy
+        if embedding_profile_id is not None:
+            body["embedding_profile_id"] = embedding_profile_id
+        if llm_profile_id is not None:
+            body["llm_profile_id"] = llm_profile_id
+        if default_query_mode is not None:
+            body["default_query_mode"] = default_query_mode
+        if clear_llm_profile:
+            body["clear_llm_profile"] = True
+        if clear_default_query_mode:
+            body["clear_default_query_mode"] = True
+        return await self._request(
+            "PATCH",
+            f"/collections/{collection_id}",
+            json=body,
+        )
+
+    async def delete_collection(self, collection_id: str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/collections/{collection_id}")
+
     # -- Ingestion ----------------------------------------------------------
 
     async def ingest_chunk(self, collection_id: str, text: str) -> dict[str, Any]:

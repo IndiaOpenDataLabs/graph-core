@@ -4,6 +4,7 @@ import uuid
 
 from sqlalchemy import select
 
+from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.credential import Credential
 from graph_core.models.profile import Profile
@@ -54,6 +55,13 @@ class PlatformService:
                 credential = await session.get(Credential, credential_id)
                 if not credential or credential.namespace_id != namespace_id:
                     raise ValueError("Credential not found in namespace")
+
+            if kind == "embedding":
+                if dimensions is None:
+                    raise ValueError(
+                        "Embedding profiles require dimensions."
+                    )
+                distance_metric = distance_metric or settings.default_distance_metric
 
             profile = Profile(
                 namespace_id=namespace_id,

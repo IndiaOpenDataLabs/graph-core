@@ -261,14 +261,25 @@ class ConsoleScreen(Screen):
         ): "Create a profile.",
         "/collection list": "List collections in the active namespace.",
         (
-            "/collection create NAME --strategy S --embedding-profile ID_OR_LABEL "
-            "[--llm-profile ID_OR_LABEL] [--default-query-mode MODE]"
+            "/collection create NAME --strategy vector|light_rag|custom_graph_rag "
+            "--embedding-profile ID_OR_LABEL [--llm-profile ID_OR_LABEL] "
+            "[--default-query-mode local|global|hybrid|naive|mix]"
         ): "Create a collection.",
+        (
+            "/collection edit COLLECTION [--name NAME] "
+            "[--strategy vector|light_rag|custom_graph_rag] "
+            "[--embedding-profile ID_OR_LABEL] [--llm-profile ID_OR_LABEL] "
+            "[--clear-llm-profile] [--default-query-mode MODE] "
+            "[--clear-default-query-mode]"
+        ): "Update a collection.",
+        "/collection delete COLLECTION": "Delete a collection.",
         "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
         "/query COLLECTION \"question\" [--mode MODE]": "Query a collection.",
         "/jobs show JOB_ID": "Show job status.",
     }
+    STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
+    QUERY_MODES = ["local", "global", "hybrid", "naive", "mix"]
 
     def __init__(self) -> None:
         super().__init__()
@@ -573,7 +584,9 @@ class ConsoleScreen(Screen):
 
     async def _command_collection(self, args: list[str]) -> None:
         if not args:
-            raise ValueError("Usage: /collection list | /collection create ...")
+            raise ValueError(
+                "Usage: /collection list | /collection create|edit|delete ..."
+            )
         action = args[0]
         if action == "list":
             self._write(await self._call("list_collections"))
@@ -609,7 +622,53 @@ class ConsoleScreen(Screen):
                 call_args["default_query_mode"] = str(flags["default_query_mode"])
             self._write(await self._call("create_collection", call_args))
             return
-        raise ValueError("Usage: /collection list | /collection create ...")
+        if action == "edit" and len(args) >= 2:
+            target = args[1]
+            collection = await self._resolve_collection(target)
+            _, flags = parse_flag_args(args[2:])
+            call_args: dict[str, str | bool] = {"collection_id": collection["id"]}
+            if isinstance(flags.get("name"), str):
+                call_args["name"] = str(flags["name"])
+            if isinstance(flags.get("strategy"), str):
+                call_args["strategy"] = str(flags["strategy"])
+            if isinstance(flags.get("embedding_profile"), str):
+                embedding_profiles = await self._list_profiles("embedding")
+                embedding_profile = self._resolve_entity(
+                    str(flags["embedding_profile"]),
+                    embedding_profiles,
+                    id_key="profile_id",
+                    text_keys=["label", "model"],
+                )
+                call_args["embedding_profile_id"] = embedding_profile["profile_id"]
+            if flags.get("clear_llm_profile") is True:
+                call_args["clear_llm_profile"] = True
+            elif isinstance(flags.get("llm_profile"), str):
+                llm_profiles = await self._list_profiles("llm")
+                llm_profile = self._resolve_entity(
+                    str(flags["llm_profile"]),
+                    llm_profiles,
+                    id_key="profile_id",
+                    text_keys=["label", "model"],
+                )
+                call_args["llm_profile_id"] = llm_profile["profile_id"]
+            if flags.get("clear_default_query_mode") is True:
+                call_args["clear_default_query_mode"] = True
+            elif isinstance(flags.get("default_query_mode"), str):
+                call_args["default_query_mode"] = str(flags["default_query_mode"])
+            self._write(await self._call("update_collection", call_args))
+            return
+        if action == "delete" and len(args) >= 2:
+            collection = await self._resolve_collection(args[1])
+            self._write(
+                await self._call(
+                    "delete_collection",
+                    {"collection_id": collection["id"]},
+                )
+            )
+            return
+        raise ValueError(
+            "Usage: /collection list | /collection create|edit|delete ..."
+        )
 
     async def _command_ingest(self, args: list[str]) -> None:
         if len(args) < 3:
@@ -866,6 +925,20 @@ class ConsoleScreen(Screen):
                 for command, description in self.COMMAND_HELP.items()
                 if command.startswith(prefix)
             ]
+        elif "--strategy " in value:
+            prefix = value.rsplit("--strategy ", 1)[1].strip()
+            suggestions = [
+                (strategy, "strategy")
+                for strategy in self.STRATEGIES
+                if strategy.startswith(prefix)
+            ]
+        elif "--default-query-mode " in value:
+            prefix = value.rsplit("--default-query-mode ", 1)[1].strip()
+            suggestions = [
+                (mode, "query mode")
+                for mode in self.QUERY_MODES
+                if mode.startswith(prefix)
+            ]
         else:
             file_token = self._extract_file_token(value)
             if file_token is not None:
@@ -911,6 +984,24 @@ class ConsoleScreen(Screen):
         if current.startswith("/") and " " not in current:
             input_widget.value = value
             input_widget.cursor_position = len(value)
+            self._focus_command()
+            self._update_suggestions(input_widget.value)
+            return
+
+        if "--strategy " in current:
+            before, _, _ = current.rpartition("--strategy ")
+            new_value = f"{before}--strategy {value}"
+            input_widget.value = new_value
+            input_widget.cursor_position = len(new_value)
+            self._focus_command()
+            self._update_suggestions(input_widget.value)
+            return
+
+        if "--default-query-mode " in current:
+            before, _, _ = current.rpartition("--default-query-mode ")
+            new_value = f"{before}--default-query-mode {value}"
+            input_widget.value = new_value
+            input_widget.cursor_position = len(new_value)
             self._focus_command()
             self._update_suggestions(input_widget.value)
             return

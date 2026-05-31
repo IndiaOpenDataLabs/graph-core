@@ -19,6 +19,16 @@ class CreateCollectionRequest(BaseModel):
     default_query_mode: str | None = None
 
 
+class UpdateCollectionRequest(BaseModel):
+    name: str | None = None
+    strategy: str | None = None
+    embedding_profile_id: uuid.UUID | None = None
+    llm_profile_id: uuid.UUID | None = None
+    default_query_mode: str | None = None
+    clear_llm_profile: bool = False
+    clear_default_query_mode: bool = False
+
+
 class CollectionResponse(BaseModel):
     id: str
     name: str
@@ -62,13 +72,64 @@ async def list_collections(
     return [_to_response(c) for c in collections]
 
 
+@router.patch("/{collection_id}")
+async def update_collection(
+    collection_id: uuid.UUID,
+    body: UpdateCollectionRequest,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> CollectionResponse:
+    del session
+    try:
+        collection = await service.update_collection(
+            collection_id=collection_id,
+            namespace_id=namespace_id,
+            name=body.name,
+            strategy=body.strategy,  # type: ignore[arg-type]
+            embedding_profile_id=body.embedding_profile_id,
+            llm_profile_id=body.llm_profile_id,
+            default_query_mode=body.default_query_mode,
+            clear_llm_profile=body.clear_llm_profile,
+            clear_default_query_mode=body.clear_default_query_mode,
+        )
+        return _to_response(collection)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@router.delete("/{collection_id}")
+async def delete_collection(
+    collection_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> dict[str, str]:
+    del session
+    try:
+        collection = await service.get_collection(collection_id)
+        if collection.namespace_id != namespace_id:
+            raise PermissionError(
+                f"Collection {collection_id} does not belong to namespace "
+                f"{namespace_id}"
+            )
+        await service.delete_collection(collection_id)
+        return {"status": "deleted", "id": str(collection_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
 def _to_response(c) -> CollectionResponse:
     return CollectionResponse(
         id=str(c.id),
         name=c.name,
         strategy=c.strategy,
         namespace_id=str(c.namespace_id),
-        embedding_profile_id=str(c.embedding_profile_id) if c.embedding_profile_id else None,
+        embedding_profile_id=(
+            str(c.embedding_profile_id) if c.embedding_profile_id else None
+        ),
         llm_profile_id=str(c.llm_profile_id) if c.llm_profile_id else None,
         default_query_mode=c.default_query_mode,
     )

@@ -90,6 +90,8 @@ class GraphService:
                 raise ValueError("Embedding profile does not belong to namespace")
             if profile.kind != "embedding":
                 raise ValueError("Profile kind must be embedding")
+            if profile.dimensions is None:
+                raise ValueError("Embedding profile dimensions are required")
             dimensions = profile.dimensions
 
             if llm_profile_id is not None:
@@ -118,6 +120,66 @@ class GraphService:
             await create_all_tables(collection.id, dimensions)
 
         return collection
+
+    async def update_collection(
+        self,
+        collection_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+        *,
+        name: str | None = None,
+        strategy: Literal["vector", "custom_graph_rag", "light_rag"] | None = None,
+        embedding_profile_id: uuid.UUID | None = None,
+        llm_profile_id: uuid.UUID | None = None,
+        default_query_mode: str | None = None,
+        clear_llm_profile: bool = False,
+        clear_default_query_mode: bool = False,
+    ) -> Collection:
+        async with AsyncSessionLocal() as session:
+            collection = await session.get(Collection, collection_id)
+            if not collection:
+                raise ValueError(f"Collection {collection_id} not found")
+            self._enforce_namespace(collection, namespace_id)
+
+            if name is not None:
+                collection.name = name
+            if strategy is not None:
+                collection.strategy = strategy
+
+            if embedding_profile_id is not None:
+                profile = await session.get(Profile, embedding_profile_id)
+                if not profile:
+                    raise ValueError(
+                        f"Embedding profile {embedding_profile_id} not found"
+                    )
+                if profile.namespace_id != namespace_id:
+                    raise ValueError("Embedding profile does not belong to namespace")
+                if profile.kind != "embedding":
+                    raise ValueError("Profile kind must be embedding")
+                if profile.dimensions is None:
+                    raise ValueError("Embedding profile dimensions are required")
+                collection.embedding_profile_id = embedding_profile_id
+                collection.embedding_dimensions = profile.dimensions
+
+            if clear_llm_profile:
+                collection.llm_profile_id = None
+            elif llm_profile_id is not None:
+                llm_profile = await session.get(Profile, llm_profile_id)
+                if not llm_profile:
+                    raise ValueError(f"LLM profile {llm_profile_id} not found")
+                if llm_profile.namespace_id != namespace_id:
+                    raise ValueError("LLM profile does not belong to namespace")
+                if llm_profile.kind != "llm":
+                    raise ValueError("LLM profile kind must be llm")
+                collection.llm_profile_id = llm_profile_id
+
+            if clear_default_query_mode:
+                collection.default_query_mode = None
+            elif default_query_mode is not None:
+                collection.default_query_mode = default_query_mode
+
+            await session.commit()
+            await session.refresh(collection)
+            return collection
 
     async def delete_collection(self, collection_id: uuid.UUID) -> None:
         collection = await self.get_collection(collection_id)
