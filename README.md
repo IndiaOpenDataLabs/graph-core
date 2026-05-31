@@ -26,7 +26,7 @@ This builds and starts:
 - **Postgres** with `pgvector` (port 5432)
 - **FalkorDB** (graph DB, port 6379)
 - **Redis** (dramatiq + SSE, port 6380)
-- **App** (FastAPI, port 8000)
+- **App** (FastAPI + MCP, port 8001)
 - **Worker** (Dramatiq background jobs)
 
 ### Recommended local flow
@@ -119,13 +119,13 @@ Claude Code, and any MCP client.
 make docker-up
 ```
 
-The MCP server is part of the full Docker stack and is exposed over streamable HTTP at `http://localhost:8001/mcp/`. You do not need to run a separate `make server` target.
+The MCP server is part of the full Docker stack and is exposed over streamable HTTP at `http://localhost:8001/mcp/`. The same app process also serves the REST API on `http://localhost:8001/`. You do not need to run a separate `make server` target.
 
 Configure via environment variables:
 
 | Env Var                  | Description                          |
 |--------------------------|--------------------------------------|
-| `GRAPH_CORE_URL`         | Platform base URL (default: localhost:8000) |
+| `GRAPH_CORE_URL`         | Platform base URL (default: localhost:8001) |
 | `GRAPH_CORE_API_KEY`     | Namespace API key or admin key       |
 | `GRAPH_CORE_ADMIN_KEY`   | Admin key for namespace management   |
 

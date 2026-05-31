@@ -16,7 +16,7 @@ from graph_core.client import GraphCoreAPIError, GraphCoreClient
 
 
 def _get_base_url() -> str:
-    return os.getenv("GRAPH_CORE_URL", "http://localhost:8000").rstrip("/")
+    return os.getenv("GRAPH_CORE_URL", "http://localhost:8001").rstrip("/")
 
 
 def _extract_api_key(ctx: Context) -> str:

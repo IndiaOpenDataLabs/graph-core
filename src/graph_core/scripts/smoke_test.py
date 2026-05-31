@@ -23,7 +23,7 @@ import uuid
 
 import httpx
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:8001"
 DB_URL = "postgresql://graphcore:graphcore@localhost:5432/graphcore"
 
 # Text used for ingestion — contains entities/relationships for graph strategies
