@@ -759,7 +759,7 @@ class ConsoleScreen(Screen):
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
         (
             "/query COLLECTION \"question\" "
-            "[--mode entity-first|relationship-first|hybrid|local "
+            "[--mode entity-first|relationship-first|hybrid|mix|local "
             "(aliases: ent|rel|hyb)]"
         ): "Query a collection.",
         "/jobs list [--limit N]": "List recent jobs.",
@@ -808,7 +808,7 @@ class ConsoleScreen(Screen):
         ): "/ingest file <collection> @<path>",
         (
             "/query COLLECTION \"question\" "
-            "[--mode entity-first|relationship-first|hybrid|local "
+            "[--mode entity-first|relationship-first|hybrid|mix|local "
             "(aliases: ent|rel|hyb)]"
         ): "/query <collection> \"<question>\"",
         "/jobs list [--limit N]": "/jobs list",

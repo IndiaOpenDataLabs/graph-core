@@ -32,6 +32,15 @@ from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
+_ENTITY_RETRIEVAL_INSTRUCTION = (
+    "Retrieve ontology entities whose descriptions best explain the user's "
+    "state, process, causal mechanism, or source of exhaustion."
+)
+_RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
+    "Retrieve relationship descriptions that best explain the user's question, "
+    "especially causes, mechanisms, tensions, and energy depletion."
+)
+_MIX_REWRITE_MIN_SCORE = 0.55
 _MODE_ALIASES = {
     "local": "entity-first",
     "ent": "entity-first",
@@ -42,6 +51,7 @@ _MODE_ALIASES = {
     "relationship-first": "relationship-first",
     "hyb": "hybrid",
     "hybrid": "hybrid",
+    "mix": "mix",
 }
 
 
@@ -51,6 +61,34 @@ class GraphQueryState:
     entity_relevance: dict[str, float]
     traversed_rel_ids: list[str]
     rel_score_cache: dict[str, float]
+
+
+@dataclass
+class MixInterpretation:
+    selected_entities: list[str]
+    retrieval_subqueries: list[str]
+
+
+def _format_retrieval_query(instruction: str, query: str) -> str:
+    return f"<Instruct>: {instruction}\n<Query>: {query}"
+
+
+async def _embed_entity_query(
+    embedding_provider: EmbeddingProvider,
+    query: str,
+) -> list[float]:
+    return await embedding_provider.embed_query(
+        _format_retrieval_query(_ENTITY_RETRIEVAL_INSTRUCTION, query)
+    )
+
+
+async def _embed_relationship_query(
+    embedding_provider: EmbeddingProvider,
+    query: str,
+) -> list[float]:
+    return await embedding_provider.embed_query(
+        _format_retrieval_query(_RELATIONSHIP_RETRIEVAL_INSTRUCTION, query)
+    )
 
 
 async def _resolve_credential(
@@ -175,6 +213,28 @@ async def _search_entity_seeds(
     return seed_entity_ids, entity_relevance
 
 
+async def _top_entity_candidates(
+    collection: Collection,
+    query_embedding: list[float],
+    *,
+    top_k: int = 50,
+) -> list[tuple[str, str, float]]:
+    hits = await _graph_rag_vectors.search_entity_embeddings(
+        collection_id=collection.id,
+        query_embedding=query_embedding,
+        top_k=top_k,
+    )
+    candidates: list[tuple[str, str, float]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        name = str(hit.metadata.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        candidates.append((name, hit.content.strip(), 1.0 - hit.distance))
+    return candidates
+
+
 async def _search_relationship_seeds(
     collection: Collection,
     query_embedding: list[float],
@@ -199,7 +259,7 @@ async def _search_relationship_seeds(
 
 async def _score_relationship(
     collection: Collection,
-    query_embedding: list[float],
+    relationship_query_embedding: list[float],
     rel_id: str,
     cache: dict[str, float],
     *,
@@ -210,7 +270,7 @@ async def _score_relationship(
         return cached
     rel_hits = await _graph_rag_vectors.search_relationship_embeddings(
         collection_id=collection.id,
-        query_embedding=query_embedding,
+        query_embedding=relationship_query_embedding,
         top_k=top_k,
         relationship_id=uuid.UUID(rel_id),
     )
@@ -222,7 +282,8 @@ async def _score_relationship(
 async def _entity_first_state(
     question: str,
     collection: Collection,
-    query_embedding: list[float],
+    entity_query_embedding: list[float],
+    relationship_query_embedding: list[float],
 ) -> GraphQueryState:
     top_k = 10
     min_edge_sim = settings.graph_rag_min_edge_similarity
@@ -232,7 +293,7 @@ async def _entity_first_state(
     seed_entity_ids, entity_relevance = await _search_entity_seeds(
         question,
         collection,
-        query_embedding,
+        entity_query_embedding,
     )
 
     async with AsyncSessionLocal() as session:
@@ -246,7 +307,7 @@ async def _entity_first_state(
 
     rel_hits = await _graph_rag_vectors.search_relationship_embeddings(
         collection_id=collection.id,
-        query_embedding=query_embedding,
+        query_embedding=relationship_query_embedding,
         top_k=max(top_k * 5, 50),
     )
 
@@ -302,7 +363,10 @@ async def _entity_first_state(
 
             rel_id_str = str(edge_props["id"])
             sim = await _score_relationship(
-                collection, query_embedding, rel_id_str, rel_score_cache
+                collection,
+                relationship_query_embedding,
+                rel_id_str,
+                rel_score_cache,
             )
             if sim >= effective_min_edge_sim:
                 scored_edges.append((sim, neighbor, rel_id_str))
@@ -335,7 +399,7 @@ async def _entity_first_state(
 async def _find_relevant_path(
     graph_storage,
     collection: Collection,
-    query_embedding: list[float],
+    relationship_query_embedding: list[float],
     source_id: str,
     target_id: str,
     rel_score_cache: dict[str, float],
@@ -367,7 +431,10 @@ async def _find_relevant_path(
 
             rel_id = str(edge_props["id"])
             sim = await _score_relationship(
-                collection, query_embedding, rel_id, rel_score_cache
+                collection,
+                relationship_query_embedding,
+                rel_id,
+                rel_score_cache,
             )
             candidates.append((sim, neighbor, rel_id))
 
@@ -381,15 +448,18 @@ async def _find_relevant_path(
     return None
 
 
-async def _relationship_first_state(
-    question: str,
+async def _relationship_seed_state(
     collection: Collection,
-    query_embedding: list[float],
+    relationship_query_embedding: list[float],
+    *,
+    top_k: int = 10,
+    max_endpoints: int = 20,
+    max_pairs: int = 30,
 ) -> GraphQueryState:
     rel_seeds = await _search_relationship_seeds(
         collection,
-        query_embedding,
-        top_k=10,
+        relationship_query_embedding,
+        top_k=top_k,
     )
 
     traversed_rel_ids: list[str] = []
@@ -398,7 +468,7 @@ async def _relationship_first_state(
     entity_relevance: dict[str, float] = {}
 
     async with AsyncSessionLocal() as session:
-        for rel_id_str, sim in rel_seeds[:10]:
+        for rel_id_str, sim in rel_seeds[:top_k]:
             rel = await session.get(GraphRelationship, uuid.UUID(rel_id_str))
             if not rel:
                 continue
@@ -413,10 +483,9 @@ async def _relationship_first_state(
         discovered_entity_ids,
         key=lambda eid: entity_relevance.get(eid, 0.0),
         reverse=True,
-    )[:20]
+    )[:max_endpoints]
 
     graph_storage = get_graph_storage(collection.id)
-    max_pairs = 30
     pair_count = 0
     for source_id, target_id in combinations(endpoint_ids, 2):
         if pair_count >= max_pairs:
@@ -425,7 +494,7 @@ async def _relationship_first_state(
         path = await _find_relevant_path(
             graph_storage,
             collection,
-            query_embedding,
+            relationship_query_embedding,
             source_id,
             target_id,
             rel_score_cache,
@@ -444,22 +513,42 @@ async def _relationship_first_state(
             if eid not in entity_relevance or path_score > entity_relevance[eid]:
                 entity_relevance[eid] = path_score
 
-    seed_entity_ids, seed_scores = await _search_entity_seeds(
-        question,
-        collection,
-        query_embedding,
-    )
-    for eid in seed_entity_ids[:5]:
-        discovered_entity_ids.add(eid)
-        if eid not in entity_relevance or seed_scores[eid] > entity_relevance[eid]:
-            entity_relevance[eid] = seed_scores[eid]
-
     return GraphQueryState(
         discovered_entity_ids=discovered_entity_ids,
         entity_relevance=entity_relevance,
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
     )
+
+
+async def _relationship_first_state(
+    question: str,
+    collection: Collection,
+    entity_query_embedding: list[float],
+    relationship_query_embedding: list[float],
+) -> GraphQueryState:
+    state = await _relationship_seed_state(
+        collection,
+        relationship_query_embedding,
+        top_k=10,
+        max_endpoints=20,
+        max_pairs=30,
+    )
+
+    seed_entity_ids, seed_scores = await _search_entity_seeds(
+        question,
+        collection,
+        entity_query_embedding,
+    )
+    for eid in seed_entity_ids[:5]:
+        state.discovered_entity_ids.add(eid)
+        if (
+            eid not in state.entity_relevance
+            or seed_scores[eid] > state.entity_relevance[eid]
+        ):
+            state.entity_relevance[eid] = seed_scores[eid]
+
+    return state
 
 
 def _merge_states(*states: GraphQueryState) -> GraphQueryState:
@@ -484,6 +573,179 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
     )
+
+
+def _fallback_mix_interpretation(
+    candidates: list[tuple[str, str, float]],
+) -> MixInterpretation:
+    names = [name for name, _, _ in candidates[:8]]
+    if not names:
+        return MixInterpretation(selected_entities=[], retrieval_subqueries=[])
+    subqueries: list[str] = []
+    if "Rajas" in names and "The Mind" in names:
+        subqueries.append(
+            "Why does sustained focused activity of Rajas in The Mind "
+            "still lead to exhaustion?"
+        )
+    if "Prana" in names or "Ojas" in names:
+        subqueries.append(
+            "How do Prana and Ojas explain mental drain, reduced steadiness, "
+            "and loss of endurance after overwork?"
+        )
+    if "Samkalpa" in names:
+        subqueries.append(
+            "What is the relationship between Samkalpa, repeated mental effort, "
+            "and exhaustion from solving one problem after another?"
+        )
+    if "Pratyahara" in names:
+        subqueries.append(
+            "Does lack of Pratyahara or stopping allow The Mind to keep spending "
+            "energy without recovery?"
+        )
+    if not subqueries:
+        subqueries = [
+            (
+                "How do "
+                + ", ".join(names[:4])
+                + " explain continuous mental effort and exhaustion?"
+            ),
+            (
+                "How do "
+                + ", ".join(names[4:8])
+                + " relate to steadiness, recovery, and endurance?"
+            ),
+        ]
+    return MixInterpretation(
+        selected_entities=names,
+        retrieval_subqueries=[query for query in subqueries if query.strip()][:4],
+    )
+
+
+async def _interpret_mix_queries(
+    question: str,
+    candidates: list[tuple[str, str, float]],
+    llm_provider: LLMProvider,
+) -> MixInterpretation:
+    if isinstance(llm_provider, LocalEchoLLMProvider):
+        return _fallback_mix_interpretation(candidates)
+
+    entity_lines = []
+    for idx, (name, description, score) in enumerate(candidates[:20], start=1):
+        snippet = description.replace("\n", " ").strip()
+        entity_lines.append(f"{idx}. {name} (score={score:.3f}): {snippet[:120]}")
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "selected_entities": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "retrieval_subqueries": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["selected_entities", "retrieval_subqueries"],
+    }
+
+    prompt = (
+        "You are preparing retrieval queries for a knowledge graph.\n"
+        "Use only the entity names from the candidate list.\n"
+        "Select up to 8 relevant entities for the user's question.\n"
+        "Then produce 2 to 4 longer retrieval subqueries.\n"
+        "Each subquery should be one sentence, around 12 to 30 words, and target "
+        "a separate explanatory dimension of the question.\n"
+        "Use selected entity names heavily, but keep the subqueries semantically "
+        "specific instead of turning them into short keyword bags.\n"
+        "Favor dimensions like mechanism, energetic depletion, counterbalance, "
+        "and the user's stated contrast or objection.\n"
+        "Preserve the user's distinctions and negations.\n\n"
+        f"User question:\n{question}\n\n"
+        "Candidate entities:\n"
+        f"{chr(10).join(entity_lines)}"
+    )
+
+    try:
+        result = await llm_provider.structured_extract(prompt=prompt, schema=schema)
+    except Exception:
+        return _fallback_mix_interpretation(candidates)
+
+    selected_entities = [
+        str(value).strip()
+        for value in result.get("selected_entities", [])
+        if str(value).strip()
+    ]
+    retrieval_subqueries = [
+        str(value).strip()
+        for value in result.get("retrieval_subqueries", [])
+        if str(value).strip()
+    ]
+
+    if not retrieval_subqueries:
+        return _fallback_mix_interpretation(candidates)
+
+    return MixInterpretation(
+        selected_entities=selected_entities[:8],
+        retrieval_subqueries=retrieval_subqueries[:4],
+    )
+
+
+async def _mix_state(
+    question: str,
+    collection: Collection,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
+    embedding_provider: EmbeddingProvider,
+    entity_query_embedding: list[float],
+    relationship_query_embedding: list[float],
+) -> GraphQueryState:
+    candidates = await _top_entity_candidates(
+        collection,
+        entity_query_embedding,
+        top_k=50,
+    )
+    top_entity_score = candidates[0][2] if candidates else 0.0
+    if top_entity_score < _MIX_REWRITE_MIN_SCORE:
+        return await _relationship_seed_state(
+            collection,
+            relationship_query_embedding,
+            top_k=10,
+            max_endpoints=20,
+            max_pairs=30,
+        )
+
+    llm_provider = await _resolve_llm_provider(
+        namespace_id=namespace_id,
+        llm_profile_id=llm_profile_id,
+    )
+    interpretation = await _interpret_mix_queries(question, candidates, llm_provider)
+
+    states: list[GraphQueryState] = []
+    for subquery in interpretation.retrieval_subqueries:
+        subquery_embedding = await _embed_relationship_query(
+            embedding_provider,
+            subquery,
+        )
+        states.append(
+            await _relationship_seed_state(
+                collection,
+                subquery_embedding,
+                top_k=8,
+                max_endpoints=16,
+                max_pairs=20,
+            )
+        )
+
+    if not states:
+        return await _relationship_first_state(
+            question,
+            collection,
+            entity_query_embedding,
+            relationship_query_embedding,
+        )
+
+    return _merge_states(*states)
 
 
 async def _build_context(
@@ -609,23 +871,53 @@ async def graph_rag_query(
     llm_profile_id: uuid.UUID | None = None,
 ) -> QueryResult:
     embedding_provider = await _resolve_embedding_provider(collection)
-    query_embedding = await embedding_provider.embed_query(question)
+    entity_query_embedding = await _embed_entity_query(embedding_provider, question)
+    relationship_query_embedding = await _embed_relationship_query(
+        embedding_provider,
+        question,
+    )
 
     requested_mode = (mode or "relationship-first").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "relationship-first")
 
     if effective_mode == "relationship-first":
-        state = await _relationship_first_state(question, collection, query_embedding)
+        state = await _relationship_first_state(
+            question,
+            collection,
+            entity_query_embedding,
+            relationship_query_embedding,
+        )
+    elif effective_mode == "mix":
+        state = await _mix_state(
+            question,
+            collection,
+            namespace_id,
+            llm_profile_id,
+            embedding_provider,
+            entity_query_embedding,
+            relationship_query_embedding,
+        )
     elif effective_mode == "hybrid":
-        entity_state = await _entity_first_state(question, collection, query_embedding)
+        entity_state = await _entity_first_state(
+            question,
+            collection,
+            entity_query_embedding,
+            relationship_query_embedding,
+        )
         relationship_state = await _relationship_first_state(
             question,
             collection,
-            query_embedding,
+            entity_query_embedding,
+            relationship_query_embedding,
         )
         state = _merge_states(entity_state, relationship_state)
     else:
-        state = await _entity_first_state(question, collection, query_embedding)
+        state = await _entity_first_state(
+            question,
+            collection,
+            entity_query_embedding,
+            relationship_query_embedding,
+        )
         effective_mode = "entity-first"
 
     context, entities_used, relationships_used, rel_context = await _build_context(
