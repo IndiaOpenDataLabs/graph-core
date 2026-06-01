@@ -266,7 +266,7 @@ class GraphService:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
         if collection.strategy == "custom_graph_rag":
-            default_mode = "relationship-first"
+            default_mode = "mix"
         else:
             default_mode = "local"
         effective_mode = mode or collection.default_query_mode or default_mode

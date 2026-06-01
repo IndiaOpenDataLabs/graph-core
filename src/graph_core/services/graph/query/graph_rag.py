@@ -877,8 +877,8 @@ async def graph_rag_query(
         question,
     )
 
-    requested_mode = (mode or "relationship-first").lower()
-    effective_mode = _MODE_ALIASES.get(requested_mode, "relationship-first")
+    requested_mode = (mode or "mix").lower()
+    effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
 
     if effective_mode == "relationship-first":
         state = await _relationship_first_state(
