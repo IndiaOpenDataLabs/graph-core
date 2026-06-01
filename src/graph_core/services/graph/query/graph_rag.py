@@ -611,8 +611,8 @@ async def graph_rag_query(
     embedding_provider = await _resolve_embedding_provider(collection)
     query_embedding = await embedding_provider.embed_query(question)
 
-    requested_mode = (mode or "entity-first").lower()
-    effective_mode = _MODE_ALIASES.get(requested_mode, "entity-first")
+    requested_mode = (mode or "relationship-first").lower()
+    effective_mode = _MODE_ALIASES.get(requested_mode, "relationship-first")
 
     if effective_mode == "relationship-first":
         state = await _relationship_first_state(question, collection, query_embedding)

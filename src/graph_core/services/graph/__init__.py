@@ -265,7 +265,11 @@ class GraphService:
     ) -> QueryResult:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
-        effective_mode = mode or collection.default_query_mode or "local"
+        if collection.strategy == "custom_graph_rag":
+            default_mode = "relationship-first"
+        else:
+            default_mode = "local"
+        effective_mode = mode or collection.default_query_mode or default_mode
         effective_llm_profile_id = llm_profile_id or collection.llm_profile_id
 
         if collection.strategy == "vector":
