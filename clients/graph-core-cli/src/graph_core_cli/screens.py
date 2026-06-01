@@ -1814,15 +1814,15 @@ class ConsoleScreen(Screen):
                 for strategy in self.STRATEGIES
                 if strategy.startswith(prefix)
             ]
-        elif "--default-query-mode " in value:
-            prefix = value.rsplit("--default-query-mode ", 1)[1].strip()
+        elif (
+            prefix := self._extract_flag_prefix(value, "--default-query-mode")
+        ) is not None:
             suggestions = [
                 (mode, "query mode")
                 for mode in self.QUERY_MODES
                 if mode.startswith(prefix)
             ]
-        elif "--mode " in value:
-            prefix = value.rsplit("--mode ", 1)[1].strip()
+        elif (prefix := self._extract_flag_prefix(value, "--mode")) is not None:
             suggestions = [
                 (mode, "query mode")
                 for mode in self.QUERY_MODES
@@ -1884,18 +1884,20 @@ class ConsoleScreen(Screen):
             self._update_suggestions(input_widget.value)
             return
 
-        if "--default-query-mode " in current:
-            before, _, _ = current.rpartition("--default-query-mode ")
-            new_value = f"{before}--default-query-mode {value}"
+        if self._extract_flag_prefix(current, "--default-query-mode") is not None:
+            new_value = self._replace_flag_value(
+                current,
+                "--default-query-mode",
+                value,
+            )
             input_widget.value = new_value
             input_widget.cursor_position = len(new_value)
             self._focus_command()
             self._update_suggestions(input_widget.value)
             return
 
-        if "--mode " in current:
-            before, _, _ = current.rpartition("--mode ")
-            new_value = f"{before}--mode {value}"
+        if self._extract_flag_prefix(current, "--mode") is not None:
+            new_value = self._replace_flag_value(current, "--mode", value)
             input_widget.value = new_value
             input_widget.cursor_position = len(new_value)
             self._focus_command()
@@ -1917,6 +1919,19 @@ class ConsoleScreen(Screen):
             return None
         token = match.group(2)
         return token if token.startswith("@") else None
+
+    def _extract_flag_prefix(self, value: str, flag: str) -> str | None:
+        match = re.search(rf"{re.escape(flag)}(?:\s+([^\s]*))?$", value)
+        if not match:
+            return None
+        return (match.group(1) or "").strip()
+
+    def _replace_flag_value(self, value: str, flag: str, replacement: str) -> str:
+        return re.sub(
+            rf"{re.escape(flag)}(?:\s+[^\s]*)?$",
+            f"{flag} {replacement}",
+            value,
+        )
 
     def _normalize_file_reference(self, value: str) -> str:
         return value[1:] if value.startswith("@") else value
