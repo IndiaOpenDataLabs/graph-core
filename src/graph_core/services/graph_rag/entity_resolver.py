@@ -380,10 +380,19 @@ class IncrementalEntityResolver:
                     except ValueError:
                         existing_desc_id = None
                     if existing_desc_id:
+                        existing_desc = await session.get(
+                            EntityDescription, existing_desc_id
+                        )
+                        hashes = list(existing_desc.source_chunk_hashes or []) if existing_desc else []
+                        if source_chunk_hash not in hashes:
+                            hashes.append(source_chunk_hash)
                         await session.execute(
                             update(EntityDescription)
                             .where(EntityDescription.id == existing_desc_id)
-                            .values(weight=EntityDescription.weight + 1)
+                            .values(
+                                weight=EntityDescription.weight + 1,
+                                source_chunk_hashes=hashes,
+                            )
                         )
                         return
 
@@ -426,7 +435,7 @@ class IncrementalEntityResolver:
             collection_id=self._collection_id,
             canonical_name=canonical_name,
             primary_type=primary_type,
-            description_count=n,
+            description_count=n + 1,
             embedding=new_centroid,
         )
 
@@ -466,10 +475,19 @@ class IncrementalEntityResolver:
                     except ValueError:
                         existing_desc_id = None
                     if existing_desc_id:
+                        existing_desc = await session.get(
+                            RelationshipDescription, existing_desc_id
+                        )
+                        hashes = list(existing_desc.source_chunk_hashes or []) if existing_desc else []
+                        if source_chunk_hash not in hashes:
+                            hashes.append(source_chunk_hash)
                         await session.execute(
                             update(RelationshipDescription)
                             .where(RelationshipDescription.id == existing_desc_id)
-                            .values(weight=RelationshipDescription.weight + 1)
+                            .values(
+                                weight=RelationshipDescription.weight + 1,
+                                source_chunk_hashes=hashes,
+                            )
                         )
                         return
 

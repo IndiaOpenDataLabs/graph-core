@@ -225,20 +225,16 @@ async def _ingest_graph_chunk(
 
     cached = await _get_raw_extraction(chunk_hash, collection.id)
     if cached:
-        return ChunkIngestionResult(
+        extraction = cached
+    else:
+        extractor = LLMGraphExtractor(llm=llm_provider)
+        extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
+
+        await _save_raw_extraction(
             chunk_hash=chunk_hash,
-            entity_count=len(cached.entities),
-            relationship_count=len(cached.relationships),
+            collection_id=collection.id,
+            extraction=extraction,
         )
-
-    extractor = LLMGraphExtractor(llm=llm_provider)
-    extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
-
-    await _save_raw_extraction(
-        chunk_hash=chunk_hash,
-        collection_id=collection.id,
-        extraction=extraction,
-    )
 
     chunk_embedding = await embedding_provider.embed_query(text)
     await _graph_rag_vectors.upsert_chunk_embedding(
@@ -422,20 +418,16 @@ async def _ingest_lightrag_chunk(
 
     cached = await _get_raw_extraction(chunk_hash, collection.id)
     if cached:
-        return ChunkIngestionResult(
+        extraction = cached
+    else:
+        extractor = LLMGraphExtractor(llm=llm_provider)
+        extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
+
+        await _save_raw_extraction(
             chunk_hash=chunk_hash,
-            entity_count=len(cached.entities),
-            relationship_count=len(cached.relationships),
+            collection_id=collection.id,
+            extraction=extraction,
         )
-
-    extractor = LLMGraphExtractor(llm=llm_provider)
-    extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
-
-    await _save_raw_extraction(
-        chunk_hash=chunk_hash,
-        collection_id=collection.id,
-        extraction=extraction,
-    )
 
     chunk_embedding = await embedding_provider.embed_query(text)
     await _graph_rag_vectors.upsert_chunk_embedding(
