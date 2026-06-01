@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -174,7 +174,12 @@ async def graph_rag_query(
                 select(EntityAlias).join(
                     GraphEntity, GraphEntity.id == EntityAlias.entity_id
                 ).where(
-                    EntityAlias.alias_name.ilike(f"%{kw}%"),
+                    or_(
+                        EntityAlias.alias_name.ilike(f"% {kw} %"),
+                        EntityAlias.alias_name.ilike(f"{kw} %"),
+                        EntityAlias.alias_name.ilike(f"% {kw}"),
+                        EntityAlias.alias_name.ilike(kw),
+                    ),
                     GraphEntity.collection_id == collection.id,
                 ).limit(5)
             )

@@ -14,11 +14,9 @@ import re
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from typing import Optional
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from graph_core.config import settings
@@ -52,8 +50,8 @@ class RelationshipResolutionResult:
 class IncrementalEntityResolver:
     """Resolves extracted entities/relationships against existing DB records."""
 
-    HIGH_CONFIDENCE_THRESHOLD = 0.3
-    MEDIUM_CONFIDENCE_THRESHOLD = 0.7
+    HIGH_CONFIDENCE_SIMILARITY = 0.8
+    MEDIUM_CONFIDENCE_SIMILARITY = 0.65
     FUZZY_NAME_THRESHOLD = 0.8
     DESCRIPTION_SIMILARITY_THRESHOLD = 0.90
 
@@ -78,7 +76,12 @@ class IncrementalEntityResolver:
 
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
-            select(EntityAlias).where(EntityAlias.alias_name == normalized_name)
+            select(EntityAlias)
+            .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
+            .where(
+                EntityAlias.alias_name == normalized_name,
+                GraphEntity.collection_id == self._collection_id,
+            )
         )
         alias = alias_result.scalar_one_or_none()
         if alias:
@@ -157,10 +160,17 @@ class IncrementalEntityResolver:
             row = result.fetchone()
             if row:
                 entity_id = row[0]
-                await session.commit()
-                await self._add_alias(session, entity_id, normalized_name, source_chunk_hash)
+                entity = await session.get(GraphEntity, entity_id)
+                await self._add_alias(
+                    session, entity_id, normalized_name, source_chunk_hash
+                )
                 await self._add_description_and_update_centroid(
-                    session, entity_id, None, description, source_chunk_hash, query_embedding,
+                    session,
+                    entity_id,
+                    entity,
+                    description,
+                    source_chunk_hash,
+                    query_embedding,
                 )
                 self._add_or_increment_type(session, entity_id, entity_type)
                 logger.info("New entity created: %s (type=%s)", normalized_name, entity_type)
@@ -287,7 +297,7 @@ class IncrementalEntityResolver:
         query_embedding: list[float],
         name: str,
         entity_type: str,
-    ) -> Optional[GraphEntity]:
+    ) -> GraphEntity | None:
         """Search for similar entities using centroid proximity via pgvector."""
         centroid_hits = await self._vstore.search_entity_centroids(
             collection_id=self._collection_id,
@@ -308,13 +318,14 @@ class IncrementalEntityResolver:
             if not entity:
                 continue
 
-            # ChromaDB-style: distance is L2; convert to cosine-like similarity
-            distance = hit.distance
-            if distance < self.HIGH_CONFIDENCE_THRESHOLD:
+            similarity = 1.0 - hit.distance
+            if similarity >= self.HIGH_CONFIDENCE_SIMILARITY:
                 if not self._types_compatible(entity_type, entity.primary_type or ""):
                     continue
                 return entity
-            elif distance < self.MEDIUM_CONFIDENCE_THRESHOLD:
+            elif similarity >= self.MEDIUM_CONFIDENCE_SIMILARITY:
+                if not self._types_compatible(entity_type, entity.primary_type or ""):
+                    continue
                 if self._fuzzy_match(name, hit.metadata.get("canonical_name", "")):
                     return entity
             else:
@@ -344,6 +355,38 @@ class IncrementalEntityResolver:
         if not description:
             return
 
+        if entity is None:
+            entity = await session.get(GraphEntity, entity_id)
+        if entity is None:
+            return
+
+        embed_text = f"{entity.canonical_name}: {description}"
+        embedding = await self._embedding.embed_query(embed_text)
+
+        existing_descs = await self._vstore.search_entity_embeddings(
+            collection_id=self._collection_id,
+            query_embedding=embedding,
+            top_k=1,
+            entity_id=entity_id,
+        )
+        if existing_descs:
+            best_match = existing_descs[0]
+            cosine_sim = 1.0 - best_match.distance
+            if cosine_sim >= self.DESCRIPTION_SIMILARITY_THRESHOLD:
+                desc_id = best_match.metadata.get("description_id")
+                if desc_id:
+                    try:
+                        existing_desc_id = uuid.UUID(desc_id)
+                    except ValueError:
+                        existing_desc_id = None
+                    if existing_desc_id:
+                        await session.execute(
+                            update(EntityDescription)
+                            .where(EntityDescription.id == existing_desc_id)
+                            .values(weight=EntityDescription.weight + 1)
+                        )
+                        return
+
         desc = EntityDescription(
             id=uuid.uuid4(),
             entity_id=entity_id,
@@ -354,7 +397,7 @@ class IncrementalEntityResolver:
         desc_id = desc.id
         session.add(desc)
 
-        n = (entity.description_count or 0) + 1 if entity else 1
+        n = entity.description_count or 0
 
         # Hebbian learning: new_centroid = (old_centroid * n + new) / (n + 1)
         old_centroid = await self._vstore.get_entity_centroid(entity_id, self._collection_id)
@@ -366,8 +409,8 @@ class IncrementalEntityResolver:
         else:
             new_centroid = list(context_embedding)
 
-        canonical_name = entity.canonical_name if entity else ""
-        primary_type = entity.primary_type if entity else None
+        canonical_name = entity.canonical_name
+        primary_type = entity.primary_type
 
         await self._vstore.upsert_entity_embedding(
             entity_id=entity_id,
@@ -375,7 +418,7 @@ class IncrementalEntityResolver:
             name=canonical_name,
             description=description,
             description_id=desc_id,
-            embedding=context_embedding,
+            embedding=embedding,
         )
 
         await self._vstore.upsert_entity_centroid(
@@ -387,12 +430,11 @@ class IncrementalEntityResolver:
             embedding=new_centroid,
         )
 
-        if entity:
-            await session.execute(
-                update(GraphEntity)
-                .where(GraphEntity.id == entity_id)
-                .values(description_count=GraphEntity.description_count + 1)
-            )
+        await session.execute(
+            update(GraphEntity)
+            .where(GraphEntity.id == entity_id)
+            .values(description_count=GraphEntity.description_count + 1)
+        )
 
     async def _add_relationship_description(
         self,
@@ -404,6 +446,33 @@ class IncrementalEntityResolver:
         source_name: str = "",
         target_name: str = "",
     ) -> None:
+        embed_text = f"{source_name} -> {target_name}: {description}"
+        embedding = await self._embedding.embed_query(embed_text)
+
+        existing_descs = await self._vstore.search_relationship_embeddings(
+            collection_id=self._collection_id,
+            query_embedding=embedding,
+            top_k=1,
+            relationship_id=relationship_id,
+        )
+        if existing_descs:
+            best_match = existing_descs[0]
+            cosine_sim = 1.0 - best_match.distance
+            if cosine_sim >= self.DESCRIPTION_SIMILARITY_THRESHOLD:
+                desc_id = best_match.metadata.get("description_id")
+                if desc_id:
+                    try:
+                        existing_desc_id = uuid.UUID(desc_id)
+                    except ValueError:
+                        existing_desc_id = None
+                    if existing_desc_id:
+                        await session.execute(
+                            update(RelationshipDescription)
+                            .where(RelationshipDescription.id == existing_desc_id)
+                            .values(weight=RelationshipDescription.weight + 1)
+                        )
+                        return
+
         desc = RelationshipDescription(
             id=uuid.uuid4(),
             relationship_id=relationship_id,
@@ -414,9 +483,6 @@ class IncrementalEntityResolver:
         )
         session.add(desc)
 
-        # Embed the relationship description
-        embed_text = f"{source_name} -> {target_name}: {description}"
-        embedding = await self._embedding.embed_query(embed_text)
         await self._vstore.upsert_relationship_embedding(
             relationship_id=relationship_id,
             collection_id=self._collection_id,

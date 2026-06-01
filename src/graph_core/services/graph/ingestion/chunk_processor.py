@@ -261,12 +261,14 @@ async def _ingest_graph_chunk(
     name_cache = EntityNameCache(str(collection.id))
 
     resolved_entity_ids: dict[str, uuid.UUID] = {}
+    pending_cache: list[tuple[list[str], uuid.UUID]] = []
 
     async with AsyncSessionLocal() as session:
         for entity in extraction.entities:
             cached_id = await name_cache.get(entity.name)
             if cached_id:
                 resolved_entity_ids[entity.name] = cached_id
+                resolved_entity_ids[entity.name.strip().title()] = cached_id
                 continue
 
             result = await resolver.resolve_entity(
@@ -277,20 +279,75 @@ async def _ingest_graph_chunk(
                 source_chunk_hash=chunk_hash,
             )
             resolved_entity_ids[entity.name] = result.entity_id
+            resolved_entity_ids[entity.name.strip().title()] = result.entity_id
 
             if result.is_new:
-                await name_cache.set_many(
-                    [entity.name, result.canonical_name], result.entity_id
+                pending_cache.append(
+                    (
+                        [
+                            entity.name,
+                            entity.name.strip().title(),
+                            result.canonical_name,
+                        ],
+                        result.entity_id,
+                    )
                 )
 
-            await session.commit()
+        await session.commit()
+        for names, entity_id in pending_cache:
+            await name_cache.set_many(names, entity_id)
+
+        canonical_name_by_id: dict[uuid.UUID, str] = {}
+        if resolved_entity_ids:
+            entity_ids = list(dict.fromkeys(resolved_entity_ids.values()))
+            entity_rows = await session.execute(
+                select(GraphEntity).where(GraphEntity.id.in_(entity_ids))
+            )
+            canonical_name_by_id = {
+                entity_row.id: entity_row.canonical_name
+                for entity_row in entity_rows.scalars().all()
+            }
 
         nodes_to_upsert = []
         edges_to_upsert = []
 
         for rel in extraction.relationships:
-            source_id = resolved_entity_ids.get(rel.source_name)
-            target_id = resolved_entity_ids.get(rel.target_name)
+            source_id = (
+                resolved_entity_ids.get(rel.source_name)
+                or resolved_entity_ids.get(rel.source_name.strip().title())
+                or await name_cache.get(rel.source_name)
+            )
+            target_id = (
+                resolved_entity_ids.get(rel.target_name)
+                or resolved_entity_ids.get(rel.target_name.strip().title())
+                or await name_cache.get(rel.target_name)
+            )
+
+            for is_source, name in [
+                (True, rel.source_name),
+                (False, rel.target_name),
+            ]:
+                if (source_id if is_source else target_id) is None:
+                    synthetic = await resolver.resolve_entity(
+                        session=session,
+                        name=name,
+                        entity_type="",
+                        description="",
+                        source_chunk_hash=chunk_hash,
+                    )
+                    await session.commit()
+                    await name_cache.set_many(
+                        [name, name.strip().title(), synthetic.canonical_name],
+                        synthetic.entity_id,
+                    )
+                    resolved_entity_ids[name] = synthetic.entity_id
+                    resolved_entity_ids[name.strip().title()] = synthetic.entity_id
+                    canonical_name_by_id[synthetic.entity_id] = synthetic.canonical_name
+                    if is_source:
+                        source_id = synthetic.entity_id
+                    else:
+                        target_id = synthetic.entity_id
+
             if not source_id or not target_id:
                 continue
 
@@ -305,14 +362,20 @@ async def _ingest_graph_chunk(
             )
             await session.commit()
 
+            source_name = canonical_name_by_id.get(
+                source_id, rel.source_name.strip().title()
+            )
+            target_name = canonical_name_by_id.get(
+                target_id, rel.target_name.strip().title()
+            )
             nodes_to_upsert.append({
                 "id": str(source_id),
-                "name": rel.source_name,
+                "name": source_name,
                 "collection_id": str(collection.id),
             })
             nodes_to_upsert.append({
                 "id": str(target_id),
-                "name": rel.target_name,
+                "name": target_name,
                 "collection_id": str(collection.id),
             })
             edges_to_upsert.append({
