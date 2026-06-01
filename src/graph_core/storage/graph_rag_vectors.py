@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from graph_core.database import AsyncSessionLocal, _uuid_for_sql
 from graph_core.storage.vector_tables import (
@@ -49,6 +50,7 @@ class GraphRAGVectorStore:
         description: str,
         description_id: uuid.UUID,
         embedding: list[float],
+        session: AsyncSession | None = None,
     ) -> None:
         tbl = table_name(collection_id, "entity_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -57,7 +59,11 @@ class GraphRAGVectorStore:
 
         cast = _vector_cast_sql(dimensions)
 
-        async with AsyncSessionLocal() as session:
+        owns_session = session is None
+        if session is None:
+            session = AsyncSessionLocal()
+
+        try:
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
@@ -73,7 +79,11 @@ class GraphRAGVectorStore:
                     "emb": _embedding_literal(embedding),
                 },
             )
-            await session.commit()
+            if owns_session:
+                await session.commit()
+        finally:
+            if owns_session:
+                await session.close()
 
     async def search_entity_embeddings(
         self,
@@ -229,6 +239,7 @@ class GraphRAGVectorStore:
         primary_type: str | None,
         description_count: int,
         embedding: list[float],
+        session: AsyncSession | None = None,
     ) -> None:
         tbl = table_name(collection_id, "entity_centroids")
         dimensions = await get_collection_dimensions(collection_id)
@@ -238,7 +249,11 @@ class GraphRAGVectorStore:
         cast = _vector_cast_sql(dimensions)
         emb_str = _embedding_literal(embedding)
 
-        async with AsyncSessionLocal() as session:
+        owns_session = session is None
+        if session is None:
+            session = AsyncSessionLocal()
+
+        try:
             existing = await session.execute(
                 text(f"SELECT id FROM {tbl} WHERE entity_id = :eid"),
                 {"eid": _uuid_for_sql(entity_id)},
@@ -278,7 +293,11 @@ class GraphRAGVectorStore:
                         "emb": emb_str,
                     },
                 )
-            await session.commit()
+            if owns_session:
+                await session.commit()
+        finally:
+            if owns_session:
+                await session.close()
 
     async def search_entity_centroids(
         self,

@@ -428,6 +428,7 @@ class IncrementalEntityResolver:
             description=description,
             description_id=desc_id,
             embedding=embedding,
+            session=session,
         )
 
         await self._vstore.upsert_entity_centroid(
@@ -437,6 +438,7 @@ class IncrementalEntityResolver:
             primary_type=primary_type,
             description_count=n + 1,
             embedding=new_centroid,
+            session=session,
         )
 
         await session.execute(
