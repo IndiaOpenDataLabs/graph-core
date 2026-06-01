@@ -1385,7 +1385,7 @@ class ConsoleScreen(Screen):
         async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_key}"},
             follow_redirects=True,
-            timeout=180.0,
+            timeout=600.0,
         ) as client:
             response = await client.post(
                 f"{base_url}/collections/{collection_id}/query",
