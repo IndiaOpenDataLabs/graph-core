@@ -760,7 +760,7 @@ class ConsoleScreen(Screen):
         (
             "/query COLLECTION \"question\" "
             "[--mode entity-first|relationship-first|hybrid|mix|local "
-            "(aliases: ent|rel|hyb)]"
+            "(aliases: ent|rel|hyb); default: mix for custom_graph_rag]"
         ): "Query a collection.",
         "/jobs list [--limit N]": "List recent jobs.",
         "/jobs show JOB_ID": "Show job status.",
@@ -809,7 +809,7 @@ class ConsoleScreen(Screen):
         (
             "/query COLLECTION \"question\" "
             "[--mode entity-first|relationship-first|hybrid|mix|local "
-            "(aliases: ent|rel|hyb)]"
+            "(aliases: ent|rel|hyb); default: mix for custom_graph_rag]"
         ): "/query <collection> \"<question>\"",
         "/jobs list [--limit N]": "/jobs list",
         "/jobs show JOB_ID": "/jobs show <job_id>",
