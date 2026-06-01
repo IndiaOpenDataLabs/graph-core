@@ -1,6 +1,12 @@
 """Graph RAG query functions extracted from GraphService."""
 
+from __future__ import annotations
+
+import string
 import uuid
+from collections import deque
+from dataclasses import dataclass
+from itertools import combinations
 
 from sqlalchemy import or_, select
 
@@ -24,19 +30,21 @@ from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
-# ── Module-level singleton dependencies ──
-
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
 
 
-# ── Credential / provider resolution helpers ──
+@dataclass
+class GraphQueryState:
+    discovered_entity_ids: set[str]
+    entity_relevance: dict[str, float]
+    traversed_rel_ids: list[str]
+    rel_score_cache: dict[str, float]
 
 
 async def _resolve_credential(
     session, profile: Profile
 ) -> tuple[str | None, str | None]:
-    """Decrypt a profile's credential, returning (api_key, base_url)."""
     if profile.credential_id is None:
         return None, None
     credential = await session.get(Credential, profile.credential_id)
@@ -46,7 +54,6 @@ async def _resolve_credential(
 
 
 async def _resolve_embedding_provider(collection: Collection) -> EmbeddingProvider:
-    """Resolve the embedding provider for a collection."""
     if collection.embedding_profile_id is None:
         return get_embedding_provider()
     async with AsyncSessionLocal() as session:
@@ -72,7 +79,6 @@ async def _resolve_llm_provider(
     namespace_id: uuid.UUID,
     llm_profile_id: uuid.UUID | None = None,
 ) -> LLMProvider:
-    """Resolve the LLM provider for a namespace."""
     if llm_profile_id is None:
         return get_llm_provider()
     async with AsyncSessionLocal() as session:
@@ -93,86 +99,52 @@ async def _resolve_llm_provider(
         )
 
 
-# ── Utility functions ──
-
-
 def get_graph_storage(collection_id: uuid.UUID):
-    """Return a FalkorDBGraphStorage scoped to the collection's own graph."""
     from graph_core.storage.graph_storage import FalkorDBGraphStorage
 
     graph_name = f"collection_{str(collection_id).replace('-', '')}"
     return FalkorDBGraphStorage(graph_name)
 
 
-# ── Query functions ──
+def _extract_query_keywords(question: str) -> list[str]:
+    stop_words = {
+        "the", "a", "an", "and", "or", "in", "on", "at", "to",
+        "for", "of", "with", "is", "what", "how", "why", "who",
+        "i", "me", "my", "can", "be", "when",
+    }
+    tokens = [w.strip(string.punctuation).lower() for w in question.split()]
+    keywords = [w for w in tokens if w and w not in stop_words and len(w) > 2]
+    return list(dict.fromkeys([question] + keywords))
 
 
-async def graph_rag_query(
+async def _search_entity_seeds(
     question: str,
     collection: Collection,
-    namespace_id: uuid.UUID,
-    llm_profile_id: uuid.UUID | None = None,
-) -> QueryResult:
-    """Full Graph RAG query pipeline with energy-decay DFS traversal.
-
-    Steps:
-    1. Embed query
-    2. Seed entity search (pgvector entity embeddings + alias ILIKE)
-    3. Score seeds by relationship relevance
-    4. Energy-decay DFS traversal in FalkorDB
-    5. Fetch EntityDescriptions from Postgres
-    6. Fetch RelationshipDescriptions from Postgres
-    7. Build context and call LLM
-    """
-    import string
-
-    embedding_provider = await _resolve_embedding_provider(collection)
-
-    # Step 1: Embed query
-    query_embedding = await embedding_provider.embed_query(question)
-
-    # Step 2: Seed entity search
-    TOP_K = 10
-    MIN_EDGE_SIM = settings.graph_rag_min_edge_similarity
-    ENERGY_BUDGET = 7.0
-    MAX_DEPTH = 8
-    MAX_ENTITIES = 10
-    MAX_ENTITY_DESCS = 4
-    MAX_REL_DESCS = 4
+    query_embedding: list[float],
+) -> tuple[list[str], dict[str, float]]:
+    top_k = 10
+    seed_entity_ids: list[str] = []
+    entity_relevance: dict[str, float] = {}
 
     entity_hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
-        top_k=TOP_K,
+        top_k=top_k,
     )
-
-    seed_entity_ids: list[str] = []
-    entity_relevance: dict[str, float] = {}
-
     for hit in entity_hits:
-        meta = hit.metadata
-        entity_id_str = meta.get("entity_id", "")
+        entity_id_str = hit.metadata.get("entity_id", "")
         sim = 1.0 - hit.distance
         if entity_id_str and entity_id_str not in seed_entity_ids:
             seed_entity_ids.append(entity_id_str)
             entity_relevance[entity_id_str] = sim
 
-    # Step 2b: Alias lookup — catch entities missed by vector search
+    keywords = _extract_query_keywords(question)
     async with AsyncSessionLocal() as session:
-        stop_words = {
-            "the", "a", "an", "and", "or", "in", "on", "at", "to",
-            "for", "of", "with", "is", "what", "how", "why", "who",
-            "i", "me", "my",
-        }
-        tokens = [w.strip(string.punctuation).lower() for w in question.split()]
-        keywords = [w for w in tokens if w and w not in stop_words and len(w) > 2]
-        keywords = list(dict.fromkeys([question] + keywords))
-
         for kw in keywords[:5]:
             alias_result = await session.execute(
-                select(EntityAlias).join(
-                    GraphEntity, GraphEntity.id == EntityAlias.entity_id
-                ).where(
+                select(EntityAlias)
+                .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
+                .where(
                     or_(
                         EntityAlias.alias_name.ilike(f"% {kw} %"),
                         EntityAlias.alias_name.ilike(f"{kw} %"),
@@ -180,7 +152,8 @@ async def graph_rag_query(
                         EntityAlias.alias_name.ilike(kw),
                     ),
                     GraphEntity.collection_id == collection.id,
-                ).limit(5)
+                )
+                .limit(5)
             )
             for alias in alias_result.scalars().all():
                 eid = str(alias.entity_id)
@@ -188,125 +161,338 @@ async def graph_rag_query(
                     seed_entity_ids.append(eid)
                     entity_relevance[eid] = 1.0
 
-    # Step 3: Score seed entities by relationship relevance
+    return seed_entity_ids, entity_relevance
+
+
+async def _search_relationship_seeds(
+    collection: Collection,
+    query_embedding: list[float],
+    *,
+    top_k: int = 10,
+) -> list[tuple[str, float]]:
+    hits = await _graph_rag_vectors.search_relationship_embeddings(
+        collection_id=collection.id,
+        query_embedding=query_embedding,
+        top_k=top_k,
+    )
+    rel_seeds: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        rel_id = hit.metadata.get("relationship_id") or hit.metadata.get("id")
+        if not rel_id or rel_id in seen:
+            continue
+        seen.add(rel_id)
+        rel_seeds.append((str(rel_id), 1.0 - hit.distance))
+    return rel_seeds
+
+
+async def _score_relationship(
+    collection: Collection,
+    query_embedding: list[float],
+    rel_id: str,
+    cache: dict[str, float],
+    *,
+    top_k: int = 4,
+) -> float:
+    cached = cache.get(rel_id)
+    if cached is not None:
+        return cached
     rel_hits = await _graph_rag_vectors.search_relationship_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
-        top_k=max(TOP_K * 5, 50),
+        top_k=top_k,
+        relationship_id=uuid.UUID(rel_id),
+    )
+    score = max((1.0 - hit.distance for hit in rel_hits), default=0.0)
+    cache[rel_id] = score
+    return score
+
+
+async def _entity_first_state(
+    question: str,
+    collection: Collection,
+    query_embedding: list[float],
+) -> GraphQueryState:
+    top_k = 10
+    min_edge_sim = settings.graph_rag_min_edge_similarity
+    energy_budget = 7.0
+    max_depth = 8
+
+    seed_entity_ids, entity_relevance = await _search_entity_seeds(
+        question,
+        collection,
+        query_embedding,
     )
 
-    # Build name -> entity_id map
     async with AsyncSessionLocal() as session:
         seed_entity_rows = await session.execute(
-            select(GraphEntity).where(
-                GraphEntity.collection_id == collection.id
-            )
+            select(GraphEntity).where(GraphEntity.collection_id == collection.id)
         )
         name_to_eid = {
-            e.canonical_name.lower(): str(e.id)
-            for e in seed_entity_rows.scalars().all()
+            entity.canonical_name.lower(): str(entity.id)
+            for entity in seed_entity_rows.scalars().all()
         }
+
+    rel_hits = await _graph_rag_vectors.search_relationship_embeddings(
+        collection_id=collection.id,
+        query_embedding=query_embedding,
+        top_k=max(top_k * 5, 50),
+    )
 
     seed_rel_scores: dict[str, float] = {eid: 0.0 for eid in seed_entity_ids}
     best_seed_sim = max(entity_relevance.values()) if entity_relevance else 0.0
-    effective_depth = MAX_DEPTH
     if best_seed_sim < 0.25:
-        effective_min_edge_sim = max(MIN_EDGE_SIM, 0.5)
+        effective_min_edge_sim = max(min_edge_sim, 0.5)
         effective_energy_budget = 2.5
     elif best_seed_sim < 0.4:
-        effective_min_edge_sim = max(MIN_EDGE_SIM, 0.4)
+        effective_min_edge_sim = max(min_edge_sim, 0.4)
         effective_energy_budget = 4.0
     else:
-        effective_min_edge_sim = MIN_EDGE_SIM
-        effective_energy_budget = ENERGY_BUDGET
+        effective_min_edge_sim = min_edge_sim
+        effective_energy_budget = energy_budget
 
     for hit in rel_hits:
-        meta = hit.metadata
         sim = 1.0 - hit.distance
         if sim < effective_min_edge_sim:
             continue
         for name_field in ("source_name", "target_name"):
-            name = meta.get(name_field, "").lower()
+            name = hit.metadata.get(name_field, "").lower()
             eid = name_to_eid.get(name)
             if eid and sim > seed_rel_scores.get(eid, 0.0):
                 seed_rel_scores[eid] = sim
 
-    # Step 4: Energy-decay DFS traversal in FalkorDB
     graph_storage = get_graph_storage(collection.id)
     visited = set(seed_entity_ids)
     traversed_rel_ids: list[str] = []
-    discovered_entity_ids = list(seed_entity_ids)
-    energy = effective_energy_budget
+    discovered_entity_ids = set(seed_entity_ids)
     rel_score_cache: dict[str, float] = {}
+    energy = effective_energy_budget
 
-    # Sort seeds by relationship relevance ascending so highest-rel seeds
-    # sit on top of stack (LIFO = explored first)
-    sorted_seeds = sorted(
-        seed_entity_ids,
-        key=lambda e: seed_rel_scores.get(e, 0.0),
-    )
+    sorted_seeds = sorted(seed_entity_ids, key=lambda e: seed_rel_scores.get(e, 0.0))
     stack = [(node_id, 0) for node_id in sorted_seeds]
 
-    async with AsyncSessionLocal() as session:
-        while stack and energy > 0:
-            node_id, depth = stack.pop()
-            if depth >= effective_depth:
+    while stack and energy > 0:
+        node_id, depth = stack.pop()
+        if depth >= max_depth:
+            continue
+
+        edges = await graph_storage.get_node_edges(node_id)
+        scored_edges: list[tuple[float, str, str]] = []
+        for src, tgt in edges:
+            neighbor = tgt if src == node_id else src
+            if neighbor in visited:
                 continue
 
-            edges = await graph_storage.get_node_edges(node_id)
-            scored_edges: list[tuple[float, str, str]] = []
+            edge_props = await graph_storage.get_edge(src, tgt)
+            if not edge_props:
+                edge_props = await graph_storage.get_edge(tgt, src)
+            if not (edge_props and edge_props.get("id")):
+                continue
 
-            for src, tgt in edges:
-                neighbor = tgt if src == node_id else src
-                if neighbor in visited:
-                    continue
+            rel_id_str = str(edge_props["id"])
+            sim = await _score_relationship(
+                collection, query_embedding, rel_id_str, rel_score_cache
+            )
+            if sim >= effective_min_edge_sim:
+                scored_edges.append((sim, neighbor, rel_id_str))
 
-                edge_props = await graph_storage.get_edge(src, tgt)
-                if not edge_props:
-                    edge_props = await graph_storage.get_edge(tgt, src)
-                if not (edge_props and edge_props.get("id")):
-                    continue
+        for sim, neighbor, rel_id_str in sorted(scored_edges, key=lambda x: x[0]):
+            cost = max(0.05, 1.0 - sim)
+            if energy - cost <= 0:
+                continue
+            energy -= cost
+            visited.add(neighbor)
+            stack.append((neighbor, depth + 1))
+            discovered_entity_ids.add(neighbor)
+            if rel_id_str not in traversed_rel_ids:
+                traversed_rel_ids.append(rel_id_str)
+            edge_sim = 1.0 - cost
+            if (
+                neighbor not in entity_relevance
+                or edge_sim > entity_relevance[neighbor]
+            ):
+                entity_relevance[neighbor] = edge_sim
 
-                rel_id_str = str(edge_props["id"])
+    return GraphQueryState(
+        discovered_entity_ids=discovered_entity_ids,
+        entity_relevance=entity_relevance,
+        traversed_rel_ids=traversed_rel_ids,
+        rel_score_cache=rel_score_cache,
+    )
 
-                # Score edge by relationship embedding similarity
-                rel_vdb_hits = await _graph_rag_vectors.search_relationship_embeddings(
-                    collection_id=collection.id,
-                    query_embedding=query_embedding,
-                    top_k=MAX_REL_DESCS,
-                    relationship_id=uuid.UUID(rel_id_str),
-                )
-                sim = max(1.0 - r.distance for r in rel_vdb_hits) if rel_vdb_hits else 0.0
-                rel_score_cache[rel_id_str] = sim
 
-                if sim >= effective_min_edge_sim:
-                    scored_edges.append((sim, neighbor, rel_id_str))
+async def _find_relevant_path(
+    graph_storage,
+    collection: Collection,
+    query_embedding: list[float],
+    source_id: str,
+    target_id: str,
+    rel_score_cache: dict[str, float],
+    *,
+    max_depth: int = 3,
+    beam_width: int = 4,
+) -> tuple[list[str], list[str]] | None:
+    queue: deque[tuple[str, list[str], list[str], int]] = deque(
+        [(source_id, [source_id], [], 0)]
+    )
 
-            # Push low-sim edges first so high-sim edges are on top of stack
-            for sim, neighbor, rel_id_str in sorted(scored_edges, key=lambda x: x[0]):
-                cost = max(0.05, 1.0 - sim)
-                if energy - cost > 0:
-                    energy -= cost
-                    visited.add(neighbor)
-                    stack.append((neighbor, depth + 1))
-                    if rel_id_str and rel_id_str not in traversed_rel_ids:
-                        traversed_rel_ids.append(rel_id_str)
-                    if neighbor not in discovered_entity_ids:
-                        discovered_entity_ids.append(neighbor)
-                    edge_sim = 1.0 - cost
-                    if neighbor not in entity_relevance or edge_sim > entity_relevance[neighbor]:
-                        entity_relevance[neighbor] = edge_sim
+    while queue:
+        node_id, path_nodes, path_rels, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
 
-        # Step 5: Fetch EntityDescriptions from Postgres
+        edges = await graph_storage.get_node_edges(node_id)
+        candidates: list[tuple[float, str, str]] = []
+        for src, tgt in edges:
+            neighbor = tgt if src == node_id else src
+            if neighbor in path_nodes:
+                continue
+
+            edge_props = await graph_storage.get_edge(src, tgt)
+            if not edge_props:
+                edge_props = await graph_storage.get_edge(tgt, src)
+            if not (edge_props and edge_props.get("id")):
+                continue
+
+            rel_id = str(edge_props["id"])
+            sim = await _score_relationship(
+                collection, query_embedding, rel_id, rel_score_cache
+            )
+            candidates.append((sim, neighbor, rel_id))
+
+        for _, neighbor, rel_id in sorted(candidates, reverse=True)[:beam_width]:
+            next_nodes = path_nodes + [neighbor]
+            next_rels = path_rels + [rel_id]
+            if neighbor == target_id:
+                return next_nodes, next_rels
+            queue.append((neighbor, next_nodes, next_rels, depth + 1))
+
+    return None
+
+
+async def _relationship_first_state(
+    question: str,
+    collection: Collection,
+    query_embedding: list[float],
+) -> GraphQueryState:
+    rel_seeds = await _search_relationship_seeds(
+        collection,
+        query_embedding,
+        top_k=10,
+    )
+
+    traversed_rel_ids: list[str] = []
+    rel_score_cache: dict[str, float] = {}
+    discovered_entity_ids: set[str] = set()
+    entity_relevance: dict[str, float] = {}
+
+    async with AsyncSessionLocal() as session:
+        for rel_id_str, sim in rel_seeds[:10]:
+            rel = await session.get(GraphRelationship, uuid.UUID(rel_id_str))
+            if not rel:
+                continue
+            traversed_rel_ids.append(rel_id_str)
+            rel_score_cache[rel_id_str] = sim
+            for eid in (str(rel.source_entity_id), str(rel.target_entity_id)):
+                discovered_entity_ids.add(eid)
+                if eid not in entity_relevance or sim > entity_relevance[eid]:
+                    entity_relevance[eid] = sim
+
+    endpoint_ids = sorted(
+        discovered_entity_ids,
+        key=lambda eid: entity_relevance.get(eid, 0.0),
+        reverse=True,
+    )[:20]
+
+    graph_storage = get_graph_storage(collection.id)
+    max_pairs = 30
+    pair_count = 0
+    for source_id, target_id in combinations(endpoint_ids, 2):
+        if pair_count >= max_pairs:
+            break
+        pair_count += 1
+        path = await _find_relevant_path(
+            graph_storage,
+            collection,
+            query_embedding,
+            source_id,
+            target_id,
+            rel_score_cache,
+        )
+        if not path:
+            continue
+        path_nodes, path_rels = path
+        discovered_entity_ids.update(path_nodes)
+        for rel_id in path_rels:
+            if rel_id not in traversed_rel_ids:
+                traversed_rel_ids.append(rel_id)
+        path_score = sum(rel_score_cache.get(rel_id, 0.0) for rel_id in path_rels)
+        if path_rels:
+            path_score /= len(path_rels)
+        for eid in path_nodes:
+            if eid not in entity_relevance or path_score > entity_relevance[eid]:
+                entity_relevance[eid] = path_score
+
+    seed_entity_ids, seed_scores = await _search_entity_seeds(
+        question,
+        collection,
+        query_embedding,
+    )
+    for eid in seed_entity_ids[:5]:
+        discovered_entity_ids.add(eid)
+        if eid not in entity_relevance or seed_scores[eid] > entity_relevance[eid]:
+            entity_relevance[eid] = seed_scores[eid]
+
+    return GraphQueryState(
+        discovered_entity_ids=discovered_entity_ids,
+        entity_relevance=entity_relevance,
+        traversed_rel_ids=traversed_rel_ids,
+        rel_score_cache=rel_score_cache,
+    )
+
+
+def _merge_states(*states: GraphQueryState) -> GraphQueryState:
+    discovered_entity_ids: set[str] = set()
+    entity_relevance: dict[str, float] = {}
+    traversed_rel_ids: list[str] = []
+    rel_score_cache: dict[str, float] = {}
+
+    for state in states:
+        discovered_entity_ids.update(state.discovered_entity_ids)
+        for eid, score in state.entity_relevance.items():
+            if eid not in entity_relevance or score > entity_relevance[eid]:
+                entity_relevance[eid] = score
+        for rel_id in state.traversed_rel_ids:
+            if rel_id not in traversed_rel_ids:
+                traversed_rel_ids.append(rel_id)
+        rel_score_cache.update(state.rel_score_cache)
+
+    return GraphQueryState(
+        discovered_entity_ids=discovered_entity_ids,
+        entity_relevance=entity_relevance,
+        traversed_rel_ids=traversed_rel_ids,
+        rel_score_cache=rel_score_cache,
+    )
+
+
+async def _build_context(
+    state: GraphQueryState,
+    collection: Collection,
+) -> tuple[str, list[str], list[str], str]:
+    max_entities = 10
+    max_entity_descs = 4
+    max_rel_descs = 4
+
+    async with AsyncSessionLocal() as session:
         ranked_entity_ids = sorted(
-            discovered_entity_ids,
-            key=lambda eid: entity_relevance.get(eid, 0.0),
+            state.discovered_entity_ids,
+            key=lambda eid: state.entity_relevance.get(eid, 0.0),
             reverse=True,
         )
 
         entity_context_parts: list[str] = []
         entities_used: list[str] = []
-        for eid_str in ranked_entity_ids[:MAX_ENTITIES]:
+        for eid_str in ranked_entity_ids[:max_entities]:
             try:
                 eid = uuid.UUID(eid_str)
             except ValueError:
@@ -318,20 +504,22 @@ async def graph_rag_query(
                 select(EntityDescription)
                 .where(EntityDescription.entity_id == eid)
                 .order_by(EntityDescription.weight.desc())
-                .limit(MAX_ENTITY_DESCS)
+                .limit(max_entity_descs)
             )
             descs = descs_result.scalars().all()
             if descs:
-                desc_texts = " | ".join(d.description for d in descs)
+                desc_texts = " | ".join(
+                    description.description for description in descs
+                )
                 entity_context_parts.append(
-                    f"{entity.canonical_name} ({entity.primary_type or 'unknown'}): {desc_texts}"
+                    f"{entity.canonical_name} ({entity.primary_type or 'unknown'}): "
+                    f"{desc_texts}"
                 )
                 entities_used.append(entity.canonical_name)
 
-        # Step 6: Fetch RelationshipDescriptions from Postgres
-        rel_context_parts: list[str] = []
+        rel_context_parts: list[tuple[float, str]] = []
         relationships_used: list[str] = []
-        for rel_id_str in traversed_rel_ids[:50]:
+        for rel_id_str in state.traversed_rel_ids[:50]:
             try:
                 rel_uuid = uuid.UUID(rel_id_str)
             except ValueError:
@@ -347,52 +535,105 @@ async def graph_rag_query(
                 select(RelationshipDescription)
                 .where(RelationshipDescription.relationship_id == rel_uuid)
                 .order_by(RelationshipDescription.weight.desc())
-                .limit(MAX_REL_DESCS)
+                .limit(max_rel_descs)
             )
             descs = descs_result.scalars().all()
-            sim = rel_score_cache.get(rel_id_str, 0.0)
-            for d in descs:
-                rel_text = f"{src_name} \u2192 {tgt_name}: {d.description}"
+            sim = state.rel_score_cache.get(rel_id_str, 0.0)
+            for description in descs:
+                rel_text = f"{src_name} -> {tgt_name}: {description.description}"
                 rel_context_parts.append((sim, rel_text))
-                relationships_used.append(f"{src_name} \u2192 {tgt_name}")
+                relationships_used.append(f"{src_name} -> {tgt_name}")
 
-        rel_context_parts.sort(key=lambda x: x[0], reverse=True)
+    rel_context_parts.sort(key=lambda item: item[0], reverse=True)
+    entity_context = "\n".join(entity_context_parts)
+    rel_context = "\n".join(text for _, text in rel_context_parts)
+    context = (
+        "Context:\n"
+        "Entities:\n"
+        f"{entity_context or '(none)'}\n"
+        "Relationships:\n"
+        f"{rel_context or '(none)'}"
+    )
+    return context, entities_used, list(dict.fromkeys(relationships_used)), rel_context
 
-        # Step 7: Build context
-        entity_context = "\n".join(entity_context_parts)
-        rel_context = "\n".join(text for _, text in rel_context_parts)
 
-        context = f"""Context:
-Entities:
-{entity_context or "(none)"}
-Relationships:
-{rel_context or "(none)"}"""
-
+async def _answer_from_context(
+    question: str,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
+    context: str,
+    fallback_text: str,
+) -> str:
     llm_provider = await _resolve_llm_provider(
-        namespace_id=namespace_id, llm_profile_id=llm_profile_id,
+        namespace_id=namespace_id,
+        llm_profile_id=llm_profile_id,
     )
     if isinstance(llm_provider, LocalEchoLLMProvider):
-        response = entity_context or rel_context or "No relevant context found."
-    else:
-        response = await llm_provider.chat([
-            {
-                "role": "system",
-                "content": (
-                    "Use the context below to answer the question. "
-                    "Draw on the entities and relationships to reason through your answer - "
-                    "explain, connect, and illuminate rather than just report. "
-                    "Write in natural prose. If the context is insufficient for part of the "
-                    "question, acknowledge it briefly without making it the focus."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"{context}\n\nQuestion: {question}",
-            },
-        ])
+        return fallback_text or "No relevant context found."
+    return await llm_provider.chat([
+        {
+            "role": "system",
+            "content": (
+                "Use the context below to answer the question. "
+                "Draw on the entities and relationships to reason through "
+                "your answer - "
+                "explain, connect, and illuminate rather than just report. "
+                "Write in natural prose. If the context is insufficient "
+                "for part of the "
+                "question, acknowledge it briefly without making it the focus."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"{context}\n\nQuestion: {question}",
+        },
+    ])
 
+
+async def graph_rag_query(
+    question: str,
+    collection: Collection,
+    namespace_id: uuid.UUID,
+    mode: str | None = None,
+    llm_profile_id: uuid.UUID | None = None,
+) -> QueryResult:
+    embedding_provider = await _resolve_embedding_provider(collection)
+    query_embedding = await embedding_provider.embed_query(question)
+
+    effective_mode = (mode or "entity-first").lower()
+    if effective_mode == "local":
+        effective_mode = "entity-first"
+
+    if effective_mode == "relationship-first":
+        state = await _relationship_first_state(question, collection, query_embedding)
+    elif effective_mode == "hybrid":
+        entity_state = await _entity_first_state(question, collection, query_embedding)
+        relationship_state = await _relationship_first_state(
+            question,
+            collection,
+            query_embedding,
+        )
+        state = _merge_states(entity_state, relationship_state)
+    else:
+        state = await _entity_first_state(question, collection, query_embedding)
+        effective_mode = "entity-first"
+
+    context, entities_used, relationships_used, rel_context = await _build_context(
+        state,
+        collection,
+    )
+    entity_fallback = "\n".join(entities_used)
+    fallback_text = rel_context or entity_fallback
+    response = await _answer_from_context(
+        question,
+        namespace_id,
+        llm_profile_id,
+        context,
+        fallback_text,
+    )
     return QueryResult(
         response=response,
         entities_used=entities_used,
-        relationships_used=list(dict.fromkeys(relationships_used)),
+        relationships_used=relationships_used,
+        mode=effective_mode,
     )

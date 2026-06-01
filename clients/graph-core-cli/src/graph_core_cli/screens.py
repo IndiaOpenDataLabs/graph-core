@@ -506,6 +506,8 @@ class CollectionFormScreen(Screen):
     QUERY_MODES = [
         ("(leave unchanged / none)", ""),
         ("local", "local"),
+        ("entity-first", "entity-first"),
+        ("relationship-first", "relationship-first"),
         ("global", "global"),
         ("hybrid", "hybrid"),
         ("naive", "naive"),
@@ -742,7 +744,8 @@ class ConsoleScreen(Screen):
         (
             "/collection create NAME --strategy vector|light_rag|custom_graph_rag "
             "--embedding-profile ID_OR_LABEL [--llm-profile ID_OR_LABEL] "
-            "[--default-query-mode local|global|hybrid|naive|mix]"
+            "[--default-query-mode "
+            "local|entity-first|relationship-first|global|hybrid|naive|mix]"
         ): "Create a collection.",
         (
             "/collection edit COLLECTION [--name NAME] "
@@ -806,7 +809,15 @@ class ConsoleScreen(Screen):
         "/jobs watch JOB_ID": "/jobs watch <job_id>",
     }
     STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
-    QUERY_MODES = ["local", "global", "hybrid", "naive", "mix"]
+    QUERY_MODES = [
+        "local",
+        "entity-first",
+        "relationship-first",
+        "global",
+        "hybrid",
+        "naive",
+        "mix",
+    ]
 
     def __init__(self) -> None:
         super().__init__()

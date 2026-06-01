@@ -278,6 +278,7 @@ class GraphService:
                 question,
                 collection,
                 namespace_id,
+                effective_mode,
                 llm_profile_id=effective_llm_profile_id,
             )
         if collection.strategy == "light_rag":
