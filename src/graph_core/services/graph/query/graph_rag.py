@@ -134,7 +134,6 @@ async def graph_rag_query(
     # Step 2: Seed entity search
     TOP_K = 10
     MIN_EDGE_SIM = settings.graph_rag_min_edge_similarity
-    MIN_SEED_SIM = 0.4
     ENERGY_BUDGET = 7.0
     MAX_DEPTH = 8
     MAX_ENTITIES = 10
@@ -209,10 +208,22 @@ async def graph_rag_query(
         }
 
     seed_rel_scores: dict[str, float] = {eid: 0.0 for eid in seed_entity_ids}
+    best_seed_sim = max(entity_relevance.values()) if entity_relevance else 0.0
+    effective_depth = MAX_DEPTH
+    if best_seed_sim < 0.25:
+        effective_min_edge_sim = max(MIN_EDGE_SIM, 0.5)
+        effective_energy_budget = 2.5
+    elif best_seed_sim < 0.4:
+        effective_min_edge_sim = max(MIN_EDGE_SIM, 0.4)
+        effective_energy_budget = 4.0
+    else:
+        effective_min_edge_sim = MIN_EDGE_SIM
+        effective_energy_budget = ENERGY_BUDGET
+
     for hit in rel_hits:
         meta = hit.metadata
         sim = 1.0 - hit.distance
-        if sim < MIN_EDGE_SIM:
+        if sim < effective_min_edge_sim:
             continue
         for name_field in ("source_name", "target_name"):
             name = meta.get(name_field, "").lower()
@@ -225,11 +236,8 @@ async def graph_rag_query(
     visited = set(seed_entity_ids)
     traversed_rel_ids: list[str] = []
     discovered_entity_ids = list(seed_entity_ids)
-    energy = ENERGY_BUDGET
+    energy = effective_energy_budget
     rel_score_cache: dict[str, float] = {}
-
-    best_seed_sim = max(entity_relevance.values()) if entity_relevance else 0.0
-    effective_depth = 1 if best_seed_sim < MIN_SEED_SIM else MAX_DEPTH
 
     # Sort seeds by relationship relevance ascending so highest-rel seeds
     # sit on top of stack (LIFO = explored first)
@@ -271,7 +279,7 @@ async def graph_rag_query(
                 sim = max(1.0 - r.distance for r in rel_vdb_hits) if rel_vdb_hits else 0.0
                 rel_score_cache[rel_id_str] = sim
 
-                if sim >= MIN_EDGE_SIM:
+                if sim >= effective_min_edge_sim:
                     scored_edges.append((sim, neighbor, rel_id_str))
 
             # Push low-sim edges first so high-sim edges are on top of stack
