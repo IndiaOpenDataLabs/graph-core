@@ -75,21 +75,81 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
 }
 
 
-_EXTRACTION_SYSTEM_PROMPT = """You are a knowledge graph extractor. Given a text passage, extract all entities and their relationships.
+_EXTRACTION_SYSTEM_PROMPT = """---Role---
+You are a Knowledge Graph Specialist responsible for extracting
+entities and relationships from input text.
 
-Entity types to look for: {entity_types}
+---Instructions---
+1. Entity extraction:
+   - Identify clearly defined, meaningful entities that are
+     explicitly supported by the text.
+   - For each entity, extract: name, type, description.
+   - Entity types to consider: {entity_types}. If none apply, use "Other".
+   - Use concise title case names and keep naming consistent across the extraction.
+   - Do not extract generic filler terms or vague concepts that are
+     not functioning as real entities in context.
 
-Return structured JSON with two arrays: "entities" and "relationships".
-Each entity has: name, type, description.
-Each relationship has: source, target, description, keywords (array), weight (0-1).
+2. Relationship extraction:
+   - Identify direct relationships between extracted entities.
+   - For N-ary relationships, decompose them into binary pairs.
+   - For each relationship, extract: source, target, description, keywords, weight.
+   - Relationship descriptions must explain the nature of the
+     connection, the context in which it holds, and why it matters.
+   - Treat relationships as undirected unless the text clearly indicates direction.
+   - Avoid duplicate relationships.
 
-Only extract entities that are meaningfully mentioned in the text. Do not extract generic terms.
+3. Output requirements:
+   - Return structured JSON with two arrays: "entities" and "relationships".
+   - Each entity must have: name, type, description.
+   - Each relationship must have: source, target, description, keywords, weight.
+   - "keywords" should be a compact list of relevant terms.
+   - "weight" should be a float between 0 and 1 representing confidence or salience.
+   - Use third-person phrasing and avoid pronouns where possible.
+   - Only extract entities and relationships explicitly supported by the text.
 """
 
 
-_EXTRACTION_USER_PROMPT = """Extract entities and relationships from this text:
+_EXTRACTION_USER_PROMPT = """Extract all entities and relationships
+from the following text.
+
+Text:
+{text}
+
+Output all entities first, then all relationships.
+"""
+
+
+_GLEANING_SYSTEM_PROMPT = """---Role---
+You are a Knowledge Graph Specialist responsible for extracting
+entities and relationships from input text.
+
+---Instructions---
+Based on the previous extraction, identify only missed or incorrectly
+formatted entities and relationships.
+
+1. Do not repeat entities or relationships that were already extracted correctly.
+2. Focus on:
+   - entities missed in the first pass
+   - relationships missed in the first pass
+   - items that need correction to match the required structure
+3. Entity types to consider: {entity_types}. If none apply, use "Other".
+4. Keep naming consistent with the previously extracted entities.
+5. Relationship descriptions must still explain the nature, context,
+   and significance of the connection.
+6. Return only new or corrected items in the same JSON structure as
+   the main extraction.
+7. Only include items explicitly supported by the text.
+"""
+
+
+_GLEANING_USER_PROMPT = """Previously extracted:
+{existing_info}
+
+Now extract any additional or corrected entities and relationships from:
 
 {text}
+
+Only output new or corrected items.
 """
 
 
@@ -109,6 +169,22 @@ class LLMGraphExtractor:
             normalized = normalized[:256]
         return normalized
 
+    @staticmethod
+    def _build_extraction_prompt(text: str, entity_types: str) -> str:
+        return (
+            _EXTRACTION_SYSTEM_PROMPT.format(entity_types=entity_types)
+            + "\n\n"
+            + _EXTRACTION_USER_PROMPT.format(text=text)
+        )
+
+    @staticmethod
+    def _build_gleaning_prompt(text: str, entity_types: str, existing_info: str) -> str:
+        return (
+            _GLEANING_SYSTEM_PROMPT.format(entity_types=entity_types)
+            + "\n\n"
+            + _GLEANING_USER_PROMPT.format(existing_info=existing_info, text=text)
+        )
+
     async def extract(
         self,
         text: str,
@@ -120,18 +196,18 @@ class LLMGraphExtractor:
             return self._cache[content_hash]
 
         types_str = ", ".join(entity_types) if entity_types else "general"
-        prompt = _EXTRACTION_USER_PROMPT.format(text=text)
+        prompt = self._build_extraction_prompt(text=text, entity_types=types_str)
 
         try:
             result = await self._llm.structured_extract(
-                prompt=_EXTRACTION_SYSTEM_PROMPT.format(entity_types=types_str) + "\n\n" + prompt,
+                prompt=prompt,
                 schema=_EXTRACTION_SCHEMA,
             )
         except Exception as e:
             logger.warning("LLM extraction failed, retrying once: %s", e)
             try:
                 result = await self._llm.structured_extract(
-                    prompt=_EXTRACTION_SYSTEM_PROMPT.format(entity_types=types_str) + "\n\n" + prompt,
+                    prompt=prompt,
                     schema=_EXTRACTION_SCHEMA,
                 )
             except Exception as e2:
@@ -155,7 +231,11 @@ class LLMGraphExtractor:
             if source and target:
                 keywords_str = rel.get("keywords", [])
                 if isinstance(keywords_str, str):
-                    keywords_str = [k.strip() for k in keywords_str.split(",") if k.strip()]
+                    keywords_str = [
+                        k.strip()
+                        for k in keywords_str.split(",")
+                        if k.strip()
+                    ]
                 weight = rel.get("weight", 1.0)
                 try:
                     weight = float(weight)
@@ -171,10 +251,17 @@ class LLMGraphExtractor:
                     weight=weight,
                 ))
 
-        extraction_result = ExtractionResult(entities=entities, relationships=relationships)
+        extraction_result = ExtractionResult(
+            entities=entities,
+            relationships=relationships,
+        )
         self._cache[content_hash] = extraction_result
 
-        logger.info("Extracted %d entities, %d relationships", len(entities), len(relationships))
+        logger.info(
+            "Extracted %d entities, %d relationships",
+            len(entities),
+            len(relationships),
+        )
         return extraction_result
 
     async def extract_with_gleaning(
@@ -192,21 +279,27 @@ class LLMGraphExtractor:
 
         for gleaning_pass in range(max_gleaning):
             existing_info = "Already extracted:\n"
-            existing_info += "Entities: " + ", ".join(e.name for e in current_entities) + "\n"
+            existing_info += (
+                "Entities: "
+                + ", ".join(e.name for e in current_entities)
+                + "\n"
+            )
             existing_info += "Relationships: " + ", ".join(
                 f"{r.source_name} -> {r.target_name}" for r in current_relationships
             )
 
             types_str = ", ".join(entity_types) if entity_types else "general"
-            gleaning_prompt = (
-                _EXTRACTION_SYSTEM_PROMPT.format(entity_types=types_str)
-                + "\n\nFind ADDITIONAL entities and relationships NOT already extracted.\n\n"
-                + existing_info + "\n\n"
-                + _EXTRACTION_USER_PROMPT.format(text=text)
+            gleaning_prompt = self._build_gleaning_prompt(
+                text=text,
+                entity_types=types_str,
+                existing_info=existing_info,
             )
 
             try:
-                gleamed = await self._llm.structured_extract(prompt=gleaning_prompt, schema=_EXTRACTION_SCHEMA)
+                gleamed = await self._llm.structured_extract(
+                    prompt=gleaning_prompt,
+                    schema=_EXTRACTION_SCHEMA,
+                )
             except Exception as e:
                 logger.warning("Gleaning failed: %s", e)
                 break
@@ -231,7 +324,11 @@ class LLMGraphExtractor:
                 if source and target:
                     keywords_str = rel.get("keywords", [])
                     if isinstance(keywords_str, str):
-                        keywords_str = [k.strip() for k in keywords_str.split(",") if k.strip()]
+                        keywords_str = [
+                            k.strip()
+                            for k in keywords_str.split(",")
+                            if k.strip()
+                        ]
                     weight = rel.get("weight", 1.0)
                     try:
                         weight = max(0.0, min(1.0, float(weight)))
@@ -246,9 +343,20 @@ class LLMGraphExtractor:
                         weight=weight,
                     ))
 
-            current_relationships = list({f"{r.source_name}__{r.target_name}": r for r in current_relationships}.values())
+            current_relationships = list(
+                {
+                    f"{r.source_name}__{r.target_name}": r
+                    for r in current_relationships
+                }.values()
+            )
 
-            if len(current_entities) == prev_entity_count and len(current_relationships) == prev_rel_count:
+            if (
+                len(current_entities) == prev_entity_count
+                and len(current_relationships) == prev_rel_count
+            ):
                 break
 
-        return ExtractionResult(entities=current_entities, relationships=current_relationships)
+        return ExtractionResult(
+            entities=current_entities,
+            relationships=current_relationships,
+        )
