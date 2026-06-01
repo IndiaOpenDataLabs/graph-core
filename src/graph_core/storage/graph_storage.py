@@ -37,6 +37,8 @@ class FalkorDBGraphStorage:
         self._graph_name = namespace or settings.falkordb_graph_name
         self._host = "localhost"
         self._port = 6379
+        self._client: Optional[Any] = None
+        self._graph: Optional[Any] = None
         # Parse URL if provided
         if settings.falkordb_url:
             url = settings.falkordb_url
@@ -76,12 +78,17 @@ class FalkorDBGraphStorage:
             raise RuntimeError(
                 "FalkorDB client not installed. Install with: pip install graph-core[graph]"
             )
+        if self._graph is not None:
+            return self._graph
         if self._test_client is not None:
-            return self._test_client.select_graph(self._graph_name)
+            self._graph = self._test_client.select_graph(self._graph_name)
+            return self._graph
 
         pool = self._get_connection_pool()
-        client = FalkorDB(connection_pool=pool)
-        return client.select_graph(self._graph_name)
+        if self._client is None:
+            self._client = FalkorDB(connection_pool=pool)
+        self._graph = self._client.select_graph(self._graph_name)
+        return self._graph
 
     async def has_node(self, node_id: str) -> bool:
         graph = await self._get_graph()
