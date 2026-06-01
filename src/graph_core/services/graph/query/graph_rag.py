@@ -32,6 +32,17 @@ from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
+_MODE_ALIASES = {
+    "local": "entity-first",
+    "ent": "entity-first",
+    "entity": "entity-first",
+    "entity-first": "entity-first",
+    "rel": "relationship-first",
+    "relationship": "relationship-first",
+    "relationship-first": "relationship-first",
+    "hyb": "hybrid",
+    "hybrid": "hybrid",
+}
 
 
 @dataclass
@@ -600,9 +611,8 @@ async def graph_rag_query(
     embedding_provider = await _resolve_embedding_provider(collection)
     query_embedding = await embedding_provider.embed_query(question)
 
-    effective_mode = (mode or "entity-first").lower()
-    if effective_mode == "local":
-        effective_mode = "entity-first"
+    requested_mode = (mode or "entity-first").lower()
+    effective_mode = _MODE_ALIASES.get(requested_mode, "entity-first")
 
     if effective_mode == "relationship-first":
         state = await _relationship_first_state(question, collection, query_embedding)

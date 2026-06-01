@@ -757,7 +757,11 @@ class ConsoleScreen(Screen):
         "/collection delete COLLECTION": "Delete a collection.",
         "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
-        "/query COLLECTION \"question\" [--mode MODE]": "Query a collection.",
+        (
+            "/query COLLECTION \"question\" "
+            "[--mode entity-first|relationship-first|hybrid|local "
+            "(aliases: ent|rel|hyb)]"
+        ): "Query a collection.",
         "/jobs list [--limit N]": "List recent jobs.",
         "/jobs show JOB_ID": "Show job status.",
         "/jobs watch JOB_ID": "Poll a job until it finishes.",
@@ -787,7 +791,8 @@ class ConsoleScreen(Screen):
         (
             "/collection create NAME --strategy vector|light_rag|custom_graph_rag "
             "--embedding-profile ID_OR_LABEL [--llm-profile ID_OR_LABEL] "
-            "[--default-query-mode local|global|hybrid|naive|mix]"
+            "[--default-query-mode "
+            "local|entity-first|relationship-first|global|hybrid|naive|mix]"
         ): "/collection create",
         (
             "/collection edit COLLECTION [--name NAME] "
@@ -802,7 +807,9 @@ class ConsoleScreen(Screen):
             "/ingest file COLLECTION /path/to/file.txt"
         ): "/ingest file <collection> @<path>",
         (
-            "/query COLLECTION \"question\" [--mode MODE]"
+            "/query COLLECTION \"question\" "
+            "[--mode entity-first|relationship-first|hybrid|local "
+            "(aliases: ent|rel|hyb)]"
         ): "/query <collection> \"<question>\"",
         "/jobs list [--limit N]": "/jobs list",
         "/jobs show JOB_ID": "/jobs show <job_id>",
@@ -811,8 +818,11 @@ class ConsoleScreen(Screen):
     STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
     QUERY_MODES = [
         "local",
+        "ent",
         "entity-first",
+        "rel",
         "relationship-first",
+        "hyb",
         "global",
         "hybrid",
         "naive",
@@ -1811,6 +1821,13 @@ class ConsoleScreen(Screen):
                 for mode in self.QUERY_MODES
                 if mode.startswith(prefix)
             ]
+        elif "--mode " in value:
+            prefix = value.rsplit("--mode ", 1)[1].strip()
+            suggestions = [
+                (mode, "query mode")
+                for mode in self.QUERY_MODES
+                if mode.startswith(prefix)
+            ]
         else:
             file_token = self._extract_file_token(value)
             if file_token is not None:
@@ -1870,6 +1887,15 @@ class ConsoleScreen(Screen):
         if "--default-query-mode " in current:
             before, _, _ = current.rpartition("--default-query-mode ")
             new_value = f"{before}--default-query-mode {value}"
+            input_widget.value = new_value
+            input_widget.cursor_position = len(new_value)
+            self._focus_command()
+            self._update_suggestions(input_widget.value)
+            return
+
+        if "--mode " in current:
+            before, _, _ = current.rpartition("--mode ")
+            new_value = f"{before}--mode {value}"
             input_widget.value = new_value
             input_widget.cursor_position = len(new_value)
             self._focus_command()
