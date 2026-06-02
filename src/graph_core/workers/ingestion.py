@@ -5,6 +5,7 @@ import uuid
 
 import dramatiq
 
+import graph_core.broker  # noqa: F401
 from graph_core.config import settings
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.ingestion.document_pipeline import (
@@ -39,7 +40,7 @@ async def run_ingestion(job_id: str):
 
 @dramatiq.actor(
     max_retries=3,
-    max_age=1800000,
+    max_age=settings.ingest_chunk_max_age_ms,
     time_limit=settings.ingest_chunk_time_limit_ms,
 )
 async def run_chunk(job_id: str, chunk_index: int):
