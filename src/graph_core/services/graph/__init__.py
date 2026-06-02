@@ -1087,12 +1087,6 @@ class GraphService:
             )
         else:
             retrieval_question = question
-        if chat_context:
-            retrieval_question = (
-                "Relevant prior chat context:\n"
-                f"{chat_context}\n\n"
-                f"Rewritten current question:\n{retrieval_question}"
-            )
 
         if collection.strategy == "vector":
             result = await vector_query(
