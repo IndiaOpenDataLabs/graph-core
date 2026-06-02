@@ -166,6 +166,8 @@ class FalkorDBGraphStorage:
             "type",
             "description",
             "source_ids",
+            "source_message_ids",
+            "source_roles",
             "role",
             "content",
             "question",
@@ -193,7 +195,16 @@ class FalkorDBGraphStorage:
         self, source_id: str, target_id: str, properties: dict[str, Any]
     ) -> None:
         graph = await self._get_graph()
-        allowed_keys = {"id", "weight", "keywords", "collection_id", "description", "source_ids"}
+        allowed_keys = {
+            "id",
+            "weight",
+            "keywords",
+            "collection_id",
+            "description",
+            "source_ids",
+            "source_message_ids",
+            "source_roles",
+        }
         set_clauses = []
         params: dict[str, object] = {"source_id": source_id, "target_id": target_id}
         for key, value in properties.items():
@@ -217,6 +228,51 @@ class FalkorDBGraphStorage:
             )
 
         await graph.query(query, params)
+
+    async def get_nodes_by_source_message_id(
+        self,
+        message_id: str,
+    ) -> list[dict[str, Any]]:
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH (n:Entity)
+            WHERE n.source_message_ids CONTAINS $message_id
+            RETURN n
+            """,
+            {"message_id": message_id},
+        )
+        rows: list[dict[str, Any]] = []
+        if result and result.result_set:
+            for row in result.result_set:
+                node = row[0]
+                if node:
+                    rows.append(dict(node.properties))
+        return rows
+
+    async def get_edges_by_source_message_id(
+        self,
+        message_id: str,
+    ) -> list[dict[str, Any]]:
+        graph = await self._get_graph()
+        result = await graph.query(
+            """
+            MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+            WHERE r.source_message_ids CONTAINS $message_id
+            RETURN a.id, b.id, r
+            """,
+            {"message_id": message_id},
+        )
+        edges: list[dict[str, Any]] = []
+        if result and result.result_set:
+            for row in result.result_set:
+                rel = row[2]
+                if rel:
+                    props = dict(rel.properties)
+                    props["source_id"] = row[0]
+                    props["target_id"] = row[1]
+                    edges.append(props)
+        return edges
 
     # ── LightRAG name-based operations ──
 

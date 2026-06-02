@@ -5,6 +5,8 @@ logic lives there; this package provides the familiar class API used by
 API routes and workers.
 """
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -50,6 +52,10 @@ from graph_core.services.graph.query.lightrag import lightrag_query
 from graph_core.services.graph.query.vector import (
     QueryResult,
     vector_query,
+)
+from graph_core.services.graph_rag.extractor import (
+    ExtractedRelationship,
+    LLMGraphExtractor,
 )
 from graph_core.services.sanitizer import TextSanitizer
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
@@ -171,11 +177,46 @@ class GraphService:
         speaker = "User" if role == "user" else "Assistant"
         return f"{speaker} (turn {turn_index}):\n{content}"
 
+    @staticmethod
+    def _parse_json_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return [value] if value.strip() else []
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item).strip()]
+        return []
+
+    @staticmethod
+    def _semantic_entity_id(name: str) -> str:
+        normalized = " ".join(name.strip().lower().split())
+        return f"entity:{normalized}"
+
+    @staticmethod
+    def _semantic_relationship_id(
+        source_name: str,
+        target_name: str,
+    ) -> str:
+        return (
+            f"{GraphService._semantic_entity_id(source_name)}"
+            f"__{GraphService._semantic_entity_id(target_name)}"
+        )
+
+    @staticmethod
+    def _chat_chunk_hash(*parts: object) -> str:
+        raw = "::".join(str(part) for part in parts)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
     async def _load_recent_chat_messages(
         self,
         chat_id: uuid.UUID,
         *,
-        limit: int = 4,
+        limit: int = 6,
     ) -> list[ChatMessage]:
         async with AsyncSessionLocal() as session:
             messages = (
@@ -206,14 +247,353 @@ class GraphService:
             ).scalars().all()
         return rows
 
+    @staticmethod
+    def _format_semantic_entity(name: str, description: str) -> str:
+        return f"Entity: {name}. {description}".strip()
+
+    @staticmethod
+    def _format_semantic_relationship(rel: ExtractedRelationship) -> str:
+        keywords = ", ".join(rel.keywords[:5])
+        suffix = f" Keywords: {keywords}." if keywords else ""
+        return (
+            f"Relationship: {rel.source_name} -> {rel.target_name}. "
+            f"{rel.description}{suffix}"
+        ).strip()
+
+    async def _extract_chat_semantics(
+        self,
+        collection: Collection,
+        text: str,
+        llm_profile_id: uuid.UUID | None,
+    ):
+        llm_provider = await self._resolve_collection_llm_provider(
+            collection,
+            llm_profile_id,
+        )
+        extractor = LLMGraphExtractor(llm_provider)
+        return await extractor.extract_with_gleaning(
+            text=text,
+            max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+        )
+
+    async def _merge_chat_semantic_node(
+        self,
+        storage: FalkorDBGraphStorage,
+        collection: Collection,
+        *,
+        node_id: str,
+        name: str,
+        description: str,
+        source_message_id: str,
+        source_role: str,
+    ) -> None:
+        existing = await storage.get_node(node_id)
+        source_message_ids = set(
+            self._parse_json_list(existing.get("source_message_ids"))
+            if existing
+            else []
+        )
+        source_roles = set(
+            self._parse_json_list(existing.get("source_roles")) if existing else []
+        )
+        source_message_ids.add(source_message_id)
+        source_roles.add(source_role)
+        existing_description = (
+            str(existing.get("description") or "") if existing else ""
+        )
+        final_description = (
+            description
+            if len(description) >= len(existing_description)
+            else existing_description
+        )
+        await storage.upsert_node(
+            node_id,
+            {
+                "id": node_id,
+                "name": name,
+                "collection_id": str(collection.id),
+                "type": "semantic_entity",
+                "description": final_description,
+                "source_message_ids": json.dumps(sorted(source_message_ids)),
+                "source_roles": json.dumps(sorted(source_roles)),
+            },
+        )
+
+    async def _merge_chat_semantic_edge(
+        self,
+        storage: FalkorDBGraphStorage,
+        collection: Collection,
+        *,
+        relationship: ExtractedRelationship,
+        source_message_id: str,
+        source_role: str,
+    ) -> None:
+        source_id = self._semantic_entity_id(relationship.source_name)
+        target_id = self._semantic_entity_id(relationship.target_name)
+        existing = await storage.get_edge(source_id, target_id)
+        source_message_ids = set(
+            self._parse_json_list(existing.get("source_message_ids"))
+            if existing
+            else []
+        )
+        source_roles = set(
+            self._parse_json_list(existing.get("source_roles")) if existing else []
+        )
+        source_message_ids.add(source_message_id)
+        source_roles.add(source_role)
+        existing_keywords = (
+            self._parse_json_list(existing.get("keywords")) if existing else []
+        )
+        merged_keywords = sorted(
+            {
+                *(keyword.strip() for keyword in existing_keywords if keyword.strip()),
+                *(
+                    keyword.strip()
+                    for keyword in relationship.keywords
+                    if keyword.strip()
+                ),
+            }
+        )
+        existing_description = (
+            str(existing.get("description") or "") if existing else ""
+        )
+        final_description = (
+            relationship.description
+            if len(relationship.description) >= len(existing_description)
+            else existing_description
+        )
+        await storage.upsert_edge(
+            source_id,
+            target_id,
+            {
+                "id": self._semantic_relationship_id(
+                    relationship.source_name,
+                    relationship.target_name,
+                ),
+                "weight": max(
+                    float(existing.get("weight", 0.0)) if existing else 0.0,
+                    float(relationship.weight),
+                ),
+                "collection_id": str(collection.id),
+                "description": final_description,
+                "keywords": merged_keywords,
+                "source_message_ids": json.dumps(sorted(source_message_ids)),
+                "source_roles": json.dumps(sorted(source_roles)),
+            },
+        )
+
+    async def _store_chat_semantic_memory(
+        self,
+        collection: Collection,
+        namespace_id: uuid.UUID,
+        chat_id: uuid.UUID,
+        message: ChatMessage,
+        embedding_provider,
+        llm_profile_id: uuid.UUID | None,
+    ) -> None:
+        extraction = await self._extract_chat_semantics(
+            collection,
+            message.content,
+            llm_profile_id,
+        )
+        if not extraction.entities and not extraction.relationships:
+            return
+
+        storage = self._chat_storage(chat_id)
+        vector_chunks: list[dict[str, Any]] = []
+
+        for index, entity in enumerate(extraction.entities):
+            node_id = self._semantic_entity_id(entity.name)
+            await self._merge_chat_semantic_node(
+                storage,
+                collection,
+                node_id=node_id,
+                name=entity.name,
+                description=entity.description,
+                source_message_id=str(message.id),
+                source_role=message.role,
+            )
+            entity_content = self._format_semantic_entity(
+                entity.name,
+                entity.description,
+            )
+            vector_chunks.append(
+                {
+                    "chunk_hash": self._chat_chunk_hash(
+                        "chat_semantic",
+                        chat_id,
+                        message.id,
+                        "entity",
+                        index,
+                    ),
+                    "chunk_index": index,
+                    "content": entity_content,
+                    "token_count": len(entity_content.split()),
+                    "metadata": {
+                        "memory_type": "chat_semantic",
+                        "chat_id": str(chat_id),
+                        "source_message_id": str(message.id),
+                        "source_role": message.role,
+                        "semantic_kind": "entity",
+                        "semantic_id": node_id,
+                        "entity_name": entity.name,
+                    },
+                    "embedding": await embedding_provider.embed_query(entity_content),
+                }
+            )
+
+        relationship_offset = len(vector_chunks)
+        for index, relationship in enumerate(extraction.relationships):
+            await self._merge_chat_semantic_node(
+                storage,
+                collection,
+                node_id=self._semantic_entity_id(relationship.source_name),
+                name=relationship.source_name,
+                description="",
+                source_message_id=str(message.id),
+                source_role=message.role,
+            )
+            await self._merge_chat_semantic_node(
+                storage,
+                collection,
+                node_id=self._semantic_entity_id(relationship.target_name),
+                name=relationship.target_name,
+                description="",
+                source_message_id=str(message.id),
+                source_role=message.role,
+            )
+            await self._merge_chat_semantic_edge(
+                storage,
+                collection,
+                relationship=relationship,
+                source_message_id=str(message.id),
+                source_role=message.role,
+            )
+            rel_content = self._format_semantic_relationship(relationship)
+            vector_chunks.append(
+                {
+                    "chunk_hash": self._chat_chunk_hash(
+                        "chat_semantic",
+                        chat_id,
+                        message.id,
+                        "relationship",
+                        index,
+                    ),
+                    "chunk_index": relationship_offset + index,
+                    "content": rel_content,
+                    "token_count": len(rel_content.split()),
+                    "metadata": {
+                        "memory_type": "chat_semantic",
+                        "chat_id": str(chat_id),
+                        "source_message_id": str(message.id),
+                        "source_role": message.role,
+                        "semantic_kind": "relationship",
+                        "semantic_id": self._semantic_relationship_id(
+                            relationship.source_name,
+                            relationship.target_name,
+                        ),
+                    },
+                    "embedding": await embedding_provider.embed_query(rel_content),
+                }
+            )
+
+        if vector_chunks:
+            await self._vector_store.upsert_chunks(
+                namespace_id=namespace_id,
+                collection_id=collection.id,
+                chunks=vector_chunks,
+            )
+
+    async def _load_semantic_region(
+        self,
+        chat_id: uuid.UUID,
+        source_message_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        storage = self._chat_storage(chat_id)
+        nodes_by_id: dict[str, dict[str, Any]] = {}
+        edges_by_id: dict[str, dict[str, Any]] = {}
+        for message_id in source_message_ids:
+            for node in await storage.get_nodes_by_source_message_id(message_id):
+                node_id = str(node.get("id") or "")
+                if node_id:
+                    nodes_by_id[node_id] = node
+            for edge in await storage.get_edges_by_source_message_id(message_id):
+                edge_id = str(edge.get("id") or "")
+                if edge_id:
+                    edges_by_id[edge_id] = edge
+                    source_id = str(edge.get("source_id") or "")
+                    target_id = str(edge.get("target_id") or "")
+                    if source_id and source_id not in nodes_by_id:
+                        node = await storage.get_node(source_id)
+                        if node:
+                            nodes_by_id[source_id] = node
+                    if target_id and target_id not in nodes_by_id:
+                        node = await storage.get_node(target_id)
+                        if node:
+                            nodes_by_id[target_id] = node
+
+        for node_id in list(nodes_by_id):
+            for source_id, target_id in await storage.get_node_edges(node_id):
+                edge = await storage.get_edge(source_id, target_id)
+                if not edge:
+                    continue
+                edge_id = str(edge.get("id") or "")
+                if edge_id:
+                    edge["source_id"] = source_id
+                    edge["target_id"] = target_id
+                    edges_by_id[edge_id] = edge
+                neighbor_id = target_id if source_id == node_id else source_id
+                if neighbor_id and neighbor_id not in nodes_by_id:
+                    neighbor = await storage.get_node(neighbor_id)
+                    if neighbor:
+                        nodes_by_id[neighbor_id] = neighbor
+        nodes = sorted(
+            nodes_by_id.values(),
+            key=lambda node: str(node.get("name") or ""),
+        )
+        edges = sorted(
+            edges_by_id.values(),
+            key=lambda edge: (
+                str(edge.get("source_id") or ""),
+                str(edge.get("target_id") or ""),
+            ),
+        )
+        return nodes, edges
+
+    def _format_semantic_context(
+        self,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+    ) -> str:
+        lines: list[str] = []
+        for node in nodes[:8]:
+            name = str(node.get("name") or "").strip()
+            description = str(node.get("description") or "").strip()
+            if name and description:
+                lines.append(f"Entity: {name}. {description}")
+            elif name:
+                lines.append(f"Entity: {name}")
+        for edge in edges[:10]:
+            source_id = str(edge.get("source_id") or "")
+            target_id = str(edge.get("target_id") or "")
+            source_name = source_id.removeprefix("entity:")
+            target_name = target_id.removeprefix("entity:")
+            description = str(edge.get("description") or "").strip()
+            if source_name and target_name and description:
+                lines.append(
+                    f"Relationship: {source_name} -> {target_name}. {description}"
+                )
+        return "\n".join(lines)
+
     async def _rewrite_chat_question(
         self,
         collection: Collection,
         question: str,
-        chat_context: str,
+        chronology_context: str,
+        semantic_context: str,
         llm_profile_id: uuid.UUID | None,
     ) -> str:
-        if not chat_context.strip():
+        if not chronology_context.strip() and not semantic_context.strip():
             return question
         llm_provider = await self._resolve_collection_llm_provider(
             collection,
@@ -225,16 +605,20 @@ class GraphService:
                     "role": "system",
                     "content": (
                         "Rewrite the user's latest message into a standalone "
-                        "retrieval query using the provided prior chat context. "
-                        "Preserve the user's intent and resolve omitted references "
-                        "like it/that/this/trip/place/person from context. "
-                        "Be specific and concise. Return only the rewritten query."
+                        "retrieval query using the provided chronology and semantic "
+                        "memory from the chat. Resolve omitted references like "
+                        "it/that/this/trip/place/person from context. Preserve the "
+                        "user's intent. If the latest message is a correction or "
+                        "disagreement, make the rewritten query explicitly compare "
+                        "what the user said with what the assistant inferred. "
+                        "Return only the rewritten query."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Prior chat context:\n{chat_context}\n\n"
+                        f"Recent chat messages:\n{chronology_context}\n\n"
+                        f"Semantic memory:\n{semantic_context}\n\n"
                         f"Latest user message:\n{question}"
                     ),
                 },
@@ -250,7 +634,7 @@ class GraphService:
         chat_id: uuid.UUID,
         llm_profile_id: uuid.UUID | None,
     ) -> tuple[str, str]:
-        recent_messages = await self._load_recent_chat_messages(chat_id, limit=4)
+        recent_messages = await self._load_recent_chat_messages(chat_id, limit=6)
         embedding_provider = await self._resolve_collection_embedding_provider(
             collection
         )
@@ -258,54 +642,49 @@ class GraphService:
         hits = await self._vector_store.query_chunks(
             collection_id=collection.id,
             query_embedding=query_embedding,
-            top_k=4,
+            top_k=6,
             metadata_filters={
-                "memory_type": "chat_message",
+                "memory_type": "chat_semantic",
                 "chat_id": str(chat_id),
             },
         )
-        storage = self._chat_storage(chat_id)
-        selected_ids: set[str] = set()
-
-        for message in recent_messages[-2:]:
-            selected_ids.add(str(message.id))
-
-        for hit in hits:
-            metadata = hit.get("metadata") or {}
-            message_id = str(metadata.get("message_id") or "").strip()
-            if message_id:
-                selected_ids.add(message_id)
-
-        neighbor_ids: set[str] = set()
-        for message_id in list(selected_ids):
-            for source_id, target_id in await storage.get_node_edges(message_id):
-                neighbor = target_id if source_id == message_id else source_id
-                if neighbor and neighbor not in selected_ids:
-                    neighbor_ids.add(neighbor)
-        selected_ids.update(neighbor_ids)
-
-        message_rows = await self._load_chat_message_rows(chat_id, selected_ids)
-        if not message_rows:
-            message_rows = recent_messages[-2:]
-
-        if not message_rows:
-            return "", question
-
-        context = "\n\n".join(
+        chronology_context = "\n\n".join(
             self._format_chat_message(
                 message.role,
                 message.content,
                 message.turn_index,
             )
-            for message in message_rows[-6:]
+            for message in recent_messages[-4:]
         )
+
+        selected_message_ids: set[str] = set()
+        top_score = 0.0
+        for hit in hits:
+            top_score = max(top_score, float(hit.get("score") or 0.0))
+            metadata = hit.get("metadata") or {}
+            message_id = str(metadata.get("source_message_id") or "").strip()
+            if message_id:
+                selected_message_ids.add(message_id)
+
+        if top_score < 0.55 or not selected_message_ids:
+            for message in recent_messages[-2:]:
+                selected_message_ids.add(str(message.id))
+
+        nodes, edges = await self._load_semantic_region(chat_id, selected_message_ids)
+        semantic_context = self._format_semantic_context(nodes, edges)
         rewritten = await self._rewrite_chat_question(
             collection,
             question,
-            context,
+            chronology_context,
+            semantic_context,
             llm_profile_id,
         )
-        return context, rewritten
+        combined_context = chronology_context
+        if semantic_context:
+            combined_context = (
+                f"{chronology_context}\n\nSemantic memory:\n{semantic_context}"
+            )
+        return combined_context, rewritten
 
     async def _record_chat_exchange(
         self,
@@ -315,6 +694,7 @@ class GraphService:
         question: str,
         response: str,
         mode: str | None,
+        llm_profile_id: uuid.UUID | None,
     ) -> None:
         embedding_provider = await self._resolve_collection_embedding_provider(
             collection
@@ -362,14 +742,6 @@ class GraphService:
             await session.refresh(user_message)
             await session.refresh(assistant_message)
 
-            previous_message_id = await session.scalar(
-                select(ChatMessage.id)
-                .where(ChatMessage.chat_id == chat_id)
-                .where(
-                    ChatMessage.message_index == assistant_message.message_index - 2
-                )
-            )
-
         user_embedding = await embedding_provider.embed_query(
             self._format_chat_message("user", question, turn_index)
         )
@@ -381,7 +753,11 @@ class GraphService:
             collection_id=collection.id,
             chunks=[
                 {
-                    "chunk_hash": f"chat:{chat_id}:{user_message.message_index}",
+                    "chunk_hash": self._chat_chunk_hash(
+                        "chat_message",
+                        chat_id,
+                        user_message.message_index,
+                    ),
                     "chunk_index": 0,
                     "content": self._format_chat_message("user", question, turn_index),
                     "token_count": len(question.split()),
@@ -396,7 +772,11 @@ class GraphService:
                     "embedding": user_embedding,
                 },
                 {
-                    "chunk_hash": f"chat:{chat_id}:{assistant_message.message_index}",
+                    "chunk_hash": self._chat_chunk_hash(
+                        "chat_message",
+                        chat_id,
+                        assistant_message.message_index,
+                    ),
                     "chunk_index": 0,
                     "content": self._format_chat_message(
                         "assistant",
@@ -416,62 +796,22 @@ class GraphService:
                 },
             ],
         )
-
-        storage = self._chat_storage(chat_id)
-        await storage.upsert_node(
-            str(user_message.id),
-            {
-                "id": str(user_message.id),
-                "name": f"User turn {turn_index}",
-                "collection_id": str(collection.id),
-                "type": "user_message",
-                "description": question[:256],
-                "content": question,
-                "role": "user",
-                "chat_id": str(chat_id),
-                "turn_index": turn_index,
-                "message_index": user_message.message_index,
-            },
+        await self._store_chat_semantic_memory(
+            collection,
+            namespace_id,
+            chat_id,
+            user_message,
+            embedding_provider,
+            llm_profile_id,
         )
-        await storage.upsert_node(
-            str(assistant_message.id),
-            {
-                "id": str(assistant_message.id),
-                "name": f"Assistant turn {turn_index}",
-                "collection_id": str(collection.id),
-                "type": "assistant_message",
-                "description": response[:256],
-                "content": response,
-                "role": "assistant",
-                "chat_id": str(chat_id),
-                "turn_index": turn_index,
-                "message_index": assistant_message.message_index,
-            },
+        await self._store_chat_semantic_memory(
+            collection,
+            namespace_id,
+            chat_id,
+            assistant_message,
+            embedding_provider,
+            llm_profile_id,
         )
-        await storage.upsert_edge(
-            str(user_message.id),
-            str(assistant_message.id),
-            {
-                "id": f"{user_message.id}__answered_by__{assistant_message.id}",
-                "weight": 1,
-                "collection_id": str(collection.id),
-                "description": "answered by",
-                "keywords": ["chat", "answer", "pair"],
-            },
-        )
-        if previous_message_id:
-            prev_id = str(previous_message_id)
-            await storage.upsert_edge(
-                prev_id,
-                str(user_message.id),
-                {
-                    "id": f"{prev_id}__next__{user_message.id}",
-                    "weight": 1,
-                    "collection_id": str(collection.id),
-                    "description": "next message",
-                    "keywords": ["chat", "next"],
-                },
-            )
 
     async def _resolve_collection_embedding_provider(
         self,
@@ -794,6 +1134,7 @@ class GraphService:
                 question=question,
                 response=result.response,
                 mode=result.mode,
+                llm_profile_id=effective_llm_profile_id,
             )
             result.chat_id = str(chat_id)
         return result
