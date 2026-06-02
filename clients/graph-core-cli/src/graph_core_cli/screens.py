@@ -554,6 +554,12 @@ class CollectionFormScreen(Screen):
                 allow_blank=True,
                 id="collection-query-mode",
             ),
+            Label("Gleaning Passes"),
+            Input(
+                value=str(self._collection.get("gleaning_passes", 1)),
+                placeholder="1",
+                id="collection-gleaning-passes",
+            ),
             Container(
                 Button(
                     "Save" if self._mode == "edit" else "Create",
@@ -624,9 +630,21 @@ class CollectionFormScreen(Screen):
             "#collection-query-mode",
             Select,
         ).value
+        gleaning_passes_raw = self.query_one(
+            "#collection-gleaning-passes",
+            Input,
+        ).value.strip()
 
         if not name:
             self.notify("Collection name is required.", severity="error")
+            return
+        try:
+            gleaning_passes = int(gleaning_passes_raw or "1")
+        except ValueError:
+            self.notify("Gleaning passes must be an integer.", severity="error")
+            return
+        if gleaning_passes < 0:
+            self.notify("Gleaning passes must be 0 or greater.", severity="error")
             return
 
         client = self.app.mcp_client_for_key(self.app.active_api_key)
@@ -645,12 +663,14 @@ class CollectionFormScreen(Screen):
                     args["llm_profile_id"] = str(llm_profile_id)
                 if default_query_mode:
                     args["default_query_mode"] = str(default_query_mode)
+                args["gleaning_passes"] = gleaning_passes
                 result = await client.call("create_collection", args)
             else:
                 args = {
                     "collection_id": str(self._collection["id"]),
                     "name": name,
                     "strategy": str(strategy),
+                    "gleaning_passes": gleaning_passes,
                 }
                 if embedding_profile_id:
                     args["embedding_profile_id"] = str(embedding_profile_id)
@@ -744,6 +764,7 @@ class ConsoleScreen(Screen):
         (
             "/collection create NAME --strategy vector|light_rag|custom_graph_rag "
             "--embedding-profile ID_OR_LABEL [--llm-profile ID_OR_LABEL] "
+            "[--gleaning-passes N] "
             "[--default-query-mode "
             "local|entity-first|relationship-first|global|hybrid|naive|mix]"
         ): "Create a collection.",
@@ -751,6 +772,7 @@ class ConsoleScreen(Screen):
             "/collection edit COLLECTION [--name NAME] "
             "[--strategy vector|light_rag|custom_graph_rag] "
             "[--embedding-profile ID_OR_LABEL] [--llm-profile ID_OR_LABEL] "
+            "[--gleaning-passes N] "
             "[--clear-llm-profile] [--default-query-mode MODE] "
             "[--clear-default-query-mode]"
         ): "Update a collection.",
@@ -791,6 +813,7 @@ class ConsoleScreen(Screen):
         (
             "/collection create NAME --strategy vector|light_rag|custom_graph_rag "
             "--embedding-profile ID_OR_LABEL [--llm-profile ID_OR_LABEL] "
+            "[--gleaning-passes N] "
             "[--default-query-mode "
             "local|entity-first|relationship-first|global|hybrid|naive|mix]"
         ): "/collection create",
@@ -798,6 +821,7 @@ class ConsoleScreen(Screen):
             "/collection edit COLLECTION [--name NAME] "
             "[--strategy vector|light_rag|custom_graph_rag] "
             "[--embedding-profile ID_OR_LABEL] [--llm-profile ID_OR_LABEL] "
+            "[--gleaning-passes N] "
             "[--clear-llm-profile] [--default-query-mode MODE] "
             "[--clear-default-query-mode]"
         ): "/collection edit ",
@@ -1228,6 +1252,13 @@ class ConsoleScreen(Screen):
                 call_args["llm_profile_id"] = llm_profile["profile_id"]
             if isinstance(flags.get("default_query_mode"), str):
                 call_args["default_query_mode"] = str(flags["default_query_mode"])
+            if "gleaning_passes" in flags:
+                try:
+                    call_args["gleaning_passes"] = int(flags["gleaning_passes"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "--gleaning-passes must be an integer"
+                    ) from exc
             self._write(await self._call("create_collection", call_args))
             return
         if action == "edit" and len(args) == 2:
@@ -1270,6 +1301,13 @@ class ConsoleScreen(Screen):
                 call_args["clear_default_query_mode"] = True
             elif isinstance(flags.get("default_query_mode"), str):
                 call_args["default_query_mode"] = str(flags["default_query_mode"])
+            if "gleaning_passes" in flags:
+                try:
+                    call_args["gleaning_passes"] = int(flags["gleaning_passes"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "--gleaning-passes must be an integer"
+                    ) from exc
             self._write(await self._call("update_collection", call_args))
             return
         if action == "delete" and len(args) >= 2:

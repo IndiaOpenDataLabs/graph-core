@@ -161,6 +161,7 @@ async def create_collection(
     ctx: Context,
     llm_profile_id: str | None = None,
     default_query_mode: str | None = None,
+    gleaning_passes: int | None = None,
 ) -> str:
     """Create a new collection in the current namespace.
 
@@ -170,6 +171,7 @@ async def create_collection(
         embedding_profile_id: Required embedding profile UUID.
         llm_profile_id: Optional LLM profile UUID.
         default_query_mode: Optional default query mode.
+        gleaning_passes: Optional number of extra gleaning passes per chunk.
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
@@ -179,6 +181,7 @@ async def create_collection(
         embedding_profile_id=embedding_profile_id,
         llm_profile_id=llm_profile_id,
         default_query_mode=default_query_mode,
+        gleaning_passes=gleaning_passes,
     )
     return (
         f"Created collection:\n"
@@ -186,7 +189,8 @@ async def create_collection(
         f"  name: {result['name']}\n"
         f"  strategy: {result['strategy']}\n"
         f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
-        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}"
+        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
+        f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
     )
 
 
@@ -213,6 +217,7 @@ async def update_collection(
     embedding_profile_id: str | None = None,
     llm_profile_id: str | None = None,
     default_query_mode: str | None = None,
+    gleaning_passes: int | None = None,
     clear_llm_profile: bool = False,
     clear_default_query_mode: bool = False,
 ) -> str:
@@ -226,6 +231,7 @@ async def update_collection(
         embedding_profile_id=embedding_profile_id,
         llm_profile_id=llm_profile_id,
         default_query_mode=default_query_mode,
+        gleaning_passes=gleaning_passes,
         clear_llm_profile=clear_llm_profile,
         clear_default_query_mode=clear_default_query_mode,
     )
@@ -235,7 +241,8 @@ async def update_collection(
         f"  name: {result['name']}\n"
         f"  strategy: {result['strategy']}\n"
         f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
-        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}"
+        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
+        f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
     )
 
 

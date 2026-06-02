@@ -1,10 +1,9 @@
 """Collection model — knowledge graph scoped to a namespace."""
 
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, Enum, ForeignKey, Integer, String, func
-from sqlalchemy.dialects.postgresql import UUID as UUIDType
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from graph_core.database import Base
@@ -13,37 +12,82 @@ from graph_core.database import Base
 class Collection(Base):
     __tablename__ = "collections"
 
-    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    namespace_id = Column(UUIDType(as_uuid=True), ForeignKey("namespaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    namespace_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("namespaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     name = Column(String(255), nullable=False, index=True)
     description = Column(String(1024), nullable=True)
 
     # Strategy: immutable after creation
-    strategy = Column(Enum("vector", "light_rag", "custom_graph_rag", name="rag_strategy", create_type=True), nullable=False)
+    strategy = Column(
+        Enum(
+            "vector",
+            "light_rag",
+            "custom_graph_rag",
+            name="rag_strategy",
+            create_type=True,
+        ),
+        nullable=False,
+    )
     default_query_mode = Column(String(64), nullable=True)
+    gleaning_passes = Column(Integer, nullable=False, default=1, server_default="1")
 
     # Embedding profile: immutable after creation
-    embedding_profile_id = Column(UUIDType(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    embedding_profile_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # LLM profile: immutable after creation
-    llm_profile_id = Column(UUIDType(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    llm_profile_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # Resolved embedding dimensions from profile at creation time.
     # Used for dynamic per-collection vector table creation.
     embedding_dimensions = Column(Integer, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
     namespace = relationship("Namespace", back_populates="collections")
     embedding_profile = relationship("Profile", foreign_keys=[embedding_profile_id])
-    ingestion_records = relationship("IngestionRecord", back_populates="collection", cascade="all, delete-orphan")
-    jobs = relationship("Job", back_populates="collection", cascade="all, delete-orphan")
-    graph_entities = relationship("GraphEntity", back_populates="collection", cascade="all, delete-orphan")
+    ingestion_records = relationship(
+        "IngestionRecord",
+        back_populates="collection",
+        cascade="all, delete-orphan",
+    )
+    jobs = relationship(
+        "Job",
+        back_populates="collection",
+        cascade="all, delete-orphan",
+    )
+    graph_entities = relationship(
+        "GraphEntity",
+        back_populates="collection",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (
         # Unique name per namespace
-        __import__("sqlalchemy").UniqueConstraint("namespace_id", "name", name="uq_namespace_collection_name"),
+        __import__("sqlalchemy").UniqueConstraint(
+            "namespace_id",
+            "name",
+            name="uq_namespace_collection_name",
+        ),
     )
 
     def __repr__(self) -> str:

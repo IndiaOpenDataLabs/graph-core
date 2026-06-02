@@ -95,6 +95,7 @@ class GraphCoreClient:
         embedding_profile_id: str | None = None,
         llm_profile_id: str | None = None,
         default_query_mode: str | None = None,
+        gleaning_passes: int | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"name": name, "strategy": strategy}
         if embedding_profile_id:
@@ -103,6 +104,8 @@ class GraphCoreClient:
             body["llm_profile_id"] = llm_profile_id
         if default_query_mode:
             body["default_query_mode"] = default_query_mode
+        if gleaning_passes is not None:
+            body["gleaning_passes"] = gleaning_passes
         return await self._request("POST", "/collections/", json=body)
 
     async def list_collections(self) -> list[dict[str, Any]]:
@@ -117,6 +120,7 @@ class GraphCoreClient:
         embedding_profile_id: str | None = None,
         llm_profile_id: str | None = None,
         default_query_mode: str | None = None,
+        gleaning_passes: int | None = None,
         clear_llm_profile: bool = False,
         clear_default_query_mode: bool = False,
     ) -> dict[str, Any]:
@@ -131,6 +135,8 @@ class GraphCoreClient:
             body["llm_profile_id"] = llm_profile_id
         if default_query_mode is not None:
             body["default_query_mode"] = default_query_mode
+        if gleaning_passes is not None:
+            body["gleaning_passes"] = gleaning_passes
         if clear_llm_profile:
             body["clear_llm_profile"] = True
         if clear_default_query_mode:

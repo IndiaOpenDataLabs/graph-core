@@ -17,6 +17,7 @@ class CreateCollectionRequest(BaseModel):
     embedding_profile_id: uuid.UUID | None = None
     llm_profile_id: uuid.UUID | None = None
     default_query_mode: str | None = None
+    gleaning_passes: int = 1
 
 
 class UpdateCollectionRequest(BaseModel):
@@ -25,6 +26,7 @@ class UpdateCollectionRequest(BaseModel):
     embedding_profile_id: uuid.UUID | None = None
     llm_profile_id: uuid.UUID | None = None
     default_query_mode: str | None = None
+    gleaning_passes: int | None = None
     clear_llm_profile: bool = False
     clear_default_query_mode: bool = False
 
@@ -37,6 +39,7 @@ class CollectionResponse(BaseModel):
     embedding_profile_id: str | None
     llm_profile_id: str | None
     default_query_mode: str | None
+    gleaning_passes: int
 
 
 router = APIRouter(prefix="/collections", tags=["collections"])
@@ -57,6 +60,7 @@ async def create_collection(
             embedding_profile_id=body.embedding_profile_id,
             llm_profile_id=body.llm_profile_id,
             default_query_mode=body.default_query_mode,
+            gleaning_passes=body.gleaning_passes,
         )
         return _to_response(collection)
     except ValueError as e:
@@ -89,6 +93,7 @@ async def update_collection(
             embedding_profile_id=body.embedding_profile_id,
             llm_profile_id=body.llm_profile_id,
             default_query_mode=body.default_query_mode,
+            gleaning_passes=body.gleaning_passes,
             clear_llm_profile=body.clear_llm_profile,
             clear_default_query_mode=body.clear_default_query_mode,
         )
@@ -132,4 +137,5 @@ def _to_response(c) -> CollectionResponse:
         ),
         llm_profile_id=str(c.llm_profile_id) if c.llm_profile_id else None,
         default_query_mode=c.default_query_mode,
+        gleaning_passes=c.gleaning_passes,
     )

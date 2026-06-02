@@ -73,7 +73,10 @@ class GraphService:
         embedding_profile_id: uuid.UUID | None = None,
         llm_profile_id: uuid.UUID | None = None,
         default_query_mode: str | None = None,
+        gleaning_passes: int = 1,
     ) -> Collection:
+        if gleaning_passes < 0:
+            raise ValueError("Gleaning passes must be 0 or greater")
         async with AsyncSessionLocal() as session:
             ns = await session.get(Namespace, namespace_id)
             if not ns:
@@ -110,6 +113,7 @@ class GraphService:
                 embedding_profile_id=embedding_profile_id,
                 llm_profile_id=llm_profile_id,
                 default_query_mode=default_query_mode,
+                gleaning_passes=gleaning_passes,
                 embedding_dimensions=dimensions,
             )
             session.add(collection)
@@ -131,6 +135,7 @@ class GraphService:
         embedding_profile_id: uuid.UUID | None = None,
         llm_profile_id: uuid.UUID | None = None,
         default_query_mode: str | None = None,
+        gleaning_passes: int | None = None,
         clear_llm_profile: bool = False,
         clear_default_query_mode: bool = False,
     ) -> Collection:
@@ -139,6 +144,8 @@ class GraphService:
             if not collection:
                 raise ValueError(f"Collection {collection_id} not found")
             self._enforce_namespace(collection, namespace_id)
+            if gleaning_passes is not None and gleaning_passes < 0:
+                raise ValueError("Gleaning passes must be 0 or greater")
 
             if name is not None:
                 collection.name = name
@@ -176,6 +183,8 @@ class GraphService:
                 collection.default_query_mode = None
             elif default_query_mode is not None:
                 collection.default_query_mode = default_query_mode
+            if gleaning_passes is not None:
+                collection.gleaning_passes = gleaning_passes
 
             await session.commit()
             await session.refresh(collection)

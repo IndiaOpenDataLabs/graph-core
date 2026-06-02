@@ -228,7 +228,10 @@ async def _ingest_graph_chunk(
         extraction = cached
     else:
         extractor = LLMGraphExtractor(llm=llm_provider)
-        extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
+        extraction = await extractor.extract_with_gleaning(
+            text=text,
+            max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+        )
 
         await _save_raw_extraction(
             chunk_hash=chunk_hash,
@@ -421,7 +424,10 @@ async def _ingest_lightrag_chunk(
         extraction = cached
     else:
         extractor = LLMGraphExtractor(llm=llm_provider)
-        extraction = await extractor.extract_with_gleaning(text=text, max_gleaning=1)
+        extraction = await extractor.extract_with_gleaning(
+            text=text,
+            max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+        )
 
         await _save_raw_extraction(
             chunk_hash=chunk_hash,
