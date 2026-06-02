@@ -150,6 +150,32 @@ class GraphCoreClient:
     async def delete_collection(self, collection_id: str) -> dict[str, Any]:
         return await self._request("DELETE", f"/collections/{collection_id}")
 
+    async def create_chat_session(
+        self,
+        collection_id: str,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        return await self._request(
+            "POST",
+            f"/collections/{collection_id}/chats/",
+            json=body,
+        )
+
+    async def list_chat_sessions(
+        self,
+        collection_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return await self._request(
+            "GET",
+            f"/collections/{collection_id}/chats/",
+            params={"limit": limit},
+        )
+
     # -- Ingestion ----------------------------------------------------------
 
     async def ingest_chunk(self, collection_id: str, text: str) -> dict[str, Any]:
@@ -170,12 +196,15 @@ class GraphCoreClient:
         question: str,
         mode: str | None = None,
         llm_profile_id: str | None = None,
+        chat_id: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"question": question}
         if mode:
             body["mode"] = mode
         if llm_profile_id:
             body["llm_profile_id"] = llm_profile_id
+        if chat_id:
+            body["chat_id"] = chat_id
         return await self._request(
             "POST", f"/collections/{collection_id}/query", json=body
         )

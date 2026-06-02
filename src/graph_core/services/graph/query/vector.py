@@ -24,6 +24,7 @@ class QueryResult:
     entities_used: list[str]
     relationships_used: list[str]
     mode: str | None = None
+    chat_id: str | None = None
 
 
 # ── Module-level singleton dependencies ──

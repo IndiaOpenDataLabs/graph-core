@@ -15,6 +15,7 @@ class QueryRequest(BaseModel):
     question: str
     mode: str | None = None
     llm_profile_id: uuid.UUID | None = None
+    chat_id: uuid.UUID | None = None
 
 
 class QueryResponse(BaseModel):
@@ -22,6 +23,7 @@ class QueryResponse(BaseModel):
     entities_used: list[str]
     relationships_used: list[str]
     mode: str | None = None
+    chat_id: str | None = None
 
 
 router = APIRouter(tags=["query"])
@@ -41,6 +43,7 @@ async def query_collection(
             namespace_id,
             body.mode,
             llm_profile_id=body.llm_profile_id,
+            chat_id=body.chat_id,
         )
         return QueryResponse(**result.__dict__)
     except PermissionError as e:

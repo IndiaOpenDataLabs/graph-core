@@ -335,18 +335,24 @@ async def query_collection(
     question: str,
     ctx: Context,
     mode: str | None = None,
+    chat_id: str | None = None,
 ) -> str:
     """Query a collection with a natural language question.
 
     Args:
         collection_id: The UUID of the collection to query.
         question: The natural language question.
-        mode: Query mode for light_rag: 'local', 'global', 'hybrid', 'naive', 'mix'.
-                Leave empty for default.
+        mode: Query mode for light_rag/custom graph retrieval. Leave empty for default.
+        chat_id: Optional chat session UUID for follow-up memory.
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.query_collection(collection_id, question, mode=mode)
+    result = await client.query_collection(
+        collection_id,
+        question,
+        mode=mode,
+        chat_id=chat_id,
+    )
     lines = [result["response"]]
     if result.get("entities_used"):
         lines.append(f"\nEntities used: {', '.join(result['entities_used'])}")
@@ -354,6 +360,48 @@ async def query_collection(
         lines.append(f"Relationships: {', '.join(result['relationships_used'])}")
     if result.get("mode"):
         lines.append(f"Mode: {result['mode']}")
+    if result.get("chat_id"):
+        lines.append(f"Chat ID: {result['chat_id']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def create_chat_session(
+    collection_id: str,
+    ctx: Context,
+    title: str | None = None,
+) -> str:
+    """Create a chat session for follow-up query context."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    result = await client.create_chat_session(collection_id, title=title)
+    return (
+        f"Created chat session:\n"
+        f"  id: {result['id']}\n"
+        f"  collection_id: {result['collection_id']}\n"
+        f"  title: {result.get('title') or '-'}\n"
+        f"  turn_count: {result.get('turn_count', 0)}"
+    )
+
+
+@mcp.tool()
+async def list_chat_sessions(
+    collection_id: str,
+    ctx: Context,
+    limit: int = 20,
+) -> str:
+    """List chat sessions for a collection."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    rows = await client.list_chat_sessions(collection_id, limit=limit)
+    if not rows:
+        return "No chat sessions found."
+    lines = ["Chat sessions:"]
+    for row in rows:
+        lines.append(
+            f"  - {row['id']} | turns={row.get('turn_count', 0)}"
+            f" | title={row.get('title') or '-'}"
+        )
     return "\n".join(lines)
 
 

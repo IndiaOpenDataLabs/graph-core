@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from graph_core.api import collections, ingest, jobs, namespaces, platform, query
+from graph_core.api import chats, collections, ingest, jobs, namespaces, platform, query
 from graph_core.database import current_namespace_id
 from graph_core.mcp.server import mcp as mcp_server
 
@@ -57,6 +57,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 app.include_router(namespaces.router)
 app.include_router(platform.router)
 app.include_router(collections.router)
+app.include_router(chats.router)
 app.include_router(ingest.router)
 app.include_router(jobs.router)
 app.include_router(query.router)

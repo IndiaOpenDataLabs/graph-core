@@ -781,9 +781,14 @@ class ConsoleScreen(Screen):
         "/collection delete COLLECTION": "Delete a collection.",
         "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
+        "/chat create COLLECTION [--title TITLE]": (
+            "Create a chat session for a collection."
+        ),
+        "/chat list COLLECTION [--limit N]": "List chat sessions for a collection.",
         (
             "/query COLLECTION \"question\" "
             "[--mode entity-first|relationship-first|hybrid|mix|local "
+            "[--chat-id ID] "
             "(aliases: ent|rel|hyb); default: mix for custom_graph_rag]"
         ): "Query a collection.",
         "/jobs list [--limit N]": "List recent jobs.",
@@ -832,9 +837,12 @@ class ConsoleScreen(Screen):
         (
             "/ingest file COLLECTION /path/to/file.txt"
         ): "/ingest file <collection> @<path>",
+        "/chat create COLLECTION [--title TITLE]": "/chat create <collection>",
+        "/chat list COLLECTION [--limit N]": "/chat list <collection>",
         (
             "/query COLLECTION \"question\" "
             "[--mode entity-first|relationship-first|hybrid|mix|local "
+            "[--chat-id ID] "
             "(aliases: ent|rel|hyb); default: mix for custom_graph_rag]"
         ): "/query <collection> \"<question>\"",
         "/jobs list [--limit N]": "/jobs list",
@@ -1007,6 +1015,9 @@ class ConsoleScreen(Screen):
                 return
             if command == "/collection":
                 await self._command_collection(parts[1:])
+                return
+            if command == "/chat":
+                await self._command_chat(parts[1:])
                 return
             if command == "/ingest":
                 await self._command_ingest(parts[1:])
@@ -1364,6 +1375,31 @@ class ConsoleScreen(Screen):
             "/ingest file COLLECTION PATH"
         )
 
+    async def _command_chat(self, args: list[str]) -> None:
+        if not args:
+            raise ValueError("Usage: /chat create|list ...")
+        action = args[0]
+        if action == "create" and len(args) >= 2:
+            collection = await self._resolve_collection(args[1])
+            _, flags = parse_flag_args(args[2:])
+            call_args = {"collection_id": collection["id"]}
+            if isinstance(flags.get("title"), str) and flags["title"]:
+                call_args["title"] = str(flags["title"])
+            self._write(await self._call("create_chat_session", call_args))
+            return
+        if action == "list" and len(args) >= 2:
+            collection = await self._resolve_collection(args[1])
+            _, flags = parse_flag_args(args[2:])
+            call_args: dict[str, str | int] = {"collection_id": collection["id"]}
+            if isinstance(flags.get("limit"), str) and flags["limit"]:
+                call_args["limit"] = int(str(flags["limit"]))
+            self._write(await self._call("list_chat_sessions", call_args))
+            return
+        raise ValueError(
+            "Usage: /chat create COLLECTION [--title TITLE] | "
+            "/chat list COLLECTION [--limit N]"
+        )
+
     async def _command_query(self, args: list[str]) -> None:
         if len(args) < 2:
             raise ValueError("Usage: /query COLLECTION \"question\" [--mode MODE]")
@@ -1375,6 +1411,8 @@ class ConsoleScreen(Screen):
         call_args = {"collection_id": collection["id"], "question": question}
         if isinstance(flags.get("mode"), str) and flags["mode"]:
             call_args["mode"] = str(flags["mode"])
+        if isinstance(flags.get("chat_id"), str) and flags["chat_id"]:
+            call_args["chat_id"] = str(flags["chat_id"])
         self._start_query_progress(collection["name"])
         try:
             result = await self._query_via_rest(call_args)
@@ -1439,6 +1477,8 @@ class ConsoleScreen(Screen):
         body: dict[str, str] = {"question": arguments["question"]}
         if "mode" in arguments:
             body["mode"] = arguments["mode"]
+        if "chat_id" in arguments:
+            body["chat_id"] = arguments["chat_id"]
 
         async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_key}"},
@@ -1472,6 +1512,8 @@ class ConsoleScreen(Screen):
             )
         if result.get("mode"):
             lines.append(f"Mode: {result['mode']}")
+        if result.get("chat_id"):
+            lines.append(f"Chat ID: {result['chat_id']}")
         return "\n".join(lines)
 
     async def _list_profiles(self, kind: str) -> list[dict]:

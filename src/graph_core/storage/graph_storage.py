@@ -159,7 +159,18 @@ class FalkorDBGraphStorage:
 
     async def upsert_node(self, node_id: str, properties: dict[str, Any]) -> None:
         graph = await self._get_graph()
-        allowed_keys = {"id", "name", "collection_id", "type", "description", "source_ids"}
+        allowed_keys = {
+            "id",
+            "name",
+            "collection_id",
+            "type",
+            "description",
+            "source_ids",
+            "question",
+            "response",
+            "chat_id",
+            "turn_index",
+        }
         set_clauses = []
         params: dict[str, object] = {"id": node_id}
         for key, value in properties.items():

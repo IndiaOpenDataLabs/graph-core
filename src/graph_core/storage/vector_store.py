@@ -90,6 +90,7 @@ class VectorStore:
         collection_id: uuid.UUID,
         query_embedding: list[float],
         top_k: int,
+        metadata_filters: dict[str, str] | None = None,
     ) -> list[dict]:
         tbl = table_name(collection_id, "vector_chunks")
         dimensions = await get_collection_dimensions(collection_id)
@@ -98,6 +99,23 @@ class VectorStore:
 
         cast = _vector_cast_sql(dimensions)
 
+        filter_clauses: list[str] = ["collection_id = :cid"]
+        params: dict[str, object] = {
+            "cid": _uuid_for_sql(collection_id),
+            "top_k": top_k,
+            "qemb": _embedding_literal(query_embedding),
+        }
+        if metadata_filters:
+            for idx, (key, value) in enumerate(metadata_filters.items()):
+                key_param = f"meta_key_{idx}"
+                value_param = f"meta_value_{idx}"
+                filter_clauses.append(
+                    f"metadata_json::jsonb ->> :{key_param} = :{value_param}"
+                )
+                params[key_param] = key
+                params[value_param] = value
+        where_sql = " AND ".join(filter_clauses)
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
@@ -105,23 +123,19 @@ class VectorStore:
                     SELECT id::text, content, metadata_json,
                            1 - (embedding <=> (:qemb){cast}) AS score
                     FROM {tbl}
-                    WHERE collection_id = :cid
+                    WHERE {where_sql}
                     ORDER BY embedding <=> (:qemb){cast}
                     LIMIT :top_k
                     """
                 ),
-                {
-                    "cid": _uuid_for_sql(collection_id),
-                    "top_k": top_k,
-                    "qemb": _embedding_literal(query_embedding),
-                },
+                params,
             )
             return [
                 {
                     "chunk_id": row[0],
                     "content": row[1],
                     "score": float(row[3]),
-                    "metadata": row[2],
+                    "metadata": json.loads(row[2]) if isinstance(row[2], str) else row[2],
                 }
                 for row in result
             ]
