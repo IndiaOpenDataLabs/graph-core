@@ -118,6 +118,22 @@ Notes:
 
 - `/query <collection> "<question>"`
 - `/query <collection> "<question>" --mode local`
+- `/query <collection> "<question>" --chat-id <chat_id>`
+
+### Chat Sessions
+
+- `/chat create <collection> [--title <title>]`
+- `/chat list <collection> [--limit <n>]`
+
+Chat sessions are explicit. The CLI does not keep an implicit active chat yet.
+
+Use `/chat create` first, then pass the returned `chat_id` to `/query`.
+
+Behind the scenes:
+
+- chronology is stored as ordered role-based messages
+- semantic follow-up memory is stored separately and retrieved by provenance from those messages
+- short follow-ups are rewritten into standalone queries from that recovered context
 
 ### Jobs
 
@@ -145,6 +161,7 @@ Autocomplete is intentionally lightweight today:
 - command suggestions after `/`
 - strategy suggestions after `--strategy`
 - query mode suggestions after `--default-query-mode`
+- chat mode suggestions after `--mode`
 - file suggestions after `@`
 
 ## Architecture

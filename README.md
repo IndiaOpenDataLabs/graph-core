@@ -76,9 +76,32 @@ make docker-up
 
 - **Namespace** — top-level isolation boundary (e.g., `scripture-assistant-prod`)
 - **Collection** — knowledge graph scoped to a namespace, binds strategy + embedding profile
+- **Chat Session** — follow-up query scope attached to a collection
 - **Job** — durable async unit of work, tracked in Postgres
 - **Profile** — reusable configuration for embeddings or LLMs
 - **Credential** — encrypted secret reference, bound to namespace
+
+## Chat Sessions
+
+Chat follow-ups are managed with two layers:
+
+- **Chronology**: ordered `chat_messages` in Postgres with `role`, `message_index`, and `turn_index`
+- **Semantic memory**: a chat-specific Falkor graph plus vectorized semantic memory extracted from chat messages
+
+Each extracted semantic node/edge carries provenance:
+
+- `source_message_ids`
+- `source_roles`
+
+This supports two different follow-up behaviors:
+
+- **Ordinary follow-up**: retrieve relevant semantic memory and rewrite the short follow-up into a standalone query
+- **Correction / disagreement**: use recent chronological messages to anchor the relevant message IDs, then pull the semantic region sourced from those IDs
+
+Current implementation note:
+
+- chat semantic extraction runs synchronously in the query path today
+- it is not backgrounded yet like document ingestion
 
 ## Clients
 
@@ -147,6 +170,8 @@ Configure via environment variables:
 | `ingest_document`      | Ingest a document (async, returns job_id) |
 | `ingest_file`          | Ingest from a local file path      |
 | `query_collection`     | Query a collection with a question |
+| `create_chat_session`  | Create a chat session for follow-up memory |
+| `list_chat_sessions`   | List chat sessions for a collection |
 | `get_job_status`       | Check async job status             |
 | `get_capabilities`     | List platform capabilities         |
 
