@@ -33,16 +33,16 @@ class ChatSession(Base):
         onupdate=func.now(),
     )
 
-    turns = relationship(
-        "ChatTurn",
+    messages = relationship(
+        "ChatMessage",
         back_populates="chat_session",
         cascade="all, delete-orphan",
-        order_by="ChatTurn.turn_index",
+        order_by="ChatMessage.message_index",
     )
 
 
-class ChatTurn(Base):
-    __tablename__ = "chat_turns"
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     chat_id = Column(
@@ -57,10 +57,11 @@ class ChatTurn(Base):
         nullable=False,
         index=True,
     )
+    role = Column(String(32), nullable=False)
     turn_index = Column(Integer, nullable=False)
-    question = Column(Text, nullable=False)
-    response = Column(Text, nullable=False)
+    message_index = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
     mode = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    chat_session = relationship("ChatSession", back_populates="turns")
+    chat_session = relationship("ChatSession", back_populates="messages")

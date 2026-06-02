@@ -166,10 +166,13 @@ class FalkorDBGraphStorage:
             "type",
             "description",
             "source_ids",
+            "role",
+            "content",
             "question",
             "response",
             "chat_id",
             "turn_index",
+            "message_index",
         }
         set_clauses = []
         params: dict[str, object] = {"id": node_id}

@@ -13,7 +13,8 @@ from sqlalchemy import delete, func, select
 
 from graph_core.database import AsyncSessionLocal
 from graph_core.embedding import get_embedding_provider
-from graph_core.models.chat import ChatSession, ChatTurn
+from graph_core.llm import get_llm_provider
+from graph_core.models.chat import ChatMessage, ChatSession
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
 from graph_core.models.job import Job, JobEvent
@@ -90,10 +91,6 @@ class GraphService:
     def _chat_storage(self, chat_id: uuid.UUID) -> FalkorDBGraphStorage:
         return FalkorDBGraphStorage(self._chat_graph_name(chat_id))
 
-    @staticmethod
-    def _chat_turn_content(question: str, response: str) -> str:
-        return f"Question:\n{question}\n\nResponse:\n{response}"
-
     async def create_chat_session(
         self,
         collection_id: uuid.UUID,
@@ -127,9 +124,11 @@ class GraphService:
             result = await session.execute(
                 select(
                     ChatSession,
-                    func.count(ChatTurn.id).label("turn_count"),
+                    func.count(ChatMessage.id)
+                    .filter(ChatMessage.role == "user")
+                    .label("turn_count"),
                 )
-                .outerjoin(ChatTurn, ChatTurn.chat_id == ChatSession.id)
+                .outerjoin(ChatMessage, ChatMessage.chat_id == ChatSession.id)
                 .where(ChatSession.collection_id == collection_id)
                 .where(ChatSession.namespace_id == namespace_id)
                 .group_by(ChatSession.id)
@@ -167,12 +166,91 @@ class GraphService:
                 raise PermissionError("Chat session does not belong to collection")
             return chat
 
+    @staticmethod
+    def _format_chat_message(role: str, content: str, turn_index: int) -> str:
+        speaker = "User" if role == "user" else "Assistant"
+        return f"{speaker} (turn {turn_index}):\n{content}"
+
+    async def _load_recent_chat_messages(
+        self,
+        chat_id: uuid.UUID,
+        *,
+        limit: int = 4,
+    ) -> list[ChatMessage]:
+        async with AsyncSessionLocal() as session:
+            messages = (
+                await session.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.chat_id == chat_id)
+                    .order_by(ChatMessage.message_index.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+        return list(reversed(messages))
+
+    async def _load_chat_message_rows(
+        self,
+        chat_id: uuid.UUID,
+        message_ids: set[str],
+    ) -> list[ChatMessage]:
+        if not message_ids:
+            return []
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.chat_id == chat_id)
+                    .where(ChatMessage.id.in_([uuid.UUID(mid) for mid in message_ids]))
+                    .order_by(ChatMessage.message_index)
+                )
+            ).scalars().all()
+        return rows
+
+    async def _rewrite_chat_question(
+        self,
+        collection: Collection,
+        question: str,
+        chat_context: str,
+        llm_profile_id: uuid.UUID | None,
+    ) -> str:
+        if not chat_context.strip():
+            return question
+        llm_provider = await self._resolve_collection_llm_provider(
+            collection,
+            llm_profile_id,
+        )
+        rewritten = await llm_provider.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the user's latest message into a standalone "
+                        "retrieval query using the provided prior chat context. "
+                        "Preserve the user's intent and resolve omitted references "
+                        "like it/that/this/trip/place/person from context. "
+                        "Be specific and concise. Return only the rewritten query."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Prior chat context:\n{chat_context}\n\n"
+                        f"Latest user message:\n{question}"
+                    ),
+                },
+            ]
+        )
+        candidate = rewritten.strip()
+        return candidate or question
+
     async def _load_chat_context(
         self,
         collection: Collection,
         question: str,
         chat_id: uuid.UUID,
-    ) -> str:
+        llm_profile_id: uuid.UUID | None,
+    ) -> tuple[str, str]:
+        recent_messages = await self._load_recent_chat_messages(chat_id, limit=4)
         embedding_provider = await self._resolve_collection_embedding_provider(
             collection
         )
@@ -180,58 +258,56 @@ class GraphService:
         hits = await self._vector_store.query_chunks(
             collection_id=collection.id,
             query_embedding=query_embedding,
-            top_k=3,
+            top_k=4,
             metadata_filters={
-                "memory_type": "chat_turn",
+                "memory_type": "chat_message",
                 "chat_id": str(chat_id),
             },
         )
-        if not hits:
-            return ""
+        storage = self._chat_storage(chat_id)
+        selected_ids: set[str] = set()
 
-        memory_lines: list[str] = []
-        seen_turn_ids: set[str] = set()
-        turn_ids: list[str] = []
+        for message in recent_messages[-2:]:
+            selected_ids.add(str(message.id))
+
         for hit in hits:
             metadata = hit.get("metadata") or {}
-            turn_id = str(metadata.get("turn_id") or "").strip()
-            if turn_id and turn_id not in seen_turn_ids:
-                seen_turn_ids.add(turn_id)
-                turn_ids.append(turn_id)
-                memory_lines.append(hit["content"])
+            message_id = str(metadata.get("message_id") or "").strip()
+            if message_id:
+                selected_ids.add(message_id)
 
-        storage = self._chat_storage(chat_id)
         neighbor_ids: set[str] = set()
-        for turn_id in turn_ids:
-            for source_id, target_id in await storage.get_node_edges(turn_id):
-                neighbor = target_id if source_id == turn_id else source_id
-                if neighbor and neighbor not in seen_turn_ids:
+        for message_id in list(selected_ids):
+            for source_id, target_id in await storage.get_node_edges(message_id):
+                neighbor = target_id if source_id == message_id else source_id
+                if neighbor and neighbor not in selected_ids:
                     neighbor_ids.add(neighbor)
+        selected_ids.update(neighbor_ids)
 
-        neighbor_rows: list[tuple[int, str]] = []
-        for neighbor_id in neighbor_ids:
-            node = await storage.get_node(neighbor_id)
-            if not node:
-                continue
-            question_text = str(node.get("question") or "").strip()
-            response_text = str(node.get("response") or "").strip()
-            if not question_text and not response_text:
-                continue
-            turn_index = int(node.get("turn_index") or 0)
-            neighbor_rows.append(
-                (
-                    turn_index,
-                    self._chat_turn_content(question_text, response_text),
-                )
+        message_rows = await self._load_chat_message_rows(chat_id, selected_ids)
+        if not message_rows:
+            message_rows = recent_messages[-2:]
+
+        if not message_rows:
+            return "", question
+
+        context = "\n\n".join(
+            self._format_chat_message(
+                message.role,
+                message.content,
+                message.turn_index,
             )
+            for message in message_rows[-6:]
+        )
+        rewritten = await self._rewrite_chat_question(
+            collection,
+            question,
+            context,
+            llm_profile_id,
+        )
+        return context, rewritten
 
-        for _, content in sorted(neighbor_rows, key=lambda item: item[0])[:2]:
-            if content not in memory_lines:
-                memory_lines.append(content)
-
-        return "\n\n".join(memory_lines[:4])
-
-    async def _record_chat_turn(
+    async def _record_chat_exchange(
         self,
         collection: Collection,
         namespace_id: uuid.UUID,
@@ -243,7 +319,6 @@ class GraphService:
         embedding_provider = await self._resolve_collection_embedding_provider(
             collection
         )
-        content = self._chat_turn_content(question, response)
         async with AsyncSessionLocal() as session:
             chat = await session.get(ChatSession, chat_id)
             if not chat:
@@ -252,74 +327,148 @@ class GraphService:
                 raise PermissionError("Chat session does not belong to collection")
 
             max_turn = await session.scalar(
-                select(func.max(ChatTurn.turn_index)).where(ChatTurn.chat_id == chat_id)
+                select(func.max(ChatMessage.turn_index)).where(
+                    ChatMessage.chat_id == chat_id
+                )
             )
             turn_index = int(max_turn or 0) + 1
-            turn = ChatTurn(
+            max_message_index = await session.scalar(
+                select(func.max(ChatMessage.message_index)).where(
+                    ChatMessage.chat_id == chat_id
+                )
+            )
+            user_message = ChatMessage(
                 chat_id=chat_id,
                 collection_id=collection.id,
+                role="user",
                 turn_index=turn_index,
-                question=question,
-                response=response,
+                message_index=int(max_message_index or 0) + 1,
+                content=question,
+                mode=None,
+            )
+            assistant_message = ChatMessage(
+                chat_id=chat_id,
+                collection_id=collection.id,
+                role="assistant",
+                turn_index=turn_index,
+                message_index=int(max_message_index or 0) + 2,
+                content=response,
                 mode=mode,
             )
             chat.updated_at = datetime.now(UTC)
-            session.add(turn)
+            session.add(user_message)
+            session.add(assistant_message)
             await session.commit()
-            await session.refresh(turn)
+            await session.refresh(user_message)
+            await session.refresh(assistant_message)
 
-            previous_turn_id = await session.scalar(
-                select(ChatTurn.id)
-                .where(ChatTurn.chat_id == chat_id)
-                .where(ChatTurn.turn_index == turn_index - 1)
+            previous_message_id = await session.scalar(
+                select(ChatMessage.id)
+                .where(ChatMessage.chat_id == chat_id)
+                .where(
+                    ChatMessage.message_index == assistant_message.message_index - 2
+                )
             )
 
-        embedding = await embedding_provider.embed_query(content)
+        user_embedding = await embedding_provider.embed_query(
+            self._format_chat_message("user", question, turn_index)
+        )
+        assistant_embedding = await embedding_provider.embed_query(
+            self._format_chat_message("assistant", response, turn_index)
+        )
         await self._vector_store.upsert_chunks(
             namespace_id=namespace_id,
             collection_id=collection.id,
             chunks=[
                 {
-                    "chunk_hash": f"chat:{chat_id}:{turn_index}",
+                    "chunk_hash": f"chat:{chat_id}:{user_message.message_index}",
                     "chunk_index": 0,
-                    "content": content,
-                    "token_count": len(content.split()),
+                    "content": self._format_chat_message("user", question, turn_index),
+                    "token_count": len(question.split()),
                     "metadata": {
-                        "memory_type": "chat_turn",
+                        "memory_type": "chat_message",
                         "chat_id": str(chat_id),
-                        "turn_id": str(turn.id),
+                        "message_id": str(user_message.id),
+                        "role": "user",
                         "turn_index": str(turn_index),
+                        "message_index": str(user_message.message_index),
                     },
-                    "embedding": embedding,
-                }
+                    "embedding": user_embedding,
+                },
+                {
+                    "chunk_hash": f"chat:{chat_id}:{assistant_message.message_index}",
+                    "chunk_index": 0,
+                    "content": self._format_chat_message(
+                        "assistant",
+                        response,
+                        turn_index,
+                    ),
+                    "token_count": len(response.split()),
+                    "metadata": {
+                        "memory_type": "chat_message",
+                        "chat_id": str(chat_id),
+                        "message_id": str(assistant_message.id),
+                        "role": "assistant",
+                        "turn_index": str(turn_index),
+                        "message_index": str(assistant_message.message_index),
+                    },
+                    "embedding": assistant_embedding,
+                },
             ],
         )
 
         storage = self._chat_storage(chat_id)
         await storage.upsert_node(
-            str(turn.id),
+            str(user_message.id),
             {
-                "id": str(turn.id),
-                "name": f"Turn {turn_index}",
+                "id": str(user_message.id),
+                "name": f"User turn {turn_index}",
                 "collection_id": str(collection.id),
-                "type": "turn",
+                "type": "user_message",
                 "description": question[:256],
-                "question": question,
-                "response": response,
+                "content": question,
+                "role": "user",
                 "chat_id": str(chat_id),
                 "turn_index": turn_index,
+                "message_index": user_message.message_index,
             },
         )
-        if previous_turn_id:
-            prev_id = str(previous_turn_id)
+        await storage.upsert_node(
+            str(assistant_message.id),
+            {
+                "id": str(assistant_message.id),
+                "name": f"Assistant turn {turn_index}",
+                "collection_id": str(collection.id),
+                "type": "assistant_message",
+                "description": response[:256],
+                "content": response,
+                "role": "assistant",
+                "chat_id": str(chat_id),
+                "turn_index": turn_index,
+                "message_index": assistant_message.message_index,
+            },
+        )
+        await storage.upsert_edge(
+            str(user_message.id),
+            str(assistant_message.id),
+            {
+                "id": f"{user_message.id}__answered_by__{assistant_message.id}",
+                "weight": 1,
+                "collection_id": str(collection.id),
+                "description": "answered by",
+                "keywords": ["chat", "answer", "pair"],
+            },
+        )
+        if previous_message_id:
+            prev_id = str(previous_message_id)
             await storage.upsert_edge(
                 prev_id,
-                str(turn.id),
+                str(user_message.id),
                 {
-                    "id": f"{prev_id}__{turn.id}",
+                    "id": f"{prev_id}__next__{user_message.id}",
                     "weight": 1,
                     "collection_id": str(collection.id),
-                    "description": "next turn",
+                    "description": "next message",
                     "keywords": ["chat", "next"],
                 },
             )
@@ -342,6 +491,29 @@ class GraphService:
                 provider_name=profile.provider,
                 model=profile.model,
                 dimensions=profile.dimensions,
+                api_key=api_key,
+                base_url=base_url,
+                profile_id=str(profile.id),
+                max_concurrent_calls=profile.max_concurrent_calls,
+            )
+
+    async def _resolve_collection_llm_provider(
+        self,
+        collection: Collection,
+        llm_profile_id: uuid.UUID | None,
+    ):
+        profile_id = llm_profile_id or collection.llm_profile_id
+        if profile_id is None:
+            return get_llm_provider()
+        async with AsyncSessionLocal() as session:
+            profile = await session.get(Profile, profile_id)
+            if not profile:
+                raise ValueError(f"LLM profile {profile_id} not found")
+            api_key, cred_base_url = await _resolve_credential(session, profile)
+            base_url = profile.base_url or cred_base_url
+            return get_llm_provider(
+                provider_name=profile.provider,
+                model=profile.model,
                 api_key=api_key,
                 base_url=base_url,
                 profile_id=str(profile.id),
@@ -567,13 +739,19 @@ class GraphService:
         chat_context = ""
         if chat_id is not None:
             await self._get_chat_session(chat_id, collection_id, namespace_id)
-            chat_context = await self._load_chat_context(collection, question, chat_id)
-        retrieval_question = question
+            chat_context, retrieval_question = await self._load_chat_context(
+                collection,
+                question,
+                chat_id,
+                effective_llm_profile_id,
+            )
+        else:
+            retrieval_question = question
         if chat_context:
             retrieval_question = (
                 "Relevant prior chat context:\n"
                 f"{chat_context}\n\n"
-                f"Current question:\n{question}"
+                f"Rewritten current question:\n{retrieval_question}"
             )
 
         if collection.strategy == "vector":
@@ -609,7 +787,7 @@ class GraphService:
             )
 
         if chat_id is not None:
-            await self._record_chat_turn(
+            await self._record_chat_exchange(
                 collection=collection,
                 namespace_id=namespace_id,
                 chat_id=chat_id,

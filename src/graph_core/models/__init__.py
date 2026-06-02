@@ -1,6 +1,6 @@
 """SQLAlchemy model definitions."""
 
-from graph_core.models.chat import ChatSession, ChatTurn
+from graph_core.models.chat import ChatMessage, ChatSession
 from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
@@ -29,7 +29,7 @@ __all__ = [
     "IngestionRecord",
     "IngestionChunk",
     "ChatSession",
-    "ChatTurn",
+    "ChatMessage",
     "GraphEntity",
     "EntityDescription",
     "EntityAlias",
