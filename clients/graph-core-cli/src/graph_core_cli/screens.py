@@ -963,7 +963,7 @@ class ConsoleScreen(Screen):
 
         self._history.append(raw)
         self._history_index = len(self._history)
-        self._write(f"> {raw}")
+        self._write_command(raw)
         self.run_worker(self._execute_command(raw), exclusive=True, group="command")
 
     @on(Input.Changed, "#command")
@@ -1380,11 +1380,7 @@ class ConsoleScreen(Screen):
             result = await self._query_via_rest(call_args)
         finally:
             self._stop_query_progress()
-        self._write_query_exchange(
-            collection["name"],
-            question,
-            result,
-        )
+        self._write(result)
 
     async def _command_jobs(self, args: list[str]) -> None:
         if not args or args[0] == "list":
@@ -1467,7 +1463,7 @@ class ConsoleScreen(Screen):
             ) from None
 
         result = response.json()
-        lines = ["Response", result.get("response", "")]
+        lines = [result.get("response", "")]
         if result.get("entities_used"):
             lines.append(f"\nEntities used: {', '.join(result['entities_used'])}")
         if result.get("relationships_used"):
@@ -1477,46 +1473,6 @@ class ConsoleScreen(Screen):
         if result.get("mode"):
             lines.append(f"Mode: {result['mode']}")
         return "\n".join(lines)
-
-    def _format_query_exchange(
-        self,
-        collection_name: str,
-        question: str,
-        response_text: str,
-    ) -> str:
-        return (
-            f"Query [{collection_name}]\n"
-            f"{question}\n"
-            "--------------------\n"
-            f"{response_text}"
-        )
-
-    def _write_query_exchange(
-        self,
-        collection_name: str,
-        question: str,
-        response_text: str,
-    ) -> None:
-        plain_text = self._format_query_exchange(
-            collection_name,
-            question,
-            response_text,
-        )
-        query_panel = Panel(
-            Text(question),
-            title=f"Query [{collection_name}]",
-            border_style="#60a5fa",
-            style="on #0f172a",
-            padding=(0, 1),
-        )
-        response_panel = Panel(
-            Text(response_text),
-            title="Response",
-            border_style="#84cc16",
-            style="on #111827",
-            padding=(0, 1),
-        )
-        self._append_output(plain_text, renderables=[query_panel, response_panel])
 
     async def _list_profiles(self, kind: str) -> list[dict]:
         if kind == "embedding":
@@ -1702,7 +1658,25 @@ class ConsoleScreen(Screen):
             return
 
     def _write(self, text: str) -> None:
-        self._append_output(text)
+        panel = Panel(
+            Text(text),
+            title="Response",
+            border_style="#84cc16",
+            style="on #111827",
+            padding=(0, 1),
+        )
+        self._append_output(text, renderables=[panel])
+
+    def _write_command(self, text: str) -> None:
+        plain_text = f"> {text}"
+        panel = Panel(
+            Text(text),
+            title="Command",
+            border_style="#60a5fa",
+            style="on #0f172a",
+            padding=(0, 1),
+        )
+        self._append_output(plain_text, renderables=[panel])
 
     def _write_error(self, text: str) -> None:
         error_text = f"Error: {text}"
