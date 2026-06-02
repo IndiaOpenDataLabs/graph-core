@@ -1381,7 +1381,13 @@ class ConsoleScreen(Screen):
             result = await self._query_via_rest(call_args)
         finally:
             self._stop_query_progress()
-        self._write(result)
+        self._write(
+            self._format_query_exchange(
+                collection["name"],
+                question,
+                result,
+            )
+        )
 
     async def _command_jobs(self, args: list[str]) -> None:
         if not args or args[0] == "list":
@@ -1464,7 +1470,7 @@ class ConsoleScreen(Screen):
             ) from None
 
         result = response.json()
-        lines = [result.get("response", "")]
+        lines = ["Response", result.get("response", "")]
         if result.get("entities_used"):
             lines.append(f"\nEntities used: {', '.join(result['entities_used'])}")
         if result.get("relationships_used"):
@@ -1474,6 +1480,19 @@ class ConsoleScreen(Screen):
         if result.get("mode"):
             lines.append(f"Mode: {result['mode']}")
         return "\n".join(lines)
+
+    def _format_query_exchange(
+        self,
+        collection_name: str,
+        question: str,
+        response_text: str,
+    ) -> str:
+        return (
+            f"Query [{collection_name}]\n"
+            f"{question}\n"
+            "--------------------\n"
+            f"{response_text}"
+        )
 
     async def _list_profiles(self, kind: str) -> list[dict]:
         if kind == "embedding":
