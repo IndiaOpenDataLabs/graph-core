@@ -10,11 +10,13 @@ import sys
 from pathlib import Path
 
 import httpx
+from rich.panel import Panel
+from rich.text import Text
 from textual import events, on
 from textual.containers import Container
 from textual.css.query import NoMatches
 from textual.screen import Screen
-from textual.widgets import Button, Input, Label, Select, Static, TextArea
+from textual.widgets import Button, Input, Label, RichLog, Select, Static
 
 
 def parse_namespaces(text: str) -> list[dict]:
@@ -872,14 +874,11 @@ class ConsoleScreen(Screen):
             id="title",
         )
         yield Label("", id="context")
-        yield TextArea(
-            "",
+        yield RichLog(
             id="output",
-            read_only=True,
-            show_line_numbers=False,
-            show_cursor=False,
-            soft_wrap=True,
-            highlight_cursor_line=False,
+            wrap=True,
+            highlight=False,
+            markup=False,
         )
         yield Container(
             Label("Command", id="command-label"),
@@ -898,7 +897,7 @@ class ConsoleScreen(Screen):
         self.call_after_refresh(self._focus_command)
 
     def on_key(self, event: events.Key) -> None:
-        output = self.query_one("#output", TextArea)
+        output = self.query_one("#output", RichLog)
         if event.key in {"ctrl+shift+c", "ctrl+y"}:
             self._copy_output_selection()
             event.prevent_default()
@@ -1381,12 +1380,10 @@ class ConsoleScreen(Screen):
             result = await self._query_via_rest(call_args)
         finally:
             self._stop_query_progress()
-        self._write(
-            self._format_query_exchange(
-                collection["name"],
-                question,
-                result,
-            )
+        self._write_query_exchange(
+            collection["name"],
+            question,
+            result,
         )
 
     async def _command_jobs(self, args: list[str]) -> None:
@@ -1493,6 +1490,33 @@ class ConsoleScreen(Screen):
             "--------------------\n"
             f"{response_text}"
         )
+
+    def _write_query_exchange(
+        self,
+        collection_name: str,
+        question: str,
+        response_text: str,
+    ) -> None:
+        plain_text = self._format_query_exchange(
+            collection_name,
+            question,
+            response_text,
+        )
+        query_panel = Panel(
+            Text(question),
+            title=f"Query [{collection_name}]",
+            border_style="#60a5fa",
+            style="on #0f172a",
+            padding=(0, 1),
+        )
+        response_panel = Panel(
+            Text(response_text),
+            title="Response",
+            border_style="#84cc16",
+            style="on #111827",
+            padding=(0, 1),
+        )
+        self._append_output(plain_text, renderables=[query_panel, response_panel])
 
     async def _list_profiles(self, kind: str) -> list[dict]:
         if kind == "embedding":
@@ -1681,34 +1705,47 @@ class ConsoleScreen(Screen):
         self._append_output(text)
 
     def _write_error(self, text: str) -> None:
-        self._append_output(f"Error: {text}")
+        error_text = f"Error: {text}"
+        panel = Panel(
+            Text(error_text),
+            title="Error",
+            border_style="#ef4444",
+            style="on #1f1115",
+            padding=(0, 1),
+        )
+        self._append_output(error_text, renderables=[panel])
 
-    def _append_output(self, text: str) -> None:
+    def _append_output(
+        self,
+        text: str,
+        renderables: list[object] | None = None,
+    ) -> None:
         if self._output_buffer:
             self._output_buffer = f"{self._output_buffer}\n{text}"
         else:
             self._output_buffer = text
         try:
-            output = self.query_one("#output", TextArea)
+            output = self.query_one("#output", RichLog)
         except NoMatches:
             return
-        output.load_text(self._output_buffer)
-        lines = self._output_buffer.split("\n")
-        output.move_cursor((len(lines) - 1, len(lines[-1])), center=False)
+        if renderables:
+            for renderable in renderables:
+                output.write(renderable)
+        else:
+            output.write(text)
         self.call_after_refresh(output.scroll_end, animate=False)
 
     def _clear_output(self) -> None:
         self._output_buffer = ""
         try:
-            output = self.query_one("#output", TextArea)
+            output = self.query_one("#output", RichLog)
         except NoMatches:
             return
-        output.load_text("")
+        output.clear()
         self.call_after_refresh(output.scroll_end, animate=False)
 
     def _copy_output_selection(self) -> None:
-        output = self.query_one("#output", TextArea)
-        text = output.selected_text or self._output_buffer
+        text = self._output_buffer
         if not text:
             self.notify("Nothing to copy.", severity="warning")
             return
