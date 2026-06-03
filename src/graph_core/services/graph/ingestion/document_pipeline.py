@@ -344,6 +344,10 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
                 "((chunks_completed + 1)::float / NULLIF(chunks_total, 0) * 100) "
                 "AS integer), "
                 "status = CASE "
+                "WHEN chunks_completed + 1 >= chunks_total AND EXISTS ("
+                "  SELECT 1 FROM ingestion_chunks "
+                "  WHERE job_id = :jid AND status = 'failed'"
+                ") THEN CAST('failed' AS job_status) "
                 "WHEN chunks_completed + 1 >= chunks_total "
                 "THEN CAST('completed' AS job_status) "
                 "ELSE CAST('running' AS job_status) END "
@@ -359,7 +363,7 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
                 await session.execute(
                     text(
                         "UPDATE jobs SET completed_at = :now "
-                        "WHERE id = :jid AND status = 'completed'"
+                        "WHERE id = :jid AND status IN ('completed', 'failed')"
                     ),
                     {"now": datetime.now(UTC), "jid": str(job_id).replace("-", "")},
                 )

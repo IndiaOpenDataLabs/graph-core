@@ -25,6 +25,10 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
 
 
 def _embedding_literal(embedding: list[float]) -> str:
+    if not embedding:
+        raise ValueError("Embedding cannot be empty")
+    if any(not math.isfinite(float(v)) for v in embedding):
+        raise ValueError("Embedding contains non-finite values")
     return "[" + ",".join(str(float(v)) for v in embedding) + "]"
 
 
