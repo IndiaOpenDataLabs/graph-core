@@ -66,19 +66,25 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "source": {"type": "string"},
                     "target": {"type": "string"},
-                    "description": {"type": "string"},
-                    "keywords": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "weight": {"type": "number"},
                     "rel_type": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "keywords": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "weight": {"type": "number"},
+                            },
+                            "required": ["name"],
+                        },
                         "minItems": 1,
                     },
                 },
-                "required": ["source", "target", "description", "rel_type"],
+                "required": ["source", "target", "rel_type"],
             },
         },
     },
@@ -112,17 +118,27 @@ entities and relationships from input text.
 3. Output requirements:
    - Return structured JSON with two arrays: "entities" and "relationships".
    - Each entity must have: name, type, description.
-   - Each relationship must have: source, target, description, keywords, weight, rel_type.
-   - "keywords" should be a compact list of relevant terms.
-   - "weight" should be a float between 0 and 1 representing confidence or salience.
-   - "rel_type" must be a list with one or more entries drawn EXACTLY
-     from: {rel_type_vocab}. Do not invent new rel_types — any value
-     outside this list will be rejected and the edge will fall back
-     to "RELATES_TO". Emit one entry per distinct semantic role the
-     text supports for this pair (e.g. ["EXPLAINS",
-     "IS_AN_EXAMPLE_OF"] if the same pair is both an explanation and
-     an example). Use "RELATES_TO" only when nothing more specific
-     applies. Each list entry becomes its own edge in the graph.
+   - Each relationship must have: source, target, rel_type.
+   - "rel_type" is a list of one or more objects, each with:
+       name        (string, drawn EXACTLY from: {rel_type_vocab})
+       description (string, role-specific: explains the connection
+                    in the semantic role of THIS rel_type entry)
+       keywords    (array of strings, role-specific)
+       weight      (float 0..1, role-specific confidence)
+     Do not invent names outside the vocab — any unknown name will
+     be rejected and that entry will fall back to "RELATES_TO".
+   - DEFAULT TO A SINGLE-ENTRY rel_type LIST PER PAIR. Multi-entry
+     lists are reserved for pairs where the text genuinely supports
+     distinct, simultaneously-true semantic roles AND each entry
+     has a meaningfully different description and keyword set. If
+     you would write the same sentence for two entries, do not emit
+     both — collapse to the single most specific one. A pair that
+     "explains AND is an example of" the same thing can carry two
+     entries; a pair where the only honest answer is one
+     relationship must carry one entry.
+   - Each entry becomes its own edge in the graph; emitting an
+     entry you cannot justify with a role-specific description
+     produces duplicate noise.
    - Use third-person phrasing and avoid pronouns where possible.
    - Only extract entities and relationships explicitly supported by the text.
 """
@@ -158,8 +174,11 @@ formatted entities and relationships.
 6. Each relationship's "rel_type" must be drawn EXACTLY from:
    {rel_type_vocab}. Do not invent new rel_types — any value
    outside this list will be rejected and the edge will fall back
-   to "RELATES_TO". Pick the best fit; use "RELATES_TO" only if none
-   of the specific types apply.
+   to "RELATES_TO". DEFAULT TO A SINGLE rel_type PER PAIR; only
+   emit multiple when the text genuinely supports distinct,
+   simultaneously-true roles and you can write a meaningfully
+   different description for each. Pick the best single fit; use
+   "RELATES_TO" only if nothing more specific applies.
 7. Return only new or corrected items in the same JSON structure as
    the main extraction.
 8. Only include items explicitly supported by the text.
@@ -194,46 +213,111 @@ class LLMGraphExtractor:
         return normalized
 
     @staticmethod
-    def _coerce_rel_types(
-        value: Any, vocab: list[str] | None = None,
-    ) -> list[str]:
-        """Accept either a list of rel_types (preferred) or a single
-        string (back-compat) and return a de-duplicated list of
-        normalized values.
+    def _coerce_rel_type_entries(
+        value: Any,
+        fallback_description: str,
+        fallback_keywords: list[str],
+        fallback_weight: float,
+        vocab: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Normalize the LLM's ``rel_type`` field into a list of per-edge
+        dicts, each carrying its own validated name, description,
+        keywords, and weight.
 
-        Each candidate is first normalized (uppercase, snake_case,
-        alpha-leading) and then validated against the active domain
-        vocab when one is supplied. Anything not in the vocab is
-        rejected with a warning and falls back to ``DEFAULT_REL_TYPE``
-        so the LLM can never silently introduce a new dimension.
+        Accepts (in order of preference):
+        1. List of objects: ``[{name, description, keywords, weight}, ...]``
+        2. List of strings: ``["EXPLAINS", "CAUSES"]`` (back-compat;
+           each entry inherits the relationship-level description,
+           keywords, and weight)
+        3. A single string (very old shape): wrapped into a single entry
 
-        Falls back to ``[DEFAULT_REL_TYPE]`` for empty/missing input.
+        Each entry's name is normalized (uppercase, snake_case,
+        alpha-leading) and validated against the active domain vocab
+        when one is supplied. An unknown name is replaced with
+        ``DEFAULT_REL_TYPE`` and a warning is logged so the LLM can
+        never silently introduce a new dimension.
+
+        Returns at least one entry; the fallback is
+        ``[{"name": DEFAULT_REL_TYPE, "description": ..., "keywords": ..., "weight": ...}]``
+        when the LLM emitted nothing usable.
         """
         if value is None:
-            return [DEFAULT_REL_TYPE]
+            value = []
         if isinstance(value, str):
-            candidates = [value]
+            raw_entries: list[Any] = [{"name": value}]
         elif isinstance(value, list):
-            candidates = [v for v in value if isinstance(v, str) and v]
+            raw_entries = []
+            for item in value:
+                if isinstance(item, str):
+                    raw_entries.append({"name": item})
+                elif isinstance(item, dict):
+                    raw_entries.append(item)
         else:
-            candidates = [str(value)]
+            raw_entries = [{"name": str(value)}]
+
         vocab_set = {v.upper() for v in vocab} if vocab else None
-        normalized: list[str] = []
+        out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for raw in candidates:
-            n = normalize_rel_type(raw)
-            if vocab_set is not None and n not in vocab_set:
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_name = entry.get("name")
+            if not raw_name or not isinstance(raw_name, str):
+                continue
+            name = normalize_rel_type(raw_name)
+            if vocab_set is not None and name not in vocab_set:
                 logger.warning(
                     "LLM emitted rel_type=%r not in active domain vocab; "
                     "falling back to %s. Add it to DOMAIN_VOCAB if intentional.",
-                    raw,
+                    raw_name,
                     DEFAULT_REL_TYPE,
                 )
-                n = DEFAULT_REL_TYPE
-            if n not in seen:
-                seen.add(n)
-                normalized.append(n)
-        return normalized or [DEFAULT_REL_TYPE]
+                name = DEFAULT_REL_TYPE
+            if name in seen:
+                continue
+            seen.add(name)
+
+            description = entry.get("description", fallback_description)
+            if not isinstance(description, str):
+                description = fallback_description
+            description = description.strip() or fallback_description
+
+            keywords_value = entry.get("keywords", fallback_keywords)
+            if isinstance(keywords_value, str):
+                keywords = [
+                    k.strip() for k in keywords_value.split(",") if k.strip()
+                ]
+            elif isinstance(keywords_value, list):
+                keywords = [
+                    str(k).strip()
+                    for k in keywords_value
+                    if k is not None and str(k).strip()
+                ]
+            else:
+                keywords = list(fallback_keywords)
+
+            weight_value = entry.get("weight", fallback_weight)
+            try:
+                weight = float(weight_value)
+                weight = max(0.0, min(1.0, weight))
+            except (ValueError, TypeError):
+                weight = fallback_weight
+
+            out.append({
+                "rel_type": name,
+                "description": description,
+                "keywords": keywords,
+                "weight": weight,
+            })
+
+        if not out:
+            out.append({
+                "rel_type": DEFAULT_REL_TYPE,
+                "description": fallback_description,
+                "keywords": list(fallback_keywords),
+                "weight": fallback_weight,
+            })
+        return out
 
     @staticmethod
     def _build_extraction_prompt(
@@ -308,29 +392,34 @@ class LLMGraphExtractor:
             target = self._normalize_entity_name(rel.get("target", ""))
             if not (source and target):
                 continue
-            keywords_str = rel.get("keywords", [])
-            if isinstance(keywords_str, str):
-                keywords_str = [
+            rel_description = rel.get("description", "")
+            rel_keywords_str = rel.get("keywords", [])
+            if isinstance(rel_keywords_str, str):
+                rel_keywords_str = [
                     k.strip()
-                    for k in keywords_str.split(",")
+                    for k in rel_keywords_str.split(",")
                     if k.strip()
                 ]
-            weight = rel.get("weight", 1.0)
+            rel_keywords_list = rel_keywords_str if isinstance(rel_keywords_str, list) else []
             try:
-                weight = float(weight)
-                weight = max(0.0, min(1.0, weight))
+                rel_weight = float(rel.get("weight", 1.0))
+                rel_weight = max(0.0, min(1.0, rel_weight))
             except (ValueError, TypeError):
-                weight = 1.0
-            description = rel.get("description", "")
-            keywords_list = keywords_str if isinstance(keywords_str, list) else []
-            for rel_type in self._coerce_rel_types(rel.get("rel_type"), vocab=rel_vocab):
+                rel_weight = 1.0
+            for entry in self._coerce_rel_type_entries(
+                rel.get("rel_type"),
+                fallback_description=rel_description,
+                fallback_keywords=rel_keywords_list,
+                fallback_weight=rel_weight,
+                vocab=rel_vocab,
+            ):
                 relationships.append(ExtractedRelationship(
                     source_name=source,
                     target_name=target,
-                    description=description,
-                    keywords=list(keywords_list),
-                    weight=weight,
-                    rel_type=rel_type,
+                    description=entry["description"],
+                    keywords=list(entry["keywords"]),
+                    weight=entry["weight"],
+                    rel_type=entry["rel_type"],
                 ))
 
         extraction_result = ExtractionResult(
@@ -409,28 +498,35 @@ class LLMGraphExtractor:
                 target = self._normalize_entity_name(rel.get("target", ""))
                 if not (source and target):
                     continue
-                keywords_str = rel.get("keywords", [])
-                if isinstance(keywords_str, str):
-                    keywords_str = [
+                rel_description = rel.get("description", "")
+                rel_keywords_str = rel.get("keywords", [])
+                if isinstance(rel_keywords_str, str):
+                    rel_keywords_str = [
                         k.strip()
-                        for k in keywords_str.split(",")
+                        for k in rel_keywords_str.split(",")
                         if k.strip()
                     ]
-                weight = rel.get("weight", 1.0)
+                rel_keywords_list = (
+                    rel_keywords_str if isinstance(rel_keywords_str, list) else []
+                )
                 try:
-                    weight = max(0.0, min(1.0, float(weight)))
+                    rel_weight = max(0.0, min(1.0, float(rel.get("weight", 1.0))))
                 except (ValueError, TypeError):
-                    weight = 1.0
-                description = rel.get("description", "")
-                keywords_list = keywords_str if isinstance(keywords_str, list) else []
-                for rel_type in self._coerce_rel_types(rel.get("rel_type"), vocab=rel_vocab):
+                    rel_weight = 1.0
+                for entry in self._coerce_rel_type_entries(
+                    rel.get("rel_type"),
+                    fallback_description=rel_description,
+                    fallback_keywords=rel_keywords_list,
+                    fallback_weight=rel_weight,
+                    vocab=rel_vocab,
+                ):
                     current_relationships.append(ExtractedRelationship(
                         source_name=source,
                         target_name=target,
-                        description=description,
-                        keywords=list(keywords_list),
-                        weight=weight,
-                        rel_type=rel_type,
+                        description=entry["description"],
+                        keywords=list(entry["keywords"]),
+                        weight=entry["weight"],
+                        rel_type=entry["rel_type"],
                     ))
 
             current_relationships = list(
