@@ -72,9 +72,13 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
                         "items": {"type": "string"},
                     },
                     "weight": {"type": "number"},
-                    "rel_type": {"type": "string"},
+                    "rel_type": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
                 },
-                "required": ["source", "target", "description"],
+                "required": ["source", "target", "description", "rel_type"],
             },
         },
     },
@@ -111,8 +115,12 @@ entities and relationships from input text.
    - Each relationship must have: source, target, description, keywords, weight, rel_type.
    - "keywords" should be a compact list of relevant terms.
    - "weight" should be a float between 0 and 1 representing confidence or salience.
-   - "rel_type" must be one of: {rel_type_vocab}. Pick the single best fit. Use
-     "RELATES_TO" only if none of the specific types apply.
+   - "rel_type" must be a list with one or more entries drawn from:
+     {rel_type_vocab}. Emit one entry per distinct semantic role the
+     text supports for this pair (e.g. ["EXPLAINS",
+     "IS_AN_EXAMPLE_OF"] if the same pair is both an explanation and
+     an example). Use "RELATES_TO" only when nothing more specific
+     applies. Each list entry becomes its own edge in the graph.
    - Use third-person phrasing and avoid pronouns where possible.
    - Only extract entities and relationships explicitly supported by the text.
 """
@@ -180,6 +188,30 @@ class LLMGraphExtractor:
         if len(normalized) > 256:
             normalized = normalized[:256]
         return normalized
+
+    @staticmethod
+    def _coerce_rel_types(value: Any) -> list[str]:
+        """Accept either a list of rel_types (preferred) or a single
+        string (back-compat) and return a de-duplicated list of
+        normalized values. Falls back to ``[DEFAULT_REL_TYPE]`` for
+        empty/missing input.
+        """
+        if value is None:
+            return [DEFAULT_REL_TYPE]
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, list):
+            candidates = [v for v in value if isinstance(v, str) and v]
+        else:
+            candidates = [str(value)]
+        normalized = []
+        seen: set[str] = set()
+        for raw in candidates:
+            n = normalize_rel_type(raw)
+            if n not in seen:
+                seen.add(n)
+                normalized.append(n)
+        return normalized or [DEFAULT_REL_TYPE]
 
     @staticmethod
     def _build_extraction_prompt(
@@ -252,28 +284,29 @@ class LLMGraphExtractor:
         for rel in result.get("relationships", []):
             source = self._normalize_entity_name(rel.get("source", ""))
             target = self._normalize_entity_name(rel.get("target", ""))
-            if source and target:
-                keywords_str = rel.get("keywords", [])
-                if isinstance(keywords_str, str):
-                    keywords_str = [
-                        k.strip()
-                        for k in keywords_str.split(",")
-                        if k.strip()
-                    ]
-                weight = rel.get("weight", 1.0)
-                try:
-                    weight = float(weight)
-                    weight = max(0.0, min(1.0, weight))
-                except (ValueError, TypeError):
-                    weight = 1.0
-
-                rel_type = normalize_rel_type(rel.get("rel_type"))
-
+            if not (source and target):
+                continue
+            keywords_str = rel.get("keywords", [])
+            if isinstance(keywords_str, str):
+                keywords_str = [
+                    k.strip()
+                    for k in keywords_str.split(",")
+                    if k.strip()
+                ]
+            weight = rel.get("weight", 1.0)
+            try:
+                weight = float(weight)
+                weight = max(0.0, min(1.0, weight))
+            except (ValueError, TypeError):
+                weight = 1.0
+            description = rel.get("description", "")
+            keywords_list = keywords_str if isinstance(keywords_str, list) else []
+            for rel_type in self._coerce_rel_types(rel.get("rel_type")):
                 relationships.append(ExtractedRelationship(
                     source_name=source,
                     target_name=target,
-                    description=rel.get("description", ""),
-                    keywords=keywords_str if isinstance(keywords_str, list) else [],
+                    description=description,
+                    keywords=list(keywords_list),
                     weight=weight,
                     rel_type=rel_type,
                 ))
@@ -352,26 +385,28 @@ class LLMGraphExtractor:
             for rel in gleamed.get("relationships", []):
                 source = self._normalize_entity_name(rel.get("source", ""))
                 target = self._normalize_entity_name(rel.get("target", ""))
-                if source and target:
-                    keywords_str = rel.get("keywords", [])
-                    if isinstance(keywords_str, str):
-                        keywords_str = [
-                            k.strip()
-                            for k in keywords_str.split(",")
-                            if k.strip()
-                        ]
-                    weight = rel.get("weight", 1.0)
-                    try:
-                        weight = max(0.0, min(1.0, float(weight)))
-                    except (ValueError, TypeError):
-                        weight = 1.0
-
-                    rel_type = normalize_rel_type(rel.get("rel_type"))
+                if not (source and target):
+                    continue
+                keywords_str = rel.get("keywords", [])
+                if isinstance(keywords_str, str):
+                    keywords_str = [
+                        k.strip()
+                        for k in keywords_str.split(",")
+                        if k.strip()
+                    ]
+                weight = rel.get("weight", 1.0)
+                try:
+                    weight = max(0.0, min(1.0, float(weight)))
+                except (ValueError, TypeError):
+                    weight = 1.0
+                description = rel.get("description", "")
+                keywords_list = keywords_str if isinstance(keywords_str, list) else []
+                for rel_type in self._coerce_rel_types(rel.get("rel_type")):
                     current_relationships.append(ExtractedRelationship(
                         source_name=source,
                         target_name=target,
-                        description=rel.get("description", ""),
-                        keywords=keywords_str if isinstance(keywords_str, list) else [],
+                        description=description,
+                        keywords=list(keywords_list),
                         weight=weight,
                         rel_type=rel_type,
                     ))
