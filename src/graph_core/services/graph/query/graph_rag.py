@@ -351,7 +351,10 @@ def _combined_edge_score(
         return cos
     raw_weight = edge_props.get("weight")
     try:
-        weight_norm = min(int(raw_weight or 0), 100) / 100.0
+        # Stored weight is a 0-10 integer (resolver: int(weight * 10));
+        # normalize to 0-1 so the weight_ratio knob contributes on the
+        # same scale as the cosine and keyword ratios.
+        weight_norm = min(int(raw_weight or 0), 10) / 10.0
     except (TypeError, ValueError):
         weight_norm = 0.0
     kws = edge_props.get("keywords") or []
