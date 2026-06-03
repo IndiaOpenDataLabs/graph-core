@@ -27,9 +27,7 @@ from sqlalchemy import text  # noqa: E402
 
 import graph_core.workers  # noqa: E402,F401
 from graph_core.database import AsyncSessionLocal  # noqa: E402
-from graph_core.services.graph.ingestion.document_pipeline import (  # noqa: E402
-    dispatch_pending_chunks,
-)
+from graph_core.workers.ingestion import run_chunk  # noqa: E402
 
 
 async def active_jobs() -> None:
@@ -164,21 +162,43 @@ async def _reset_chunks(job_id: uuid.UUID, from_status: str, note: str) -> int:
         return int(result.rowcount or 0)
 
 
+async def _chunk_indices(job_id: uuid.UUID, status: str) -> list[int]:
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    select chunk_index
+                    from ingestion_chunks
+                    where job_id = :jid and status = :status
+                    order by chunk_index
+                    """
+                ),
+                {"jid": job_id, "status": status},
+            )
+        ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
 async def requeue_failed(job_id: uuid.UUID) -> None:
+    failed_indices = await _chunk_indices(job_id, "failed")
     count = await _reset_chunks(job_id, "failed", "[manual requeue from HELPER.py]")
-    dispatched = await dispatch_pending_chunks(job_id)
-    print(f"reset_failed={count} dispatched={dispatched}")
+    for chunk_index in failed_indices:
+        run_chunk.send(str(job_id), chunk_index)
+    print(f"reset_failed={count} dispatched={len(failed_indices)}")
     await show_job(job_id)
 
 
 async def requeue_processing(job_id: uuid.UUID) -> None:
+    processing_indices = await _chunk_indices(job_id, "processing")
     count = await _reset_chunks(
         job_id,
         "processing",
         "[manual reset from processing in HELPER.py]",
     )
-    dispatched = await dispatch_pending_chunks(job_id)
-    print(f"reset_processing={count} dispatched={dispatched}")
+    for chunk_index in processing_indices:
+        run_chunk.send(str(job_id), chunk_index)
+    print(f"reset_processing={count} dispatched={len(processing_indices)}")
     await show_job(job_id)
 
 
