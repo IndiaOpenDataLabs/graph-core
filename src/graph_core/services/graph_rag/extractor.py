@@ -145,9 +145,12 @@ formatted entities and relationships.
 4. Keep naming consistent with the previously extracted entities.
 5. Relationship descriptions must still explain the nature, context,
    and significance of the connection.
-6. Return only new or corrected items in the same JSON structure as
+6. Each relationship's "rel_type" must be one of: {rel_type_vocab}.
+   Pick the single best fit; use "RELATES_TO" only if none of the
+   specific types apply.
+7. Return only new or corrected items in the same JSON structure as
    the main extraction.
-7. Only include items explicitly supported by the text.
+8. Only include items explicitly supported by the text.
 """
 
 
