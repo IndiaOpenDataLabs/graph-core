@@ -358,6 +358,7 @@ async def _ingest_graph_chunk(
                 keywords=rel.keywords,
                 weight=rel.weight,
                 source_chunk_hash=chunk_hash,
+                rel_type=rel.rel_type,
             )
             await session.commit()
 
@@ -383,6 +384,7 @@ async def _ingest_graph_chunk(
                 "id": str(rel_result.relationship_id),
                 "weight": int(rel.weight * 10),
                 "keywords": rel.keywords,
+                "rel_type": rel.rel_type,
                 "collection_id": str(collection.id),
             })
 

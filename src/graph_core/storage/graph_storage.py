@@ -3,16 +3,23 @@
 Stores knowledge graph nodes and edges in FalkorDB.
 Schema:
   - Nodes: (:Entity {id, name, collection_id})
-  - Edges: [:RELATES_TO {id, weight, keywords, collection_id}]
+  - Edges: [:REL_TYPE {id, weight, keywords, collection_id, rel_type}]
+    where REL_TYPE is the per-edge rel_type (e.g. EXPLAINS, RELATES_TO).
+    The rel_type is also stored as a property for filtering.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from graph_core.config import settings
+from graph_core.models.rel_types import (
+    DEFAULT_REL_TYPE,
+    normalize_rel_type,
+)
 
 # FalkorDB is optional — only import when available
 try:
@@ -23,6 +30,30 @@ except ImportError:
     BlockingConnectionPool = None  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
+
+
+_LABEL_SAFE_RE = re.compile(r"[^A-Z0-9_]")
+
+
+def _safe_label(rel_type: str) -> str:
+    """Coerce a rel_type into a Cypher-safe label token."""
+    cleaned = normalize_rel_type(rel_type)
+    cleaned = _LABEL_SAFE_RE.sub("_", cleaned)
+    if not cleaned or not cleaned[0].isalpha():
+        cleaned = "R_" + cleaned
+    return cleaned or "RELATES_TO"
+
+
+def _edge_label_pattern(rel_types: list[str] | None) -> str:
+    """Build a Cypher pattern for one or more edge labels, e.g. `[:EXPLAINS|RELATES_TO]`."""
+    if not rel_types:
+        return ""
+    labels = [_safe_label(rt) for rt in rel_types if rt]
+    if not labels:
+        return ""
+    if len(set(labels)) == 1:
+        return f":{labels[0]}"
+    return ":" + "|".join(labels)
 
 
 class FalkorDBGraphStorage:
@@ -136,41 +167,66 @@ class FalkorDBGraphStorage:
         if not edges:
             return
         graph = await self._get_graph()
-        payload = [
-            {
-                "source_id": e["source_id"],
-                "target_id": e["target_id"],
-                "id": e.get("id", ""),
-                "weight": e.get("weight", 1),
-                "keywords": json.dumps(e["keywords"]) if isinstance(e.get("keywords"), list) else (e.get("keywords") or "[]"),
-                "collection_id": str(e.get("collection_id", "")),
-            }
-            for e in edges
-        ]
-        await graph.query(
-            "UNWIND $edges AS edge"
-            " MERGE (a:Entity {id: edge.source_id})"
-            " MERGE (b:Entity {id: edge.target_id})"
-            " MERGE (a)-[r:RELATES_TO]->(b)"
-            " SET r.id = edge.id, r.weight = edge.weight,"
-            "     r.keywords = edge.keywords, r.collection_id = edge.collection_id",
-            {"edges": payload},
-        )
+        # Group by rel_type so we can target the Cypher label precisely
+        # (FalkorDB does not support dynamic rel-type set in a single
+        # query without APOC). Each rel_type gets one MERGE pass.
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for e in edges:
+            rt = normalize_rel_type(e.get("rel_type"))
+            groups.setdefault(rt, []).append(
+                {
+                    "source_id": e["source_id"],
+                    "target_id": e["target_id"],
+                    "id": e.get("id", ""),
+                    "weight": e.get("weight", 1),
+                    "keywords": (
+                        json.dumps(e["keywords"])
+                        if isinstance(e.get("keywords"), list)
+                        else (e.get("keywords") or "[]")
+                    ),
+                    "collection_id": str(e.get("collection_id", "")),
+                    "rel_type": rt,
+                }
+            )
+        for rel_type, payload in groups.items():
+            label = _safe_label(rel_type)
+            await graph.query(
+                "UNWIND $edges AS edge"
+                " MERGE (a:Entity {id: edge.source_id})"
+                " MERGE (b:Entity {id: edge.target_id})"
+                f" MERGE (a)-[r:{label}]->(b)"
+                " SET r.id = edge.id,"
+                "     r.weight = edge.weight,"
+                "     r.keywords = edge.keywords,"
+                "     r.collection_id = edge.collection_id,"
+                "     r.rel_type = edge.rel_type",
+                {"edges": payload},
+            )
         await self._merge_keywords_for_edges(
-            [(e["source_id"], e["target_id"], e.get("keywords") or []) for e in edges]
+            [
+                (
+                    e["source_id"],
+                    e["target_id"],
+                    e.get("keywords") or [],
+                    e.get("rel_type"),
+                )
+                for e in edges
+            ]
         )
 
     async def _merge_keywords_for_edges(
-        self, edge_keyword_inputs: list[tuple[str, str, list[str]]]
+        self,
+        edge_keyword_inputs: list[tuple[str, str, list[str], str | None]],
     ) -> None:
         if not edge_keyword_inputs:
             return
         graph = await self._get_graph()
         updates: list[dict[str, Any]] = []
-        for source_id, target_id, incoming in edge_keyword_inputs:
-            existing = await self.get_edge(source_id, target_id)
+        for source_id, target_id, incoming, rel_type in edge_keyword_inputs:
+            rts = [rel_type] if rel_type else None
+            existing = await self.get_edge(source_id, target_id, rel_types=rts)
             if existing is None:
-                existing = await self.get_edge(target_id, source_id)
+                existing = await self.get_edge(target_id, source_id, rel_types=rts)
             if not existing:
                 continue
             existing_kws = existing.get("keywords") or []
@@ -195,24 +251,32 @@ class FalkorDBGraphStorage:
                     {
                         "source_id": source_id,
                         "target_id": target_id,
+                        "rel_type": rel_type or DEFAULT_REL_TYPE,
                         "keywords": json.dumps(merged),
                     }
                 )
         if not updates:
             return
-        await graph.query(
-            "UNWIND $updates AS u"
-            " MATCH (a:Entity {id: u.source_id})-[r:RELATES_TO]->(b:Entity {id: u.target_id})"
-            " SET r.keywords = u.keywords",
-            {"updates": updates},
-        )
-        await graph.query(
-            "UNWIND $updates AS u"
-            " MATCH (a:Entity {id: u.target_id})-[r:RELATES_TO]->(b:Entity {id: u.source_id})"
-            " WHERE NOT EXISTS { (a)-[:RELATES_TO {keywords: u.keywords}]->(b) }"
-            " SET r.keywords = u.keywords",
-            {"updates": updates},
-        )
+        for u in updates:
+            label = _safe_label(u["rel_type"])
+            await graph.query(
+                f"MATCH (a:Entity {{id: $source_id}})-[r:{label}]->(b:Entity {{id: $target_id}})"
+                " SET r.keywords = $keywords",
+                {
+                    "source_id": u["source_id"],
+                    "target_id": u["target_id"],
+                    "keywords": u["keywords"],
+                },
+            )
+            await graph.query(
+                f"MATCH (a:Entity {{id: $target_id}})-[r:{label}]->(b:Entity {{id: $source_id}})"
+                " SET r.keywords = $keywords",
+                {
+                    "source_id": u["source_id"],
+                    "target_id": u["target_id"],
+                    "keywords": u["keywords"],
+                },
+            )
 
     async def upsert_node(self, node_id: str, properties: dict[str, Any]) -> None:
         graph = await self._get_graph()
@@ -252,6 +316,8 @@ class FalkorDBGraphStorage:
         self, source_id: str, target_id: str, properties: dict[str, Any]
     ) -> None:
         graph = await self._get_graph()
+        rel_type = normalize_rel_type(properties.get("rel_type"))
+        label = _safe_label(rel_type)
         allowed_keys = {
             "id",
             "weight",
@@ -263,25 +329,30 @@ class FalkorDBGraphStorage:
             "source_roles",
         }
         set_clauses = []
-        params: dict[str, object] = {"source_id": source_id, "target_id": target_id}
+        params: dict[str, object] = {
+            "source_id": source_id,
+            "target_id": target_id,
+            "rel_type": rel_type,
+        }
         for key, value in properties.items():
-            if key not in ("source", "target") and key in allowed_keys:
+            if key not in ("source", "target", "rel_type") and key in allowed_keys:
                 stored_value = json.dumps(value) if isinstance(value, list) else value
                 set_clauses.append(f"r.{key} = $r_{key}")
                 params[f"r_{key}"] = stored_value
+        set_clauses.append("r.rel_type = $rel_type")
 
         if set_clauses:
             set_str = ", ".join(set_clauses)
             query = (
                 "MERGE (a:Entity {id: $source_id})"
                 " MERGE (b:Entity {id: $target_id})"
-                f" MERGE (a)-[r:RELATES_TO]->(b) SET {set_str}"
+                f" MERGE (a)-[r:{label}]->(b) SET {set_str}"
             )
         else:
             query = (
                 "MERGE (a:Entity {id: $source_id})"
                 " MERGE (b:Entity {id: $target_id})"
-                " MERGE (a)-[r:RELATES_TO]->(b)"
+                f" MERGE (a)-[r:{label}]->(b)"
             )
 
         await graph.query(query, params)
@@ -289,7 +360,16 @@ class FalkorDBGraphStorage:
         incoming_keywords = properties.get("keywords")
         if incoming_keywords is not None:
             await self._merge_keywords_for_edges(
-                [(source_id, target_id, list(incoming_keywords) if not isinstance(incoming_keywords, list) else incoming_keywords)]
+                [
+                    (
+                        source_id,
+                        target_id,
+                        list(incoming_keywords)
+                        if not isinstance(incoming_keywords, list)
+                        else incoming_keywords,
+                        rel_type,
+                    )
+                ]
             )
 
     async def get_nodes_by_source_message_id(
@@ -403,24 +483,28 @@ class FalkorDBGraphStorage:
         """Upsert a LightRAG relationship edge with name-based nodes."""
         graph = await self._get_graph()
         rel_id = properties.get("id", f"{source_name}__{target_name}")
+        rel_type = normalize_rel_type(properties.get("rel_type"))
+        label = _safe_label(rel_type)
         keywords = properties.get("keywords", [])
         source_ids = properties.get("source_ids", [])
 
         await graph.query(
             "MERGE (a:Entity {id: $source_name, collection_id: $collection_id})"
             " MERGE (b:Entity {id: $target_name, collection_id: $collection_id})"
-            " MERGE (a)-[r:RELATES_TO]->(b)"
+            f" MERGE (a)-[r:{label}]->(b)"
             " SET r.id = $rel_id,"
             " r.description = $description,"
             " r.weight = $weight,"
             " r.keywords = $keywords,"
             " r.source_ids = $source_ids,"
-            " r.collection_id = $collection_id",
+            " r.collection_id = $collection_id,"
+            " r.rel_type = $rel_type",
             {
                 "source_name": source_name,
                 "target_name": target_name,
                 "collection_id": collection_id,
                 "rel_id": rel_id,
+                "rel_type": rel_type,
                 "description": properties.get("description", ""),
                 "weight": properties.get("weight", 1),
                 "keywords": json.dumps(keywords) if isinstance(keywords, list) else (keywords or "[]"),
@@ -451,9 +535,9 @@ class FalkorDBGraphStorage:
                 merged.append(k)
             if merged != list(existing_kws or []):
                 await graph.query(
-                    "MATCH (a:Entity {id: $source_name, collection_id: $collection_id})"
-                    "-[r:RELATES_TO]->"
-                    "(b:Entity {id: $target_name, collection_id: $collection_id})"
+                    f"MATCH (a:Entity {{id: $source_name, collection_id: $collection_id}})"
+                    f"-[r:{label}]->"
+                    f"(b:Entity {{id: $target_name, collection_id: $collection_id}})"
                     " SET r.keywords = $keywords",
                     {
                         "source_name": source_name,
@@ -464,17 +548,27 @@ class FalkorDBGraphStorage:
                 )
 
     async def get_lightrag_node_edges(
-        self, node_name: str, collection_id: str
+        self,
+        node_name: str,
+        collection_id: str,
+        rel_types: list[str] | None = None,
     ) -> list[tuple[str, str]]:
         """Get all edges connected to a LightRAG entity node."""
         graph = await self._get_graph()
-        result = await graph.query(
-            """
-            MATCH (n:Entity {id: $node_name, collection_id: $cid})-[r:RELATES_TO]-(m:Entity)
-            RETURN n.id as source, m.id as target
-            """,
-            {"node_name": node_name, "cid": collection_id},
-        )
+        label_pat = _edge_label_pattern(rel_types)
+        if rel_types and not label_pat:
+            return []
+        if label_pat:
+            cypher = (
+                f"MATCH (n:Entity {{id: $node_name, collection_id: $cid}})-[r{label_pat}]-(m:Entity)"
+                " RETURN n.id as source, m.id as target"
+            )
+        else:
+            cypher = (
+                "MATCH (n:Entity {id: $node_name, collection_id: $cid})-[r]-(m:Entity)"
+                " RETURN n.id as source, m.id as target"
+            )
+        result = await graph.query(cypher, {"node_name": node_name, "cid": collection_id})
         edges: list[tuple[str, str]] = []
         if result and result.result_set:
             for row in result.result_set:
@@ -484,17 +578,29 @@ class FalkorDBGraphStorage:
         return edges
 
     async def get_lightrag_edge(
-        self, source_name: str, target_name: str, collection_id: str
+        self,
+        source_name: str,
+        target_name: str,
+        collection_id: str,
+        rel_types: list[str] | None = None,
     ) -> Optional[dict[str, Any]]:
         """Get LightRAG edge properties between two named nodes."""
         graph = await self._get_graph()
+        label_pat = _edge_label_pattern(rel_types)
+        if rel_types and not label_pat:
+            return None
+        if label_pat:
+            cypher = (
+                f"MATCH (a:Entity {{id: $source, collection_id: $cid}})-[r{label_pat}]->"
+                f"(b:Entity {{id: $target, collection_id: $cid}}) RETURN r"
+            )
+        else:
+            cypher = (
+                "MATCH (a:Entity {id: $source, collection_id: $cid})-[r]->"
+                "(b:Entity {id: $target, collection_id: $cid}) RETURN r"
+            )
         result = await graph.query(
-            """
-            MATCH (a:Entity {id: $source, collection_id: $cid})
-            -[r:RELATES_TO]->
-            (b:Entity {id: $target, collection_id: $cid})
-            RETURN r
-            """,
+            cypher,
             {"source": source_name, "target": target_name, "cid": collection_id},
         )
         if result and result.result_set:
@@ -515,15 +621,26 @@ class FalkorDBGraphStorage:
         """Delete all LightRAG nodes for a collection."""
         return await self.delete_nodes_by_collection(collection_id)
 
-    async def get_node_edges(self, node_id: str) -> list[tuple[str, str]]:
+    async def get_node_edges(
+        self,
+        node_id: str,
+        rel_types: list[str] | None = None,
+    ) -> list[tuple[str, str]]:
         graph = await self._get_graph()
-        result = await graph.query(
-            """
-            MATCH (n:Entity {id: $node_id})-[r:RELATES_TO]-(m:Entity)
-            RETURN n.id as source, m.id as target
-            """,
-            {"node_id": node_id},
-        )
+        label_pat = _edge_label_pattern(rel_types)
+        if rel_types and not label_pat:
+            return []
+        if label_pat:
+            cypher = (
+                f"MATCH (n:Entity {{id: $node_id}})-[r{label_pat}]-(m:Entity)"
+                " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
+            )
+        else:
+            cypher = (
+                "MATCH (n:Entity {id: $node_id})-[r]-(m:Entity)"
+                " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
+            )
+        result = await graph.query(cypher, {"node_id": node_id})
         edges: list[tuple[str, str]] = []
         if result and result.result_set:
             for row in result.result_set:
@@ -532,15 +649,33 @@ class FalkorDBGraphStorage:
                     edges.append((str(source), str(target)))
         return edges
 
-    async def get_edge(self, source_id: str, target_id: str) -> Optional[dict[str, Any]]:
-        """Get edge properties between two entity IDs."""
+    async def get_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        rel_types: list[str] | None = None,
+    ) -> Optional[dict[str, Any]]:
+        """Get edge properties between two entity IDs.
+
+        When ``rel_types`` is provided, restricts the match to those
+        relationship labels; when None, matches any label.
+        """
         graph = await self._get_graph()
+        label_pat = _edge_label_pattern(rel_types)
+        if rel_types and not label_pat:
+            return None
+        if label_pat:
+            cypher = (
+                f"MATCH (a:Entity {{id: $source_id}})-[r{label_pat}]->(b:Entity {{id: $target_id}})"
+                " RETURN r"
+            )
+        else:
+            cypher = (
+                "MATCH (a:Entity {id: $source_id})-[r]->(b:Entity {id: $target_id})"
+                " RETURN r"
+            )
         result = await graph.query(
-            """
-            MATCH (a:Entity {id: $source_id})-[r:RELATES_TO]->(b:Entity {id: $target_id})
-            RETURN r
-            """,
-            {"source_id": source_id, "target_id": target_id},
+            cypher, {"source_id": source_id, "target_id": target_id}
         )
         if result and result.result_set:
             edge = result.result_set[0][0]
@@ -557,16 +692,29 @@ class FalkorDBGraphStorage:
         return None
 
     async def get_knowledge_graph(
-        self, node_id: str, max_depth: int = 3, max_nodes: int = 100
+        self,
+        node_id: str,
+        max_depth: int = 3,
+        max_nodes: int = 100,
+        rel_types: list[str] | None = None,
     ) -> dict[str, Any]:
         graph = await self._get_graph()
+        label_pat = _edge_label_pattern(rel_types) if rel_types else ""
+        if rel_types and not label_pat:
+            return {"nodes": [], "edges": []}
+        if label_pat:
+            cypher = (
+                f"MATCH path = (n:Entity {{id: $node_id}})-[{label_pat.strip(':') or '*'}"
+                f"*1..$max_depth]-(m:Entity)"
+                " WITH path, m LIMIT $max_nodes RETURN path"
+            )
+        else:
+            cypher = (
+                "MATCH path = (n:Entity {id: $node_id})-[*1..$max_depth]-(m:Entity)"
+                " WITH path, m LIMIT $max_nodes RETURN path"
+            )
         result = await graph.query(
-            """
-            MATCH path = (n:Entity {id: $node_id})-[*1..$max_depth]-(m:Entity)
-            WITH path, m
-            LIMIT $max_nodes
-            RETURN path
-            """,
+            cypher,
             {"node_id": node_id, "max_depth": max_depth, "max_nodes": max_nodes},
         )
         nodes: list[dict[str, Any]] = []

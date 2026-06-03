@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     graph_rag_min_edge_similarity: float = 0.3
     graph_rag_edge_weight_score_ratio: float = 0.3
     graph_rag_keyword_score_ratio: float = 0.2
+    graph_rag_active_dimensions: list[str] = []  # empty = all
+    graph_rag_dimension_weights: dict[str, float] = {}  # rel_type -> weight
 
     model_config = {
         "env_file": ".env",

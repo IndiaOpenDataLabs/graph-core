@@ -207,10 +207,15 @@ class IncrementalEntityResolver:
         keywords: list[str],
         weight: float,
         source_chunk_hash: str,
+        rel_type: str = "RELATES_TO",
     ) -> RelationshipResolutionResult:
-        # Check for existing relationship (bidirectional)
+        # Check for existing relationship (bidirectional, scoped to rel_type).
+        # Two rels between the same pair with different rel_types are
+        # distinct edges (multi-dimensional graph) and must not merge.
         existing_result = await session.execute(
             select(GraphRelationship).where(
+                GraphRelationship.rel_type == rel_type,
+            ).where(
                 (
                     (GraphRelationship.source_entity_id == source_entity_id)
                     & (GraphRelationship.target_entity_id == target_entity_id)
@@ -256,6 +261,7 @@ class IncrementalEntityResolver:
             target_entity_id=target_entity_id,
             weight=int(weight * 10),
             keywords=keywords,
+            rel_type=rel_type,
             collection_id=self._collection_id,
         )
         session.add(rel)

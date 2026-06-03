@@ -27,6 +27,7 @@ from graph_core.models.graph_rag import (
     RelationshipDescription,
 )
 from graph_core.models.profile import Profile
+from graph_core.models.rel_types import normalize_rel_type as normalize_dim
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
@@ -54,6 +55,61 @@ _MODE_ALIASES = {
     "hybrid": "hybrid",
     "mix": "mix",
 }
+
+
+def _active_dimensions() -> list[str]:
+    """Active graph dimensions, in priority order.
+
+    Falls back to all known rel_types when the operator has not pinned
+    a subset, so collections ingested before this setting was added keep
+    working unchanged.
+    """
+    configured = list(settings.graph_rag_active_dimensions or [])
+    if configured:
+        return [normalize_dim(d) for d in configured]
+    from graph_core.models.rel_types import (
+        DEFAULT_REL_TYPE,
+        DOMAIN_VOCAB,
+    )
+    types: list[str] = []
+    for vocab in DOMAIN_VOCAB.values():
+        for t in vocab:
+            if t not in types:
+                types.append(t)
+    if DEFAULT_REL_TYPE not in types:
+        types.insert(0, DEFAULT_REL_TYPE)
+    return types
+
+
+def _dimension_weight(rel_type: str | None) -> float:
+    weights = settings.graph_rag_dimension_weights or {}
+    if not rel_type:
+        return 1.0
+    return float(weights.get(rel_type, 1.0))
+
+
+async def _fan_out_per_dimension(
+    build_state, dimensions: list[str] | None = None
+) -> GraphQueryState | None:
+    """Run ``build_state(rel_type)`` once per active dimension and merge.
+
+    Each dimension is traversed as an independent sub-graph: a node may
+    appear in multiple dimensions with different neighbours and the
+    merged ``GraphQueryState`` keeps the highest per-node and per-edge
+    scores across them. The result is the same shape as a single-dim
+    traversal, so downstream context assembly is dimension-agnostic.
+    """
+    dims = dimensions if dimensions is not None else _active_dimensions()
+    if not dims:
+        return await build_state(None)
+    states: list[GraphQueryState] = []
+    for rel_type in dims:
+        s = await build_state(rel_type)
+        if s is not None:
+            states.append(s)
+    if not states:
+        return None
+    return _merge_states(*states)
 
 
 @dataclass
@@ -319,6 +375,9 @@ async def _entity_first_state(
     collection: Collection,
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
+    *,
+    rel_types: list[str] | None = None,
+    dimension_weight: float = 1.0,
 ) -> GraphQueryState:
     top_k = 10
     min_edge_sim = settings.graph_rag_min_edge_similarity
@@ -384,16 +443,16 @@ async def _entity_first_state(
         if depth >= max_depth:
             continue
 
-        edges = await graph_storage.get_node_edges(node_id)
+        edges = await graph_storage.get_node_edges(node_id, rel_types=rel_types)
         scored_edges: list[tuple[float, str, str]] = []
         for src, tgt in edges:
             neighbor = tgt if src == node_id else src
             if neighbor in visited:
                 continue
 
-            edge_props = await graph_storage.get_edge(src, tgt)
+            edge_props = await graph_storage.get_edge(src, tgt, rel_types=rel_types)
             if not edge_props:
-                edge_props = await graph_storage.get_edge(tgt, src)
+                edge_props = await graph_storage.get_edge(tgt, src, rel_types=rel_types)
             if not (edge_props and edge_props.get("id")):
                 continue
 
@@ -404,7 +463,7 @@ async def _entity_first_state(
                 rel_id_str,
                 rel_score_cache,
             )
-            combined = _combined_edge_score(sim, edge_props, query_tokens)
+            combined = _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             if combined >= effective_min_edge_sim:
                 scored_edges.append((combined, neighbor, rel_id_str))
 
@@ -443,6 +502,8 @@ async def _find_relevant_path(
     max_depth: int = 3,
     beam_width: int = 4,
     query_tokens: set[str] | None = None,
+    rel_types: list[str] | None = None,
+    dimension_weight: float = 1.0,
 ) -> tuple[list[str], list[str]] | None:
     queue: deque[tuple[str, list[str], list[str], int]] = deque(
         [(source_id, [source_id], [], 0)]
@@ -455,16 +516,16 @@ async def _find_relevant_path(
         if depth >= max_depth:
             continue
 
-        edges = await graph_storage.get_node_edges(node_id)
+        edges = await graph_storage.get_node_edges(node_id, rel_types=rel_types)
         candidates: list[tuple[float, str, str]] = []
         for src, tgt in edges:
             neighbor = tgt if src == node_id else src
             if neighbor in path_nodes:
                 continue
 
-            edge_props = await graph_storage.get_edge(src, tgt)
+            edge_props = await graph_storage.get_edge(src, tgt, rel_types=rel_types)
             if not edge_props:
-                edge_props = await graph_storage.get_edge(tgt, src)
+                edge_props = await graph_storage.get_edge(tgt, src, rel_types=rel_types)
             if not (edge_props and edge_props.get("id")):
                 continue
 
@@ -475,7 +536,7 @@ async def _find_relevant_path(
                 rel_id,
                 rel_score_cache,
             )
-            combined = _combined_edge_score(sim, edge_props, query_tokens)
+            combined = _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             candidates.append((combined, neighbor, rel_id))
 
         for _, neighbor, rel_id in sorted(candidates, reverse=True)[:beam_width]:
@@ -496,6 +557,8 @@ async def _relationship_seed_state(
     max_endpoints: int = 20,
     max_pairs: int = 30,
     query_tokens: set[str] | None = None,
+    rel_types: list[str] | None = None,
+    dimension_weight: float = 1.0,
 ) -> GraphQueryState:
     rel_seeds = await _search_relationship_seeds(
         collection,
@@ -517,13 +580,19 @@ async def _relationship_seed_state(
             if not rel:
                 continue
             edge_props = await graph_storage.get_edge(
-                str(rel.source_entity_id), str(rel.target_entity_id)
+                str(rel.source_entity_id),
+                str(rel.target_entity_id),
+                rel_types=rel_types,
             )
             if edge_props is None:
                 edge_props = await graph_storage.get_edge(
-                    str(rel.target_entity_id), str(rel.source_entity_id)
+                    str(rel.target_entity_id),
+                    str(rel.source_entity_id),
+                    rel_types=rel_types,
                 )
-            combined = _combined_edge_score(sim, edge_props, query_tokens)
+            if not edge_props:
+                continue
+            combined = _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             traversed_rel_ids.append(rel_id_str)
             rel_score_cache[rel_id_str] = combined
             for eid in (str(rel.source_entity_id), str(rel.target_entity_id)):
@@ -550,6 +619,8 @@ async def _relationship_seed_state(
             target_id,
             rel_score_cache,
             query_tokens=query_tokens,
+            rel_types=rel_types,
+            dimension_weight=dimension_weight,
         )
         if not path:
             continue
@@ -578,6 +649,9 @@ async def _relationship_first_state(
     collection: Collection,
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
+    *,
+    rel_types: list[str] | None = None,
+    dimension_weight: float = 1.0,
 ) -> GraphQueryState:
     query_tokens = _query_token_set(question)
     state = await _relationship_seed_state(
@@ -587,6 +661,8 @@ async def _relationship_first_state(
         max_endpoints=20,
         max_pairs=30,
         query_tokens=query_tokens,
+        rel_types=rel_types,
+        dimension_weight=dimension_weight,
     )
 
     seed_entity_ids, seed_scores = await _search_entity_seeds(
@@ -753,6 +829,9 @@ async def _mix_state(
     embedding_provider: EmbeddingProvider,
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
+    *,
+    rel_types: list[str] | None = None,
+    dimension_weight: float = 1.0,
 ) -> GraphQueryState:
     query_tokens = _query_token_set(question)
     candidates = await _top_entity_candidates(
@@ -769,6 +848,8 @@ async def _mix_state(
             max_endpoints=20,
             max_pairs=30,
             query_tokens=query_tokens,
+            rel_types=rel_types,
+            dimension_weight=dimension_weight,
         )
 
     llm_provider = await _resolve_llm_provider(
@@ -792,6 +873,8 @@ async def _mix_state(
                 max_endpoints=16,
                 max_pairs=20,
                 query_tokens=subquery_tokens,
+                rel_types=rel_types,
+                dimension_weight=dimension_weight,
             )
         )
 
@@ -937,45 +1020,68 @@ async def graph_rag_query(
 
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
+    dimensions = _active_dimensions()
 
-    if effective_mode == "relationship-first":
-        state = await _relationship_first_state(
+    async def _build_state_for(rel_type: str | None) -> GraphQueryState:
+        kwargs = {
+            "rel_types": [rel_type] if rel_type else None,
+            "dimension_weight": _dimension_weight(rel_type),
+        }
+        if effective_mode == "relationship-first":
+            return await _relationship_first_state(
+                question,
+                collection,
+                entity_query_embedding,
+                relationship_query_embedding,
+                **kwargs,
+            )
+        if effective_mode == "mix":
+            return await _mix_state(
+                question,
+                collection,
+                namespace_id,
+                llm_profile_id,
+                embedding_provider,
+                entity_query_embedding,
+                relationship_query_embedding,
+                **kwargs,
+            )
+        if effective_mode == "hybrid":
+            entity_state = await _entity_first_state(
+                question,
+                collection,
+                entity_query_embedding,
+                relationship_query_embedding,
+                **kwargs,
+            )
+            relationship_state = await _relationship_first_state(
+                question,
+                collection,
+                entity_query_embedding,
+                relationship_query_embedding,
+                **kwargs,
+            )
+            return _merge_states(entity_state, relationship_state)
+        return await _entity_first_state(
             question,
             collection,
             entity_query_embedding,
             relationship_query_embedding,
+            **kwargs,
         )
-    elif effective_mode == "mix":
-        state = await _mix_state(
-            question,
-            collection,
-            namespace_id,
-            llm_profile_id,
-            embedding_provider,
-            entity_query_embedding,
-            relationship_query_embedding,
+
+    state = await _fan_out_per_dimension(_build_state_for, dimensions)
+    if state is None:
+        # No dimensions yielded any state — synthesize a minimal empty
+        # state so the context assembler still returns a structured
+        # QueryResult.
+        state = GraphQueryState(
+            discovered_entity_ids=set(),
+            entity_relevance={},
+            traversed_rel_ids=[],
+            rel_score_cache={},
         )
-    elif effective_mode == "hybrid":
-        entity_state = await _entity_first_state(
-            question,
-            collection,
-            entity_query_embedding,
-            relationship_query_embedding,
-        )
-        relationship_state = await _relationship_first_state(
-            question,
-            collection,
-            entity_query_embedding,
-            relationship_query_embedding,
-        )
-        state = _merge_states(entity_state, relationship_state)
-    else:
-        state = await _entity_first_state(
-            question,
-            collection,
-            entity_query_embedding,
-            relationship_query_embedding,
-        )
+    if effective_mode not in ("relationship-first", "mix", "hybrid"):
         effective_mode = "entity-first"
 
     context, entities_used, relationships_used, rel_context = await _build_context(

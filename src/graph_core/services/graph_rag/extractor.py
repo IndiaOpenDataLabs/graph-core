@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from graph_core.llm.interface import LLMProvider
+from graph_core.models.rel_types import (
+    DEFAULT_REL_TYPE,
+    normalize_rel_type,
+    rel_types_for_domain,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,7 @@ class ExtractedRelationship:
     description: str
     keywords: list[str]
     weight: float
+    rel_type: str = DEFAULT_REL_TYPE
 
 
 @dataclass
@@ -66,6 +72,7 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
                         "items": {"type": "string"},
                     },
                     "weight": {"type": "number"},
+                    "rel_type": {"type": "string"},
                 },
                 "required": ["source", "target", "description"],
             },
@@ -92,7 +99,7 @@ entities and relationships from input text.
 2. Relationship extraction:
    - Identify direct relationships between extracted entities.
    - For N-ary relationships, decompose them into binary pairs.
-   - For each relationship, extract: source, target, description, keywords, weight.
+   - For each relationship, extract: source, target, description, keywords, weight, rel_type.
    - Relationship descriptions must explain the nature of the
      connection, the context in which it holds, and why it matters.
    - Treat relationships as undirected unless the text clearly indicates direction.
@@ -101,9 +108,11 @@ entities and relationships from input text.
 3. Output requirements:
    - Return structured JSON with two arrays: "entities" and "relationships".
    - Each entity must have: name, type, description.
-   - Each relationship must have: source, target, description, keywords, weight.
+   - Each relationship must have: source, target, description, keywords, weight, rel_type.
    - "keywords" should be a compact list of relevant terms.
    - "weight" should be a float between 0 and 1 representing confidence or salience.
+   - "rel_type" must be one of: {rel_type_vocab}. Pick the single best fit. Use
+     "RELATES_TO" only if none of the specific types apply.
    - Use third-person phrasing and avoid pronouns where possible.
    - Only extract entities and relationships explicitly supported by the text.
 """
@@ -170,17 +179,25 @@ class LLMGraphExtractor:
         return normalized
 
     @staticmethod
-    def _build_extraction_prompt(text: str, entity_types: str) -> str:
+    def _build_extraction_prompt(
+        text: str, entity_types: str, rel_type_vocab: list[str]
+    ) -> str:
         return (
-            _EXTRACTION_SYSTEM_PROMPT.format(entity_types=entity_types)
+            _EXTRACTION_SYSTEM_PROMPT.format(
+                entity_types=entity_types, rel_type_vocab=", ".join(rel_type_vocab)
+            )
             + "\n\n"
             + _EXTRACTION_USER_PROMPT.format(text=text)
         )
 
     @staticmethod
-    def _build_gleaning_prompt(text: str, entity_types: str, existing_info: str) -> str:
+    def _build_gleaning_prompt(
+        text: str, entity_types: str, existing_info: str, rel_type_vocab: list[str]
+    ) -> str:
         return (
-            _GLEANING_SYSTEM_PROMPT.format(entity_types=entity_types)
+            _GLEANING_SYSTEM_PROMPT.format(
+                entity_types=entity_types, rel_type_vocab=", ".join(rel_type_vocab)
+            )
             + "\n\n"
             + _GLEANING_USER_PROMPT.format(existing_info=existing_info, text=text)
         )
@@ -189,6 +206,7 @@ class LLMGraphExtractor:
         self,
         text: str,
         entity_types: list[str] | None = None,
+        domain: str | None = None,
     ) -> ExtractionResult:
         content_hash = hashlib.md5(text.encode()).hexdigest()
         if content_hash in self._cache:
@@ -196,7 +214,10 @@ class LLMGraphExtractor:
             return self._cache[content_hash]
 
         types_str = ", ".join(entity_types) if entity_types else "general"
-        prompt = self._build_extraction_prompt(text=text, entity_types=types_str)
+        rel_vocab = rel_types_for_domain(domain)
+        prompt = self._build_extraction_prompt(
+            text=text, entity_types=types_str, rel_type_vocab=rel_vocab
+        )
 
         try:
             result = await self._llm.structured_extract(
@@ -243,12 +264,15 @@ class LLMGraphExtractor:
                 except (ValueError, TypeError):
                     weight = 1.0
 
+                rel_type = normalize_rel_type(rel.get("rel_type"))
+
                 relationships.append(ExtractedRelationship(
                     source_name=source,
                     target_name=target,
                     description=rel.get("description", ""),
                     keywords=keywords_str if isinstance(keywords_str, list) else [],
                     weight=weight,
+                    rel_type=rel_type,
                 ))
 
         extraction_result = ExtractionResult(
@@ -269,14 +293,16 @@ class LLMGraphExtractor:
         text: str,
         entity_types: list[str] | None = None,
         max_gleaning: int = 1,
+        domain: str | None = None,
     ) -> ExtractionResult:
-        result = await self.extract(text, entity_types)
+        result = await self.extract(text, entity_types, domain=domain)
         current_entities = list(result.entities)
         current_relationships = list(result.relationships)
 
         if not current_entities and not current_relationships:
             return result
 
+        rel_vocab = rel_types_for_domain(domain)
         for gleaning_pass in range(max_gleaning):
             existing_info = "Already extracted:\n"
             existing_info += (
@@ -285,7 +311,8 @@ class LLMGraphExtractor:
                 + "\n"
             )
             existing_info += "Relationships: " + ", ".join(
-                f"{r.source_name} -> {r.target_name}" for r in current_relationships
+                f"{r.source_name} -[{r.rel_type}]-> {r.target_name}"
+                for r in current_relationships
             )
 
             types_str = ", ".join(entity_types) if entity_types else "general"
@@ -293,6 +320,7 @@ class LLMGraphExtractor:
                 text=text,
                 entity_types=types_str,
                 existing_info=existing_info,
+                rel_type_vocab=rel_vocab,
             )
 
             try:
@@ -335,17 +363,19 @@ class LLMGraphExtractor:
                     except (ValueError, TypeError):
                         weight = 1.0
 
+                    rel_type = normalize_rel_type(rel.get("rel_type"))
                     current_relationships.append(ExtractedRelationship(
                         source_name=source,
                         target_name=target,
                         description=rel.get("description", ""),
                         keywords=keywords_str if isinstance(keywords_str, list) else [],
                         weight=weight,
+                        rel_type=rel_type,
                     ))
 
             current_relationships = list(
                 {
-                    f"{r.source_name}__{r.target_name}": r
+                    (r.source_name, r.target_name, r.rel_type): r
                     for r in current_relationships
                 }.values()
             )

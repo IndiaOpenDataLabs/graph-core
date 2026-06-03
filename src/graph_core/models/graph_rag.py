@@ -162,6 +162,7 @@ class GraphRelationship(Base):
     )
     weight = Column(Integer, default=1)
     keywords = Column(JSON, nullable=True)
+    rel_type = Column(String(64), nullable=False, default="RELATES_TO", index=True)
     collection_id = Column(
         UUIDType(as_uuid=True),
         ForeignKey("collections.id", ondelete="CASCADE"),
@@ -184,10 +185,19 @@ class GraphRelationship(Base):
 
     __table_args__ = (
         Index("ix_graph_relationships_source_target", "source_entity_id", "target_entity_id"),
+        Index(
+            "ix_graph_relationships_source_target_type",
+            "source_entity_id",
+            "target_entity_id",
+            "rel_type",
+        ),
     )
 
     def __repr__(self) -> str:
-        return f"<GraphRelationship {self.source_entity_id} -> {self.target_entity_id}>"
+        return (
+            f"<GraphRelationship {self.source_entity_id} "
+            f"-[{self.rel_type}]-> {self.target_entity_id}>"
+        )
 
 
 class RelationshipDescription(Base):

@@ -15,6 +15,10 @@ from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
 from graph_core.models.profile import Profile
 from graph_core.services.crypto import CredentialCrypto
+from graph_core.services.graph.query.graph_rag import (
+    _active_dimensions,
+    _dimension_weight,
+)
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.vector_tables import table_name
@@ -288,19 +292,46 @@ async def _lightrag_query_local(
 
     relationships: list[dict[str, Any]] = []
     rel_ids_seen: set[str] = set()
+    active_dimensions = _active_dimensions()
     for entity in entities:
         name = entity.get("name", "")
         if not name:
             continue
         try:
-            edges = await graph_storage.get_lightrag_node_edges(name, collection_id_str)
-            for src, tgt in edges:
-                edge_data = await graph_storage.get_lightrag_edge(src, tgt, collection_id_str)
-                if edge_data:
-                    edge_id = edge_data.get("id", f"{src}__{tgt}")
-                    if edge_id not in rel_ids_seen:
-                        rel_ids_seen.add(edge_id)
-                        relationships.append(edge_data)
+            if active_dimensions:
+                seen_pairs: set[tuple[str, str]] = set()
+                for rel_type in active_dimensions:
+                    edges = await graph_storage.get_lightrag_node_edges(
+                        name,
+                        collection_id_str,
+                        rel_types=[rel_type],
+                    )
+                    for src, tgt in edges:
+                        key = (src, tgt)
+                        if key in seen_pairs:
+                            continue
+                        seen_pairs.add(key)
+                        edge_data = await graph_storage.get_lightrag_edge(
+                            src, tgt, collection_id_str, rel_types=[rel_type],
+                        )
+                        if edge_data:
+                            edge_id = edge_data.get("id", f"{src}__{tgt}")
+                            if edge_id not in rel_ids_seen:
+                                rel_ids_seen.add(edge_id)
+                                relationships.append(edge_data)
+            else:
+                edges = await graph_storage.get_lightrag_node_edges(
+                    name, collection_id_str,
+                )
+                for src, tgt in edges:
+                    edge_data = await graph_storage.get_lightrag_edge(
+                        src, tgt, collection_id_str,
+                    )
+                    if edge_data:
+                        edge_id = edge_data.get("id", f"{src}__{tgt}")
+                        if edge_id not in rel_ids_seen:
+                            rel_ids_seen.add(edge_id)
+                            relationships.append(edge_data)
         except Exception:
             continue
 
@@ -378,18 +409,33 @@ async def _lightrag_query_global(
     rel_ids: list[str] = []
     graph_storage = get_graph_storage(collection.id)
     collection_id_str = str(collection.id)
+    active_dimensions = _active_dimensions()
 
     for hit in rel_hits:
         meta = hit.metadata
         src_name = meta.get("source_name", "")
         tgt_name = meta.get("target_name", "")
-        if src_name and tgt_name:
-            rel_id = f"{src_name}__{tgt_name}"
-            if rel_id not in rel_ids:
-                rel_ids.append(rel_id)
-                edge = await graph_storage.get_lightrag_edge(src_name, tgt_name, collection_id_str)
-                if edge:
-                    relationships.append(edge)
+        if not (src_name and tgt_name):
+            continue
+        rel_id = f"{src_name}__{tgt_name}"
+        if rel_id in rel_ids:
+            continue
+        edge = None
+        if active_dimensions:
+            for rel_type in active_dimensions:
+                candidate = await graph_storage.get_lightrag_edge(
+                    src_name, tgt_name, collection_id_str, rel_types=[rel_type],
+                )
+                if candidate:
+                    edge = candidate
+                    break
+        else:
+            edge = await graph_storage.get_lightrag_edge(
+                src_name, tgt_name, collection_id_str,
+            )
+        if edge:
+            rel_ids.append(rel_id)
+            relationships.append(edge)
 
     entity_ids_set: set[str] = set()
     entities: list[dict[str, Any]] = []
