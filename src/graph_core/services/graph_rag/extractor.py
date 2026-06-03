@@ -115,8 +115,10 @@ entities and relationships from input text.
    - Each relationship must have: source, target, description, keywords, weight, rel_type.
    - "keywords" should be a compact list of relevant terms.
    - "weight" should be a float between 0 and 1 representing confidence or salience.
-   - "rel_type" must be a list with one or more entries drawn from:
-     {rel_type_vocab}. Emit one entry per distinct semantic role the
+   - "rel_type" must be a list with one or more entries drawn EXACTLY
+     from: {rel_type_vocab}. Do not invent new rel_types — any value
+     outside this list will be rejected and the edge will fall back
+     to "RELATES_TO". Emit one entry per distinct semantic role the
      text supports for this pair (e.g. ["EXPLAINS",
      "IS_AN_EXAMPLE_OF"] if the same pair is both an explanation and
      an example). Use "RELATES_TO" only when nothing more specific
@@ -153,9 +155,11 @@ formatted entities and relationships.
 4. Keep naming consistent with the previously extracted entities.
 5. Relationship descriptions must still explain the nature, context,
    and significance of the connection.
-6. Each relationship's "rel_type" must be one of: {rel_type_vocab}.
-   Pick the single best fit; use "RELATES_TO" only if none of the
-   specific types apply.
+6. Each relationship's "rel_type" must be drawn EXACTLY from:
+   {rel_type_vocab}. Do not invent new rel_types — any value
+   outside this list will be rejected and the edge will fall back
+   to "RELATES_TO". Pick the best fit; use "RELATES_TO" only if none
+   of the specific types apply.
 7. Return only new or corrected items in the same JSON structure as
    the main extraction.
 8. Only include items explicitly supported by the text.
@@ -190,11 +194,20 @@ class LLMGraphExtractor:
         return normalized
 
     @staticmethod
-    def _coerce_rel_types(value: Any) -> list[str]:
+    def _coerce_rel_types(
+        value: Any, vocab: list[str] | None = None,
+    ) -> list[str]:
         """Accept either a list of rel_types (preferred) or a single
         string (back-compat) and return a de-duplicated list of
-        normalized values. Falls back to ``[DEFAULT_REL_TYPE]`` for
-        empty/missing input.
+        normalized values.
+
+        Each candidate is first normalized (uppercase, snake_case,
+        alpha-leading) and then validated against the active domain
+        vocab when one is supplied. Anything not in the vocab is
+        rejected with a warning and falls back to ``DEFAULT_REL_TYPE``
+        so the LLM can never silently introduce a new dimension.
+
+        Falls back to ``[DEFAULT_REL_TYPE]`` for empty/missing input.
         """
         if value is None:
             return [DEFAULT_REL_TYPE]
@@ -204,10 +217,19 @@ class LLMGraphExtractor:
             candidates = [v for v in value if isinstance(v, str) and v]
         else:
             candidates = [str(value)]
-        normalized = []
+        vocab_set = {v.upper() for v in vocab} if vocab else None
+        normalized: list[str] = []
         seen: set[str] = set()
         for raw in candidates:
             n = normalize_rel_type(raw)
+            if vocab_set is not None and n not in vocab_set:
+                logger.warning(
+                    "LLM emitted rel_type=%r not in active domain vocab; "
+                    "falling back to %s. Add it to DOMAIN_VOCAB if intentional.",
+                    raw,
+                    DEFAULT_REL_TYPE,
+                )
+                n = DEFAULT_REL_TYPE
             if n not in seen:
                 seen.add(n)
                 normalized.append(n)
@@ -301,7 +323,7 @@ class LLMGraphExtractor:
                 weight = 1.0
             description = rel.get("description", "")
             keywords_list = keywords_str if isinstance(keywords_str, list) else []
-            for rel_type in self._coerce_rel_types(rel.get("rel_type")):
+            for rel_type in self._coerce_rel_types(rel.get("rel_type"), vocab=rel_vocab):
                 relationships.append(ExtractedRelationship(
                     source_name=source,
                     target_name=target,
@@ -401,7 +423,7 @@ class LLMGraphExtractor:
                     weight = 1.0
                 description = rel.get("description", "")
                 keywords_list = keywords_str if isinstance(keywords_str, list) else []
-                for rel_type in self._coerce_rel_types(rel.get("rel_type")):
+                for rel_type in self._coerce_rel_types(rel.get("rel_type"), vocab=rel_vocab):
                     current_relationships.append(ExtractedRelationship(
                         source_name=source,
                         target_name=target,
