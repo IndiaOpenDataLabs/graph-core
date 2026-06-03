@@ -953,10 +953,13 @@ async def _build_context(
             )
             descs = descs_result.scalars().all()
             sim = state.rel_score_cache.get(rel_id_str, 0.0)
+            rel_type = rel.rel_type or "RELATES_TO"
             for description in descs:
-                rel_text = f"{src_name} -> {tgt_name}: {description.description}"
+                rel_text = (
+                    f"{src_name} -[{rel_type}]-> {tgt_name}: {description.description}"
+                )
                 rel_context_parts.append((sim, rel_text))
-                relationships_used.append(f"{src_name} -> {tgt_name}")
+                relationships_used.append(f"{src_name} -[{rel_type}]-> {tgt_name}")
 
     rel_context_parts.sort(key=lambda item: item[0], reverse=True)
     entity_context = "\n".join(entity_context_parts)
@@ -995,6 +998,11 @@ async def _answer_from_context(
                 "Write in natural prose. If the context is insufficient "
                 "for part of the "
                 "question, acknowledge it briefly without making it the focus."
+                "\n\nThe Relationships section lists each edge in the form"
+                " 'SRC -[REL_TYPE]-> TGT: description'. REL_TYPE is the"
+                " semantic role of the edge (e.g. EXPLAINS, CAUSES, IS_AN_EXAMPLE_OF);"
+                " the same SRC and TGT may appear with several different"
+                " REL_TYPEs and each one carries a separate meaning."
             ),
         },
         {

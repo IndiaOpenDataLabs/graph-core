@@ -155,6 +155,32 @@ async def lightrag_query(
         )
 
 
+def _format_lightrag_relationship(edge: dict[str, Any]) -> str:
+    """Render a LightRAG edge for the answer-LLM context, exposing the
+    rel_type explicitly so the per-dim distinction is visible.
+
+    LightRAG stores the edge id as ``f"{source_name}__{target_name}"``;
+    we split it back so the answer LLM can see the named endpoints and
+    the rel_type that connects them.
+    """
+    edge_id = edge.get("id", "?")
+    src, _, tgt = edge_id.partition("__")
+    rel_type = edge.get("rel_type") or "RELATES_TO"
+    description = edge.get("description", "")
+    if not tgt:
+        return f"{edge_id} -[{rel_type}]-> ?: {description}"
+    return f"{src} -[{rel_type}]-> {tgt}: {description}"
+
+
+def _format_lightrag_relationship_id(edge: dict[str, Any]) -> str:
+    edge_id = edge.get("id", "")
+    rel_type = edge.get("rel_type") or "RELATES_TO"
+    src, _, tgt = edge_id.partition("__")
+    if not tgt:
+        return f"{edge_id} -[{rel_type}]-> ?"
+    return f"{src} -[{rel_type}]-> {tgt}"
+
+
 async def extract_keywords(
     query: str, llm_provider: LLMProvider
 ) -> tuple[list[str], list[str]]:
@@ -350,8 +376,8 @@ async def _lightrag_query_local(
     )
 
     rel_context, rels_used = _build_budgeted_context(
-        [f"{r.get('id', '?')}: {r.get('description', '')}" for r in relationships],
-        [r.get("id", "") for r in relationships],
+        [_format_lightrag_relationship(r) for r in relationships],
+        [_format_lightrag_relationship_id(r) for r in relationships],
         8000,
     )
 
@@ -456,8 +482,8 @@ async def _lightrag_query_global(
     chunks = await _get_chunks_by_hashes(collection.id, list(chunk_ids))
 
     rel_context, rels_used = _build_budgeted_context(
-        [f"{r.get('id', '?')}: {r.get('description', '')}" for r in relationships],
-        [r.get("id", "") for r in relationships],
+        [_format_lightrag_relationship(r) for r in relationships],
+        [_format_lightrag_relationship_id(r) for r in relationships],
         8000,
     )
 
