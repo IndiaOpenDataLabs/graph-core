@@ -7,6 +7,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from itertools import combinations
+from typing import Any
 
 from sqlalchemy import or_, select
 
@@ -166,6 +167,10 @@ def _extract_query_keywords(question: str) -> list[str]:
     return list(dict.fromkeys([question] + keywords))
 
 
+def _query_token_set(question: str) -> set[str]:
+    return {w.lower() for w in _extract_query_keywords(question)}
+
+
 async def _search_entity_seeds(
     question: str,
     collection: Collection,
@@ -279,6 +284,36 @@ async def _score_relationship(
     return score
 
 
+def _combined_edge_score(
+    cos: float,
+    edge_props: dict[str, Any] | None,
+    query_tokens: set[str],
+) -> float:
+    weight_ratio = settings.graph_rag_edge_weight_score_ratio
+    keyword_ratio = settings.graph_rag_keyword_score_ratio
+    if not edge_props:
+        return cos
+    raw_weight = edge_props.get("weight")
+    try:
+        weight_norm = min(int(raw_weight or 0), 100) / 100.0
+    except (TypeError, ValueError):
+        weight_norm = 0.0
+    kws = edge_props.get("keywords") or []
+    if not isinstance(kws, list):
+        kws = []
+    if kws and query_tokens:
+        norm_kws = [str(k).lower().strip() for k in kws if str(k).strip()]
+        hits = sum(1 for k in norm_kws if k in query_tokens)
+        kw_norm = hits / len(norm_kws)
+    else:
+        kw_norm = 0.0
+    return (
+        (1.0 - weight_ratio - keyword_ratio) * cos
+        + weight_ratio * weight_norm
+        + keyword_ratio * kw_norm
+    )
+
+
 async def _entity_first_state(
     question: str,
     collection: Collection,
@@ -289,6 +324,7 @@ async def _entity_first_state(
     min_edge_sim = settings.graph_rag_min_edge_similarity
     energy_budget = 7.0
     max_depth = 8
+    query_tokens = _query_token_set(question)
 
     seed_entity_ids, entity_relevance = await _search_entity_seeds(
         question,
@@ -368,11 +404,12 @@ async def _entity_first_state(
                 rel_id_str,
                 rel_score_cache,
             )
-            if sim >= effective_min_edge_sim:
-                scored_edges.append((sim, neighbor, rel_id_str))
+            combined = _combined_edge_score(sim, edge_props, query_tokens)
+            if combined >= effective_min_edge_sim:
+                scored_edges.append((combined, neighbor, rel_id_str))
 
-        for sim, neighbor, rel_id_str in sorted(scored_edges, key=lambda x: x[0]):
-            cost = max(0.05, 1.0 - sim)
+        for combined, neighbor, rel_id_str in sorted(scored_edges, key=lambda x: x[0]):
+            cost = max(0.05, 1.0 - combined)
             if energy - cost <= 0:
                 continue
             energy -= cost
@@ -381,12 +418,11 @@ async def _entity_first_state(
             discovered_entity_ids.add(neighbor)
             if rel_id_str not in traversed_rel_ids:
                 traversed_rel_ids.append(rel_id_str)
-            edge_sim = 1.0 - cost
             if (
                 neighbor not in entity_relevance
-                or edge_sim > entity_relevance[neighbor]
+                or combined > entity_relevance[neighbor]
             ):
-                entity_relevance[neighbor] = edge_sim
+                entity_relevance[neighbor] = combined
 
     return GraphQueryState(
         discovered_entity_ids=discovered_entity_ids,
@@ -406,10 +442,13 @@ async def _find_relevant_path(
     *,
     max_depth: int = 3,
     beam_width: int = 4,
+    query_tokens: set[str] | None = None,
 ) -> tuple[list[str], list[str]] | None:
     queue: deque[tuple[str, list[str], list[str], int]] = deque(
         [(source_id, [source_id], [], 0)]
     )
+    if query_tokens is None:
+        query_tokens = set()
 
     while queue:
         node_id, path_nodes, path_rels, depth = queue.popleft()
@@ -436,7 +475,8 @@ async def _find_relevant_path(
                 rel_id,
                 rel_score_cache,
             )
-            candidates.append((sim, neighbor, rel_id))
+            combined = _combined_edge_score(sim, edge_props, query_tokens)
+            candidates.append((combined, neighbor, rel_id))
 
         for _, neighbor, rel_id in sorted(candidates, reverse=True)[:beam_width]:
             next_nodes = path_nodes + [neighbor]
@@ -455,29 +495,41 @@ async def _relationship_seed_state(
     top_k: int = 10,
     max_endpoints: int = 20,
     max_pairs: int = 30,
+    query_tokens: set[str] | None = None,
 ) -> GraphQueryState:
     rel_seeds = await _search_relationship_seeds(
         collection,
         relationship_query_embedding,
         top_k=top_k,
     )
+    if query_tokens is None:
+        query_tokens = set()
 
     traversed_rel_ids: list[str] = []
     rel_score_cache: dict[str, float] = {}
     discovered_entity_ids: set[str] = set()
     entity_relevance: dict[str, float] = {}
+    graph_storage = get_graph_storage(collection.id)
 
     async with AsyncSessionLocal() as session:
         for rel_id_str, sim in rel_seeds[:top_k]:
             rel = await session.get(GraphRelationship, uuid.UUID(rel_id_str))
             if not rel:
                 continue
+            edge_props = await graph_storage.get_edge(
+                str(rel.source_entity_id), str(rel.target_entity_id)
+            )
+            if edge_props is None:
+                edge_props = await graph_storage.get_edge(
+                    str(rel.target_entity_id), str(rel.source_entity_id)
+                )
+            combined = _combined_edge_score(sim, edge_props, query_tokens)
             traversed_rel_ids.append(rel_id_str)
-            rel_score_cache[rel_id_str] = sim
+            rel_score_cache[rel_id_str] = combined
             for eid in (str(rel.source_entity_id), str(rel.target_entity_id)):
                 discovered_entity_ids.add(eid)
-                if eid not in entity_relevance or sim > entity_relevance[eid]:
-                    entity_relevance[eid] = sim
+                if eid not in entity_relevance or combined > entity_relevance[eid]:
+                    entity_relevance[eid] = combined
 
     endpoint_ids = sorted(
         discovered_entity_ids,
@@ -485,7 +537,6 @@ async def _relationship_seed_state(
         reverse=True,
     )[:max_endpoints]
 
-    graph_storage = get_graph_storage(collection.id)
     pair_count = 0
     for source_id, target_id in combinations(endpoint_ids, 2):
         if pair_count >= max_pairs:
@@ -498,6 +549,7 @@ async def _relationship_seed_state(
             source_id,
             target_id,
             rel_score_cache,
+            query_tokens=query_tokens,
         )
         if not path:
             continue
@@ -527,12 +579,14 @@ async def _relationship_first_state(
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
 ) -> GraphQueryState:
+    query_tokens = _query_token_set(question)
     state = await _relationship_seed_state(
         collection,
         relationship_query_embedding,
         top_k=10,
         max_endpoints=20,
         max_pairs=30,
+        query_tokens=query_tokens,
     )
 
     seed_entity_ids, seed_scores = await _search_entity_seeds(
@@ -700,6 +754,7 @@ async def _mix_state(
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
 ) -> GraphQueryState:
+    query_tokens = _query_token_set(question)
     candidates = await _top_entity_candidates(
         collection,
         entity_query_embedding,
@@ -713,6 +768,7 @@ async def _mix_state(
             top_k=10,
             max_endpoints=20,
             max_pairs=30,
+            query_tokens=query_tokens,
         )
 
     llm_provider = await _resolve_llm_provider(
@@ -727,6 +783,7 @@ async def _mix_state(
             embedding_provider,
             subquery,
         )
+        subquery_tokens = query_tokens | _query_token_set(subquery)
         states.append(
             await _relationship_seed_state(
                 collection,
@@ -734,6 +791,7 @@ async def _mix_state(
                 top_k=8,
                 max_endpoints=16,
                 max_pairs=20,
+                query_tokens=subquery_tokens,
             )
         )
 

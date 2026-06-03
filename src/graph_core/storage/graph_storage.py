@@ -156,6 +156,63 @@ class FalkorDBGraphStorage:
             "     r.keywords = edge.keywords, r.collection_id = edge.collection_id",
             {"edges": payload},
         )
+        await self._merge_keywords_for_edges(
+            [(e["source_id"], e["target_id"], e.get("keywords") or []) for e in edges]
+        )
+
+    async def _merge_keywords_for_edges(
+        self, edge_keyword_inputs: list[tuple[str, str, list[str]]]
+    ) -> None:
+        if not edge_keyword_inputs:
+            return
+        graph = await self._get_graph()
+        updates: list[dict[str, Any]] = []
+        for source_id, target_id, incoming in edge_keyword_inputs:
+            existing = await self.get_edge(source_id, target_id)
+            if existing is None:
+                existing = await self.get_edge(target_id, source_id)
+            if not existing:
+                continue
+            existing_kws = existing.get("keywords") or []
+            if isinstance(existing_kws, str):
+                try:
+                    existing_kws = json.loads(existing_kws)
+                except (json.JSONDecodeError, TypeError):
+                    existing_kws = []
+            incoming_clean = [
+                str(k).strip() for k in (incoming or []) if str(k).strip()
+            ]
+            merged: list[str] = []
+            seen: set[str] = set()
+            for k in list(existing_kws) + incoming_clean:
+                key = k.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(k)
+            if merged != list(existing_kws or []):
+                updates.append(
+                    {
+                        "source_id": source_id,
+                        "target_id": target_id,
+                        "keywords": json.dumps(merged),
+                    }
+                )
+        if not updates:
+            return
+        await graph.query(
+            "UNWIND $updates AS u"
+            " MATCH (a:Entity {id: u.source_id})-[r:RELATES_TO]->(b:Entity {id: u.target_id})"
+            " SET r.keywords = u.keywords",
+            {"updates": updates},
+        )
+        await graph.query(
+            "UNWIND $updates AS u"
+            " MATCH (a:Entity {id: u.target_id})-[r:RELATES_TO]->(b:Entity {id: u.source_id})"
+            " WHERE NOT EXISTS { (a)-[:RELATES_TO {keywords: u.keywords}]->(b) }"
+            " SET r.keywords = u.keywords",
+            {"updates": updates},
+        )
 
     async def upsert_node(self, node_id: str, properties: dict[str, Any]) -> None:
         graph = await self._get_graph()
@@ -228,6 +285,12 @@ class FalkorDBGraphStorage:
             )
 
         await graph.query(query, params)
+
+        incoming_keywords = properties.get("keywords")
+        if incoming_keywords is not None:
+            await self._merge_keywords_for_edges(
+                [(source_id, target_id, list(incoming_keywords) if not isinstance(incoming_keywords, list) else incoming_keywords)]
+            )
 
     async def get_nodes_by_source_message_id(
         self,
@@ -364,6 +427,41 @@ class FalkorDBGraphStorage:
                 "source_ids": json.dumps(source_ids) if isinstance(source_ids, list) else (source_ids or "[]"),
             },
         )
+
+        existing = await self.get_lightrag_edge(source_name, target_name, collection_id)
+        if existing is None:
+            existing = await self.get_lightrag_edge(target_name, source_name, collection_id)
+        if existing:
+            existing_kws = existing.get("keywords") or []
+            if isinstance(existing_kws, str):
+                try:
+                    existing_kws = json.loads(existing_kws)
+                except (json.JSONDecodeError, TypeError):
+                    existing_kws = []
+            incoming_clean = [
+                str(k).strip() for k in (keywords or []) if str(k).strip()
+            ]
+            merged: list[str] = []
+            seen: set[str] = set()
+            for k in list(existing_kws) + incoming_clean:
+                key = k.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(k)
+            if merged != list(existing_kws or []):
+                await graph.query(
+                    "MATCH (a:Entity {id: $source_name, collection_id: $collection_id})"
+                    "-[r:RELATES_TO]->"
+                    "(b:Entity {id: $target_name, collection_id: $collection_id})"
+                    " SET r.keywords = $keywords",
+                    {
+                        "source_name": source_name,
+                        "target_name": target_name,
+                        "collection_id": collection_id,
+                        "keywords": json.dumps(merged),
+                    },
+                )
 
     async def get_lightrag_node_edges(
         self, node_name: str, collection_id: str
