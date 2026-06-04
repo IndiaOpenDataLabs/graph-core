@@ -900,6 +900,7 @@ class ConsoleScreen(Screen):
         "media",
         "public",
         ".egg-info",
+        "tests",
     }
     INGEST_NOISE_FILE_NAMES = {
         "readme.md",
