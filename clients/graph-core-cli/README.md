@@ -84,6 +84,7 @@ Keyboard behavior:
 - `/collection create`
 - `/collection edit <collection>`
 - `/collection delete <collection>`
+- `/enhance <collection>`
 
 The create/edit flows open guided forms with:
 - name
@@ -104,15 +105,34 @@ Supported default query modes:
 - `naive`
 - `mix`
 
+`/enhance <collection>` rebuilds the collection's derived understanding graph
+from the current base graph and persists the updated summaries.
+
 ### Ingestion
 
 - `/ingest chunk <collection> "<text>"`
 - `/ingest file <collection> @<path>`
+- `/ingest dir <collection> @<path>`
 
 Notes:
 - `chunk` is synchronous
 - `file` is asynchronous and returns a `job_id`
+- `dir` walks the directory recursively and enqueues one document-ingest job per file
 - `@` triggers file autocomplete in the repo/workspace
+
+Directory ingest behavior:
+
+- uses the provided directory as the walk root
+- reads `.gitignore` and `.dockerignore` from that directory if present
+- excludes matching files and directories before enqueueing
+- also skips common local/cache directories such as:
+  - `.git`
+  - `.venv`
+  - `node_modules`
+  - `__pycache__`
+
+The ignore handling is practical rather than a complete Git-spec parser, but it
+covers the common project patterns.
 
 ### Query
 
@@ -154,6 +174,7 @@ Typing `@` suggests files from the workspace. This is especially useful for:
 
 ```text
 /ingest file coll1 @docs/large-document.txt
+/ingest dir coll1 @src/
 ```
 
 Autocomplete is intentionally lightweight today:

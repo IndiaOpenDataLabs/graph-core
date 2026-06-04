@@ -153,6 +153,7 @@ Current top-level commands:
 - `/namespace ...`
 - `/profile ...`
 - `/collection ...`
+- `/enhance ...`
 - `/ingest ...`
 - `/query ...`
 - `/jobs ...`
@@ -213,6 +214,15 @@ This is intentional:
 
 Do not revert this to passing raw file paths through to the backend.
 
+`/ingest dir ...` is also intentionally CLI-local:
+- directory walking happens on the host
+- `.gitignore` / `.dockerignore` are read from the provided directory root
+- matching files and directories are excluded before enqueueing
+- remaining files are sent one by one as normal `ingest_document` requests
+
+This keeps host-path semantics and ignore behavior in the client, where the
+paths actually exist.
+
 ## Job Tracking Pattern
 
 Async file/document ingestion returns a `job_id`.
@@ -226,6 +236,25 @@ The CLI supports:
 `ConsoleScreen` keeps `_last_job_id` so recent ingestion flows can do:
 - `/jobs show last`
 - `/jobs watch last`
+
+For `/ingest dir ...`, multiple jobs may be started, one per file.
+The CLI currently stores the most recent returned `job_id` in `_last_job_id`.
+
+## Enhance Pattern
+
+`/enhance <collection>` is a collection-scoped operation that rebuilds the
+derived understanding graph from the current canonical base graph.
+
+Design intent:
+- the CLI should not know how derived graphs are built
+- it should call a first-class collection operation through MCP
+- the backend owns:
+  - graph analysis
+  - derived summary generation
+  - derived Falkor graph persistence
+  - derived vector-summary persistence
+
+So `/enhance` belongs next to collection operations, not under ingest or jobs.
 
 ## Profile and Collection Patterns
 
