@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import string
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
