@@ -400,7 +400,7 @@ class FalkorDBGraphStorage:
         graph = await self._get_graph()
         result = await graph.query(
             """
-            MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+            MATCH (a:Entity)-[r]->(b:Entity)
             WHERE r.source_message_ids CONTAINS $message_id
             RETURN a.id, b.id, r
             """,
