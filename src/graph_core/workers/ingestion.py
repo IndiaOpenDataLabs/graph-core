@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 @dramatiq.actor(
+    queue_name="ingestion_control",
     max_retries=3,
-    max_age=3600000,
+    max_age=604800000,
     time_limit=float("inf"),
 )
 async def run_ingestion(job_id: str):
@@ -40,6 +41,7 @@ async def run_ingestion(job_id: str):
 
 
 @dramatiq.actor(
+    queue_name="ingestion_chunks",
     max_retries=3,
     max_age=settings.ingest_chunk_max_age_ms,
     time_limit=settings.ingest_chunk_time_limit_ms,
