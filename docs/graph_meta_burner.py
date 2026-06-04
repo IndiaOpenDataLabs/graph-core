@@ -58,6 +58,20 @@ QUESTION_TERMS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+REL_FAMILIES: dict[str, str] = {
+    "CALLS": "behavior",
+    "USES": "behavior",
+    "DEPENDS_ON": "behavior",
+    "REFERENCES": "behavior",
+    "IMPORTS": "behavior",
+    "DEFINES": "structure",
+    "EXTENDS": "structure",
+    "IMPLEMENTS": "structure",
+    "DOCUMENTS": "evidence",
+    "TESTS": "evidence",
+    "RELATES_TO": "generic",
+}
+
 
 def contains_any(text: str, terms: tuple[str, ...]) -> bool:
     lowered = text.lower()
@@ -71,6 +85,10 @@ def normalize(scores: dict[str, float]) -> dict[str, float]:
     if max_value <= 0.0:
         return {key: 0.0 for key in scores}
     return {key: float(value) / float(max_value) for key, value in scores.items()}
+
+
+def family_for_rel_type(rel_type: str) -> str:
+    return REL_FAMILIES.get(rel_type, "other")
 
 
 async def main() -> None:
@@ -183,6 +201,16 @@ async def main() -> None:
             float(entry["closeness"]), float(row.get("closeness", 0.0))
         )
 
+    bridge_rows = sorted(
+        bridge_entities.values(),
+        key=lambda item: (
+            len(item["rel_types"]),
+            len(item["external_communities"]),
+            float(item["betweenness"]),
+        ),
+        reverse=True,
+    )
+
     connector_motifs: Counter[tuple[str, str]] = Counter()
     connector_examples: dict[tuple[str, str], list[str]] = defaultdict(list)
     for path in analysis.get("connector_paths", []):
@@ -203,6 +231,141 @@ async def main() -> None:
         if not contains_any(blob, terms):
             continue
         community_patterns[(str(community.get("rel_type") or "RELATES_TO"), int(community.get("size") or 0))] += 1
+
+    meta_edges: list[dict[str, object]] = []
+    sorted_routes = sorted(
+        normalized_routes.items(), key=lambda item: item[1], reverse=True
+    )
+    primary_route = sorted_routes[0][0] if sorted_routes else "central"
+    if sorted_routes:
+        for rel_type, value in sorted(
+            normalized_rel_types.items(), key=lambda item: item[1], reverse=True
+        )[:5]:
+            meta_edges.append(
+                {
+                    "source": f"route:{primary_route}",
+                    "rel_type": "SUPPORTS",
+                    "target": f"rel_type:{rel_type}",
+                    "score": round(float(value), 6),
+                    "reason": "Top relation type aligned with the selected route.",
+                }
+            )
+        if len(sorted_routes) > 1 and (sorted_routes[0][1] - sorted_routes[1][1]) <= 0.2:
+            meta_edges.append(
+                {
+                    "source": f"route:{sorted_routes[1][0]}",
+                    "rel_type": "QUALIFIES",
+                    "target": f"route:{sorted_routes[0][0]}",
+                    "score": round(float(sorted_routes[1][1]), 6),
+                    "reason": "Secondary route score is close to the primary route.",
+                }
+            )
+
+    rel_rel = sorted(
+        normalized_rel_types.items(), key=lambda item: item[1], reverse=True
+    )
+    if rel_rel:
+        top_rel_type, top_rel_score = rel_rel[0]
+        if top_rel_type == "RELATES_TO" and top_rel_score >= 0.75:
+            meta_edges.append(
+                {
+                    "source": "rel_type:RELATES_TO",
+                    "rel_type": "LIMITS",
+                    "target": f"route:{primary_route}",
+                    "score": round(float(top_rel_score), 6),
+                    "reason": "Generic relationships dominate this slice, reducing interpretability.",
+                }
+            )
+        non_generic = [
+            (rel_type, score)
+            for rel_type, score in rel_rel
+            if family_for_rel_type(rel_type) != "generic"
+        ]
+        if non_generic:
+            top_non_generic_type, top_non_generic_score = non_generic[0]
+            if float(top_non_generic_score) >= 0.35:
+                meta_edges.append(
+                    {
+                        "source": f"rel_type:{top_non_generic_type}",
+                        "rel_type": "QUALIFIES",
+                        "target": f"route:{primary_route}",
+                        "score": round(float(top_non_generic_score), 6),
+                        "reason": "A strong non-generic relation family sharpens the otherwise broad route.",
+                    }
+                )
+        if len(non_generic) > 1:
+            a_rel, a_score = non_generic[0]
+            b_rel, b_score = non_generic[1]
+            if family_for_rel_type(a_rel) != family_for_rel_type(b_rel):
+                meta_edges.append(
+                    {
+                        "source": f"rel_type:{a_rel}",
+                        "rel_type": "DISTINGUISHES",
+                        "target": f"rel_type:{b_rel}",
+                        "score": round(min(float(a_score), float(b_score)), 6),
+                        "reason": "Top non-generic relation types come from different semantic families.",
+                    }
+                )
+            elif abs(float(a_score) - float(b_score)) <= 0.05:
+                meta_edges.append(
+                    {
+                        "source": f"rel_type:{a_rel}",
+                        "rel_type": "CONTRADICTS",
+                        "target": f"rel_type:{b_rel}",
+                        "score": round(min(float(a_score), float(b_score)), 6),
+                        "reason": "Top non-generic relation types compete with nearly equal weight but imply different interpretations.",
+                    }
+                )
+        if len(rel_rel) > 1:
+            a_rel, a_score = rel_rel[0]
+            b_rel, b_score = rel_rel[1]
+            if (
+                family_for_rel_type(a_rel) != family_for_rel_type(b_rel)
+                and family_for_rel_type(a_rel) != "generic"
+                and family_for_rel_type(b_rel) != "generic"
+            ):
+                meta_edges.append(
+                    {
+                        "source": f"rel_type:{a_rel}",
+                        "rel_type": "DISTINGUISHES",
+                        "target": f"rel_type:{b_rel}",
+                        "score": round(min(float(a_score), float(b_score)), 6),
+                        "reason": "Top relation types come from different semantic families.",
+                    }
+                )
+            elif abs(float(a_score) - float(b_score)) <= 0.05:
+                meta_edges.append(
+                    {
+                        "source": f"rel_type:{a_rel}",
+                        "rel_type": "CONTRADICTS",
+                        "target": f"rel_type:{b_rel}",
+                        "score": round(min(float(a_score), float(b_score)), 6),
+                        "reason": "Top relation types compete with nearly equal weight but imply different interpretations.",
+                    }
+                )
+
+    for row in bridge_rows[:5]:
+        if len(row["external_communities"]) >= 4 and float(row["betweenness"]) > 0.0:
+            meta_edges.append(
+                {
+                    "source": f"bridge:{row['name']}",
+                    "rel_type": "JUSTIFIES",
+                    "target": "route:bridge",
+                    "score": round(float(row["betweenness"]), 6),
+                    "reason": "Bridge entity connects many external communities.",
+                }
+            )
+
+    for (rel_type, motif), count in connector_motifs.most_common(5):
+        meta_edges.append(
+            {
+                "source": f"connector:{rel_type}:{motif}",
+                "rel_type": "SUPPORTS",
+                "target": f"route:{primary_route}",
+                "score": round(float(count), 6),
+                "reason": "Recurring connector motif reinforces the selected route.",
+            }
+        )
 
     print(f"collection={coll.name} id={coll.id}")
     print(f"question_type={args.question_type}")
@@ -250,15 +413,6 @@ async def main() -> None:
         )
 
     print("\n[bridge motifs]")
-    bridge_rows = sorted(
-        bridge_entities.values(),
-        key=lambda item: (
-            len(item["rel_types"]),
-            len(item["external_communities"]),
-            float(item["betweenness"]),
-        ),
-        reverse=True,
-    )
     for row in bridge_rows[:12]:
         print(
             {
@@ -284,6 +438,10 @@ async def main() -> None:
     print("\n[community patterns]")
     for (rel_type, size), count in community_patterns.most_common(12):
         print({"rel_type": rel_type, "size": size, "count": count})
+
+    print("\n[meta edges]")
+    for edge in meta_edges[:20]:
+        print(edge)
 
 
 if __name__ == "__main__":
