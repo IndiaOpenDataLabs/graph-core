@@ -22,9 +22,9 @@ It focuses on the current implementation in this repo, not an abstract design.
 
 2. **Derived graph**
    - higher-level summaries built from the base graph
-   - community summaries
-   - bridge-node summaries
-   - connector-path summaries
+   - typed community summaries
+   - typed bridge-node summaries
+   - directed typed connector-path summaries
    - separate FalkorDB graph plus derived summary vectors
 
 The base graph is the source of truth.
@@ -266,17 +266,26 @@ This is the layer that should eventually support more genuine â€œunderstandingâ€
 
 The first pass is structural analysis over the base graph.
 
-Current implementation:
+Current implementation is **rel-type-aware** and partly **direction-aware**:
 
-1. Build a weighted undirected projection of canonical relationships
-2. Compute strong-edge communities using `min_edge_strength`
-3. Merge very small communities into stronger neighbors
-4. Compute bridge nodes using:
+1. Split canonical relationships by `rel_type`
+2. For each `rel_type`:
+   - build a weighted undirected projection for community detection
+   - build a directed adjacency view for path and metric analysis
+3. Compute strong-edge communities using `min_edge_strength`
+4. Merge very small communities into stronger neighbors
+5. Compute per-node graph metrics for each `rel_type`:
+   - `PageRank`
+   - `HITS` authority / hub
+   - `eigenvector centrality`
+   - directed `betweenness`
+   - directed harmonic `closeness`
    - articulation behavior
    - cross-community connectivity
-   - weighted degree
-5. Select top anchors
-6. Build bounded connector paths between anchors
+   - inbound / outbound strength
+6. Select typed anchors and typed bridge nodes
+7. Build bounded **directed** connector paths between anchors for that `rel_type`
+8. Aggregate the per-type analyses into a collection-level summary
 
 This runs over canonical collection-level relationships, not chunk-local raw extractions.
 
@@ -284,10 +293,11 @@ This runs over canonical collection-level relationships, not chunk-local raw ext
 
 The analysis returns:
 
-- communities
-- top anchors
-- bridge nodes
-- connector paths
+- `rel_type`-specific communities
+- `rel_type`-specific node metrics
+- aggregated top anchors
+- aggregated bridge nodes
+- directed connector paths
 
 This is a structural view, not yet a natural-language summary layer.
 
@@ -337,8 +347,11 @@ So the derived layer is treated as canonical generated state, not append-only me
 
 ### Community summaries
 
-Each strong community becomes a summary node with text like:
+Each strong community becomes a summary node scoped to a specific `rel_type`.
 
+The summary includes:
+
+- `rel_type`
 - size
 - strong edge count
 - anchor preview
@@ -349,35 +362,78 @@ Each strong community becomes a summary node with text like:
 Each important bridge node becomes a derived summary node describing:
 
 - its community
+- the `rel_type`s in which it is important
 - which other communities it connects to
 - external connection strength
 - weighted degree
+- inbound / outbound strength
+- graph metrics such as:
+  - betweenness
+  - closeness
+  - hub score
+  - authority score
 
 ### Connector summaries
 
 Each bounded connector path becomes a derived summary node describing:
 
+- `rel_type`
 - start anchor
 - end anchor
 - hop count
 - path score
-- ordered flow of entities
+- directed flow of entities and edges
 
 ## How Queries Use the Derived Graph
 
 Derived graph usage is now integrated into `custom_graph_rag` query flow.
 
-### 1. Derived summary retrieval
+### 1. Initial base-graph retrieval
 
-At query time:
+At query time, the normal `custom_graph_rag` retrieval runs first:
 
-- the user question is embedded with a derived-retrieval instruction
-- vector search is run against collection chunks filtered by:
-  - `memory_type=derived_graph`
+- entity-first, relationship-first, hybrid, or mix
+- rel-type-aware graph traversal
+- combined relationship scoring using similarity, weight, keywords, and dimension weight
 
-This returns the most relevant derived summaries.
+This builds the initial matched graph footprint.
 
-### 2. Derived graph expansion
+### 2. Graph-grounded route profiling
+
+The matched footprint is then compared against offline graph metrics from the enhanced analysis.
+
+From the matched nodes, the query layer derives a route profile across:
+
+- `hub`
+- `authority`
+- `bridge`
+- `central`
+- `importance`
+
+This routing is **graph-grounded**, not keyword-routed:
+
+- it uses the metric profile of the actually matched nodes
+- it also tracks dominant matched `rel_type`s
+
+### 3. Route-aware derived summary retrieval
+
+The user question is embedded with a derived-retrieval instruction and vector search is run against collection chunks filtered by:
+
+- `memory_type=derived_graph`
+
+But the resulting derived summaries are no longer treated equally.
+They are reranked by:
+
+- route kind
+  - e.g. hub-like questions slightly prefer bridge/connector derived nodes
+  - authority-like questions slightly prefer community summaries
+  - bridge-like questions strongly prefer bridge/connector summaries
+  - central questions prefer connector/community summaries
+- matched `rel_type` profile
+
+So the derived layer is used differently depending on the graph shape of the query.
+
+### 4. Derived graph expansion
 
 For each matched derived summary:
 
@@ -388,14 +444,14 @@ For each matched derived summary:
   - linked target nodes
   - base graph provenance from `source_ids`
 
-### 3. Seeding base graph retrieval
+### 5. Seeding base graph retrieval
 
 Base entity IDs recovered from derived provenance are injected into the base graph query state as additional relevant entities.
 
 So the derived layer does not replace base retrieval.
 It nudges the base retrieval toward the right part of the graph.
 
-### 4. Final answer context
+### 6. Final answer context
 
 The final prompt now includes:
 
@@ -449,18 +505,26 @@ Later it can grow into:
 - failure modes
 - code-flow understanding
 
-### 2. Query integration is conservative
+### 2. Query routing is metric-aware, but still lightweight
 
-Current query usage is:
+Current query usage is stronger than before:
 
-- retrieve derived summaries
+- retrieve base graph footprint first
+- derive a metric-based route profile from matched nodes
+- rerank derived summaries by route kind and `rel_type`
 - expand one hop
 - seed base entity IDs
 - prepend derived understanding to the final prompt
 
-That is a safe first integration, but not the final form.
+This is better than uniform derived retrieval, but it is still lightweight.
 
-A later version can query the derived graph as a real routing layer first, then descend into selected base subgraphs more aggressively.
+It does **not** yet:
+
+- run full metric-specific traversal policies
+- construct different detailed subgraphs for hub vs authority vs bridge questions
+- use the derived graph as the primary planner for the entire retrieval path
+
+A later version can make routing more aggressive and subgraph-aware.
 
 ### 3. No background build pipeline yet
 
@@ -473,16 +537,35 @@ The base graph already merges entities and relationships across chunks, but true
 
 The derived graph is the beginning of that layer, not the end state.
 
+### 5. Sparse semantic analyses are still missing
+
+The current enhanced graph is best at structural architecture questions.
+
+It is still weaker on sparse semantic questions that need special edge families, such as:
+
+- exception redundancy
+- field write/read usage
+- auth gating
+- config propagation
+
+Those cases will require richer base graph edges such as:
+
+- `RAISES`
+- `CATCHES`
+- `READS`
+- `WRITES`
+- `GUARDS`
+
 ## Mental Model
 
 The simplest way to think about `custom_graph_rag` now is:
 
 - **base graph** = grounded extracted facts
-- **derived graph** = structural summaries of important regions and flows
+- **derived graph** = typed structural summaries and routing hints over important regions and flows
 
 Querying now uses both:
 
-- derived graph for guidance
+- derived graph for metric-aware guidance
 - base graph for evidence
 
 That is the current architecture. It is already more expressive than chunk-only retrieval, but it is still an intermediate step toward richer graph reasoning.
