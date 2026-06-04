@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import string
 import uuid
 from collections import defaultdict, deque
@@ -43,6 +44,7 @@ from graph_core.storage.vector_store import VectorStore
 _graph_rag_vectors = GraphRAGVectorStore()
 _vector_store = VectorStore()
 _crypto = CredentialCrypto()
+logger = logging.getLogger(__name__)
 _ENTITY_RETRIEVAL_INSTRUCTION = (
     "Retrieve ontology entities whose descriptions best explain the user's "
     "state, process, causal mechanism, or source of exhaustion."
@@ -1091,6 +1093,20 @@ async def _derive_route_profile(
         normalized_route_scores.items(),
         key=lambda item: item[1],
     )[0]
+    top_rel_types = sorted(
+        rel_type_scores.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:5]
+    logger.info(
+        "graph_rag route profile collection=%s primary_route=%s route_scores=%s rel_types=%s matched_entities=%d traversed_rels=%d",
+        collection.name,
+        primary_route,
+        normalized_route_scores,
+        top_rel_types,
+        len(state.discovered_entity_ids),
+        len(state.traversed_rel_ids),
+    )
     return DerivedRouteProfile(
         primary_route=primary_route,
         route_scores=normalized_route_scores,
@@ -1219,6 +1235,24 @@ async def _load_derived_context(
                         or score > base_entity_ids[maybe_uuid]
                     ):
                         base_entity_ids[maybe_uuid] = score
+
+    logger.info(
+        "graph_rag derived context collection=%s route=%s summaries=%d derived_nodes=%d derived_edges=%d base_entities=%d",
+        collection.name,
+        route_profile.primary_route,
+        len(summary_lines),
+        len(derived_nodes_used),
+        len(derived_edges_used),
+        len(base_entity_ids),
+    )
+    if derived_nodes_used:
+        logger.info(
+            "graph_rag derived touchpoints collection=%s derived_nodes=%s derived_edges=%s base_entity_ids=%s",
+            collection.name,
+            derived_nodes_used[:10],
+            derived_edges_used[:10],
+            list(base_entity_ids.keys())[:10],
+        )
 
     if not summary_lines and not graph_lines:
         return DerivedContext(
@@ -1481,6 +1515,15 @@ async def graph_rag_query(
         state,
         collection,
         derived_context=derived.context,
+    )
+    logger.info(
+        "graph_rag final context collection=%s route=%s entities=%d relationships=%d derived_nodes=%d derived_edges=%d",
+        collection.name,
+        route_profile.primary_route,
+        len(entities_used),
+        len(relationships_used),
+        len(derived.derived_nodes_used),
+        len(derived.derived_edges_used),
     )
     entity_fallback = "\n".join(entities_used)
     fallback_text = derived.context or rel_context or entity_fallback
