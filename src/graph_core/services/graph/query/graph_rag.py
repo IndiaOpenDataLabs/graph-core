@@ -337,6 +337,7 @@ async def _search_entity_seeds(
                         EntityAlias.alias_name.ilike(f"% {kw}"),
                         EntityAlias.alias_name.ilike(kw),
                     ),
+                    EntityAlias.collection_id == collection.id,
                     GraphEntity.collection_id == collection.id,
                 )
                 .limit(5)

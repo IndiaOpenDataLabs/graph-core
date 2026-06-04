@@ -78,10 +78,9 @@ class IncrementalEntityResolver:
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
             select(EntityAlias)
-            .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
             .where(
                 EntityAlias.alias_name == normalized_name,
-                GraphEntity.collection_id == self._collection_id,
+                EntityAlias.collection_id == self._collection_id,
             )
         )
         alias = alias_result.scalar_one_or_none()
@@ -544,6 +543,7 @@ class IncrementalEntityResolver:
             pg_insert(EntityAlias)
             .values(
                 id=uuid.uuid4(),
+                collection_id=self._collection_id,
                 alias_name=alias_name,
                 entity_id=entity_id,
                 source_chunk_hash=source_chunk_hash,

@@ -93,6 +93,12 @@ class EntityAlias(Base):
     __tablename__ = "entity_aliases"
 
     id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collection_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("collections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     entity_id = Column(
         UUIDType(as_uuid=True),
         ForeignKey("graph_entities.id", ondelete="CASCADE"),
@@ -108,8 +114,9 @@ class EntityAlias(Base):
 
     __table_args__ = (
         UniqueConstraint(
+            "collection_id",
             "alias_name",
-            name="uq_entity_aliases_alias_name",
+            name="uq_entity_aliases_collection_alias_name",
         ),
     )
 
