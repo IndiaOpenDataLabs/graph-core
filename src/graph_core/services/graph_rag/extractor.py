@@ -127,15 +127,11 @@ entities and relationships from input text.
        weight      (float 0..1, role-specific confidence)
      Do not invent names outside the vocab — any unknown name will
      be rejected and that entry will fall back to "RELATES_TO".
-   - DEFAULT TO A SINGLE-ENTRY rel_type LIST PER PAIR. Multi-entry
-     lists are reserved for pairs where the text genuinely supports
-     distinct, simultaneously-true semantic roles AND each entry
-     has a meaningfully different description and keyword set. If
-     you would write the same sentence for two entries, do not emit
-     both — collapse to the single most specific one. A pair that
-     "explains AND is an example of" the same thing can carry two
-     entries; a pair where the only honest answer is one
-     relationship must carry one entry.
+   - Emit every distinct rel_type that is genuinely supported for the
+     pair. Multi-entry rel_type lists are expected when the same pair
+     carries different semantic roles. Each entry must have its own
+     role-specific description and keywords. If two entries would say
+     the same thing, collapse them to the single most specific one.
    - Each entry becomes its own edge in the graph; emitting an
      entry you cannot justify with a role-specific description
      produces duplicate noise.
@@ -179,9 +175,12 @@ formatted entities and relationships.
    simultaneously-true roles and you can write a meaningfully
    different description for each. Pick the best single fit; use
    "RELATES_TO" only if nothing more specific applies.
-7. Return only new or corrected items in the same JSON structure as
+7. Preserve multiple genuinely distinct rel_type entries for the same
+   source/target pair when the text supports them; do not collapse them
+   to one generic edge unless the evidence really supports only one.
+8. Return only new or corrected items in the same JSON structure as
    the main extraction.
-8. Only include items explicitly supported by the text.
+9. Only include items explicitly supported by the text.
 """
 
 

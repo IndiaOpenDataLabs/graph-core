@@ -27,7 +27,10 @@ from graph_core.models.graph_rag import (
     RelationshipDescription,
 )
 from graph_core.models.profile import Profile
-from graph_core.models.rel_types import normalize_rel_type as normalize_dim
+from graph_core.models.rel_types import (
+    normalize_rel_type as normalize_dim,
+    relationship_embedding_text,
+)
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
@@ -142,9 +145,24 @@ async def _embed_entity_query(
 async def _embed_relationship_query(
     embedding_provider: EmbeddingProvider,
     query: str,
+    rel_type: str | None = None,
 ) -> list[float]:
+    focus = ""
+    if rel_type:
+        focus = (
+            f" Focus on relationships whose semantic role is {normalize_dim(rel_type)}."
+        )
     return await embedding_provider.embed_query(
-        _format_retrieval_query(_RELATIONSHIP_RETRIEVAL_INSTRUCTION, query)
+        _format_retrieval_query(
+            _RELATIONSHIP_RETRIEVAL_INSTRUCTION + focus,
+            relationship_embedding_text(
+                source_name="user-question",
+                target_name="graph-answer",
+                rel_type=rel_type,
+                description=query,
+                keywords=[],
+            ),
+        )
     )
 
 
@@ -700,6 +718,11 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
                 traversed_rel_ids.append(rel_id)
         rel_score_cache.update(state.rel_score_cache)
 
+    traversed_rel_ids.sort(
+        key=lambda rel_id: rel_score_cache.get(rel_id, 0.0),
+        reverse=True,
+    )
+
     return GraphQueryState(
         discovered_entity_ids=discovered_entity_ids,
         entity_relevance=entity_relevance,
@@ -866,6 +889,7 @@ async def _mix_state(
         subquery_embedding = await _embed_relationship_query(
             embedding_provider,
             subquery,
+            rel_type=rel_types[0] if rel_types else None,
         )
         subquery_tokens = query_tokens | _query_token_set(subquery)
         states.append(
@@ -887,6 +911,8 @@ async def _mix_state(
             collection,
             entity_query_embedding,
             relationship_query_embedding,
+            rel_types=rel_types,
+            dimension_weight=dimension_weight,
         )
 
     return _merge_states(*states)
@@ -934,7 +960,7 @@ async def _build_context(
                 )
                 entities_used.append(entity.canonical_name)
 
-        rel_context_parts: list[tuple[float, str]] = []
+        rel_context_parts_by_type: dict[str, list[tuple[float, str]]] = {}
         relationships_used: list[str] = []
         for rel_id_str in state.traversed_rel_ids[:50]:
             try:
@@ -961,17 +987,25 @@ async def _build_context(
                 rel_text = (
                     f"{src_name} -[{rel_type}]-> {tgt_name}: {description.description}"
                 )
-                rel_context_parts.append((sim, rel_text))
+                rel_context_parts_by_type.setdefault(rel_type, []).append(
+                    (sim, rel_text)
+                )
                 relationships_used.append(f"{src_name} -[{rel_type}]-> {tgt_name}")
 
-    rel_context_parts.sort(key=lambda item: item[0], reverse=True)
     entity_context = "\n".join(entity_context_parts)
-    rel_context = "\n".join(text for _, text in rel_context_parts)
+    rel_sections: list[tuple[float, str]] = []
+    for rel_type, items in rel_context_parts_by_type.items():
+        items.sort(key=lambda item: item[0], reverse=True)
+        section_text = "\n".join(text for _, text in items)
+        section_score = items[0][0] if items else 0.0
+        rel_sections.append((section_score, f"{rel_type}:\n{section_text}"))
+    rel_sections.sort(key=lambda item: item[0], reverse=True)
+    rel_context = "\n\n".join(text for _, text in rel_sections)
     context = (
         "Context:\n"
         "Entities:\n"
         f"{entity_context or '(none)'}\n"
-        "Relationships:\n"
+        "Relationships By Type:\n"
         f"{rel_context or '(none)'}"
     )
     return context, entities_used, list(dict.fromkeys(relationships_used)), rel_context
@@ -1001,7 +1035,8 @@ async def _answer_from_context(
                 "Write in natural prose. If the context is insufficient "
                 "for part of the "
                 "question, acknowledge it briefly without making it the focus."
-                "\n\nThe Relationships section lists each edge in the form"
+                "\n\nThe Relationships By Type section groups edges by"
+                " semantic role. Each edge is listed in the form"
                 " 'SRC -[REL_TYPE]-> TGT: description'. REL_TYPE is the"
                 " semantic role of the edge (e.g. EXPLAINS, CAUSES, IS_AN_EXAMPLE_OF);"
                 " the same SRC and TGT may appear with several different"
@@ -1024,16 +1059,17 @@ async def graph_rag_query(
 ) -> QueryResult:
     embedding_provider = await _resolve_embedding_provider(collection)
     entity_query_embedding = await _embed_entity_query(embedding_provider, question)
-    relationship_query_embedding = await _embed_relationship_query(
-        embedding_provider,
-        question,
-    )
 
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
     dimensions = _active_dimensions()
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
+        relationship_query_embedding = await _embed_relationship_query(
+            embedding_provider,
+            question,
+            rel_type=rel_type,
+        )
         kwargs = {
             "rel_types": [rel_type] if rel_type else None,
             "dimension_weight": _dimension_weight(rel_type),

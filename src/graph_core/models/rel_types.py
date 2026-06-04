@@ -97,3 +97,28 @@ def normalize_rel_type(value: str | None) -> str:
     if not cleaned[0].isalpha():
         cleaned = "R_" + cleaned
     return cleaned
+
+
+def relationship_embedding_text(
+    source_name: str,
+    target_name: str,
+    rel_type: str | None,
+    description: str,
+    keywords: list[str] | None = None,
+) -> str:
+    """Canonical text used for relationship embeddings.
+
+    The rel_type is included explicitly so different semantic
+    dimensions between the same endpoints can separate in vector space.
+    """
+    clean_rel_type = normalize_rel_type(rel_type)
+    keyword_text = ", ".join(k.strip() for k in (keywords or []) if k.strip())
+    text = (
+        f"Relationship type: {clean_rel_type}. "
+        f"Source: {source_name}. "
+        f"Target: {target_name}. "
+        f"Description: {description}"
+    )
+    if keyword_text:
+        text += f" Keywords: {keyword_text}."
+    return text

@@ -29,6 +29,7 @@ from graph_core.models.graph_rag import (
     GraphRelationship,
     RelationshipDescription,
 )
+from graph_core.models.rel_types import relationship_embedding_text
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,7 @@ class IncrementalEntityResolver:
             await self._add_relationship_description(
                 session, existing.id, description, keywords, source_chunk_hash,
                 source_name=src_name, target_name=tgt_name,
+                rel_type=rel_type,
             )
             new_kw = list(set(existing.keywords or []) | set(keywords))
             max_weight = settings.graph_rag_max_relationship_weight
@@ -284,7 +286,13 @@ class IncrementalEntityResolver:
         await session.commit()
 
         # Write relationship embedding
-        embed_text = f"{src_name} -> {tgt_name}: {description}"
+        embed_text = relationship_embedding_text(
+            src_name,
+            tgt_name,
+            rel_type,
+            description,
+            keywords,
+        )
         embedding = await self._embedding.embed_query(embed_text)
         await self._vstore.upsert_relationship_embedding(
             relationship_id=new_rel_id,
@@ -462,8 +470,15 @@ class IncrementalEntityResolver:
         source_chunk_hash: str,
         source_name: str = "",
         target_name: str = "",
+        rel_type: str = "RELATES_TO",
     ) -> None:
-        embed_text = f"{source_name} -> {target_name}: {description}"
+        embed_text = relationship_embedding_text(
+            source_name,
+            target_name,
+            rel_type,
+            description,
+            keywords,
+        )
         embedding = await self._embedding.embed_query(embed_text)
 
         existing_descs = await self._vstore.search_relationship_embeddings(
