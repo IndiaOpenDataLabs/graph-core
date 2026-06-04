@@ -7,12 +7,14 @@ Examples:
   PYTHONPATH=src .venv/bin/python docs/HELPER.py finalize-failed <job_id>
   PYTHONPATH=src .venv/bin/python docs/HELPER.py requeue-failed <job_id>
   PYTHONPATH=src .venv/bin/python docs/HELPER.py requeue-processing <job_id>
+  PYTHONPATH=src .venv/bin/python docs/HELPER.py graph-analysis <collection_id>
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -27,6 +29,7 @@ from sqlalchemy import text  # noqa: E402
 
 import graph_core.workers  # noqa: E402,F401
 from graph_core.database import AsyncSessionLocal  # noqa: E402
+from graph_core.services.graph.analytics import analyze_collection_graph  # noqa: E402
 from graph_core.workers.ingestion import run_chunk  # noqa: E402
 
 
@@ -202,6 +205,26 @@ async def requeue_processing(job_id: uuid.UUID) -> None:
     await show_job(job_id)
 
 
+async def graph_analysis(
+    collection_id: uuid.UUID,
+    *,
+    min_edge_strength: float,
+    min_community_size: int,
+    max_anchors: int,
+    max_path_depth: int,
+    max_connector_paths: int,
+) -> None:
+    analysis = await analyze_collection_graph(
+        collection_id,
+        min_edge_strength=min_edge_strength,
+        min_community_size=min_community_size,
+        max_anchors=max_anchors,
+        max_path_depth=max_path_depth,
+        max_connector_paths=max_connector_paths,
+    )
+    print(json.dumps(analysis, indent=2))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -214,6 +237,13 @@ def parse_args() -> argparse.Namespace:
     ):
         cmd = sub.add_parser(name)
         cmd.add_argument("job_id", type=uuid.UUID)
+    graph = sub.add_parser("graph-analysis")
+    graph.add_argument("collection_id", type=uuid.UUID)
+    graph.add_argument("--min-edge-strength", type=float, default=0.2)
+    graph.add_argument("--min-community-size", type=int, default=2)
+    graph.add_argument("--max-anchors", type=int, default=12)
+    graph.add_argument("--max-path-depth", type=int, default=4)
+    graph.add_argument("--max-connector-paths", type=int, default=20)
     return parser.parse_args()
 
 
@@ -229,6 +259,15 @@ async def main() -> None:
         await requeue_failed(args.job_id)
     elif args.command == "requeue-processing":
         await requeue_processing(args.job_id)
+    elif args.command == "graph-analysis":
+        await graph_analysis(
+            args.collection_id,
+            min_edge_strength=args.min_edge_strength,
+            min_community_size=args.min_community_size,
+            max_anchors=args.max_anchors,
+            max_path_depth=args.max_path_depth,
+            max_connector_paths=args.max_connector_paths,
+        )
 
 
 if __name__ == "__main__":

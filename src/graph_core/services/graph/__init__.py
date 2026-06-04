@@ -23,6 +23,7 @@ from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
 from graph_core.services.crypto import CredentialCrypto
+from graph_core.services.graph.analytics import analyze_collection_graph
 from graph_core.services.graph.ingestion import (
     deterministic_uuid,
     fan_out_chunks,
@@ -1188,6 +1189,28 @@ class GraphService:
                 for job in jobs
             ]
 
+    async def analyze_collection_graph(
+        self,
+        collection_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+        *,
+        min_edge_strength: float = 0.2,
+        min_community_size: int = 2,
+        max_anchors: int = 12,
+        max_path_depth: int = 4,
+        max_connector_paths: int = 20,
+    ) -> dict[str, Any]:
+        collection = await self.get_collection(collection_id)
+        self._enforce_namespace(collection, namespace_id)
+        return await analyze_collection_graph(
+            collection_id,
+            min_edge_strength=min_edge_strength,
+            min_community_size=min_community_size,
+            max_anchors=max_anchors,
+            max_path_depth=max_path_depth,
+            max_connector_paths=max_connector_paths,
+        )
+
     async def update_job_status(
         self,
         job_id: uuid.UUID,
@@ -1247,4 +1270,5 @@ __all__ = [
     "generate_vector_answer",
     "extract_keywords",
     "fallback_keywords",
+    "analyze_collection_graph",
 ]
