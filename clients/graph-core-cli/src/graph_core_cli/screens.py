@@ -728,7 +728,7 @@ class ConsoleScreen(Screen):
     }
 
     .copy-button {
-        min-width: 8;
+        min-width: 6;
         width: auto;
         height: 3;
         margin-left: 1;
@@ -910,7 +910,8 @@ class ConsoleScreen(Screen):
         yield Container(
             Container(
                 Label("Response", id="output-title"),
-                Button("⧉", id="copy-response", classes="copy-button"),
+                Button("⧉R", id="copy-response", classes="copy-button"),
+                Button("⧉C", id="copy-command", classes="copy-button"),
                 id="output-header",
             ),
             RichLog(
@@ -922,11 +923,7 @@ class ConsoleScreen(Screen):
             id="output-panel",
         )
         yield Container(
-            Container(
-                Label("Command", id="command-label"),
-                Button("⧉", id="copy-command", classes="copy-button"),
-                id="command-header",
-            ),
+            Label("Command", id="command-label"),
             Input(placeholder="/help", id="command"),
             Static("", id="suggestions"),
             id="command-panel",
