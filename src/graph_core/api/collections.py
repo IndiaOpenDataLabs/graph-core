@@ -42,6 +42,15 @@ class CollectionResponse(BaseModel):
     gleaning_passes: int
 
 
+class EnhanceCollectionResponse(BaseModel):
+    status: str
+    collection_id: str
+    graph_name: str
+    node_count: int
+    edge_count: int
+    chunk_count: int
+
+
 router = APIRouter(prefix="/collections", tags=["collections"])
 service = GraphService()
 
@@ -120,6 +129,33 @@ async def delete_collection(
             )
         await service.delete_collection(collection_id)
         return {"status": "deleted", "id": str(collection_id)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@router.post("/{collection_id}/enhance")
+async def enhance_collection(
+    collection_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> EnhanceCollectionResponse:
+    del session
+    try:
+        result = await service.build_collection_understanding(
+            collection_id=collection_id,
+            namespace_id=namespace_id,
+        )
+        derived_graph = result["derived_graph"]
+        return EnhanceCollectionResponse(
+            status="enhanced",
+            collection_id=str(collection_id),
+            graph_name=str(derived_graph["graph_name"]),
+            node_count=int(derived_graph["node_count"]),
+            edge_count=int(derived_graph["edge_count"]),
+            chunk_count=int(derived_graph["chunk_count"]),
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:

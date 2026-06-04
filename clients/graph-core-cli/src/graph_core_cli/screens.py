@@ -779,6 +779,9 @@ class ConsoleScreen(Screen):
             "[--clear-default-query-mode]"
         ): "Update a collection.",
         "/collection delete COLLECTION": "Delete a collection.",
+        "/enhance COLLECTION": (
+            "Build or rebuild the derived understanding graph for a collection."
+        ),
         "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
         "/chat create COLLECTION [--title TITLE]": (
@@ -833,6 +836,7 @@ class ConsoleScreen(Screen):
             "[--clear-default-query-mode]"
         ): "/collection edit ",
         "/collection delete COLLECTION": "/collection delete <collection>",
+        "/enhance COLLECTION": "/enhance <collection>",
         "/ingest chunk COLLECTION \"text\"": "/ingest chunk <collection> \"<text>\"",
         (
             "/ingest file COLLECTION /path/to/file.txt"
@@ -1015,6 +1019,9 @@ class ConsoleScreen(Screen):
                 return
             if command == "/collection":
                 await self._command_collection(parts[1:])
+                return
+            if command == "/enhance":
+                await self._command_enhance(parts[1:])
                 return
             if command == "/chat":
                 await self._command_chat(parts[1:])
@@ -1373,6 +1380,17 @@ class ConsoleScreen(Screen):
         raise ValueError(
             "Usage: /ingest chunk COLLECTION \"text\" | "
             "/ingest file COLLECTION PATH"
+        )
+
+    async def _command_enhance(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise ValueError("Usage: /enhance COLLECTION")
+        collection = await self._resolve_collection(args[0])
+        self._write(
+            await self._call(
+                "enhance_collection",
+                {"collection_id": collection["id"]},
+            )
         )
 
     async def _command_chat(self, args: list[str]) -> None:

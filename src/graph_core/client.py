@@ -150,6 +150,9 @@ class GraphCoreClient:
     async def delete_collection(self, collection_id: str) -> dict[str, Any]:
         return await self._request("DELETE", f"/collections/{collection_id}")
 
+    async def enhance_collection(self, collection_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/collections/{collection_id}/enhance")
+
     async def create_chat_session(
         self,
         collection_id: str,

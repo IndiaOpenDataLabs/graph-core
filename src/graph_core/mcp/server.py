@@ -255,6 +255,22 @@ async def delete_collection(collection_id: str, ctx: Context) -> str:
     return f"Deleted collection {result.get('id', collection_id)}"
 
 
+@mcp.tool()
+async def enhance_collection(collection_id: str, ctx: Context) -> str:
+    """Build or rebuild the derived understanding graph for a collection."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    result = await client.enhance_collection(collection_id)
+    return (
+        f"Enhanced collection:\n"
+        f"  collection_id: {result['collection_id']}\n"
+        f"  graph_name: {result['graph_name']}\n"
+        f"  node_count: {result['node_count']}\n"
+        f"  edge_count: {result['edge_count']}\n"
+        f"  chunk_count: {result['chunk_count']}"
+    )
+
+
 # -- Ingestion tools --------------------------------------------------------
 
 
