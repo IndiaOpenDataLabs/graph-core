@@ -813,7 +813,7 @@ class ConsoleScreen(Screen):
             "[--chat-id ID] "
             "(aliases: ent|rel|hyb); default: mix for custom_graph_rag]"
         ): "Query a collection.",
-        "/jobs list [--limit N]": "List recent jobs.",
+        "/jobs list [--limit N] [--collection COLLECTION]": "List recent jobs.",
         "/jobs show JOB_ID": "Show job status.",
         "/jobs watch JOB_ID": "Poll a job until it finishes.",
     }
@@ -868,7 +868,7 @@ class ConsoleScreen(Screen):
             "[--chat-id ID] "
             "(aliases: ent|rel|hyb); default: mix for custom_graph_rag]"
         ): "/query <collection> \"<question>\"",
-        "/jobs list [--limit N]": "/jobs list",
+        "/jobs list [--limit N] [--collection COLLECTION]": "/jobs list",
         "/jobs show JOB_ID": "/jobs show <job_id>",
         "/jobs watch JOB_ID": "/jobs watch <job_id>",
     }
@@ -1537,11 +1537,16 @@ class ConsoleScreen(Screen):
     async def _command_jobs(self, args: list[str]) -> None:
         if not args or args[0] == "list":
             limit = 20
+            call_args: dict[str, object] = {"limit": limit}
             if len(args) > 1:
                 _, flags = parse_flag_args(args[1:])
                 if isinstance(flags.get("limit"), str):
                     limit = int(str(flags["limit"]))
-            self._write(await self._call("list_jobs", {"limit": limit}))
+                    call_args["limit"] = limit
+                if isinstance(flags.get("collection"), str) and flags["collection"]:
+                    collection = await self._resolve_collection(str(flags["collection"]))
+                    call_args["collection_id"] = collection["id"]
+            self._write(await self._call("list_jobs", call_args))
             return
         if len(args) >= 2 and args[0] == "show":
             job_id = self._resolve_job_id(args[1])
@@ -1552,7 +1557,7 @@ class ConsoleScreen(Screen):
             await self._watch_job(job_id)
             return
         raise ValueError(
-            "Usage: /jobs list [--limit N] | "
+            "Usage: /jobs list [--limit N] [--collection COLLECTION] | "
             "/jobs show JOB_ID | /jobs watch JOB_ID"
         )
 

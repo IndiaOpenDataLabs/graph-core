@@ -460,11 +460,15 @@ async def get_job_status(job_id: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def list_jobs(ctx: Context, limit: int = 20) -> str:
+async def list_jobs(
+    ctx: Context,
+    limit: int = 20,
+    collection_id: str | None = None,
+) -> str:
     """List recent jobs in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    jobs = await client.list_jobs(limit=limit)
+    jobs = await client.list_jobs(limit=limit, collection_id=collection_id)
     if not jobs:
         return "No jobs found."
     lines = ["Jobs:"]

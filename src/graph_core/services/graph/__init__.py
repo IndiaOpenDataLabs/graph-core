@@ -1174,14 +1174,18 @@ class GraphService:
         namespace_id: uuid.UUID,
         *,
         limit: int = 20,
+        collection_id: uuid.UUID | None = None,
     ) -> list[dict[str, Any]]:
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
+            query = (
                 select(Job)
                 .where(Job.namespace_id == namespace_id)
                 .order_by(Job.created_at.desc())
                 .limit(limit)
             )
+            if collection_id is not None:
+                query = query.where(Job.collection_id == collection_id)
+            result = await session.execute(query)
             jobs = list(result.scalars().all())
             return [
                 {

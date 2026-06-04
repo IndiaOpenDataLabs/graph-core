@@ -17,9 +17,14 @@ service = GraphService()
 async def list_jobs(
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
     limit: int = Query(default=20, ge=1, le=100),
+    collection_id: uuid.UUID | None = Query(default=None),
 ) -> list[dict]:
     """List recent jobs for the current namespace."""
-    return await service.list_jobs(namespace_id, limit=limit)
+    return await service.list_jobs(
+        namespace_id,
+        limit=limit,
+        collection_id=collection_id,
+    )
 
 
 @router.get("/{job_id}")
