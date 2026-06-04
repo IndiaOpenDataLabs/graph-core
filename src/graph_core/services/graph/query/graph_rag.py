@@ -121,6 +121,7 @@ class GraphQueryState:
     entity_relevance: dict[str, float]
     traversed_rel_ids: list[str]
     rel_score_cache: dict[str, float]
+    rel_combined_score_cache: dict[str, float]
 
 
 @dataclass
@@ -369,10 +370,8 @@ def _combined_edge_score(
         return cos
     raw_weight = edge_props.get("weight")
     try:
-        # Stored weight is a 0-10 integer (resolver: int(weight * 10));
-        # normalize to 0-1 so the weight_ratio knob contributes on the
-        # same scale as the cosine and keyword ratios.
-        weight_norm = min(int(raw_weight or 0), 10) / 10.0
+        max_weight = max(1, int(settings.graph_rag_max_relationship_weight))
+        weight_norm = min(int(raw_weight or 0), max_weight) / float(max_weight)
     except (TypeError, ValueError):
         weight_norm = 0.0
     kws = edge_props.get("keywords") or []
@@ -454,6 +453,7 @@ async def _entity_first_state(
     traversed_rel_ids: list[str] = []
     discovered_entity_ids = set(seed_entity_ids)
     rel_score_cache: dict[str, float] = {}
+    rel_combined_score_cache: dict[str, float] = {}
     energy = effective_energy_budget
 
     sorted_seeds = sorted(seed_entity_ids, key=lambda e: seed_rel_scores.get(e, 0.0))
@@ -498,6 +498,7 @@ async def _entity_first_state(
             discovered_entity_ids.add(neighbor)
             if rel_id_str not in traversed_rel_ids:
                 traversed_rel_ids.append(rel_id_str)
+            rel_combined_score_cache[rel_id_str] = combined
             if (
                 neighbor not in entity_relevance
                 or combined > entity_relevance[neighbor]
@@ -509,6 +510,7 @@ async def _entity_first_state(
         entity_relevance=entity_relevance,
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
+        rel_combined_score_cache=rel_combined_score_cache,
     )
 
 
@@ -591,6 +593,7 @@ async def _relationship_seed_state(
 
     traversed_rel_ids: list[str] = []
     rel_score_cache: dict[str, float] = {}
+    rel_combined_score_cache: dict[str, float] = {}
     discovered_entity_ids: set[str] = set()
     entity_relevance: dict[str, float] = {}
     graph_storage = get_graph_storage(collection.id)
@@ -615,7 +618,8 @@ async def _relationship_seed_state(
                 continue
             combined = _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             traversed_rel_ids.append(rel_id_str)
-            rel_score_cache[rel_id_str] = combined
+            rel_score_cache[rel_id_str] = sim
+            rel_combined_score_cache[rel_id_str] = combined
             for eid in (str(rel.source_entity_id), str(rel.target_entity_id)):
                 discovered_entity_ids.add(eid)
                 if eid not in entity_relevance or combined > entity_relevance[eid]:
@@ -650,7 +654,9 @@ async def _relationship_seed_state(
         for rel_id in path_rels:
             if rel_id not in traversed_rel_ids:
                 traversed_rel_ids.append(rel_id)
-        path_score = sum(rel_score_cache.get(rel_id, 0.0) for rel_id in path_rels)
+        path_score = sum(
+            rel_combined_score_cache.get(rel_id, 0.0) for rel_id in path_rels
+        )
         if path_rels:
             path_score /= len(path_rels)
         for eid in path_nodes:
@@ -662,6 +668,7 @@ async def _relationship_seed_state(
         entity_relevance=entity_relevance,
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
+        rel_combined_score_cache=rel_combined_score_cache,
     )
 
 
@@ -707,6 +714,7 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
     entity_relevance: dict[str, float] = {}
     traversed_rel_ids: list[str] = []
     rel_score_cache: dict[str, float] = {}
+    rel_combined_score_cache: dict[str, float] = {}
 
     for state in states:
         discovered_entity_ids.update(state.discovered_entity_ids)
@@ -717,9 +725,10 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
             if rel_id not in traversed_rel_ids:
                 traversed_rel_ids.append(rel_id)
         rel_score_cache.update(state.rel_score_cache)
+        rel_combined_score_cache.update(state.rel_combined_score_cache)
 
     traversed_rel_ids.sort(
-        key=lambda rel_id: rel_score_cache.get(rel_id, 0.0),
+        key=lambda rel_id: rel_combined_score_cache.get(rel_id, 0.0),
         reverse=True,
     )
 
@@ -728,6 +737,7 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
         entity_relevance=entity_relevance,
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
+        rel_combined_score_cache=rel_combined_score_cache,
     )
 
 
@@ -981,7 +991,7 @@ async def _build_context(
                 .limit(max_rel_descs)
             )
             descs = descs_result.scalars().all()
-            sim = state.rel_score_cache.get(rel_id_str, 0.0)
+            sim = state.rel_combined_score_cache.get(rel_id_str, 0.0)
             rel_type = rel.rel_type or "RELATES_TO"
             for description in descs:
                 rel_text = (
@@ -1127,6 +1137,7 @@ async def graph_rag_query(
             entity_relevance={},
             traversed_rel_ids=[],
             rel_score_cache={},
+            rel_combined_score_cache={},
         )
     if effective_mode not in ("relationship-first", "mix", "hybrid"):
         effective_mode = "entity-first"

@@ -360,6 +360,10 @@ async def _ingest_graph_chunk(
                 source_chunk_hash=chunk_hash,
                 rel_type=rel.rel_type,
             )
+            persisted_rel = await session.get(
+                GraphRelationship,
+                rel_result.relationship_id,
+            )
             await session.commit()
 
             source_name = canonical_name_by_id.get(
@@ -382,9 +386,15 @@ async def _ingest_graph_chunk(
                 "source_id": str(source_id),
                 "target_id": str(target_id),
                 "id": str(rel_result.relationship_id),
-                "weight": int(rel.weight * 10),
-                "keywords": rel.keywords,
-                "rel_type": rel.rel_type,
+                "weight": int(
+                    persisted_rel.weight if persisted_rel else int(rel.weight * 10)
+                ),
+                "keywords": (
+                    persisted_rel.keywords if persisted_rel else rel.keywords
+                ),
+                "rel_type": (
+                    persisted_rel.rel_type if persisted_rel else rel.rel_type
+                ),
                 "collection_id": str(collection.id),
             })
 
