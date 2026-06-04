@@ -1,6 +1,6 @@
 """Scope entity aliases to collection.
 
-Revision ID: 0015_scope_entity_aliases_to_collection
+Revision ID: 0015_aliases_per_collection
 Revises: 0014_add_relationship_rel_type
 Create Date: 2026-06-04
 """
@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 
-revision = "0015_scope_entity_aliases_to_collection"
+revision = "0015_aliases_per_collection"
 down_revision = "0014_add_relationship_rel_type"
 branch_labels = None
 depends_on = None
