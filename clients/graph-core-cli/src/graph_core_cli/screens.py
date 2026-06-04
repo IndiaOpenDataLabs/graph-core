@@ -1,6 +1,7 @@
 """Slash-command console screens for Graph Core."""
 
 import asyncio
+import fnmatch
 import os
 import re
 import shlex
@@ -784,6 +785,10 @@ class ConsoleScreen(Screen):
         ),
         "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
+        "/ingest dir COLLECTION /path/to/dir": (
+            "Ingest a directory recursively, honoring .gitignore and .dockerignore "
+            "from that directory when present."
+        ),
         "/chat create COLLECTION [--title TITLE]": (
             "Create a chat session for a collection."
         ),
@@ -841,6 +846,7 @@ class ConsoleScreen(Screen):
         (
             "/ingest file COLLECTION /path/to/file.txt"
         ): "/ingest file <collection> @<path>",
+        "/ingest dir COLLECTION /path/to/dir": "/ingest dir <collection> @<path>",
         "/chat create COLLECTION [--title TITLE]": "/chat create <collection>",
         "/chat list COLLECTION [--limit N]": "/chat list <collection>",
         (
@@ -1349,7 +1355,8 @@ class ConsoleScreen(Screen):
         if len(args) < 3:
             raise ValueError(
                 "Usage: /ingest chunk COLLECTION \"text\" | "
-                "/ingest file COLLECTION PATH"
+                "/ingest file COLLECTION PATH | "
+                "/ingest dir COLLECTION PATH"
             )
         action = args[0]
         collection = await self._resolve_collection(args[1])
@@ -1377,9 +1384,15 @@ class ConsoleScreen(Screen):
                 self._last_job_id = job_id
             self._write(result)
             return
+        if action == "dir":
+            directory_path = Path(self._normalize_file_reference(payload)).expanduser()
+            summary = await self._ingest_directory(collection["id"], directory_path)
+            self._write(summary)
+            return
         raise ValueError(
             "Usage: /ingest chunk COLLECTION \"text\" | "
-            "/ingest file COLLECTION PATH"
+            "/ingest file COLLECTION PATH | "
+            "/ingest dir COLLECTION PATH"
         )
 
     async def _command_enhance(self, args: list[str]) -> None:
@@ -2063,6 +2076,143 @@ class ConsoleScreen(Screen):
 
     def _normalize_file_reference(self, value: str) -> str:
         return value[1:] if value.startswith("@") else value
+
+    def _load_ignore_rules(self, root: Path) -> list[tuple[str, bool]]:
+        rules: list[tuple[str, bool]] = []
+        for name in (".gitignore", ".dockerignore"):
+            ignore_file = root / name
+            if not ignore_file.is_file():
+                continue
+            try:
+                lines = ignore_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                include = raw.startswith("!")
+                pattern = raw[1:] if include else raw
+                pattern = pattern.strip()
+                if pattern:
+                    rules.append((pattern, include))
+        return rules
+
+    def _matches_ignore_pattern(
+        self,
+        rel_path: str,
+        pattern: str,
+        *,
+        is_dir: bool,
+    ) -> bool:
+        normalized_path = rel_path.strip("/")
+        normalized_pattern = pattern.strip()
+        dir_only = normalized_pattern.endswith("/")
+        if dir_only:
+            normalized_pattern = normalized_pattern.rstrip("/")
+            if not is_dir:
+                return False
+        anchored = normalized_pattern.startswith("/")
+        if anchored:
+            normalized_pattern = normalized_pattern.lstrip("/")
+        candidates = [normalized_path]
+        if "/" not in normalized_pattern:
+            candidates.append(Path(normalized_path).name)
+        for candidate in candidates:
+            if fnmatch.fnmatch(candidate, normalized_pattern):
+                return True
+            if not anchored and normalized_path.startswith(normalized_pattern + "/"):
+                return True
+        return False
+
+    def _is_ignored_path(
+        self,
+        rel_path: Path,
+        rules: list[tuple[str, bool]],
+        *,
+        is_dir: bool,
+    ) -> bool:
+        normalized = rel_path.as_posix()
+        ignored = False
+        for pattern, include in rules:
+            if self._matches_ignore_pattern(normalized, pattern, is_dir=is_dir):
+                ignored = not include
+        return ignored
+
+    async def _ingest_directory(self, collection_id: str, directory_path: Path) -> str:
+        if not directory_path.exists():
+            raise ValueError(f"Directory does not exist: {directory_path}")
+        if not directory_path.is_dir():
+            raise ValueError(f"Path is not a directory: {directory_path}")
+
+        root = directory_path.resolve()
+        rules = self._load_ignore_rules(root)
+        excluded_dirs = {".git", ".venv", "node_modules", "__pycache__"}
+        candidate_files: list[Path] = []
+        skipped_files: list[str] = []
+
+        for current_root, dirs, files in os.walk(root):
+            current_path = Path(current_root)
+            next_dirs: list[str] = []
+            for directory in dirs:
+                if directory in excluded_dirs:
+                    continue
+                rel_dir = (current_path / directory).relative_to(root)
+                if self._is_ignored_path(rel_dir, rules, is_dir=True):
+                    continue
+                next_dirs.append(directory)
+            dirs[:] = next_dirs
+
+            for filename in files:
+                if filename.endswith((".pyc", ".pyo")):
+                    continue
+                full_path = current_path / filename
+                rel_file = full_path.relative_to(root)
+                if self._is_ignored_path(rel_file, rules, is_dir=False):
+                    continue
+                candidate_files.append(full_path)
+
+        if not candidate_files:
+            return "No files matched for ingestion."
+
+        results: list[str] = []
+        jobs_started = 0
+        for file_path in sorted(candidate_files):
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                skipped_files.append(str(file_path.relative_to(root)))
+                continue
+            except OSError as exc:
+                skipped_files.append(f"{file_path.relative_to(root)} ({exc})")
+                continue
+
+            result = await self._call(
+                "ingest_document",
+                {"collection_id": collection_id, "text": content},
+            )
+            job_id = extract_job_id(result)
+            if job_id:
+                self._last_job_id = job_id
+                jobs_started += 1
+            results.append(str(file_path.relative_to(root)))
+
+        lines = [
+            f"Directory ingest root: {root}",
+            f"Files enqueued: {len(results)}",
+            f"Jobs started: {jobs_started}",
+        ]
+        if results:
+            preview = ", ".join(results[:10])
+            lines.append(f"Enqueued files: {preview}")
+            if len(results) > 10:
+                lines.append(f"... and {len(results) - 10} more")
+        if skipped_files:
+            preview = ", ".join(skipped_files[:10])
+            lines.append(f"Skipped files: {preview}")
+            if len(skipped_files) > 10:
+                lines.append(f"... and {len(skipped_files) - 10} more skipped")
+        return "\n".join(lines)
 
     def _collect_files(self) -> list[str]:
         root = Path.cwd()
