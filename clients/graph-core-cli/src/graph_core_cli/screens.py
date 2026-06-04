@@ -710,24 +710,39 @@ class ConsoleScreen(Screen):
         color: $text-muted;
     }
 
-    #output {
+    #output-panel {
         border: round $accent;
         margin: 0 1;
-        padding: 0 1;
+        padding: 0 1 1 1;
+    }
+
+    #output-header, #command-header {
+        height: auto;
+        layout: horizontal;
+    }
+
+    #output-title, #command-label {
+        width: 1fr;
+        color: $accent;
+        text-style: bold;
+    }
+
+    .copy-button {
+        min-width: 8;
+        width: auto;
+        height: 3;
+        margin-left: 1;
+    }
+
+    #output {
         scrollbar-size-vertical: 1;
     }
 
     #command-panel {
         margin: 0 1 1 1;
         border: round $accent;
-        height: 8;
+        height: 10;
         padding: 0 1;
-    }
-
-    #command-label {
-        padding: 0;
-        color: $accent;
-        text-style: bold;
     }
 
     #command {
@@ -745,7 +760,6 @@ class ConsoleScreen(Screen):
     COMMAND_HELP = {
         "/help": "Show command help.",
         "/status": "Show current auth and namespace context.",
-        "/copy": "Copy selected output, or the full output if nothing is selected.",
         "/clear": "Clear console output.",
         "/quit": "Exit the CLI.",
         "/exit": "Exit the CLI.",
@@ -806,7 +820,6 @@ class ConsoleScreen(Screen):
     COMMAND_INSERT_TEXT = {
         "/help": "/help ",
         "/status": "/status",
-        "/copy": "/copy",
         "/clear": "/clear",
         "/quit": "/quit",
         "/exit": "/exit",
@@ -883,23 +896,37 @@ class ConsoleScreen(Screen):
         self._file_cache: list[str] = []
         self._last_job_id = ""
         self._output_buffer = ""
+        self._last_command_text = ""
+        self._last_response_text = ""
         self._query_started_at: float | None = None
         self._query_progress_task: asyncio.Task | None = None
 
     def compose(self):
         yield Label(
-            "Graph Core CLI  |  Slash commands only  |  q=Quit  |  /copy or y=Copy",
+            "Graph Core CLI  |  Slash commands only  |  q=Quit",
             id="title",
         )
         yield Label("", id="context")
-        yield RichLog(
-            id="output",
-            wrap=True,
-            highlight=False,
-            markup=False,
+        yield Container(
+            Container(
+                Label("Response", id="output-title"),
+                Button("⧉", id="copy-response", classes="copy-button"),
+                id="output-header",
+            ),
+            RichLog(
+                id="output",
+                wrap=True,
+                highlight=False,
+                markup=False,
+            ),
+            id="output-panel",
         )
         yield Container(
-            Label("Command", id="command-label"),
+            Container(
+                Label("Command", id="command-label"),
+                Button("⧉", id="copy-command", classes="copy-button"),
+                id="command-header",
+            ),
             Input(placeholder="/help", id="command"),
             Static("", id="suggestions"),
             id="command-panel",
@@ -916,16 +943,6 @@ class ConsoleScreen(Screen):
 
     def on_key(self, event: events.Key) -> None:
         output = self.query_one("#output", RichLog)
-        if event.key in {"ctrl+shift+c", "ctrl+y"}:
-            self._copy_output_selection()
-            event.prevent_default()
-            event.stop()
-            return
-        if self.focused is output and event.key == "y":
-            self._copy_output_selection()
-            event.prevent_default()
-            event.stop()
-            return
         command_input = self.query_one("#command", Input)
         if event.is_printable and self.focused is not command_input:
             command_input.focus()
@@ -988,6 +1005,15 @@ class ConsoleScreen(Screen):
     def handle_command_changed(self, event: Input.Changed) -> None:
         self._update_suggestions(event.value)
 
+    @on(Button.Pressed)
+    def handle_console_buttons(self, event: Button.Pressed) -> None:
+        if event.button.id == "copy-response":
+            self._copy_response()
+            return
+        if event.button.id == "copy-command":
+            self._copy_command()
+            return
+
     async def _execute_command(self, raw: str) -> None:
         try:
             if not raw.startswith("/"):
@@ -1001,9 +1027,6 @@ class ConsoleScreen(Screen):
                 return
             if command in {"/quit", "/exit"}:
                 self.app.exit()
-                return
-            if command == "/copy":
-                self._copy_output_selection()
                 return
             if command == "/clear":
                 self._clear_output()
@@ -1753,6 +1776,7 @@ class ConsoleScreen(Screen):
             return
 
     def _write(self, text: str) -> None:
+        self._last_response_text = text
         panel = Panel(
             Text(text),
             title="Response",
@@ -1763,6 +1787,7 @@ class ConsoleScreen(Screen):
         self._append_output(text, renderables=[panel])
 
     def _write_command(self, text: str) -> None:
+        self._last_command_text = text
         plain_text = f"> {text}"
         panel = Panel(
             Text(text),
@@ -1775,6 +1800,7 @@ class ConsoleScreen(Screen):
 
     def _write_error(self, text: str) -> None:
         error_text = f"Error: {text}"
+        self._last_response_text = error_text
         panel = Panel(
             Text(error_text),
             title="Error",
@@ -1806,6 +1832,7 @@ class ConsoleScreen(Screen):
 
     def _clear_output(self) -> None:
         self._output_buffer = ""
+        self._last_response_text = ""
         try:
             output = self.query_one("#output", RichLog)
         except NoMatches:
@@ -1813,13 +1840,22 @@ class ConsoleScreen(Screen):
         output.clear()
         self.call_after_refresh(output.scroll_end, animate=False)
 
-    def _copy_output_selection(self) -> None:
-        text = self._output_buffer
+    def _copy_response(self) -> None:
+        text = self._last_response_text or self._output_buffer
         if not text:
             self.notify("Nothing to copy.", severity="warning")
             return
         self._copy_text_to_clipboard(text)
-        self.notify("Copied output to clipboard.")
+        self.notify("Copied response to clipboard.")
+
+    def _copy_command(self) -> None:
+        current = self.query_one("#command", Input).value.strip()
+        text = current or self._last_command_text
+        if not text:
+            self.notify("Nothing to copy.", severity="warning")
+            return
+        self._copy_text_to_clipboard(text)
+        self.notify("Copied command to clipboard.")
 
     def _copy_text_to_clipboard(self, text: str) -> None:
         if sys.platform == "darwin":
