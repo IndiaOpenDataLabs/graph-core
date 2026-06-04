@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from itertools import combinations
+from itertools import permutations
 from typing import Any
 
 from sqlalchemy import select
@@ -53,10 +53,23 @@ class EdgeAggregate:
 
 
 @dataclass(slots=True)
+class DirectedEdgeAggregate:
+    source_id: uuid.UUID
+    target_id: uuid.UUID
+    strength: float
+    total_weight: int
+    rel_type: str
+    relationship_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
 class NodeMetrics:
     node_id: uuid.UUID
     name: str
     community_id: int
+    rel_type: str
+    inbound_strength: float
+    outbound_strength: float
     weighted_degree: float
     external_communities: tuple[int, ...]
     external_strength: float
@@ -181,10 +194,10 @@ def _articulation_points(
     return articulation
 
 
-def _shortest_path(
+def _shortest_directed_path(
     start_id: uuid.UUID,
     end_id: uuid.UUID,
-    adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]],
+    adjacency: dict[uuid.UUID, dict[uuid.UUID, DirectedEdgeAggregate]],
     *,
     max_depth: int,
 ) -> list[uuid.UUID] | None:
@@ -210,6 +223,10 @@ def _shortest_path(
             seen.add(neighbor_id)
             queue.append((neighbor_id, [*path, neighbor_id]))
     return None
+
+
+def _top_rel_types(relationships: list[RelationshipRecord]) -> list[str]:
+    return sorted({rel.rel_type or "RELATES_TO" for rel in relationships})
 
 
 async def _load_graph_records(
@@ -279,10 +296,11 @@ async def _load_graph_records(
     )
 
 
-def build_collection_analysis(
+def _build_rel_type_analysis(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
     *,
+    rel_type: str,
     min_edge_strength: float = 0.2,
     min_community_size: int = 2,
     max_anchors: int = 12,
@@ -292,12 +310,11 @@ def build_collection_analysis(
 ) -> dict[str, Any]:
     max_weight = max_relationship_weight or settings.graph_rag_max_relationship_weight
     node_names = {node.id: node.name for node in nodes}
+    rels = [rel for rel in relationships if (rel.rel_type or "RELATES_TO") == rel_type]
 
-    by_pair: dict[
-        tuple[uuid.UUID, uuid.UUID],
-        dict[str, Any],
-    ] = {}
-    for rel in relationships:
+    by_pair: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
+    by_direction: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
+    for rel in rels:
         pair = _pair_key(rel.source_id, rel.target_id)
         bucket = by_pair.setdefault(
             pair,
@@ -310,8 +327,20 @@ def build_collection_analysis(
         bucket["total_weight"] += max(0, int(rel.weight))
         bucket["rel_types"].add(rel.rel_type)
         bucket["relationship_ids"].append(str(rel.id))
+        directed = by_direction.setdefault(
+            (rel.source_id, rel.target_id),
+            {
+                "total_weight": 0,
+                "relationship_ids": [],
+            },
+        )
+        directed["total_weight"] += max(0, int(rel.weight))
+        directed["relationship_ids"].append(str(rel.id))
 
     full_adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]] = defaultdict(dict)
+    directed_adjacency: dict[
+        uuid.UUID, dict[uuid.UUID, DirectedEdgeAggregate]
+    ] = defaultdict(dict)
     all_edges: list[EdgeAggregate] = []
     for (left_id, right_id), bucket in by_pair.items():
         aggregate = EdgeAggregate(
@@ -325,6 +354,15 @@ def build_collection_analysis(
         full_adjacency[left_id][right_id] = aggregate
         full_adjacency[right_id][left_id] = aggregate
         all_edges.append(aggregate)
+    for (source_id, target_id), bucket in by_direction.items():
+        directed_adjacency[source_id][target_id] = DirectedEdgeAggregate(
+            source_id=source_id,
+            target_id=target_id,
+            strength=_edge_strength(bucket["total_weight"], max_weight),
+            total_weight=int(bucket["total_weight"]),
+            rel_type=rel_type,
+            relationship_ids=tuple(sorted(bucket["relationship_ids"])),
+        )
 
     strong_adjacency: dict[
         uuid.UUID, dict[uuid.UUID, EdgeAggregate]
@@ -352,6 +390,15 @@ def build_collection_analysis(
 
     metrics: list[NodeMetrics] = []
     for node in nodes:
+        outbound_strength = sum(
+            edge.strength for edge in directed_adjacency.get(node.id, {}).values()
+        )
+        inbound_strength = sum(
+            edge.strength
+            for neighbors in directed_adjacency.values()
+            for target_id, edge in neighbors.items()
+            if target_id == node.id
+        )
         weighted_degree = sum(
             edge.strength for edge in full_adjacency.get(node.id, {}).values()
         )
@@ -363,7 +410,9 @@ def build_collection_analysis(
                 external_communities.add(neighbor_community)
                 external_strength += edge.strength
         anchor_score = (
-            weighted_degree
+            outbound_strength
+            + inbound_strength
+            + weighted_degree
             + (2.0 * len(external_communities))
             + (1.5 * external_strength)
             + (3.0 if node.id in articulation else 0.0)
@@ -373,6 +422,9 @@ def build_collection_analysis(
                 node_id=node.id,
                 name=node.name,
                 community_id=community_of.get(node.id, -1),
+                rel_type=rel_type,
+                inbound_strength=round(inbound_strength, 4),
+                outbound_strength=round(outbound_strength, 4),
                 weighted_degree=round(weighted_degree, 4),
                 external_communities=tuple(sorted(external_communities)),
                 external_strength=round(external_strength, 4),
@@ -385,6 +437,7 @@ def build_collection_analysis(
         metrics,
         key=lambda item: (
             item.anchor_score,
+            item.outbound_strength + item.inbound_strength,
             item.weighted_degree,
             len(item.external_communities),
             item.name,
@@ -394,13 +447,13 @@ def build_collection_analysis(
 
     connector_paths: list[dict[str, Any]] = []
     seen_paths: set[tuple[str, ...]] = set()
-    for left_anchor, right_anchor in combinations(top_anchors, 2):
+    for left_anchor, right_anchor in permutations(top_anchors, 2):
         if len(connector_paths) >= max_connector_paths:
             break
-        path = _shortest_path(
+        path = _shortest_directed_path(
             left_anchor.node_id,
             right_anchor.node_id,
-            full_adjacency,
+            directed_adjacency,
             max_depth=max_path_depth,
         )
         if not path or len(path) < 2:
@@ -412,7 +465,7 @@ def build_collection_analysis(
         hops: list[dict[str, Any]] = []
         path_score = 0.0
         for current_id, next_id in zip(path, path[1:], strict=False):
-            edge = full_adjacency[current_id][next_id]
+            edge = directed_adjacency[current_id][next_id]
             path_score += edge.strength
             hops.append(
                 {
@@ -421,12 +474,13 @@ def build_collection_analysis(
                     "target_id": str(next_id),
                     "target": node_names[next_id],
                     "strength": round(edge.strength, 4),
-                    "rel_types": list(edge.rel_types),
+                    "rel_types": [edge.rel_type],
                     "relationship_ids": list(edge.relationship_ids),
                 }
             )
         connector_paths.append(
             {
+                "rel_type": rel_type,
                 "from_anchor": left_anchor.name,
                 "to_anchor": right_anchor.name,
                 "source_community": left_anchor.community_id,
@@ -467,6 +521,7 @@ def build_collection_analysis(
         ]
         community_summaries.append(
             {
+                "rel_type": rel_type,
                 "community_id": idx,
                 "size": len(members),
                 "node_ids": [str(node_id) for node_id in members],
@@ -486,6 +541,7 @@ def build_collection_analysis(
         )
 
     return {
+        "rel_type": rel_type,
         "parameters": {
             "min_edge_strength": min_edge_strength,
             "min_community_size": min_community_size,
@@ -496,7 +552,8 @@ def build_collection_analysis(
         },
         "totals": {
             "entities": len(nodes),
-            "relationships": len(relationships),
+            "relationships": len(rels),
+            "directed_pairs": len(by_direction),
             "undirected_pairs": len(all_edges),
             "strong_pairs": sum(
                 1 for edge in all_edges if edge.strength >= min_edge_strength
@@ -509,7 +566,10 @@ def build_collection_analysis(
                 "node_id": str(metric.node_id),
                 "name": metric.name,
                 "community_id": metric.community_id,
+                "rel_type": metric.rel_type,
                 "anchor_score": metric.anchor_score,
+                "inbound_strength": metric.inbound_strength,
+                "outbound_strength": metric.outbound_strength,
                 "weighted_degree": metric.weighted_degree,
                 "external_communities": list(metric.external_communities),
                 "external_strength": metric.external_strength,
@@ -522,7 +582,10 @@ def build_collection_analysis(
                 "node_id": str(metric.node_id),
                 "name": metric.name,
                 "community_id": metric.community_id,
+                "rel_type": metric.rel_type,
                 "anchor_score": metric.anchor_score,
+                "inbound_strength": metric.inbound_strength,
+                "outbound_strength": metric.outbound_strength,
                 "weighted_degree": metric.weighted_degree,
                 "external_communities": list(metric.external_communities),
                 "external_strength": metric.external_strength,
@@ -542,6 +605,146 @@ def build_collection_analysis(
                 reverse=True,
             )[: max(10, max_anchors)]
         ],
+        "connector_paths": connector_paths[:max_connector_paths],
+    }
+
+
+def build_collection_analysis(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+    *,
+    min_edge_strength: float = 0.2,
+    min_community_size: int = 2,
+    max_anchors: int = 12,
+    max_path_depth: int = 4,
+    max_connector_paths: int = 20,
+    max_relationship_weight: int | None = None,
+) -> dict[str, Any]:
+    rel_types = _top_rel_types(relationships)
+    analyses = [
+        _build_rel_type_analysis(
+            nodes,
+            relationships,
+            rel_type=rel_type,
+            min_edge_strength=min_edge_strength,
+            min_community_size=min_community_size,
+            max_anchors=max_anchors,
+            max_path_depth=max_path_depth,
+            max_connector_paths=max_connector_paths,
+            max_relationship_weight=max_relationship_weight,
+        )
+        for rel_type in rel_types
+    ]
+
+    anchor_totals: dict[str, dict[str, Any]] = {}
+    bridge_totals: dict[str, dict[str, Any]] = {}
+    communities: list[dict[str, Any]] = []
+    connector_paths: list[dict[str, Any]] = []
+    total_strong_pairs = 0
+    total_directed_pairs = 0
+    total_undirected_pairs = 0
+    for analysis in analyses:
+        total_strong_pairs += int(analysis["totals"]["strong_pairs"])
+        total_directed_pairs += int(analysis["totals"]["directed_pairs"])
+        total_undirected_pairs += int(analysis["totals"]["undirected_pairs"])
+        communities.extend(analysis["communities"])
+        connector_paths.extend(analysis["connector_paths"])
+        for bucket, items in (
+            (anchor_totals, analysis["top_anchors"]),
+            (bridge_totals, analysis["bridge_nodes"]),
+        ):
+            for item in items:
+                entry = bucket.setdefault(
+                    item["node_id"],
+                    {
+                        **item,
+                        "rel_types": [],
+                        "anchor_score": 0.0,
+                        "inbound_strength": 0.0,
+                        "outbound_strength": 0.0,
+                        "weighted_degree": 0.0,
+                        "external_strength": 0.0,
+                    },
+                )
+                entry["rel_types"].append(item["rel_type"])
+                entry["anchor_score"] += float(item["anchor_score"])
+                entry["inbound_strength"] += float(item["inbound_strength"])
+                entry["outbound_strength"] += float(item["outbound_strength"])
+                entry["weighted_degree"] += float(item["weighted_degree"])
+                entry["external_strength"] += float(item["external_strength"])
+                entry["is_articulation"] = (
+                    bool(entry.get("is_articulation")) or bool(item["is_articulation"])
+                )
+                entry["external_communities"] = sorted(
+                    set(entry.get("external_communities", []))
+                    | set(item.get("external_communities", []))
+                )
+
+    def _finalize_entries(items: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        rows = list(items.values())
+        for row in rows:
+            row["rel_types"] = sorted(set(row["rel_types"]))
+            for key in (
+                "anchor_score",
+                "inbound_strength",
+                "outbound_strength",
+                "weighted_degree",
+                "external_strength",
+            ):
+                row[key] = round(float(row[key]), 4)
+        rows.sort(
+            key=lambda item: (
+                item["anchor_score"],
+                item["outbound_strength"] + item["inbound_strength"],
+                item["weighted_degree"],
+                len(item["rel_types"]),
+                item["name"],
+            ),
+            reverse=True,
+        )
+        return rows
+
+    communities.sort(
+        key=lambda item: (
+            item["strong_edge_count"],
+            item["average_strong_edge_strength"],
+            item["size"],
+        ),
+        reverse=True,
+    )
+    connector_paths.sort(
+        key=lambda item: (
+            item["source_community"] != item["target_community"],
+            item["path_score"],
+            -item["hop_count"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "parameters": {
+            "min_edge_strength": min_edge_strength,
+            "min_community_size": min_community_size,
+            "max_anchors": max_anchors,
+            "max_path_depth": max_path_depth,
+            "max_connector_paths": max_connector_paths,
+            "max_relationship_weight": (
+                max_relationship_weight or settings.graph_rag_max_relationship_weight
+            ),
+        },
+        "totals": {
+            "entities": len(nodes),
+            "relationships": len(relationships),
+            "directed_pairs": total_directed_pairs,
+            "undirected_pairs": total_undirected_pairs,
+            "strong_pairs": total_strong_pairs,
+            "communities": len(communities),
+            "rel_types": len(rel_types),
+        },
+        "rel_type_analyses": analyses,
+        "communities": communities,
+        "top_anchors": _finalize_entries(anchor_totals)[:max_anchors],
+        "bridge_nodes": _finalize_entries(bridge_totals)[: max(10, max_anchors)],
         "connector_paths": connector_paths[:max_connector_paths],
     }
 
@@ -610,12 +813,14 @@ def build_collection_understanding(
 
     chunk_index = 0
     for community in analysis["communities"]:
-        node_id = f"derived:community:{community['community_id']}"
+        rel_type = str(community.get("rel_type") or "RELATES_TO")
+        node_id = f"derived:community:{rel_type.lower()}:{community['community_id']}"
         anchor_preview = community.get("anchor_preview") or []
         node_names = community.get("node_names") or []
         description = (
-            f"Community {community['community_id']} contains {community['size']} "
-            f"entities with {community['strong_edge_count']} strong edges. "
+            f"{rel_type} community {community['community_id']} contains "
+            f"{community['size']} entities with {community['strong_edge_count']} "
+            f"strong {rel_type} edges. "
             f"Representative anchors: {', '.join(anchor_preview) or 'none'}. "
             f"This region appears centered on: "
             f"{', '.join(node_names[:6]) or 'no nodes'}."
@@ -624,7 +829,7 @@ def build_collection_understanding(
         nodes.append(
             {
                 "id": node_id,
-                "name": f"Community {community['community_id']}",
+                "name": f"{rel_type} Community {community['community_id']}",
                 "collection_id": collection["id"],
                 "type": "derived_community",
                 "description": description,
@@ -634,7 +839,7 @@ def build_collection_understanding(
         chunks.append(
             {
                 "chunk_hash": (
-                    f"{collection['id']}::derived::community::"
+                    f"{collection['id']}::derived::community::{rel_type}::"
                     f"{community['community_id']}"
                 ),
                 "chunk_index": chunk_index,
@@ -642,6 +847,7 @@ def build_collection_understanding(
                 "metadata": {
                     "memory_type": "derived_graph",
                     "derived_kind": "community",
+                    "rel_type": rel_type,
                     "derived_id": node_id,
                     "collection_id": collection["id"],
                 },
@@ -658,25 +864,32 @@ def build_collection_understanding(
                     "collection_id": collection["id"],
                     "rel_type": "SUMMARIZES",
                     "description": (
-                        f"Community {community['community_id']} is summarized in part "
-                        f"by anchor entity {name}."
+                        f"{rel_type} community {community['community_id']} is "
+                        f"summarized in part by anchor entity {name}."
                     ),
                     "source_ids": source_ids,
                 }
             )
 
     for bridge in analysis["bridge_nodes"]:
-        node_id = f"derived:bridge:{'_'.join(bridge['name'].strip().lower().split())}"
+        rel_type_list = bridge.get("rel_types") or [bridge.get("rel_type") or "RELATES_TO"]
+        rel_type_text = ", ".join(rel_type_list)
+        node_id = (
+            f"derived:bridge:{'_'.join(bridge['name'].strip().lower().split())}:"
+            f"{'_'.join(rel_type.lower() for rel_type in rel_type_list)}"
+        )
         source_ids = [bridge["node_id"]] if bridge.get("node_id") else []
         external_list = ", ".join(
             str(cid) for cid in bridge["external_communities"]
         ) or "none"
         description = (
             f"{bridge['name']} acts as a bridge node in community "
-            f"{bridge['community_id']}. It connects to external communities "
-            f"{external_list} "
+            f"{bridge['community_id']} across relation types {rel_type_text}. "
+            f"It connects to external communities {external_list} "
             f"with external strength {bridge['external_strength']} and weighted "
-            f"degree {bridge['weighted_degree']}."
+            f"degree {bridge['weighted_degree']}. Inbound strength "
+            f"{bridge['inbound_strength']} and outbound strength "
+            f"{bridge['outbound_strength']}."
         )
         nodes.append(
             {
@@ -690,12 +903,16 @@ def build_collection_understanding(
         )
         chunks.append(
             {
-                "chunk_hash": f"{collection['id']}::derived::bridge::{bridge['name']}",
+                "chunk_hash": (
+                    f"{collection['id']}::derived::bridge::{bridge['name']}::"
+                    f"{'_'.join(rel_type_list)}"
+                ),
                 "chunk_index": chunk_index,
                 "content": description,
                 "metadata": {
                     "memory_type": "derived_graph",
                     "derived_kind": "bridge",
+                    "rel_types": rel_type_list,
                     "derived_id": node_id,
                     "collection_id": collection["id"],
                 },
@@ -716,23 +933,29 @@ def build_collection_understanding(
         )
 
     for idx, path in enumerate(analysis["connector_paths"]):
-        node_id = f"derived:path:{idx}"
+        rel_type = str(path.get("rel_type") or "RELATES_TO")
+        node_id = f"derived:path:{rel_type.lower()}:{idx}"
         path_nodes = path.get("nodes") or []
         supporting_rel_ids = [
             rel_id
             for hop in path.get("hops", [])
             for rel_id in hop.get("relationship_ids", [])
         ]
+        flow_parts = [
+            f"{hop['source']} -[{rel_type}]-> {hop['target']}"
+            for hop in path.get("hops", [])
+        ]
         description = (
-            f"Connector path from {path['from_anchor']} to {path['to_anchor']} "
-            f"crosses {path['hop_count']} hops with score {path['path_score']}. "
-            f"Flow: {' -> '.join(path_nodes)}."
+            f"Directed {rel_type} connector path from {path['from_anchor']} to "
+            f"{path['to_anchor']} crosses {path['hop_count']} hops with score "
+            f"{path['path_score']}. Flow: "
+            f"{'; '.join(flow_parts) or ' -> '.join(path_nodes)}."
         )
         nodes.append(
             {
                 "id": node_id,
                 "name": (
-                    f"Connector {idx}: {path['from_anchor']} -> "
+                    f"{rel_type} Connector {idx}: {path['from_anchor']} -> "
                     f"{path['to_anchor']}"
                 ),
                 "collection_id": collection["id"],
@@ -743,12 +966,15 @@ def build_collection_understanding(
         )
         chunks.append(
             {
-                "chunk_hash": f"{collection['id']}::derived::connector::{idx}",
+                "chunk_hash": (
+                    f"{collection['id']}::derived::connector::{rel_type}::{idx}"
+                ),
                 "chunk_index": chunk_index,
                 "content": description,
                 "metadata": {
                     "memory_type": "derived_graph",
                     "derived_kind": "connector",
+                    "rel_type": rel_type,
                     "derived_id": node_id,
                     "collection_id": collection["id"],
                 },
@@ -776,7 +1002,7 @@ def build_collection_understanding(
                 path["source_community"],
                 path["target_community"],
             ):
-                target_id = f"derived:community:{community_id}"
+                target_id = f"derived:community:{rel_type.lower()}:{community_id}"
                 edges.append(
                     {
                         "source_id": node_id,
