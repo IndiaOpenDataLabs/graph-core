@@ -1468,6 +1468,10 @@ class ConsoleScreen(Screen):
             return
         if action == "dir":
             directory_path = Path(self._normalize_file_reference(payload)).expanduser()
+            domain_suffix = f" (domain={domain})" if domain else ""
+            self._write(
+                f"Scanning directory for ingestion: {directory_path}{domain_suffix}"
+            )
             summary = await self._ingest_directory(
                 collection["id"], directory_path, domain=domain
             )
@@ -2302,9 +2306,13 @@ class ConsoleScreen(Screen):
         if not candidate_files:
             return "No files matched for ingestion."
 
+        self._write(
+            f"Directory ingest matched {len(candidate_files)} files. Enqueuing..."
+        )
+
         results: list[str] = []
         jobs_started = 0
-        for file_path in sorted(candidate_files):
+        for index, file_path in enumerate(sorted(candidate_files), start=1):
             try:
                 content = file_path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
@@ -2327,6 +2335,11 @@ class ConsoleScreen(Screen):
                 self._last_job_id = job_id
                 jobs_started += 1
             results.append(str(file_path.relative_to(root)))
+            if index == 1 or index % 25 == 0 or index == len(candidate_files):
+                self._write(
+                    f"Directory ingest progress: {index}/{len(candidate_files)} files processed, "
+                    f"{jobs_started} jobs started."
+                )
 
         lines = [
             f"Directory ingest root: {root}",
