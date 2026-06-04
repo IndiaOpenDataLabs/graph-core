@@ -1484,6 +1484,9 @@ class ConsoleScreen(Screen):
                 content = file_path.read_text(encoding="utf-8")
             except OSError as exc:
                 raise ValueError(f"Unable to read file: {file_path} ({exc})") from exc
+            if not content.strip():
+                self._write(f"Skipped empty file: {file_path}")
+                return
             result = await self._call(
                 "ingest_document",
                 {
@@ -2351,6 +2354,9 @@ class ConsoleScreen(Screen):
                 continue
             except OSError as exc:
                 skipped_files.append(f"{file_path.relative_to(root)} ({exc})")
+                continue
+            if not content.strip():
+                skipped_files.append(f"{file_path.relative_to(root)} (empty)")
                 continue
 
             result = await self._call(

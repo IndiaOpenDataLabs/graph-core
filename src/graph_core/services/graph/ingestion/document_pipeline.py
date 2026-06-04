@@ -82,6 +82,8 @@ async def enqueue_document_ingestion_job(
     domain: str | None = None,
 ) -> DocumentIngestionResult:
     """Create a pending ingest_document Job and return its result wrapper."""
+    if not text.strip():
+        raise ValueError("Cannot ingest an empty document")
     async with AsyncSessionLocal() as session:
         collection = await session.get(Collection, collection_id)
         if not collection:

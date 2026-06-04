@@ -1031,6 +1031,8 @@ class GraphService:
         namespace_id: uuid.UUID,
         domain: str | None = None,
     ) -> ChunkIngestionResult:
+        if not text.strip():
+            raise ValueError("Cannot ingest an empty chunk")
         collection = await self.get_collection(collection_id)
         return await ingest_collection_chunk(
             text=text,
@@ -1047,6 +1049,8 @@ class GraphService:
         namespace_id: uuid.UUID,
         domain: str | None = None,
     ) -> DocumentIngestionResult:
+        if not text.strip():
+            raise ValueError("Cannot ingest an empty document")
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
         return await enqueue_document_ingestion_job(
