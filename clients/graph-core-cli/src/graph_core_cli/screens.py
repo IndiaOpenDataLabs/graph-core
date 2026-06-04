@@ -885,6 +885,47 @@ class ConsoleScreen(Screen):
         "naive",
         "mix",
     ]
+    INGEST_NOISE_DIRS = {
+        ".git",
+        ".venv",
+        "node_modules",
+        "__pycache__",
+        ".github",
+        "docs",
+        "examples",
+        "media",
+        "public",
+    }
+    INGEST_NOISE_FILE_NAMES = {
+        "readme.md",
+        "contributing.md",
+        "patterns.md",
+        "agents.md",
+        "license",
+        "license.md",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "uv.lock",
+        "tsconfig.json",
+        "components.json",
+    }
+    INGEST_NOISE_FILE_PATTERNS = (
+        ".github/workflows/*.yml",
+        ".github/workflows/*.yaml",
+        "*.md",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.gif",
+        "*.svg",
+        "*.ico",
+        "next.config.*",
+        "postcss.config.*",
+        "eslint.config.*",
+        "tailwind.config.*",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -2194,6 +2235,20 @@ class ConsoleScreen(Screen):
                 ignored = not include
         return ignored
 
+    def _is_builtin_ingest_noise(self, rel_path: Path, *, is_dir: bool) -> bool:
+        normalized = rel_path.as_posix()
+        name = rel_path.name.lower()
+        if is_dir:
+            return name in self.INGEST_NOISE_DIRS
+        if name.endswith((".pyc", ".pyo")):
+            return True
+        if name in self.INGEST_NOISE_FILE_NAMES:
+            return True
+        for pattern in self.INGEST_NOISE_FILE_PATTERNS:
+            if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(name, pattern):
+                return True
+        return False
+
     async def _ingest_directory(
         self,
         collection_id: str,
@@ -2208,7 +2263,6 @@ class ConsoleScreen(Screen):
 
         root = directory_path.resolve()
         rules = self._load_ignore_rules(root)
-        excluded_dirs = {".git", ".venv", "node_modules", "__pycache__"}
         candidate_files: list[Path] = []
         skipped_files: list[str] = []
 
@@ -2216,19 +2270,19 @@ class ConsoleScreen(Screen):
             current_path = Path(current_root)
             next_dirs: list[str] = []
             for directory in dirs:
-                if directory in excluded_dirs:
-                    continue
                 rel_dir = (current_path / directory).relative_to(root)
+                if self._is_builtin_ingest_noise(rel_dir, is_dir=True):
+                    continue
                 if self._is_ignored_path(rel_dir, rules, is_dir=True):
                     continue
                 next_dirs.append(directory)
             dirs[:] = next_dirs
 
             for filename in files:
-                if filename.endswith((".pyc", ".pyo")):
-                    continue
                 full_path = current_path / filename
                 rel_file = full_path.relative_to(root)
+                if self._is_builtin_ingest_noise(rel_file, is_dir=False):
+                    continue
                 if self._is_ignored_path(rel_file, rules, is_dir=False):
                     continue
                 candidate_files.append(full_path)
