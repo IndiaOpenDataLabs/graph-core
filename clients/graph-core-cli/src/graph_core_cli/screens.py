@@ -901,6 +901,7 @@ class ConsoleScreen(Screen):
         ".hypothesis",
         ".github",
         ".devcontainer",
+        ".opencode",
         "docs",
         "examples",
         "media",
