@@ -10,6 +10,7 @@ It is intentionally dependency-free for now.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -1103,6 +1104,10 @@ def build_collection_understanding(
     chunks: list[dict[str, Any]] = []
     seen_entity_refs: set[str] = set()
 
+    def derived_chunk_hash(*parts: object) -> str:
+        raw = "::".join(str(part) for part in parts)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
     def entity_ref_node(name: str) -> str:
         normalized = "_".join(name.strip().lower().split())
         return f"derived:entity:{normalized}"
@@ -1155,9 +1160,11 @@ def build_collection_understanding(
         )
         chunks.append(
             {
-                "chunk_hash": (
-                    f"{collection['id']}::derived::community::{rel_type}::"
-                    f"{community['community_id']}"
+                "chunk_hash": derived_chunk_hash(
+                    collection["id"],
+                    "community",
+                    rel_type,
+                    community["community_id"],
                 ),
                 "chunk_index": chunk_index,
                 "content": description,
@@ -1222,9 +1229,11 @@ def build_collection_understanding(
         )
         chunks.append(
             {
-                "chunk_hash": (
-                    f"{collection['id']}::derived::bridge::{bridge['name']}::"
-                    f"{'_'.join(rel_type_list)}"
+                "chunk_hash": derived_chunk_hash(
+                    collection["id"],
+                    "bridge",
+                    bridge["name"],
+                    "_".join(rel_type_list),
                 ),
                 "chunk_index": chunk_index,
                 "content": description,
@@ -1285,8 +1294,11 @@ def build_collection_understanding(
         )
         chunks.append(
             {
-                "chunk_hash": (
-                    f"{collection['id']}::derived::connector::{rel_type}::{idx}"
+                "chunk_hash": derived_chunk_hash(
+                    collection["id"],
+                    "connector",
+                    rel_type,
+                    idx,
                 ),
                 "chunk_index": chunk_index,
                 "content": description,
