@@ -1294,6 +1294,11 @@ class GraphService:
                 chunks=vector_chunks,
             )
 
+        kind_counts: dict[str, int] = {}
+        for node in understanding["nodes"]:
+            node_type = str(node.get("type") or "unknown")
+            kind_counts[node_type] = kind_counts.get(node_type, 0) + 1
+
         return {
             "analysis": analysis,
             "derived_graph": {
@@ -1301,6 +1306,7 @@ class GraphService:
                 "node_count": len(understanding["nodes"]),
                 "edge_count": len(understanding["edges"]),
                 "chunk_count": len(understanding["chunks"]),
+                "node_type_counts": kind_counts,
             },
         }
 

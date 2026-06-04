@@ -496,6 +496,31 @@ def _build_rel_type_analysis(
     max_weight = max_relationship_weight or settings.graph_rag_max_relationship_weight
     node_names = {node.id: node.name for node in nodes}
     rels = [rel for rel in relationships if (rel.rel_type or "RELATES_TO") == rel_type]
+    if not rels:
+        return {
+            "rel_type": rel_type,
+            "parameters": {
+                "min_edge_strength": min_edge_strength,
+                "min_community_size": min_community_size,
+                "max_anchors": max_anchors,
+                "max_path_depth": max_path_depth,
+                "max_connector_paths": max_connector_paths,
+                "max_relationship_weight": max_weight,
+            },
+            "totals": {
+                "entities": 0,
+                "relationships": 0,
+                "directed_pairs": 0,
+                "undirected_pairs": 0,
+                "strong_pairs": 0,
+                "communities": 0,
+            },
+            "node_metrics": [],
+            "communities": [],
+            "top_anchors": [],
+            "bridge_nodes": [],
+            "connector_paths": [],
+        }
 
     by_pair: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
     by_direction: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
@@ -558,7 +583,12 @@ def _build_rel_type_analysis(
         strong_adjacency[edge.node_a][edge.node_b] = edge
         strong_adjacency[edge.node_b][edge.node_a] = edge
 
-    node_ids = [node.id for node in nodes]
+    active_node_ids = sorted(
+        {rel.source_id for rel in rels} | {rel.target_id for rel in rels},
+        key=lambda node_id: node_id.hex,
+    )
+    active_nodes = [node for node in nodes if node.id in set(active_node_ids)]
+    node_ids = active_node_ids
     out_edges_weighted: dict[uuid.UUID, list[tuple[uuid.UUID, float]]] = defaultdict(list)
     in_edges_weighted: dict[uuid.UUID, list[tuple[uuid.UUID, float]]] = defaultdict(list)
     directed_neighbors: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
@@ -606,7 +636,7 @@ def _build_rel_type_analysis(
     articulation = _articulation_points(strong_adjacency)
 
     metrics: list[NodeMetrics] = []
-    for node in nodes:
+    for node in active_nodes:
         outbound_strength = sum(
             edge.strength for edge in directed_adjacency.get(node.id, {}).values()
         )
@@ -783,7 +813,7 @@ def _build_rel_type_analysis(
             "max_relationship_weight": max_weight,
         },
         "totals": {
-            "entities": len(nodes),
+            "entities": len(active_nodes),
             "relationships": len(rels),
             "directed_pairs": len(by_direction),
             "undirected_pairs": len(all_edges),

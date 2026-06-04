@@ -49,6 +49,12 @@ class EnhanceCollectionResponse(BaseModel):
     node_count: int
     edge_count: int
     chunk_count: int
+    rel_type_count: int
+    community_count: int
+    anchor_count: int
+    bridge_count: int
+    connector_count: int
+    node_type_counts: dict[str, int]
 
 
 router = APIRouter(prefix="/collections", tags=["collections"])
@@ -155,6 +161,12 @@ async def enhance_collection(
             node_count=int(derived_graph["node_count"]),
             edge_count=int(derived_graph["edge_count"]),
             chunk_count=int(derived_graph["chunk_count"]),
+            rel_type_count=int(result["analysis"]["totals"].get("rel_types", 0)),
+            community_count=len(result["analysis"].get("communities", [])),
+            anchor_count=len(result["analysis"].get("top_anchors", [])),
+            bridge_count=len(result["analysis"].get("bridge_nodes", [])),
+            connector_count=len(result["analysis"].get("connector_paths", [])),
+            node_type_counts=dict(derived_graph.get("node_type_counts", {})),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
