@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import distinct, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -34,7 +34,7 @@ from graph_core.models.rel_types import (
     relationship_embedding_text,
 )
 from graph_core.services.crypto import CredentialCrypto
-from graph_core.services.graph.analytics import analyze_collection_graph, derived_graph_name
+from graph_core.services.graph.analytics import derived_graph_name
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
@@ -71,25 +71,33 @@ _MODE_ALIASES = {
 }
 
 
-def _active_dimensions() -> list[str]:
-    """Active graph dimensions, in priority order.
+async def _active_dimensions(collection: Collection) -> list[str]:
+    """Active graph dimensions for this collection, in priority order.
 
-    Falls back to all known rel_types when the operator has not pinned
-    a subset, so collections ingested before this setting was added keep
-    working unchanged.
+    Falls back to the configured subset when the operator has pinned one.
+    Otherwise uses only rel_types that actually exist in the collection,
+    avoiding a fan-out across every domain's vocabulary on each query.
     """
     configured = list(settings.graph_rag_active_dimensions or [])
     if configured:
         return [normalize_dim(d) for d in configured]
-    from graph_core.models.rel_types import (
-        DEFAULT_REL_TYPE,
-        DOMAIN_VOCAB,
-    )
+    from graph_core.models.rel_types import DEFAULT_REL_TYPE
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(distinct(GraphRelationship.rel_type)).where(
+                GraphRelationship.collection_id == collection.id
+            )
+        )
+        found = [
+            normalize_dim(str(value))
+            for value in result.scalars().all()
+            if value is not None and str(value).strip()
+        ]
     types: list[str] = []
-    for vocab in DOMAIN_VOCAB.values():
-        for t in vocab:
-            if t not in types:
-                types.append(t)
+    for rel_type in found:
+        if rel_type not in types:
+            types.append(rel_type)
     if DEFAULT_REL_TYPE not in types:
         types.insert(0, DEFAULT_REL_TYPE)
     return types
@@ -113,7 +121,7 @@ async def _fan_out_per_dimension(
     scores across them. The result is the same shape as a single-dim
     traversal, so downstream context assembly is dimension-agnostic.
     """
-    dims = dimensions if dimensions is not None else _active_dimensions()
+    dims = dimensions if dimensions is not None else []
     if not dims:
         return await build_state(None)
     states: list[GraphQueryState] = []
@@ -1015,76 +1023,68 @@ async def _derive_route_profile(
     collection: Collection,
     state: GraphQueryState,
 ) -> DerivedRouteProfile:
-    analysis = await analyze_collection_graph(collection.id)
-    matched_ids = set(state.discovered_entity_ids)
+    _ = collection
     route_scores = {
         "hub": 0.0,
         "authority": 0.0,
         "bridge": 0.0,
-        "central": 0.0,
-        "importance": 0.0,
+        "central": 1.0,
+        "importance": 0.8,
     }
     rel_type_scores: dict[str, float] = defaultdict(float)
-    total_rows = 0
+    if not state.traversed_rel_ids:
+        normalized_route_scores = _normalize_scalar_map(route_scores)
+        return DerivedRouteProfile(
+            primary_route=max(
+                normalized_route_scores.items(),
+                key=lambda item: item[1],
+            )[0],
+            route_scores=normalized_route_scores,
+            rel_type_scores={},
+        )
 
-    for rel_analysis in analysis.get("rel_type_analyses", []):
-        rows = rel_analysis.get("node_metrics", [])
-        if not rows:
-            continue
-        metric_max = {
-            "hub_score": max(float(row.get("hub_score", 0.0)) for row in rows) or 0.0,
-            "authority_score": max(
-                float(row.get("authority_score", 0.0)) for row in rows
+    async with AsyncSessionLocal() as session:
+        rel_rows = (
+            await session.execute(
+                select(GraphRelationship.id, GraphRelationship.rel_type).where(
+                    GraphRelationship.id.in_(
+                        [
+                            uuid.UUID(rel_id)
+                            for rel_id in state.traversed_rel_ids
+                            if rel_id
+                        ]
+                    )
+                )
             )
-            or 0.0,
-            "betweenness": max(float(row.get("betweenness", 0.0)) for row in rows)
-            or 0.0,
-            "closeness": max(float(row.get("closeness", 0.0)) for row in rows) or 0.0,
-            "pagerank": max(float(row.get("pagerank", 0.0)) for row in rows) or 0.0,
-            "eigenvector_score": max(
-                float(row.get("eigenvector_score", 0.0)) for row in rows
-            )
-            or 0.0,
-        }
-        rel_type = str(rel_analysis.get("rel_type") or "RELATES_TO")
-        for row in rows:
-            node_id = str(row.get("node_id") or "")
-            if node_id not in matched_ids:
-                continue
-            total_rows += 1
-            hub = float(row.get("hub_score", 0.0))
-            authority = float(row.get("authority_score", 0.0))
-            bridge = float(row.get("betweenness", 0.0))
-            central = float(row.get("closeness", 0.0))
-            pagerank = float(row.get("pagerank", 0.0))
-            eigen = float(row.get("eigenvector_score", 0.0))
+        ).all()
 
-            route_scores["hub"] += hub / (metric_max["hub_score"] or 1.0)
-            route_scores["authority"] += authority / (
-                metric_max["authority_score"] or 1.0
-            )
-            route_scores["bridge"] += bridge / (metric_max["betweenness"] or 1.0)
-            route_scores["central"] += central / (metric_max["closeness"] or 1.0)
-            route_scores["importance"] += (
-                (pagerank / (metric_max["pagerank"] or 1.0))
-                + (eigen / (metric_max["eigenvector_score"] or 1.0))
-            ) / 2.0
-            rel_type_scores[rel_type] += (
-                hub
-                + authority
-                + bridge
-                + central
-                + pagerank
-                + eigen
-            )
-
-    if total_rows > 0:
-        route_scores = {
-            key: round(value / float(total_rows), 6)
-            for key, value in route_scores.items()
-        }
-    else:
-        route_scores = {key: 0.0 for key in route_scores}
+    for rel_id, rel_type in rel_rows:
+        rel_id_str = str(rel_id)
+        rel_type_norm = normalize_dim(rel_type or "RELATES_TO")
+        score = float(state.rel_combined_score_cache.get(rel_id_str, 0.0) or 0.0)
+        rel_type_scores[rel_type_norm] += score
+        if rel_type_norm in {"CALLS", "USES", "EMITS", "SENDS", "SPAWNS"}:
+            route_scores["hub"] += score
+        if rel_type_norm in {
+            "DEFINES",
+            "EXTENDS",
+            "IMPLEMENTS",
+            "CONTAINS",
+            "AUTHORED_BY",
+        }:
+            route_scores["authority"] += score
+        if rel_type_norm in {
+            "DEPENDS_ON",
+            "CONNECTS_TO",
+            "GUARDS",
+            "AUTHORIZES",
+            "AUTHENTICATES",
+        }:
+            route_scores["bridge"] += score
+        if rel_type_norm in {"IMPORTS", "REFERENCES", "RELATES_TO", "ABOUT"}:
+            route_scores["central"] += score
+        if rel_type_norm in {"DOCUMENTS", "DESCRIBES", "SUMMARIZES", "PROVES"}:
+            route_scores["importance"] += score / 2.0
 
     normalized_route_scores = _normalize_scalar_map(route_scores)
     primary_route = max(
@@ -1395,7 +1395,7 @@ async def graph_rag_query(
 
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
-    dimensions = _active_dimensions()
+    dimensions = await _active_dimensions(collection)
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
         relationship_query_embedding = await _embed_relationship_query(
