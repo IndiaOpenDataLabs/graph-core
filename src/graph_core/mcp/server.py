@@ -461,9 +461,9 @@ async def get_job_status(job_id: str, ctx: Context) -> str:
 
 @mcp.tool()
 async def list_jobs(
-    ctx: Context,
     limit: int = 20,
     collection_id: str | None = None,
+    ctx: Context = None,
 ) -> str:
     """List recent jobs in the current namespace."""
     api_key = _extract_api_key(ctx)
