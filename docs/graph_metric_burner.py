@@ -203,6 +203,21 @@ def top_named(score_map, name_map, subset=None, topn=12):
     return sorted(((name_map[k], v) for k, v in items), key=lambda x: x[1], reverse=True)[:topn]
 
 
+def normalize(scores):
+    if not scores:
+        return {}
+    max_value = max(scores.values()) or 0.0
+    if max_value <= 0.0:
+        return {k: 0.0 for k in scores}
+    return {k: float(v) / float(max_value) for k, v in scores.items()}
+
+
+def mean_score(scores, nodes):
+    if not nodes:
+        return 0.0
+    return sum(scores.get(node_id, 0.0) for node_id in nodes) / float(len(nodes))
+
+
 async def load_collection_graph(collection_name: str):
     async with AsyncSessionLocal() as session:
         coll = await session.scalar(select(Collection).where(Collection.name == collection_name))
@@ -286,6 +301,39 @@ async def main() -> None:
     print("\narticulation_nodes")
     for eid in sorted(focus_nodes & arts, key=lambda x: name[x])[: args.topn * 2]:
         print(" ", name[eid])
+
+    pr_n = normalize(pr)
+    auth_n = normalize(auth)
+    hub_n = normalize(hub)
+    eig_n = normalize(eig)
+    btw_n = normalize(btw)
+    close_n = normalize(close)
+    route_profile = {
+        "hub": mean_score(hub_n, focus_nodes),
+        "authority": mean_score(auth_n, focus_nodes),
+        "bridge": mean_score(btw_n, focus_nodes),
+        "central": mean_score(close_n, focus_nodes),
+        "importance": (
+            mean_score(pr_n, focus_nodes) + mean_score(eig_n, focus_nodes)
+        )
+        / 2.0,
+    }
+    routed = sorted(route_profile.items(), key=lambda item: item[1], reverse=True)
+    print("\n[routing profile]")
+    for label, value in routed:
+        print(f"  {label}: {value:.6f}")
+    top_route = routed[0][0] if routed else "importance"
+    route_scores = {
+        "hub": hub,
+        "authority": auth,
+        "bridge": btw,
+        "central": close,
+        "importance": pr,
+    }
+    print(f"route={top_route}")
+    print("route_seed_nodes")
+    for nm, val in top_named(route_scores[top_route], name, subset=focus_nodes, topn=min(args.topn, 8)):
+        print(f"  {nm}: {val:.6f}")
 
     print("\n[typed slices]")
     for rel_type in TYPED_REL_SLICES:

@@ -792,6 +792,28 @@ def _build_rel_type_analysis(
             ),
             "communities": len(communities),
         },
+        "node_metrics": [
+            {
+                "node_id": str(metric.node_id),
+                "name": metric.name,
+                "community_id": metric.community_id,
+                "rel_type": metric.rel_type,
+                "anchor_score": metric.anchor_score,
+                "pagerank": metric.pagerank,
+                "authority_score": metric.authority_score,
+                "hub_score": metric.hub_score,
+                "eigenvector_score": metric.eigenvector_score,
+                "betweenness": metric.betweenness,
+                "closeness": metric.closeness,
+                "inbound_strength": metric.inbound_strength,
+                "outbound_strength": metric.outbound_strength,
+                "weighted_degree": metric.weighted_degree,
+                "external_communities": list(metric.external_communities),
+                "external_strength": metric.external_strength,
+                "is_articulation": metric.is_articulation,
+            }
+            for metric in metrics
+        ],
         "communities": community_summaries,
         "top_anchors": [
             {

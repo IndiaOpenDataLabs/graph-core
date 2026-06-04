@@ -34,7 +34,7 @@ from graph_core.models.rel_types import (
     relationship_embedding_text,
 )
 from graph_core.services.crypto import CredentialCrypto
-from graph_core.services.graph.analytics import derived_graph_name
+from graph_core.services.graph.analytics import analyze_collection_graph, derived_graph_name
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
@@ -147,6 +147,13 @@ class DerivedContext:
     base_entity_ids: dict[str, float]
     derived_nodes_used: list[str]
     derived_edges_used: list[str]
+
+
+@dataclass
+class DerivedRouteProfile:
+    primary_route: str
+    route_scores: dict[str, float]
+    rel_type_scores: dict[str, float]
 
 
 def _format_retrieval_query(instruction: str, query: str) -> str:
@@ -995,16 +1002,115 @@ async def _mix_state(
     return _merge_states(*states)
 
 
+def _normalize_scalar_map(scores: dict[str, float]) -> dict[str, float]:
+    if not scores:
+        return {}
+    max_value = max(scores.values()) or 0.0
+    if max_value <= 0.0:
+        return {key: 0.0 for key in scores}
+    return {key: float(value) / float(max_value) for key, value in scores.items()}
+
+
+async def _derive_route_profile(
+    collection: Collection,
+    state: GraphQueryState,
+) -> DerivedRouteProfile:
+    analysis = await analyze_collection_graph(collection.id)
+    matched_ids = set(state.discovered_entity_ids)
+    route_scores = {
+        "hub": 0.0,
+        "authority": 0.0,
+        "bridge": 0.0,
+        "central": 0.0,
+        "importance": 0.0,
+    }
+    rel_type_scores: dict[str, float] = defaultdict(float)
+    total_rows = 0
+
+    for rel_analysis in analysis.get("rel_type_analyses", []):
+        rows = rel_analysis.get("node_metrics", [])
+        if not rows:
+            continue
+        metric_max = {
+            "hub_score": max(float(row.get("hub_score", 0.0)) for row in rows) or 0.0,
+            "authority_score": max(
+                float(row.get("authority_score", 0.0)) for row in rows
+            )
+            or 0.0,
+            "betweenness": max(float(row.get("betweenness", 0.0)) for row in rows)
+            or 0.0,
+            "closeness": max(float(row.get("closeness", 0.0)) for row in rows) or 0.0,
+            "pagerank": max(float(row.get("pagerank", 0.0)) for row in rows) or 0.0,
+            "eigenvector_score": max(
+                float(row.get("eigenvector_score", 0.0)) for row in rows
+            )
+            or 0.0,
+        }
+        rel_type = str(rel_analysis.get("rel_type") or "RELATES_TO")
+        for row in rows:
+            node_id = str(row.get("node_id") or "")
+            if node_id not in matched_ids:
+                continue
+            total_rows += 1
+            hub = float(row.get("hub_score", 0.0))
+            authority = float(row.get("authority_score", 0.0))
+            bridge = float(row.get("betweenness", 0.0))
+            central = float(row.get("closeness", 0.0))
+            pagerank = float(row.get("pagerank", 0.0))
+            eigen = float(row.get("eigenvector_score", 0.0))
+
+            route_scores["hub"] += hub / (metric_max["hub_score"] or 1.0)
+            route_scores["authority"] += authority / (
+                metric_max["authority_score"] or 1.0
+            )
+            route_scores["bridge"] += bridge / (metric_max["betweenness"] or 1.0)
+            route_scores["central"] += central / (metric_max["closeness"] or 1.0)
+            route_scores["importance"] += (
+                (pagerank / (metric_max["pagerank"] or 1.0))
+                + (eigen / (metric_max["eigenvector_score"] or 1.0))
+            ) / 2.0
+            rel_type_scores[rel_type] += (
+                hub
+                + authority
+                + bridge
+                + central
+                + pagerank
+                + eigen
+            )
+
+    if total_rows > 0:
+        route_scores = {
+            key: round(value / float(total_rows), 6)
+            for key, value in route_scores.items()
+        }
+    else:
+        route_scores = {key: 0.0 for key in route_scores}
+
+    normalized_route_scores = _normalize_scalar_map(route_scores)
+    primary_route = max(
+        normalized_route_scores.items(),
+        key=lambda item: item[1],
+    )[0]
+    return DerivedRouteProfile(
+        primary_route=primary_route,
+        route_scores=normalized_route_scores,
+        rel_type_scores=_normalize_scalar_map(
+            {key: float(value) for key, value in rel_type_scores.items()}
+        ),
+    )
+
+
 async def _load_derived_context(
     question: str,
     collection: Collection,
     embedding_provider: EmbeddingProvider,
+    route_profile: DerivedRouteProfile,
 ) -> DerivedContext:
     derived_query_embedding = await _embed_derived_query(embedding_provider, question)
     hits = await _vector_store.query_chunks(
         collection_id=collection.id,
         query_embedding=derived_query_embedding,
-        top_k=6,
+        top_k=12,
         metadata_filters={"memory_type": "derived_graph"},
     )
     if not hits:
@@ -1015,6 +1121,25 @@ async def _load_derived_context(
             derived_edges_used=[],
         )
 
+    kind_weights = {
+        "hub": {"bridge": 1.15, "connector": 1.05, "community": 1.0},
+        "authority": {"community": 1.15, "bridge": 1.05, "connector": 1.0},
+        "bridge": {"bridge": 1.2, "connector": 1.15, "community": 1.0},
+        "central": {"connector": 1.15, "community": 1.1, "bridge": 1.0},
+        "importance": {"community": 1.1, "bridge": 1.05, "connector": 1.0},
+    }.get(route_profile.primary_route, {})
+    scored_hits = []
+    for hit in hits:
+        metadata = hit.get("metadata") or {}
+        base_score = float(hit.get("score") or 0.0)
+        derived_kind = str(metadata.get("derived_kind") or "").strip()
+        rel_type = str(metadata.get("rel_type") or "").strip().upper()
+        score = base_score * kind_weights.get(derived_kind, 1.0)
+        if rel_type:
+            score *= 1.0 + (0.2 * route_profile.rel_type_scores.get(rel_type, 0.0))
+        scored_hits.append((score, hit))
+    scored_hits.sort(key=lambda item: item[0], reverse=True)
+
     storage = FalkorDBGraphStorage(derived_graph_name(collection.id))
     summary_lines: list[str] = []
     graph_lines: list[str] = []
@@ -1024,12 +1149,11 @@ async def _load_derived_context(
     seen_nodes: set[str] = set()
     seen_edges: set[str] = set()
 
-    for hit in hits:
+    for score, hit in scored_hits[:6]:
         metadata = hit.get("metadata") or {}
         derived_id = str(metadata.get("derived_id") or "").strip()
         if not derived_id:
             continue
-        score = float(hit.get("score") or 0.0)
         if derived_id not in seen_nodes:
             seen_nodes.add(derived_id)
             derived_nodes_used.append(derived_id)
@@ -1341,10 +1465,12 @@ async def graph_rag_query(
     if effective_mode not in ("relationship-first", "mix", "hybrid"):
         effective_mode = "entity-first"
 
+    route_profile = await _derive_route_profile(collection, state)
     derived = await _load_derived_context(
         question,
         collection,
         embedding_provider,
+        route_profile,
     )
     for eid, score in derived.base_entity_ids.items():
         state.discovered_entity_ids.add(eid)
