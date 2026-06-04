@@ -10,6 +10,7 @@ from graph_core.config import settings
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.ingestion.document_pipeline import (
     dispatch_pending_chunks,
+    increment_chunk_counter,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ async def run_chunk(job_id: str, chunk_index: int):
     try:
         await service.process_single_chunk(job_id, chunk_index)
     except Exception as e:
-        logger.error(
+        logger.exception(
             "run_chunk failed: job=%s chunk=%d error=%s",
             job_id,
             chunk_index,
@@ -58,5 +59,13 @@ async def run_chunk(job_id: str, chunk_index: int):
         )
         job_uuid = uuid.UUID(job_id)
         await service.update_chunk_status(job_uuid, chunk_index, "failed", error=str(e))
+        await increment_chunk_counter(job_uuid)
+        await service.append_job_event(
+            job_uuid,
+            "chunk_failed",
+            {
+                "chunk_index": chunk_index,
+                "error": str(e),
+            },
+        )
         await dispatch_pending_chunks(job_uuid, slots=1)
-        raise
