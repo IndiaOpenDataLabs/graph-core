@@ -68,6 +68,12 @@ class NodeMetrics:
     name: str
     community_id: int
     rel_type: str
+    pagerank: float
+    authority_score: float
+    hub_score: float
+    eigenvector_score: float
+    betweenness: float
+    closeness: float
     inbound_strength: float
     outbound_strength: float
     weighted_degree: float
@@ -229,6 +235,185 @@ def _top_rel_types(relationships: list[RelationshipRecord]) -> list[str]:
     return sorted({rel.rel_type or "RELATES_TO" for rel in relationships})
 
 
+def _power_pagerank(
+    nodes: list[uuid.UUID],
+    out_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
+    in_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
+    *,
+    alpha: float = 0.85,
+    max_iter: int = 100,
+    tol: float = 1e-8,
+) -> dict[uuid.UUID, float]:
+    count = len(nodes)
+    if count == 0:
+        return {}
+    pr = {node_id: 1.0 / count for node_id in nodes}
+    out_weight = {
+        node_id: sum(weight for _target, weight in out_edges.get(node_id, []))
+        for node_id in nodes
+    }
+    for _ in range(max_iter):
+        new = {node_id: (1.0 - alpha) / count for node_id in nodes}
+        sink = sum(pr[node_id] for node_id in nodes if out_weight.get(node_id, 0.0) == 0.0)
+        sink_share = alpha * sink / count
+        for node_id in nodes:
+            new[node_id] += sink_share
+        for node_id in nodes:
+            for source_id, weight in in_edges.get(node_id, []):
+                denom = out_weight.get(source_id, 0.0)
+                if denom > 0:
+                    new[node_id] += alpha * pr[source_id] * (weight / denom)
+        error = sum(abs(new[node_id] - pr[node_id]) for node_id in nodes)
+        pr = new
+        if error < tol:
+            break
+    return pr
+
+
+def _power_hits(
+    nodes: list[uuid.UUID],
+    out_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
+    in_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
+    *,
+    max_iter: int = 100,
+    tol: float = 1e-8,
+) -> tuple[dict[uuid.UUID, float], dict[uuid.UUID, float]]:
+    authority = {node_id: 1.0 for node_id in nodes}
+    hub = {node_id: 1.0 for node_id in nodes}
+    for _ in range(max_iter):
+        new_authority = {
+            node_id: sum(hub[src] * weight for src, weight in in_edges.get(node_id, []))
+            for node_id in nodes
+        }
+        norm = sum(value * value for value in new_authority.values()) ** 0.5 or 1.0
+        for node_id in nodes:
+            new_authority[node_id] /= norm
+        new_hub = {
+            node_id: sum(
+                new_authority[target] * weight
+                for target, weight in out_edges.get(node_id, [])
+            )
+            for node_id in nodes
+        }
+        norm = sum(value * value for value in new_hub.values()) ** 0.5 or 1.0
+        for node_id in nodes:
+            new_hub[node_id] /= norm
+        error = sum(
+            abs(new_authority[node_id] - authority[node_id])
+            + abs(new_hub[node_id] - hub[node_id])
+            for node_id in nodes
+        )
+        authority, hub = new_authority, new_hub
+        if error < tol:
+            break
+    return authority, hub
+
+
+def _power_eigenvector_undirected(
+    nodes: list[uuid.UUID],
+    neighbors: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
+    *,
+    max_iter: int = 100,
+    tol: float = 1e-8,
+) -> dict[uuid.UUID, float]:
+    scores = {node_id: 1.0 for node_id in nodes}
+    for _ in range(max_iter):
+        new = {
+            node_id: sum(scores[other_id] * weight for other_id, weight in neighbors.get(node_id, []))
+            for node_id in nodes
+        }
+        norm = sum(value * value for value in new.values()) ** 0.5 or 1.0
+        for node_id in nodes:
+            new[node_id] /= norm
+        error = sum(abs(new[node_id] - scores[node_id]) for node_id in nodes)
+        scores = new
+        if error < tol:
+            break
+    return scores
+
+
+def _shortest_paths_unweighted(
+    adjacency: dict[uuid.UUID, list[uuid.UUID]],
+    source_id: uuid.UUID,
+) -> tuple[
+    list[uuid.UUID],
+    dict[uuid.UUID, list[uuid.UUID]],
+    dict[uuid.UUID, float],
+    dict[uuid.UUID, int],
+]:
+    distance = {source_id: 0}
+    sigma: dict[uuid.UUID, float] = defaultdict(float)
+    sigma[source_id] = 1.0
+    predecessors: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    queue: deque[uuid.UUID] = deque([source_id])
+    order: list[uuid.UUID] = []
+    while queue:
+        node_id = queue.popleft()
+        order.append(node_id)
+        for neighbor_id in adjacency.get(node_id, []):
+            if neighbor_id not in distance:
+                distance[neighbor_id] = distance[node_id] + 1
+                queue.append(neighbor_id)
+            if distance[neighbor_id] == distance[node_id] + 1:
+                sigma[neighbor_id] += sigma[node_id]
+                predecessors[neighbor_id].append(node_id)
+    return order, predecessors, sigma, distance
+
+
+def _betweenness_directed(
+    nodes: list[uuid.UUID],
+    adjacency: dict[uuid.UUID, list[uuid.UUID]],
+) -> dict[uuid.UUID, float]:
+    scores = {node_id: 0.0 for node_id in nodes}
+    for source_id in nodes:
+        order, predecessors, sigma, _distance = _shortest_paths_unweighted(
+            adjacency,
+            source_id,
+        )
+        delta = {node_id: 0.0 for node_id in nodes}
+        for node_id in reversed(order):
+            for predecessor_id in predecessors[node_id]:
+                if sigma[node_id]:
+                    delta[predecessor_id] += (
+                        sigma[predecessor_id] / sigma[node_id]
+                    ) * (1.0 + delta[node_id])
+            if node_id != source_id:
+                scores[node_id] += delta[node_id]
+    count = len(nodes)
+    if count > 2:
+        scale = 1.0 / ((count - 1) * (count - 2))
+        for node_id in scores:
+            scores[node_id] *= scale
+    return scores
+
+
+def _harmonic_closeness(
+    nodes: list[uuid.UUID],
+    adjacency: dict[uuid.UUID, list[uuid.UUID]],
+) -> dict[uuid.UUID, float]:
+    scores: dict[uuid.UUID, float] = {}
+    for source_id in nodes:
+        _order, _predecessors, _sigma, distance = _shortest_paths_unweighted(
+            adjacency,
+            source_id,
+        )
+        scores[source_id] = sum(
+            1.0 / dist
+            for node_id, dist in distance.items()
+            if node_id != source_id and dist > 0
+        )
+    return scores
+
+
+def _normalize_scores(scores: dict[uuid.UUID, float]) -> dict[uuid.UUID, float]:
+    if not scores:
+        return {}
+    max_value = max(scores.values()) or 0.0
+    if max_value <= 0.0:
+        return {node_id: 0.0 for node_id in scores}
+    return {node_id: float(value) / float(max_value) for node_id, value in scores.items()}
+
+
 async def _load_graph_records(
     collection_id: uuid.UUID,
 ) -> tuple[Collection, list[NodeRecord], list[RelationshipRecord]]:
@@ -374,6 +559,38 @@ def _build_rel_type_analysis(
         strong_adjacency[edge.node_b][edge.node_a] = edge
 
     node_ids = [node.id for node in nodes]
+    out_edges_weighted: dict[uuid.UUID, list[tuple[uuid.UUID, float]]] = defaultdict(list)
+    in_edges_weighted: dict[uuid.UUID, list[tuple[uuid.UUID, float]]] = defaultdict(list)
+    directed_neighbors: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    undirected_neighbors_weighted: dict[
+        uuid.UUID, list[tuple[uuid.UUID, float]]
+    ] = defaultdict(list)
+    for source_id, targets in directed_adjacency.items():
+        for target_id, edge in targets.items():
+            weight = max(edge.strength, 1e-6)
+            out_edges_weighted[source_id].append((target_id, weight))
+            in_edges_weighted[target_id].append((source_id, weight))
+            directed_neighbors[source_id].append(target_id)
+    for node_id, neighbors in full_adjacency.items():
+        for neighbor_id, edge in neighbors.items():
+            undirected_neighbors_weighted[node_id].append(
+                (neighbor_id, max(edge.strength, 1e-6))
+            )
+
+    pagerank = _power_pagerank(node_ids, out_edges_weighted, in_edges_weighted)
+    authority_score, hub_score = _power_hits(
+        node_ids,
+        out_edges_weighted,
+        in_edges_weighted,
+    )
+    eigenvector_score = _power_eigenvector_undirected(
+        node_ids,
+        undirected_neighbors_weighted,
+    )
+    betweenness = _betweenness_directed(node_ids, directed_neighbors)
+    closeness = _harmonic_closeness(node_ids, directed_neighbors)
+    closeness_norm = _normalize_scores(closeness)
+
     communities = _connected_components(node_ids, strong_adjacency)
     communities = _merge_small_communities(
         communities,
@@ -410,7 +627,13 @@ def _build_rel_type_analysis(
                 external_communities.add(neighbor_community)
                 external_strength += edge.strength
         anchor_score = (
-            outbound_strength
+            (2.0 * pagerank.get(node.id, 0.0))
+            + (2.0 * authority_score.get(node.id, 0.0))
+            + (2.0 * hub_score.get(node.id, 0.0))
+            + (1.5 * eigenvector_score.get(node.id, 0.0))
+            + (6.0 * betweenness.get(node.id, 0.0))
+            + (2.5 * closeness_norm.get(node.id, 0.0))
+            + outbound_strength
             + inbound_strength
             + weighted_degree
             + (2.0 * len(external_communities))
@@ -423,6 +646,12 @@ def _build_rel_type_analysis(
                 name=node.name,
                 community_id=community_of.get(node.id, -1),
                 rel_type=rel_type,
+                pagerank=round(pagerank.get(node.id, 0.0), 6),
+                authority_score=round(authority_score.get(node.id, 0.0), 6),
+                hub_score=round(hub_score.get(node.id, 0.0), 6),
+                eigenvector_score=round(eigenvector_score.get(node.id, 0.0), 6),
+                betweenness=round(betweenness.get(node.id, 0.0), 6),
+                closeness=round(closeness_norm.get(node.id, 0.0), 6),
                 inbound_strength=round(inbound_strength, 4),
                 outbound_strength=round(outbound_strength, 4),
                 weighted_degree=round(weighted_degree, 4),
@@ -437,6 +666,9 @@ def _build_rel_type_analysis(
         metrics,
         key=lambda item: (
             item.anchor_score,
+            item.betweenness,
+            item.closeness,
+            item.hub_score + item.authority_score,
             item.outbound_strength + item.inbound_strength,
             item.weighted_degree,
             len(item.external_communities),
@@ -568,6 +800,12 @@ def _build_rel_type_analysis(
                 "community_id": metric.community_id,
                 "rel_type": metric.rel_type,
                 "anchor_score": metric.anchor_score,
+                "pagerank": metric.pagerank,
+                "authority_score": metric.authority_score,
+                "hub_score": metric.hub_score,
+                "eigenvector_score": metric.eigenvector_score,
+                "betweenness": metric.betweenness,
+                "closeness": metric.closeness,
                 "inbound_strength": metric.inbound_strength,
                 "outbound_strength": metric.outbound_strength,
                 "weighted_degree": metric.weighted_degree,
@@ -584,6 +822,12 @@ def _build_rel_type_analysis(
                 "community_id": metric.community_id,
                 "rel_type": metric.rel_type,
                 "anchor_score": metric.anchor_score,
+                "pagerank": metric.pagerank,
+                "authority_score": metric.authority_score,
+                "hub_score": metric.hub_score,
+                "eigenvector_score": metric.eigenvector_score,
+                "betweenness": metric.betweenness,
+                "closeness": metric.closeness,
                 "inbound_strength": metric.inbound_strength,
                 "outbound_strength": metric.outbound_strength,
                 "weighted_degree": metric.weighted_degree,
@@ -660,6 +904,12 @@ def build_collection_analysis(
                         **item,
                         "rel_types": [],
                         "anchor_score": 0.0,
+                        "pagerank": 0.0,
+                        "authority_score": 0.0,
+                        "hub_score": 0.0,
+                        "eigenvector_score": 0.0,
+                        "betweenness": 0.0,
+                        "closeness": 0.0,
                         "inbound_strength": 0.0,
                         "outbound_strength": 0.0,
                         "weighted_degree": 0.0,
@@ -668,6 +918,12 @@ def build_collection_analysis(
                 )
                 entry["rel_types"].append(item["rel_type"])
                 entry["anchor_score"] += float(item["anchor_score"])
+                entry["pagerank"] += float(item.get("pagerank", 0.0))
+                entry["authority_score"] += float(item.get("authority_score", 0.0))
+                entry["hub_score"] += float(item.get("hub_score", 0.0))
+                entry["eigenvector_score"] += float(item.get("eigenvector_score", 0.0))
+                entry["betweenness"] += float(item.get("betweenness", 0.0))
+                entry["closeness"] += float(item.get("closeness", 0.0))
                 entry["inbound_strength"] += float(item["inbound_strength"])
                 entry["outbound_strength"] += float(item["outbound_strength"])
                 entry["weighted_degree"] += float(item["weighted_degree"])
@@ -686,6 +942,12 @@ def build_collection_analysis(
             row["rel_types"] = sorted(set(row["rel_types"]))
             for key in (
                 "anchor_score",
+                "pagerank",
+                "authority_score",
+                "hub_score",
+                "eigenvector_score",
+                "betweenness",
+                "closeness",
                 "inbound_strength",
                 "outbound_strength",
                 "weighted_degree",
@@ -695,6 +957,9 @@ def build_collection_analysis(
         rows.sort(
             key=lambda item: (
                 item["anchor_score"],
+                item["betweenness"],
+                item["closeness"],
+                item["hub_score"] + item["authority_score"],
                 item["outbound_strength"] + item["inbound_strength"],
                 item["weighted_degree"],
                 len(item["rel_types"]),
@@ -889,7 +1154,9 @@ def build_collection_understanding(
             f"with external strength {bridge['external_strength']} and weighted "
             f"degree {bridge['weighted_degree']}. Inbound strength "
             f"{bridge['inbound_strength']} and outbound strength "
-            f"{bridge['outbound_strength']}."
+            f"{bridge['outbound_strength']}. Betweenness {bridge['betweenness']}, "
+            f"closeness {bridge['closeness']}, hub {bridge['hub_score']}, "
+            f"authority {bridge['authority_score']}."
         )
         nodes.append(
             {
