@@ -73,6 +73,10 @@ def _edge_strength(weight_sum: int, max_weight: int) -> float:
     return min(1.0, float(weight_sum) / float(cap))
 
 
+def derived_graph_name(collection_id: uuid.UUID) -> str:
+    return f"collection_{str(collection_id).replace('-', '')}_derived"
+
+
 def _connected_components(
     node_ids: list[uuid.UUID],
     adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]],
@@ -412,10 +416,13 @@ def build_collection_analysis(
             path_score += edge.strength
             hops.append(
                 {
+                    "source_id": str(current_id),
                     "source": node_names[current_id],
+                    "target_id": str(next_id),
                     "target": node_names[next_id],
                     "strength": round(edge.strength, 4),
                     "rel_types": list(edge.rel_types),
+                    "relationship_ids": list(edge.relationship_ids),
                 }
             )
         connector_paths.append(
@@ -462,6 +469,7 @@ def build_collection_analysis(
             {
                 "community_id": idx,
                 "size": len(members),
+                "node_ids": [str(node_id) for node_id in members],
                 "node_names": sorted(node_names[node_id] for node_id in members),
                 "strong_edge_count": len(internal_edges),
                 "average_strong_edge_strength": round(
@@ -498,6 +506,7 @@ def build_collection_analysis(
         "communities": community_summaries,
         "top_anchors": [
             {
+                "node_id": str(metric.node_id),
                 "name": metric.name,
                 "community_id": metric.community_id,
                 "anchor_score": metric.anchor_score,
@@ -510,6 +519,7 @@ def build_collection_analysis(
         ],
         "bridge_nodes": [
             {
+                "node_id": str(metric.node_id),
                 "name": metric.name,
                 "community_id": metric.community_id,
                 "anchor_score": metric.anchor_score,
@@ -562,3 +572,223 @@ async def analyze_collection_graph(
         "strategy": str(collection.strategy),
     }
     return analysis
+
+
+def build_collection_understanding(
+    analysis: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    collection = analysis["collection"]
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    chunks: list[dict[str, Any]] = []
+    seen_entity_refs: set[str] = set()
+
+    def entity_ref_node(name: str) -> str:
+        normalized = "_".join(name.strip().lower().split())
+        return f"derived:entity:{normalized}"
+
+    def ensure_entity_ref(
+        name: str,
+        *,
+        supporting_ids: list[str] | None = None,
+    ) -> str:
+        node_id = entity_ref_node(name)
+        if node_id in seen_entity_refs:
+            return node_id
+        seen_entity_refs.add(node_id)
+        nodes.append(
+            {
+                "id": node_id,
+                "name": name,
+                "collection_id": collection["id"],
+                "type": "base_entity_ref",
+                "description": f"Reference to base graph entity: {name}.",
+                "source_ids": supporting_ids or [],
+            }
+        )
+        return node_id
+
+    chunk_index = 0
+    for community in analysis["communities"]:
+        node_id = f"derived:community:{community['community_id']}"
+        anchor_preview = community.get("anchor_preview") or []
+        node_names = community.get("node_names") or []
+        description = (
+            f"Community {community['community_id']} contains {community['size']} "
+            f"entities with {community['strong_edge_count']} strong edges. "
+            f"Representative anchors: {', '.join(anchor_preview) or 'none'}. "
+            f"This region appears centered on: "
+            f"{', '.join(node_names[:6]) or 'no nodes'}."
+        )
+        source_ids = community.get("node_ids", [])
+        nodes.append(
+            {
+                "id": node_id,
+                "name": f"Community {community['community_id']}",
+                "collection_id": collection["id"],
+                "type": "derived_community",
+                "description": description,
+                "source_ids": source_ids,
+            }
+        )
+        chunks.append(
+            {
+                "chunk_hash": (
+                    f"{collection['id']}::derived::community::"
+                    f"{community['community_id']}"
+                ),
+                "chunk_index": chunk_index,
+                "content": description,
+                "metadata": {
+                    "memory_type": "derived_graph",
+                    "derived_kind": "community",
+                    "derived_id": node_id,
+                    "collection_id": collection["id"],
+                },
+            }
+        )
+        chunk_index += 1
+        for name in anchor_preview:
+            ref_id = ensure_entity_ref(name, supporting_ids=source_ids)
+            edges.append(
+                {
+                    "source_id": node_id,
+                    "target_id": ref_id,
+                    "id": f"{node_id}__{ref_id}",
+                    "collection_id": collection["id"],
+                    "rel_type": "SUMMARIZES",
+                    "description": (
+                        f"Community {community['community_id']} is summarized in part "
+                        f"by anchor entity {name}."
+                    ),
+                    "source_ids": source_ids,
+                }
+            )
+
+    for bridge in analysis["bridge_nodes"]:
+        node_id = f"derived:bridge:{'_'.join(bridge['name'].strip().lower().split())}"
+        source_ids = [bridge["node_id"]] if bridge.get("node_id") else []
+        external_list = ", ".join(
+            str(cid) for cid in bridge["external_communities"]
+        ) or "none"
+        description = (
+            f"{bridge['name']} acts as a bridge node in community "
+            f"{bridge['community_id']}. It connects to external communities "
+            f"{external_list} "
+            f"with external strength {bridge['external_strength']} and weighted "
+            f"degree {bridge['weighted_degree']}."
+        )
+        nodes.append(
+            {
+                "id": node_id,
+                "name": f"Bridge: {bridge['name']}",
+                "collection_id": collection["id"],
+                "type": "derived_bridge",
+                "description": description,
+                "source_ids": source_ids,
+            }
+        )
+        chunks.append(
+            {
+                "chunk_hash": f"{collection['id']}::derived::bridge::{bridge['name']}",
+                "chunk_index": chunk_index,
+                "content": description,
+                "metadata": {
+                    "memory_type": "derived_graph",
+                    "derived_kind": "bridge",
+                    "derived_id": node_id,
+                    "collection_id": collection["id"],
+                },
+            }
+        )
+        chunk_index += 1
+        ref_id = ensure_entity_ref(bridge["name"], supporting_ids=source_ids)
+        edges.append(
+            {
+                "source_id": node_id,
+                "target_id": ref_id,
+                "id": f"{node_id}__{ref_id}",
+                "collection_id": collection["id"],
+                "rel_type": "FOCUSES_ON",
+                "description": f"Bridge summary focuses on entity {bridge['name']}.",
+                "source_ids": source_ids,
+            }
+        )
+
+    for idx, path in enumerate(analysis["connector_paths"]):
+        node_id = f"derived:path:{idx}"
+        path_nodes = path.get("nodes") or []
+        supporting_rel_ids = [
+            rel_id
+            for hop in path.get("hops", [])
+            for rel_id in hop.get("relationship_ids", [])
+        ]
+        description = (
+            f"Connector path from {path['from_anchor']} to {path['to_anchor']} "
+            f"crosses {path['hop_count']} hops with score {path['path_score']}. "
+            f"Flow: {' -> '.join(path_nodes)}."
+        )
+        nodes.append(
+            {
+                "id": node_id,
+                "name": (
+                    f"Connector {idx}: {path['from_anchor']} -> "
+                    f"{path['to_anchor']}"
+                ),
+                "collection_id": collection["id"],
+                "type": "derived_connector",
+                "description": description,
+                "source_ids": supporting_rel_ids,
+            }
+        )
+        chunks.append(
+            {
+                "chunk_hash": f"{collection['id']}::derived::connector::{idx}",
+                "chunk_index": chunk_index,
+                "content": description,
+                "metadata": {
+                    "memory_type": "derived_graph",
+                    "derived_kind": "connector",
+                    "derived_id": node_id,
+                    "collection_id": collection["id"],
+                },
+            }
+        )
+        chunk_index += 1
+        for name in path_nodes:
+            ref_id = ensure_entity_ref(name)
+            edges.append(
+                {
+                    "source_id": node_id,
+                    "target_id": ref_id,
+                    "id": f"{node_id}__{ref_id}",
+                    "collection_id": collection["id"],
+                    "rel_type": "USES",
+                    "description": (
+                        f"Connector path between {path['from_anchor']} and "
+                        f"{path['to_anchor']} uses entity {name}."
+                    ),
+                    "source_ids": supporting_rel_ids,
+                }
+            )
+        if path["source_community"] != path["target_community"]:
+            for community_id in (
+                path["source_community"],
+                path["target_community"],
+            ):
+                target_id = f"derived:community:{community_id}"
+                edges.append(
+                    {
+                        "source_id": node_id,
+                        "target_id": target_id,
+                        "id": f"{node_id}__{target_id}",
+                        "collection_id": collection["id"],
+                        "rel_type": "CONNECTS",
+                        "description": (
+                            f"Connector path links into community {community_id}."
+                        ),
+                        "source_ids": supporting_rel_ids,
+                    }
+                )
+
+    return {"nodes": nodes, "edges": edges, "chunks": chunks}

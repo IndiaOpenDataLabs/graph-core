@@ -74,7 +74,8 @@ class VectorStore:
                         f"INSERT INTO {tbl} "
                         f"(namespace_id, collection_id, chunk_hash, chunk_index, "
                         f"content, token_count, metadata_json, embedding) "
-                        f"VALUES (:nsid, :cid, :ch, :ci, :content, :tc, :meta, (:emb){cast})"
+                        f"VALUES "
+                        f"(:nsid, :cid, :ch, :ci, :content, :tc, :meta, (:emb){cast})"
                     ),
                     {
                         "nsid": _uuid_for_sql(namespace_id),
@@ -83,7 +84,11 @@ class VectorStore:
                         "ci": chunk["chunk_index"],
                         "content": chunk["content"],
                         "tc": chunk["token_count"],
-                        "meta": json.dumps(chunk.get("metadata")) if chunk.get("metadata") else None,
+                        "meta": (
+                            json.dumps(chunk.get("metadata"))
+                            if chunk.get("metadata")
+                            else None
+                        ),
                         "emb": _embedding_literal(chunk["embedding"]),
                     },
                 )
@@ -139,7 +144,37 @@ class VectorStore:
                     "chunk_id": row[0],
                     "content": row[1],
                     "score": float(row[3]),
-                    "metadata": json.loads(row[2]) if isinstance(row[2], str) else row[2],
+                    "metadata": (
+                        json.loads(row[2])
+                        if isinstance(row[2], str)
+                        else row[2]
+                    ),
                 }
                 for row in result
             ]
+
+    async def delete_chunks_by_metadata(
+        self,
+        collection_id: uuid.UUID,
+        metadata_filters: dict[str, str],
+    ) -> int:
+        tbl = table_name(collection_id, "vector_chunks")
+        filter_clauses: list[str] = ["collection_id = :cid"]
+        params: dict[str, object] = {"cid": _uuid_for_sql(collection_id)}
+        for idx, (key, value) in enumerate(metadata_filters.items()):
+            key_param = f"meta_key_{idx}"
+            value_param = f"meta_value_{idx}"
+            filter_clauses.append(
+                f"metadata_json::jsonb ->> :{key_param} = :{value_param}"
+            )
+            params[key_param] = key
+            params[value_param] = value
+        where_sql = " AND ".join(filter_clauses)
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(f"DELETE FROM {tbl} WHERE {where_sql}"),
+                params,
+            )
+            await session.commit()
+            return int(result.rowcount or 0)

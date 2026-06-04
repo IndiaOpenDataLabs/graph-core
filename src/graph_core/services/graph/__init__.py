@@ -23,7 +23,11 @@ from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
 from graph_core.services.crypto import CredentialCrypto
-from graph_core.services.graph.analytics import analyze_collection_graph
+from graph_core.services.graph.analytics import (
+    analyze_collection_graph,
+    build_collection_understanding,
+    derived_graph_name,
+)
 from graph_core.services.graph.ingestion import (
     deterministic_uuid,
     fan_out_chunks,
@@ -97,6 +101,10 @@ class GraphService:
 
     def _chat_storage(self, chat_id: uuid.UUID) -> FalkorDBGraphStorage:
         return FalkorDBGraphStorage(self._chat_graph_name(chat_id))
+
+    @staticmethod
+    def _derived_graph_storage(collection_id: uuid.UUID) -> FalkorDBGraphStorage:
+        return FalkorDBGraphStorage(derived_graph_name(collection_id))
 
     async def create_chat_session(
         self,
@@ -993,6 +1001,7 @@ class GraphService:
         graph_name = f"collection_{str(collection_id).replace('-', '')}"
         graph_storage = FalkorDBGraphStorage(graph_name)
         await graph_storage.drop()
+        await self._derived_graph_storage(collection_id).drop()
         async with AsyncSessionLocal() as session:
             await session.execute(
                 delete(Collection).where(Collection.id == collection_id)
@@ -1211,6 +1220,78 @@ class GraphService:
             max_connector_paths=max_connector_paths,
         )
 
+    async def build_collection_understanding(
+        self,
+        collection_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+        *,
+        min_edge_strength: float = 0.2,
+        min_community_size: int = 2,
+        max_anchors: int = 12,
+        max_path_depth: int = 4,
+        max_connector_paths: int = 20,
+    ) -> dict[str, Any]:
+        collection = await self.get_collection(collection_id)
+        self._enforce_namespace(collection, namespace_id)
+        analysis = await analyze_collection_graph(
+            collection_id,
+            min_edge_strength=min_edge_strength,
+            min_community_size=min_community_size,
+            max_anchors=max_anchors,
+            max_path_depth=max_path_depth,
+            max_connector_paths=max_connector_paths,
+        )
+        understanding = build_collection_understanding(analysis)
+        derived_storage = self._derived_graph_storage(collection_id)
+        await derived_storage.drop()
+        if understanding["nodes"]:
+            for node in understanding["nodes"]:
+                await derived_storage.upsert_node(node["id"], node)
+            for edge in understanding["edges"]:
+                await derived_storage.upsert_edge(
+                    edge["source_id"],
+                    edge["target_id"],
+                    edge,
+                )
+
+        await self._vector_store.delete_chunks_by_metadata(
+            collection_id,
+            {"memory_type": "derived_graph"},
+        )
+        embedding_provider = await self._resolve_collection_embedding_provider(
+            collection
+        )
+        vector_chunks: list[dict[str, Any]] = []
+        for chunk in understanding["chunks"]:
+            vector_chunks.append(
+                {
+                    "chunk_hash": chunk["chunk_hash"],
+                    "chunk_index": chunk["chunk_index"],
+                    "content": chunk["content"],
+                    "token_count": len(chunk["content"].split()),
+                    "metadata": chunk["metadata"],
+                    "embedding": await embedding_provider.embed_query(
+                        chunk["content"]
+                    ),
+                }
+            )
+        if vector_chunks:
+            await self._vector_store.upsert_chunks(
+                namespace_id=namespace_id,
+                collection_id=collection_id,
+                chunks=vector_chunks,
+            )
+
+        return {
+            "analysis": analysis,
+            "derived_graph": {
+                "graph_name": derived_graph_name(collection_id),
+                "node_count": len(understanding["nodes"]),
+                "edge_count": len(understanding["edges"]),
+                "chunk_count": len(understanding["chunks"]),
+            },
+        }
+
     async def update_job_status(
         self,
         job_id: uuid.UUID,
@@ -1271,4 +1352,5 @@ __all__ = [
     "extract_keywords",
     "fallback_keywords",
     "analyze_collection_graph",
+    "build_collection_understanding",
 ]
