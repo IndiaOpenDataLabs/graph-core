@@ -797,9 +797,9 @@ class ConsoleScreen(Screen):
         "/enhance COLLECTION": (
             "Build or rebuild the derived understanding graph for a collection."
         ),
-        "/ingest chunk COLLECTION \"text\" [--domain DOMAIN]": "Ingest a single chunk.",
-        "/ingest file COLLECTION /path/to/file.txt [--domain DOMAIN]": "Ingest a file asynchronously.",
-        "/ingest dir COLLECTION /path/to/dir [--domain DOMAIN]": (
+        "/ingest chunk COLLECTION \"text\" [--domain general|books|code|personal]": "Ingest a single chunk.",
+        "/ingest file COLLECTION /path/to/file.txt [--domain general|books|code|personal]": "Ingest a file asynchronously.",
+        "/ingest dir COLLECTION /path/to/dir [--domain general|books|code|personal]": (
             "Ingest a directory recursively, honoring .gitignore and .dockerignore "
             "from that directory when present."
         ),
@@ -855,11 +855,11 @@ class ConsoleScreen(Screen):
         ): "/collection edit ",
         "/collection delete COLLECTION": "/collection delete <collection>",
         "/enhance COLLECTION": "/enhance <collection>",
-        "/ingest chunk COLLECTION \"text\" [--domain DOMAIN]": "/ingest chunk <collection> \"<text>\" [--domain <domain>]",
+        "/ingest chunk COLLECTION \"text\" [--domain general|books|code|personal]": "/ingest chunk <collection> \"<text>\" [--domain <domain>]",
         (
-            "/ingest file COLLECTION /path/to/file.txt [--domain DOMAIN]"
+            "/ingest file COLLECTION /path/to/file.txt [--domain general|books|code|personal]"
         ): "/ingest file <collection> @<path> [--domain <domain>]",
-        "/ingest dir COLLECTION /path/to/dir [--domain DOMAIN]": "/ingest dir <collection> @<path> [--domain <domain>]",
+        "/ingest dir COLLECTION /path/to/dir [--domain general|books|code|personal]": "/ingest dir <collection> @<path> [--domain <domain>]",
         "/chat create COLLECTION [--title TITLE]": "/chat create <collection>",
         "/chat list COLLECTION [--limit N]": "/chat list <collection>",
         (
@@ -885,6 +885,7 @@ class ConsoleScreen(Screen):
         "naive",
         "mix",
     ]
+    INGEST_DOMAINS = ["general", "books", "code", "personal"]
     INGEST_NOISE_DIRS = {
         ".git",
         ".venv",
@@ -2069,6 +2070,12 @@ class ConsoleScreen(Screen):
                 (mode, "query mode")
                 for mode in self.QUERY_MODES
                 if mode.startswith(prefix)
+            ]
+        elif (prefix := self._extract_flag_prefix(value, "--domain")) is not None:
+            suggestions = [
+                (domain, "ingest domain")
+                for domain in self.INGEST_DOMAINS
+                if domain.startswith(prefix)
             ]
         else:
             file_token = self._extract_file_token(value)
