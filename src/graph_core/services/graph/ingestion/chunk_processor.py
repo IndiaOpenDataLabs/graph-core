@@ -151,6 +151,7 @@ async def ingest_collection_chunk(
     collection: Collection,
     namespace_id: uuid.UUID,
     chunk_index: int,
+    domain: str | None = None,
 ) -> ChunkIngestionResult:
     """Route a sanitized text chunk to the appropriate strategy handler."""
     _enforce_namespace(collection, namespace_id)
@@ -163,11 +164,11 @@ async def ingest_collection_chunk(
         )
     elif collection.strategy == "light_rag":
         result = await _ingest_lightrag_chunk(
-            sanitized_text, collection, chunk_hash, report,
+            sanitized_text, collection, chunk_hash, report, domain=domain,
         )
     else:
         result = await _ingest_graph_chunk(
-            sanitized_text, collection, chunk_hash, report,
+            sanitized_text, collection, chunk_hash, report, domain=domain,
         )
 
     await _write_ledger(collection, chunk_hash, report, result)
@@ -215,6 +216,7 @@ async def _ingest_graph_chunk(
     collection: Collection,
     chunk_hash: str,
     report,
+    domain: str | None = None,
 ) -> ChunkIngestionResult:
     """Full Graph RAG pipeline: extract → resolve → store."""
     embedding_provider = await _resolve_embedding_provider(collection)
@@ -223,7 +225,7 @@ async def _ingest_graph_chunk(
         llm_profile_id=collection.llm_profile_id,
     )
 
-    cached = await _get_raw_extraction(chunk_hash, collection.id)
+    cached = await _get_raw_extraction(chunk_hash, collection.id, domain=domain)
     if cached:
         extraction = cached
     else:
@@ -231,12 +233,14 @@ async def _ingest_graph_chunk(
         extraction = await extractor.extract_with_gleaning(
             text=text,
             max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+            domain=domain,
         )
 
         await _save_raw_extraction(
             chunk_hash=chunk_hash,
             collection_id=collection.id,
             extraction=extraction,
+            domain=domain,
         )
 
     chunk_embedding = await embedding_provider.embed_query(text)
@@ -418,6 +422,7 @@ async def _ingest_lightrag_chunk(
     collection: Collection,
     chunk_hash: str,
     report,
+    domain: str | None = None,
 ) -> ChunkIngestionResult:
     """LightRAG ingestion: extract → store in FalkorDB + pgvector.
 
@@ -431,7 +436,7 @@ async def _ingest_lightrag_chunk(
         llm_profile_id=collection.llm_profile_id,
     )
 
-    cached = await _get_raw_extraction(chunk_hash, collection.id)
+    cached = await _get_raw_extraction(chunk_hash, collection.id, domain=domain)
     if cached:
         extraction = cached
     else:
@@ -439,12 +444,14 @@ async def _ingest_lightrag_chunk(
         extraction = await extractor.extract_with_gleaning(
             text=text,
             max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+            domain=domain,
         )
 
         await _save_raw_extraction(
             chunk_hash=chunk_hash,
             collection_id=collection.id,
             extraction=extraction,
+            domain=domain,
         )
 
     chunk_embedding = await embedding_provider.embed_query(text)
@@ -603,6 +610,7 @@ async def _save_raw_extraction(
     chunk_hash: str,
     collection_id: uuid.UUID,
     extraction: ExtractionResult,
+    domain: str | None = None,
 ) -> None:
     """Persist raw LLM extraction to the database for deduplication."""
     async with AsyncSessionLocal() as session:
@@ -624,9 +632,11 @@ async def _save_raw_extraction(
                     "description": r.description,
                     "keywords": r.keywords,
                     "weight": r.weight,
+                    "rel_type": r.rel_type,
                 }
                 for r in extraction.relationships
             ],
+            extraction_model=(f"domain:{domain}" if domain else None),
         )
         session.add(record)
         try:
@@ -636,7 +646,7 @@ async def _save_raw_extraction(
 
 
 async def _get_raw_extraction(
-    chunk_hash: str, collection_id: uuid.UUID
+    chunk_hash: str, collection_id: uuid.UUID, domain: str | None = None
 ) -> ExtractionResult | None:
     """Retrieve a cached extraction by chunk hash, or None if not found."""
     from graph_core.services.graph_rag.extractor import (
@@ -649,6 +659,8 @@ async def _get_raw_extraction(
             select(RawChunkExtraction).where(
                 RawChunkExtraction.chunk_content_hash == chunk_hash,
                 RawChunkExtraction.collection_id == collection_id,
+                RawChunkExtraction.extraction_model
+                == (f"domain:{domain}" if domain else None),
             )
         )
         record = result.scalar_one_or_none()
@@ -670,6 +682,7 @@ async def _get_raw_extraction(
                 description=r["description"],
                 keywords=r.get("keywords", []),
                 weight=r.get("weight", 1.0),
+                rel_type=r.get("rel_type", "RELATES_TO"),
             )
             for r in (record.relationships_json or [])
         ]

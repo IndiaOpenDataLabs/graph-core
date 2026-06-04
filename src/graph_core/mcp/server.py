@@ -275,7 +275,12 @@ async def enhance_collection(collection_id: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def ingest_chunk(collection_id: str, text: str, ctx: Context) -> str:
+async def ingest_chunk(
+    collection_id: str,
+    text: str,
+    ctx: Context,
+    domain: str | None = None,
+) -> str:
     """Ingest a text chunk directly into a collection.
 
     For large documents, use ingest_document instead (it runs async with a job).
@@ -286,7 +291,7 @@ async def ingest_chunk(collection_id: str, text: str, ctx: Context) -> str:
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.ingest_chunk(collection_id, text)
+    result = await client.ingest_chunk(collection_id, text, domain=domain)
     return (
         f"Ingested chunk:\n"
         f"  hash: {result.get('chunk_hash', 'N/A')}\n"
@@ -296,7 +301,12 @@ async def ingest_chunk(collection_id: str, text: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def ingest_document(collection_id: str, text: str, ctx: Context) -> str:
+async def ingest_document(
+    collection_id: str,
+    text: str,
+    ctx: Context,
+    domain: str | None = None,
+) -> str:
     """Ingest a full document into a collection (async, returns job_id).
 
     For large documents, the platform will chunk and process in the background.
@@ -307,7 +317,7 @@ async def ingest_document(collection_id: str, text: str, ctx: Context) -> str:
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.ingest_document(collection_id, text)
+    result = await client.ingest_document(collection_id, text, domain=domain)
     return (
         f"Document ingestion started:\n"
         f"  job_id: {result['job_id']}\n"

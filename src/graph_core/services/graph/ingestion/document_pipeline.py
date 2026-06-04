@@ -79,6 +79,7 @@ async def enqueue_document_ingestion_job(
     text: str,
     collection_id: uuid.UUID,
     namespace_id: uuid.UUID,
+    domain: str | None = None,
 ) -> DocumentIngestionResult:
     """Create a pending ingest_document Job and return its result wrapper."""
     async with AsyncSessionLocal() as session:
@@ -96,7 +97,7 @@ async def enqueue_document_ingestion_job(
             collection_id=collection_id,
             job_type="ingest_document",
             status="pending",
-            payload={"text": text},
+            payload={"text": text, "domain": domain},
         )
         session.add(job)
         await session.commit()
@@ -122,6 +123,7 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             raise ValueError(f"Collection {job.collection_id} not found")
 
         text = str(job.payload["text"])
+        domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
 
     chunks = _chunker.chunk_text(text)
     total_chunks = max(len(chunks), 1)
@@ -141,6 +143,7 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
                 collection=collection,
                 namespace_id=collection.namespace_id,
                 chunk_index=index - 1,
+                domain=domain,
             )
             progress = int(index * 100 / total_chunks)
             await _update_job_status(job_id, "running", progress_percent=progress)
@@ -295,6 +298,7 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
         collection=collection,
         namespace_id=collection.namespace_id,
         chunk_index=chunk_index,
+        domain=job.payload.get("domain") if isinstance(job.payload, dict) else None,
     )
 
     await update_chunk_status(job_uuid, chunk_index, "completed")

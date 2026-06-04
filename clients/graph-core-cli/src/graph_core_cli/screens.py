@@ -783,9 +783,9 @@ class ConsoleScreen(Screen):
         "/enhance COLLECTION": (
             "Build or rebuild the derived understanding graph for a collection."
         ),
-        "/ingest chunk COLLECTION \"text\"": "Ingest a single chunk.",
-        "/ingest file COLLECTION /path/to/file.txt": "Ingest a file asynchronously.",
-        "/ingest dir COLLECTION /path/to/dir": (
+        "/ingest chunk COLLECTION \"text\" [--domain DOMAIN]": "Ingest a single chunk.",
+        "/ingest file COLLECTION /path/to/file.txt [--domain DOMAIN]": "Ingest a file asynchronously.",
+        "/ingest dir COLLECTION /path/to/dir [--domain DOMAIN]": (
             "Ingest a directory recursively, honoring .gitignore and .dockerignore "
             "from that directory when present."
         ),
@@ -842,11 +842,11 @@ class ConsoleScreen(Screen):
         ): "/collection edit ",
         "/collection delete COLLECTION": "/collection delete <collection>",
         "/enhance COLLECTION": "/enhance <collection>",
-        "/ingest chunk COLLECTION \"text\"": "/ingest chunk <collection> \"<text>\"",
+        "/ingest chunk COLLECTION \"text\" [--domain DOMAIN]": "/ingest chunk <collection> \"<text>\" [--domain <domain>]",
         (
-            "/ingest file COLLECTION /path/to/file.txt"
-        ): "/ingest file <collection> @<path>",
-        "/ingest dir COLLECTION /path/to/dir": "/ingest dir <collection> @<path>",
+            "/ingest file COLLECTION /path/to/file.txt [--domain DOMAIN]"
+        ): "/ingest file <collection> @<path> [--domain <domain>]",
+        "/ingest dir COLLECTION /path/to/dir [--domain DOMAIN]": "/ingest dir <collection> @<path> [--domain <domain>]",
         "/chat create COLLECTION [--title TITLE]": "/chat create <collection>",
         "/chat list COLLECTION [--limit N]": "/chat list <collection>",
         (
@@ -1356,16 +1356,32 @@ class ConsoleScreen(Screen):
             raise ValueError(
                 "Usage: /ingest chunk COLLECTION \"text\" | "
                 "/ingest file COLLECTION PATH | "
-                "/ingest dir COLLECTION PATH"
+                "/ingest dir COLLECTION PATH [--domain DOMAIN]"
             )
         action = args[0]
         collection = await self._resolve_collection(args[1])
-        payload = self._normalize_file_reference(" ".join(args[2:]))
+        positional, flags = parse_flag_args(args[2:])
+        if not positional:
+            raise ValueError(
+                "Usage: /ingest chunk COLLECTION \"text\" | "
+                "/ingest file COLLECTION PATH | "
+                "/ingest dir COLLECTION PATH [--domain DOMAIN]"
+            )
+        payload = self._normalize_file_reference(" ".join(positional))
+        domain = (
+            str(flags["domain"])
+            if isinstance(flags.get("domain"), str) and flags["domain"]
+            else None
+        )
         if action == "chunk":
             self._write(
                 await self._call(
                     "ingest_chunk",
-                    {"collection_id": collection["id"], "text": payload},
+                    {
+                        "collection_id": collection["id"],
+                        "text": payload,
+                        **({"domain": domain} if domain else {}),
+                    },
                 )
             )
             return
@@ -1377,7 +1393,11 @@ class ConsoleScreen(Screen):
                 raise ValueError(f"Unable to read file: {file_path} ({exc})") from exc
             result = await self._call(
                 "ingest_document",
-                {"collection_id": collection["id"], "text": content},
+                {
+                    "collection_id": collection["id"],
+                    "text": content,
+                    **({"domain": domain} if domain else {}),
+                },
             )
             job_id = extract_job_id(result)
             if job_id:
@@ -1386,13 +1406,15 @@ class ConsoleScreen(Screen):
             return
         if action == "dir":
             directory_path = Path(self._normalize_file_reference(payload)).expanduser()
-            summary = await self._ingest_directory(collection["id"], directory_path)
+            summary = await self._ingest_directory(
+                collection["id"], directory_path, domain=domain
+            )
             self._write(summary)
             return
         raise ValueError(
             "Usage: /ingest chunk COLLECTION \"text\" | "
             "/ingest file COLLECTION PATH | "
-            "/ingest dir COLLECTION PATH"
+            "/ingest dir COLLECTION PATH [--domain DOMAIN]"
         )
 
     async def _command_enhance(self, args: list[str]) -> None:
@@ -2139,7 +2161,13 @@ class ConsoleScreen(Screen):
                 ignored = not include
         return ignored
 
-    async def _ingest_directory(self, collection_id: str, directory_path: Path) -> str:
+    async def _ingest_directory(
+        self,
+        collection_id: str,
+        directory_path: Path,
+        *,
+        domain: str | None = None,
+    ) -> str:
         if not directory_path.exists():
             raise ValueError(f"Directory does not exist: {directory_path}")
         if not directory_path.is_dir():
@@ -2189,7 +2217,11 @@ class ConsoleScreen(Screen):
 
             result = await self._call(
                 "ingest_document",
-                {"collection_id": collection_id, "text": content},
+                {
+                    "collection_id": collection_id,
+                    "text": content,
+                    **({"domain": domain} if domain else {}),
+                },
             )
             job_id = extract_job_id(result)
             if job_id:

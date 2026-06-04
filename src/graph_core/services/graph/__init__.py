@@ -1029,6 +1029,7 @@ class GraphService:
         text: str,
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
+        domain: str | None = None,
     ) -> ChunkIngestionResult:
         collection = await self.get_collection(collection_id)
         return await ingest_collection_chunk(
@@ -1036,6 +1037,7 @@ class GraphService:
             collection=collection,
             namespace_id=namespace_id,
             chunk_index=0,
+            domain=domain,
         )
 
     async def enqueue_document_ingestion(
@@ -1043,6 +1045,7 @@ class GraphService:
         text: str,
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
+        domain: str | None = None,
     ) -> DocumentIngestionResult:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
@@ -1050,6 +1053,7 @@ class GraphService:
             text=text,
             collection_id=collection_id,
             namespace_id=namespace_id,
+            domain=domain,
         )
 
     async def ingest_document_pipeline(self, job_id: uuid.UUID):

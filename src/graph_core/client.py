@@ -181,14 +181,24 @@ class GraphCoreClient:
 
     # -- Ingestion ----------------------------------------------------------
 
-    async def ingest_chunk(self, collection_id: str, text: str) -> dict[str, Any]:
+    async def ingest_chunk(
+        self, collection_id: str, text: str, domain: str | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"text": text}
+        if domain:
+            body["domain"] = domain
         return await self._request(
-            "POST", f"/collections/{collection_id}/ingest/chunk", json={"text": text}
+            "POST", f"/collections/{collection_id}/ingest/chunk", json=body
         )
 
-    async def ingest_document(self, collection_id: str, text: str) -> dict[str, Any]:
+    async def ingest_document(
+        self, collection_id: str, text: str, domain: str | None = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"text": text}
+        if domain:
+            body["domain"] = domain
         return await self._request(
-            "POST", f"/collections/{collection_id}/ingest/doc", json={"text": text}
+            "POST", f"/collections/{collection_id}/ingest/doc", json=body
         )
 
     # -- Query --------------------------------------------------------------

@@ -14,6 +14,7 @@ from graph_core.workers.ingestion import run_ingestion
 
 class IngestChunkRequest(BaseModel):
     text: str
+    domain: str | None = None
 
 
 class IngestChunkResponse(BaseModel):
@@ -24,6 +25,7 @@ class IngestChunkResponse(BaseModel):
 
 class IngestDocRequest(BaseModel):
     text: str
+    domain: str | None = None
 
 
 class IngestDocResponse(BaseModel):
@@ -45,7 +47,12 @@ async def ingest_chunk(
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
 ) -> IngestChunkResponse:
     try:
-        result = await service.ingest_chunk(body.text, collection_id, namespace_id)
+        result = await service.ingest_chunk(
+            body.text,
+            collection_id,
+            namespace_id,
+            domain=body.domain,
+        )
         return IngestChunkResponse(**result.__dict__)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -70,6 +77,7 @@ async def ingest_document(
             body.text,
             collection_id,
             namespace_id,
+            domain=body.domain,
         )
         run_ingestion.send(str(result.job_id))
         return IngestDocResponse(job_id=str(result.job_id), status=result.status)
