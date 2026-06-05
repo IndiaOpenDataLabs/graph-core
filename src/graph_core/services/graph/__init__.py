@@ -19,9 +19,17 @@ from graph_core.llm import get_llm_provider
 from graph_core.models.chat import ChatMessage, ChatSession
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
+from graph_core.models.graph_rag import (
+    EntityAlias,
+    EntityDescription,
+    GraphEntity,
+    GraphRelationship,
+    RelationshipDescription,
+)
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
+from graph_core.models.rel_types import relationship_embedding_text
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
@@ -72,6 +80,7 @@ from graph_core.storage.vector_tables import (
 )
 
 _crypto = CredentialCrypto()
+_META_COLLECTION_SUFFIX = "__meta"
 
 
 async def _resolve_credential(
@@ -103,8 +112,33 @@ class GraphService:
         return FalkorDBGraphStorage(self._chat_graph_name(chat_id))
 
     @staticmethod
-    def _derived_graph_storage(collection_id: uuid.UUID) -> FalkorDBGraphStorage:
-        return FalkorDBGraphStorage(derived_graph_name(collection_id))
+    def _graph_name(collection_id: uuid.UUID) -> str:
+        return f"collection_{str(collection_id).replace('-', '')}"
+
+    def _graph_storage(self, collection_id: uuid.UUID) -> FalkorDBGraphStorage:
+        return FalkorDBGraphStorage(self._graph_name(collection_id))
+
+    @staticmethod
+    def _meta_collection_name(collection_name: str) -> str:
+        return f"{collection_name}{_META_COLLECTION_SUFFIX}"
+
+    @staticmethod
+    def _is_meta_collection_name(collection_name: str) -> bool:
+        return collection_name.endswith(_META_COLLECTION_SUFFIX)
+
+    async def _get_collection_by_name(
+        self,
+        namespace_id: uuid.UUID,
+        name: str,
+    ) -> Collection | None:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Collection).where(
+                    Collection.namespace_id == namespace_id,
+                    Collection.name == name,
+                )
+            )
+            return result.scalar_one_or_none()
 
     async def create_chat_session(
         self,
@@ -995,13 +1029,16 @@ class GraphService:
             return collection
 
     async def delete_collection(self, collection_id: uuid.UUID) -> None:
-        await self.get_collection(collection_id)
+        collection = await self.get_collection(collection_id)
+        if not self._is_meta_collection_name(collection.name):
+            meta = await self._get_collection_by_name(
+                collection.namespace_id,
+                self._meta_collection_name(collection.name),
+            )
+            if meta is not None:
+                await self.delete_collection(meta.id)
         await drop_all_tables(collection_id)
-        from graph_core.storage.graph_storage import FalkorDBGraphStorage
-        graph_name = f"collection_{str(collection_id).replace('-', '')}"
-        graph_storage = FalkorDBGraphStorage(graph_name)
-        await graph_storage.drop()
-        await self._derived_graph_storage(collection_id).drop()
+        await self._graph_storage(collection_id).drop()
         async with AsyncSessionLocal() as session:
             await session.execute(
                 delete(Collection).where(Collection.id == collection_id)
@@ -1232,6 +1269,201 @@ class GraphService:
             max_connector_paths=max_connector_paths,
         )
 
+    async def _materialize_meta_collection(
+        self,
+        meta_collection: Collection,
+        understanding: dict[str, Any],
+    ) -> None:
+        embedding_provider = await self._resolve_collection_embedding_provider(
+            meta_collection
+        )
+        graph_storage = self._graph_storage(meta_collection.id)
+
+        nodes = understanding.get("nodes", [])
+        edges = understanding.get("edges", [])
+        node_id_map: dict[str, uuid.UUID] = {}
+        canonical_name_by_old_id: dict[str, str] = {}
+        node_rows: list[dict[str, Any]] = []
+        edge_rows: list[dict[str, Any]] = []
+        relationship_vectors: list[dict[str, Any]] = []
+
+        async with AsyncSessionLocal() as session:
+            for node in nodes:
+                old_node_id = str(node.get("id") or "").strip()
+                canonical_name = str(
+                    node.get("canonical_name") or node.get("name") or old_node_id
+                ).strip()
+                if not old_node_id or not canonical_name:
+                    continue
+                entity_id = uuid.uuid4()
+                node_id_map[old_node_id] = entity_id
+                canonical_name_by_old_id[old_node_id] = canonical_name
+                primary_type = str(
+                    node.get("primary_type") or node.get("type") or "concept"
+                ).strip() or "concept"
+                description = str(node.get("description") or "").strip() or canonical_name
+                source_ids = node.get("source_ids")
+                if not isinstance(source_ids, list):
+                    source_ids = []
+
+                session.add(
+                    GraphEntity(
+                        id=entity_id,
+                        collection_id=meta_collection.id,
+                        canonical_name=canonical_name,
+                        primary_type=primary_type,
+                        description_count=1,
+                    )
+                )
+                description_id = uuid.uuid4()
+                session.add(
+                    EntityDescription(
+                        id=description_id,
+                        entity_id=entity_id,
+                        description=description,
+                        weight=1,
+                        source_chunk_hashes=source_ids,
+                    )
+                )
+                aliases = sorted(
+                    {
+                        str(value).strip()
+                        for value in (node.get("aliases") or [])
+                        if str(value).strip() and str(value).strip() != canonical_name
+                    }
+                )
+                for alias in aliases:
+                    session.add(
+                        EntityAlias(
+                            id=uuid.uuid4(),
+                            collection_id=meta_collection.id,
+                            entity_id=entity_id,
+                            alias_name=alias,
+                            source_chunk_hash="meta",
+                        )
+                    )
+                node_rows.append(
+                    {
+                        "id": str(entity_id),
+                        "name": canonical_name,
+                        "collection_id": str(meta_collection.id),
+                    }
+                )
+                embed_text = f"{canonical_name}: {description}"
+                embedding = await embedding_provider.embed_query(embed_text)
+                await self._graph_rag_vectors.upsert_entity_embedding(
+                    entity_id=entity_id,
+                    collection_id=meta_collection.id,
+                    name=canonical_name,
+                    description=description,
+                    description_id=description_id,
+                    embedding=embedding,
+                    session=session,
+                )
+                await self._graph_rag_vectors.upsert_entity_centroid(
+                    entity_id=entity_id,
+                    collection_id=meta_collection.id,
+                    canonical_name=canonical_name,
+                    primary_type=primary_type,
+                    description_count=1,
+                    embedding=embedding,
+                    session=session,
+                )
+
+            await session.flush()
+
+            for edge in edges:
+                source_old_id = str(edge.get("source_id") or "").strip()
+                target_old_id = str(edge.get("target_id") or "").strip()
+                source_entity_id = node_id_map.get(source_old_id)
+                target_entity_id = node_id_map.get(target_old_id)
+                if source_entity_id is None or target_entity_id is None:
+                    continue
+                relationship_id = uuid.uuid4()
+                rel_type = str(edge.get("rel_type") or "RELATES_TO").strip().upper()
+                keywords = edge.get("keywords")
+                if not isinstance(keywords, list):
+                    keywords = []
+                try:
+                    weight = int(edge.get("weight") or 1)
+                except (TypeError, ValueError):
+                    weight = 1
+                session.add(
+                    GraphRelationship(
+                        id=relationship_id,
+                        source_entity_id=source_entity_id,
+                        target_entity_id=target_entity_id,
+                        weight=weight,
+                        keywords=keywords,
+                        rel_type=rel_type,
+                        collection_id=meta_collection.id,
+                    )
+                )
+                description = str(edge.get("description") or "").strip() or rel_type
+                source_ids = edge.get("source_ids")
+                if not isinstance(source_ids, list):
+                    source_ids = []
+                session.add(
+                    RelationshipDescription(
+                        id=uuid.uuid4(),
+                        relationship_id=relationship_id,
+                        description=description,
+                        keywords=keywords,
+                        weight=max(1, weight),
+                        source_chunk_hashes=source_ids,
+                    )
+                )
+                edge_rows.append(
+                    {
+                        "source_id": str(source_entity_id),
+                        "target_id": str(target_entity_id),
+                        "id": str(relationship_id),
+                        "weight": weight,
+                        "keywords": keywords,
+                        "rel_type": rel_type,
+                        "collection_id": str(meta_collection.id),
+                    }
+                )
+                relationship_vectors.append(
+                    {
+                        "relationship_id": relationship_id,
+                        "source_name": canonical_name_by_old_id.get(
+                            source_old_id, str(source_entity_id)
+                        ),
+                        "target_name": canonical_name_by_old_id.get(
+                            target_old_id, str(target_entity_id)
+                        ),
+                        "description": description,
+                        "rel_type": rel_type,
+                        "keywords": keywords,
+                    }
+                )
+
+            await session.commit()
+
+        if node_rows:
+            await graph_storage.upsert_nodes(node_rows)
+        if edge_rows:
+            await graph_storage.upsert_edges(edge_rows)
+        for vector in relationship_vectors:
+            embedding = await embedding_provider.embed_query(
+                relationship_embedding_text(
+                    vector["source_name"],
+                    vector["target_name"],
+                    vector["rel_type"],
+                    vector["description"],
+                    vector["keywords"],
+                )
+            )
+            await self._graph_rag_vectors.upsert_relationship_embedding(
+                relationship_id=vector["relationship_id"],
+                collection_id=meta_collection.id,
+                source_name=vector["source_name"],
+                target_name=vector["target_name"],
+                description=vector["description"],
+                embedding=embedding,
+            )
+
     async def build_collection_understanding(
         self,
         collection_id: uuid.UUID,
@@ -1245,6 +1477,8 @@ class GraphService:
     ) -> dict[str, Any]:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
+        if self._is_meta_collection_name(collection.name):
+            raise ValueError("Enhance should be run on a base collection, not a meta collection")
         analysis = await analyze_collection_graph(
             collection_id,
             min_edge_strength=min_edge_strength,
@@ -1258,45 +1492,29 @@ class GraphService:
             analysis,
             llm_provider=llm_provider,
         )
-        derived_storage = self._derived_graph_storage(collection_id)
-        await derived_storage.drop()
-        if understanding["nodes"]:
-            for node in understanding["nodes"]:
-                await derived_storage.upsert_node(node["id"], node)
-            for edge in understanding["edges"]:
-                await derived_storage.upsert_edge(
-                    edge["source_id"],
-                    edge["target_id"],
-                    edge,
-                )
-
+        await FalkorDBGraphStorage(derived_graph_name(collection_id)).drop()
         await self._vector_store.delete_chunks_by_metadata(
             collection_id,
             {"memory_type": "derived_graph"},
         )
-        embedding_provider = await self._resolve_collection_embedding_provider(
-            collection
+
+        old_meta = await self._get_collection_by_name(
+            namespace_id,
+            self._meta_collection_name(collection.name),
         )
-        vector_chunks: list[dict[str, Any]] = []
-        for chunk in understanding["chunks"]:
-            vector_chunks.append(
-                {
-                    "chunk_hash": chunk["chunk_hash"],
-                    "chunk_index": chunk["chunk_index"],
-                    "content": chunk["content"],
-                    "token_count": len(chunk["content"].split()),
-                    "metadata": chunk["metadata"],
-                    "embedding": await embedding_provider.embed_query(
-                        chunk["content"]
-                    ),
-                }
-            )
-        if vector_chunks:
-            await self._vector_store.upsert_chunks(
-                namespace_id=namespace_id,
-                collection_id=collection_id,
-                chunks=vector_chunks,
-            )
+        if old_meta is not None:
+            await self.delete_collection(old_meta.id)
+
+        meta_collection = await self.create_collection(
+            name=self._meta_collection_name(collection.name),
+            namespace_id=namespace_id,
+            strategy="custom_graph_rag",
+            embedding_profile_id=collection.embedding_profile_id,
+            llm_profile_id=collection.llm_profile_id,
+            default_query_mode=collection.default_query_mode,
+            gleaning_passes=0,
+        )
+        await self._materialize_meta_collection(meta_collection, understanding)
 
         kind_counts: dict[str, int] = {}
         for node in understanding["nodes"]:
@@ -1306,10 +1524,12 @@ class GraphService:
         return {
             "analysis": analysis,
             "derived_graph": {
-                "graph_name": derived_graph_name(collection_id),
+                "graph_name": self._graph_name(meta_collection.id),
+                "collection_id": str(meta_collection.id),
+                "collection_name": meta_collection.name,
                 "node_count": len(understanding["nodes"]),
                 "edge_count": len(understanding["edges"]),
-                "chunk_count": len(understanding["chunks"]),
+                "chunk_count": 0,
                 "node_type_counts": kind_counts,
             },
         }
