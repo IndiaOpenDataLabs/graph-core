@@ -1338,6 +1338,7 @@ class GraphService:
                         "collection_id": str(meta_collection.id),
                     }
                 )
+                await session.flush()
                 embed_text = f"{canonical_name}: {description}"
                 embedding = await embedding_provider.embed_query(embed_text)
                 await self._graph_rag_vectors.upsert_entity_embedding(
