@@ -141,7 +141,20 @@ class FalkorDBGraphStorage:
         if result and result.result_set:
             node = result.result_set[0][0]
             if node:
-                return dict(node.properties)
+                props = dict(node.properties)
+                for list_field in (
+                    "aliases",
+                    "source_ids",
+                    "source_message_ids",
+                    "source_roles",
+                ):
+                    val = props.get(list_field)
+                    if isinstance(val, str):
+                        try:
+                            props[list_field] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            props[list_field] = []
+                return props
         return None
 
     async def upsert_nodes(self, nodes: list[dict[str, Any]]) -> None:
@@ -283,9 +296,13 @@ class FalkorDBGraphStorage:
         allowed_keys = {
             "id",
             "name",
+            "canonical_name",
             "collection_id",
             "type",
+            "primary_type",
+            "object_type",
             "description",
+            "aliases",
             "source_ids",
             "source_message_ids",
             "source_roles",
@@ -302,7 +319,7 @@ class FalkorDBGraphStorage:
         for key, value in properties.items():
             if key != "id" and key in allowed_keys:
                 set_clauses.append(f"n.{key} = ${key}")
-                params[key] = value
+                params[key] = json.dumps(value) if isinstance(value, list) else value
 
         if set_clauses:
             set_str = ", ".join(set_clauses)
@@ -323,7 +340,9 @@ class FalkorDBGraphStorage:
             "weight",
             "keywords",
             "collection_id",
+            "object_type",
             "description",
+            "aliases",
             "source_ids",
             "source_message_ids",
             "source_roles",
@@ -607,7 +626,13 @@ class FalkorDBGraphStorage:
             edge = result.result_set[0][0]
             if edge:
                 props = dict(edge.properties)
-                for list_field in ("keywords", "source_ids"):
+                for list_field in (
+                    "aliases",
+                    "keywords",
+                    "source_ids",
+                    "source_message_ids",
+                    "source_roles",
+                ):
                     val = props.get(list_field)
                     if isinstance(val, str):
                         try:
