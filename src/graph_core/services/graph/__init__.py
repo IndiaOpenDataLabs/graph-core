@@ -113,8 +113,14 @@ class GraphService:
         return FalkorDBGraphStorage(self._graph_name(collection_id))
 
     @staticmethod
+    def _base_collection_name(collection_name: str) -> str:
+        if collection_name.endswith(_META_COLLECTION_SUFFIX):
+            return collection_name[: -len(_META_COLLECTION_SUFFIX)]
+        return collection_name
+
+    @staticmethod
     def _meta_collection_name(collection_name: str) -> str:
-        return f"{collection_name}{_META_COLLECTION_SUFFIX}"
+        return f"{GraphService._base_collection_name(collection_name)}{_META_COLLECTION_SUFFIX}"
 
     @staticmethod
     def _is_meta_collection_name(collection_name: str) -> bool:
@@ -133,6 +139,27 @@ class GraphService:
                 )
             )
             return result.scalar_one_or_none()
+
+    async def _reset_collection_contents(self, collection: Collection) -> None:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                delete(GraphRelationship).where(
+                    GraphRelationship.collection_id == collection.id
+                )
+            )
+            await session.execute(
+                delete(GraphEntity).where(
+                    GraphEntity.collection_id == collection.id
+                )
+            )
+            await session.commit()
+        await drop_all_tables(collection.id)
+        if collection.embedding_dimensions is None:
+            raise ValueError(
+                f"Collection {collection.id} has no embedding dimensions"
+            )
+        await create_all_tables(collection.id, collection.embedding_dimensions)
+        await self._graph_storage(collection.id).drop()
 
     async def create_chat_session(
         self,
@@ -1448,17 +1475,18 @@ class GraphService:
             self._meta_collection_name(collection.name),
         )
         if old_meta is not None:
-            await self.delete_collection(old_meta.id)
-
-        meta_collection = await self.create_collection(
-            name=self._meta_collection_name(collection.name),
-            namespace_id=namespace_id,
-            strategy="custom_graph_rag",
-            embedding_profile_id=collection.embedding_profile_id,
-            llm_profile_id=collection.llm_profile_id,
-            default_query_mode=collection.default_query_mode,
-            gleaning_passes=0,
-        )
+            meta_collection = old_meta
+            await self._reset_collection_contents(meta_collection)
+        else:
+            meta_collection = await self.create_collection(
+                name=self._meta_collection_name(collection.name),
+                namespace_id=namespace_id,
+                strategy="custom_graph_rag",
+                embedding_profile_id=collection.embedding_profile_id,
+                llm_profile_id=collection.llm_profile_id,
+                default_query_mode=collection.default_query_mode,
+                gleaning_passes=0,
+            )
         await self._materialize_meta_collection(meta_collection, understanding)
 
         kind_counts: dict[str, int] = {}
