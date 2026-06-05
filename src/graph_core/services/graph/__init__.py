@@ -1251,22 +1251,11 @@ class GraphService:
         self,
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
-        *,
-        min_edge_strength: float = 0.2,
-        min_community_size: int = 2,
-        max_anchors: int = 12,
-        max_path_depth: int = 4,
-        max_connector_paths: int = 20,
     ) -> dict[str, Any]:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
         return await analyze_collection_graph(
             collection_id,
-            min_edge_strength=min_edge_strength,
-            min_community_size=min_community_size,
-            max_anchors=max_anchors,
-            max_path_depth=max_path_depth,
-            max_connector_paths=max_connector_paths,
         )
 
     async def _materialize_meta_collection(
@@ -1468,12 +1457,6 @@ class GraphService:
         self,
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
-        *,
-        min_edge_strength: float = 0.2,
-        min_community_size: int = 2,
-        max_anchors: int = 12,
-        max_path_depth: int = 4,
-        max_connector_paths: int = 20,
     ) -> dict[str, Any]:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
@@ -1481,11 +1464,6 @@ class GraphService:
             raise ValueError("Enhance should be run on a base collection, not a meta collection")
         analysis = await analyze_collection_graph(
             collection_id,
-            min_edge_strength=min_edge_strength,
-            min_community_size=min_community_size,
-            max_anchors=max_anchors,
-            max_path_depth=max_path_depth,
-            max_connector_paths=max_connector_paths,
         )
         llm_provider = await self._resolve_collection_llm_provider(collection, None)
         understanding = await build_collection_understanding(
@@ -1529,7 +1507,7 @@ class GraphService:
                 "collection_name": meta_collection.name,
                 "node_count": len(understanding["nodes"]),
                 "edge_count": len(understanding["edges"]),
-                "chunk_count": 0,
+                "chunk_count": len(understanding.get("chunks", [])),
                 "node_type_counts": kind_counts,
             },
         }

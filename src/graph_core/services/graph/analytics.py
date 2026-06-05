@@ -1,11 +1,8 @@
 """Offline analytics over the canonical collection graph.
 
-This module builds a lightweight structural view over the merged graph:
-- strong-edge communities from a weighted projection
-- articulation / connector nodes that bridge graph regions
-- bounded connector paths between top anchors
-
-It is intentionally dependency-free for now.
+Builds Louvain communities per relation type, computes node centrality metrics
+(pagerank, authority, hub, eigenvector, betweenness, closeness), and induces
+semantic concepts from communities via LLM or deterministic fallback.
 """
 
 from __future__ import annotations
@@ -13,16 +10,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import uuid
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from itertools import permutations
 from typing import Any
 
 import networkx as nx
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
-from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.llm import LocalEchoLLMProvider
 from graph_core.llm.interface import LLMProvider
@@ -47,56 +42,6 @@ class RelationshipRecord:
     weight: int
 
 
-@dataclass(slots=True)
-class EdgeAggregate:
-    node_a: uuid.UUID
-    node_b: uuid.UUID
-    strength: float
-    total_weight: int
-    rel_types: tuple[str, ...]
-    relationship_ids: tuple[str, ...]
-
-
-@dataclass(slots=True)
-class DirectedEdgeAggregate:
-    source_id: uuid.UUID
-    target_id: uuid.UUID
-    strength: float
-    total_weight: int
-    rel_type: str
-    relationship_ids: tuple[str, ...]
-
-
-@dataclass(slots=True)
-class NodeMetrics:
-    node_id: uuid.UUID
-    name: str
-    community_id: int
-    rel_type: str
-    pagerank: float
-    authority_score: float
-    hub_score: float
-    eigenvector_score: float
-    betweenness: float
-    closeness: float
-    inbound_strength: float
-    outbound_strength: float
-    weighted_degree: float
-    external_communities: tuple[int, ...]
-    external_strength: float
-    is_articulation: bool
-    anchor_score: float
-
-
-def _pair_key(left: uuid.UUID, right: uuid.UUID) -> tuple[uuid.UUID, uuid.UUID]:
-    return (left, right) if left.hex <= right.hex else (right, left)
-
-
-def _edge_strength(weight_sum: int, max_weight: int) -> float:
-    cap = max(1, int(max_weight))
-    return min(1.0, float(weight_sum) / float(cap))
-
-
 def derived_graph_name(collection_id: uuid.UUID) -> str:
     return f"collection_{str(collection_id).replace('-', '')}_derived"
 
@@ -114,7 +59,7 @@ def _build_louvain_communities(
     for rel_type, rels in relationships_by_type.items():
         graph = nx.DiGraph()
         relationship_ids_by_edge: dict[tuple[str, str], list[str]] = defaultdict(list)
-        edge_count_by_pair: Counter[tuple[str, str]] = Counter()
+        edge_count_by_pair = Counter()
 
         for rel in rels:
             left = str(rel.source_id)
@@ -247,141 +192,6 @@ def _build_louvain_communities(
     return ranked
 
 
-def _connected_components(
-    node_ids: list[uuid.UUID],
-    adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]],
-) -> list[list[uuid.UUID]]:
-    seen: set[uuid.UUID] = set()
-    components: list[list[uuid.UUID]] = []
-    for node_id in node_ids:
-        if node_id in seen:
-            continue
-        queue: deque[uuid.UUID] = deque([node_id])
-        seen.add(node_id)
-        component: list[uuid.UUID] = []
-        while queue:
-            current = queue.popleft()
-            component.append(current)
-            for neighbor in adjacency.get(current, {}):
-                if neighbor in seen:
-                    continue
-                seen.add(neighbor)
-                queue.append(neighbor)
-        components.append(component)
-    return components
-
-
-def _merge_small_communities(
-    components: list[list[uuid.UUID]],
-    full_adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]],
-    *,
-    min_size: int,
-) -> list[list[uuid.UUID]]:
-    if min_size <= 1 or not components:
-        return components
-
-    community_index: dict[uuid.UUID, int] = {}
-    for idx, nodes in enumerate(components):
-        for node_id in nodes:
-            community_index[node_id] = idx
-
-    merged = [list(nodes) for nodes in components]
-    changed = True
-    while changed:
-        changed = False
-        for idx, nodes in list(enumerate(merged)):
-            if not nodes or len(nodes) >= min_size:
-                continue
-            neighbor_strengths: dict[int, float] = defaultdict(float)
-            for node_id in nodes:
-                for neighbor_id, edge in full_adjacency.get(node_id, {}).items():
-                    other_idx = community_index.get(neighbor_id)
-                    if other_idx is None or other_idx == idx:
-                        continue
-                    neighbor_strengths[other_idx] += edge.strength
-            if not neighbor_strengths:
-                continue
-            target_idx = max(neighbor_strengths, key=neighbor_strengths.get)
-            merged[target_idx].extend(nodes)
-            for node_id in nodes:
-                community_index[node_id] = target_idx
-            merged[idx] = []
-            changed = True
-
-    return [nodes for nodes in merged if nodes]
-
-
-def _articulation_points(
-    adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]],
-) -> set[uuid.UUID]:
-    discovery: dict[uuid.UUID, int] = {}
-    low: dict[uuid.UUID, int] = {}
-    parent: dict[uuid.UUID, uuid.UUID | None] = {}
-    articulation: set[uuid.UUID] = set()
-    time = 0
-
-    def dfs(node_id: uuid.UUID) -> None:
-        nonlocal time
-        time += 1
-        discovery[node_id] = time
-        low[node_id] = time
-        child_count = 0
-        for neighbor_id in adjacency.get(node_id, {}):
-            if neighbor_id not in discovery:
-                parent[neighbor_id] = node_id
-                child_count += 1
-                dfs(neighbor_id)
-                low[node_id] = min(low[node_id], low[neighbor_id])
-                if parent.get(node_id) is None and child_count > 1:
-                    articulation.add(node_id)
-                if (
-                    parent.get(node_id) is not None
-                    and low[neighbor_id] >= discovery[node_id]
-                ):
-                    articulation.add(node_id)
-            elif neighbor_id != parent.get(node_id):
-                low[node_id] = min(low[node_id], discovery[neighbor_id])
-
-    for node_id in adjacency:
-        if node_id in discovery:
-            continue
-        parent[node_id] = None
-        dfs(node_id)
-
-    return articulation
-
-
-def _shortest_directed_path(
-    start_id: uuid.UUID,
-    end_id: uuid.UUID,
-    adjacency: dict[uuid.UUID, dict[uuid.UUID, DirectedEdgeAggregate]],
-    *,
-    max_depth: int,
-) -> list[uuid.UUID] | None:
-    if start_id == end_id:
-        return [start_id]
-
-    queue: deque[tuple[uuid.UUID, list[uuid.UUID]]] = deque([(start_id, [start_id])])
-    seen: set[uuid.UUID] = {start_id}
-    while queue:
-        current, path = queue.popleft()
-        if len(path) - 1 >= max_depth:
-            continue
-        neighbors = sorted(
-            adjacency.get(current, {}).items(),
-            key=lambda item: item[1].strength,
-            reverse=True,
-        )
-        for neighbor_id, _edge in neighbors:
-            if neighbor_id == end_id:
-                return [*path, neighbor_id]
-            if neighbor_id in seen:
-                continue
-            seen.add(neighbor_id)
-            queue.append((neighbor_id, [*path, neighbor_id]))
-    return None
-
-
 def _shortest_paths_between_sets(
     adjacency: dict[uuid.UUID, list[tuple[uuid.UUID, str, float]]],
     starts: set[uuid.UUID],
@@ -390,6 +200,8 @@ def _shortest_paths_between_sets(
     max_depth: int = 4,
     limit: int = 6,
 ) -> list[dict[str, Any]]:
+    """BFS shortest paths between two node sets, used for concept-to-concept path analysis."""
+    from collections import deque
     results: list[dict[str, Any]] = []
     for start in starts:
         queue: deque[tuple[uuid.UUID, list[uuid.UUID], list[str], float]] = deque(
@@ -444,189 +256,6 @@ def _shortest_paths_between_sets(
         if len(deduped) >= limit:
             break
     return deduped
-
-
-def _top_rel_types(relationships: list[RelationshipRecord]) -> list[str]:
-    return sorted({rel.rel_type or "RELATES_TO" for rel in relationships})
-
-
-def _power_pagerank(
-    nodes: list[uuid.UUID],
-    out_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
-    in_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
-    *,
-    alpha: float = 0.85,
-    max_iter: int = 100,
-    tol: float = 1e-8,
-) -> dict[uuid.UUID, float]:
-    count = len(nodes)
-    if count == 0:
-        return {}
-    pr = {node_id: 1.0 / count for node_id in nodes}
-    out_weight = {
-        node_id: sum(weight for _target, weight in out_edges.get(node_id, []))
-        for node_id in nodes
-    }
-    for _ in range(max_iter):
-        new = {node_id: (1.0 - alpha) / count for node_id in nodes}
-        sink = sum(pr[node_id] for node_id in nodes if out_weight.get(node_id, 0.0) == 0.0)
-        sink_share = alpha * sink / count
-        for node_id in nodes:
-            new[node_id] += sink_share
-        for node_id in nodes:
-            for source_id, weight in in_edges.get(node_id, []):
-                denom = out_weight.get(source_id, 0.0)
-                if denom > 0:
-                    new[node_id] += alpha * pr[source_id] * (weight / denom)
-        error = sum(abs(new[node_id] - pr[node_id]) for node_id in nodes)
-        pr = new
-        if error < tol:
-            break
-    return pr
-
-
-def _power_hits(
-    nodes: list[uuid.UUID],
-    out_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
-    in_edges: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
-    *,
-    max_iter: int = 100,
-    tol: float = 1e-8,
-) -> tuple[dict[uuid.UUID, float], dict[uuid.UUID, float]]:
-    authority = {node_id: 1.0 for node_id in nodes}
-    hub = {node_id: 1.0 for node_id in nodes}
-    for _ in range(max_iter):
-        new_authority = {
-            node_id: sum(hub[src] * weight for src, weight in in_edges.get(node_id, []))
-            for node_id in nodes
-        }
-        norm = sum(value * value for value in new_authority.values()) ** 0.5 or 1.0
-        for node_id in nodes:
-            new_authority[node_id] /= norm
-        new_hub = {
-            node_id: sum(
-                new_authority[target] * weight
-                for target, weight in out_edges.get(node_id, [])
-            )
-            for node_id in nodes
-        }
-        norm = sum(value * value for value in new_hub.values()) ** 0.5 or 1.0
-        for node_id in nodes:
-            new_hub[node_id] /= norm
-        error = sum(
-            abs(new_authority[node_id] - authority[node_id])
-            + abs(new_hub[node_id] - hub[node_id])
-            for node_id in nodes
-        )
-        authority, hub = new_authority, new_hub
-        if error < tol:
-            break
-    return authority, hub
-
-
-def _power_eigenvector_undirected(
-    nodes: list[uuid.UUID],
-    neighbors: dict[uuid.UUID, list[tuple[uuid.UUID, float]]],
-    *,
-    max_iter: int = 100,
-    tol: float = 1e-8,
-) -> dict[uuid.UUID, float]:
-    scores = {node_id: 1.0 for node_id in nodes}
-    for _ in range(max_iter):
-        new = {
-            node_id: sum(scores[other_id] * weight for other_id, weight in neighbors.get(node_id, []))
-            for node_id in nodes
-        }
-        norm = sum(value * value for value in new.values()) ** 0.5 or 1.0
-        for node_id in nodes:
-            new[node_id] /= norm
-        error = sum(abs(new[node_id] - scores[node_id]) for node_id in nodes)
-        scores = new
-        if error < tol:
-            break
-    return scores
-
-
-def _shortest_paths_unweighted(
-    adjacency: dict[uuid.UUID, list[uuid.UUID]],
-    source_id: uuid.UUID,
-) -> tuple[
-    list[uuid.UUID],
-    dict[uuid.UUID, list[uuid.UUID]],
-    dict[uuid.UUID, float],
-    dict[uuid.UUID, int],
-]:
-    distance = {source_id: 0}
-    sigma: dict[uuid.UUID, float] = defaultdict(float)
-    sigma[source_id] = 1.0
-    predecessors: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
-    queue: deque[uuid.UUID] = deque([source_id])
-    order: list[uuid.UUID] = []
-    while queue:
-        node_id = queue.popleft()
-        order.append(node_id)
-        for neighbor_id in adjacency.get(node_id, []):
-            if neighbor_id not in distance:
-                distance[neighbor_id] = distance[node_id] + 1
-                queue.append(neighbor_id)
-            if distance[neighbor_id] == distance[node_id] + 1:
-                sigma[neighbor_id] += sigma[node_id]
-                predecessors[neighbor_id].append(node_id)
-    return order, predecessors, sigma, distance
-
-
-def _betweenness_directed(
-    nodes: list[uuid.UUID],
-    adjacency: dict[uuid.UUID, list[uuid.UUID]],
-) -> dict[uuid.UUID, float]:
-    scores = {node_id: 0.0 for node_id in nodes}
-    for source_id in nodes:
-        order, predecessors, sigma, _distance = _shortest_paths_unweighted(
-            adjacency,
-            source_id,
-        )
-        delta = {node_id: 0.0 for node_id in nodes}
-        for node_id in reversed(order):
-            for predecessor_id in predecessors[node_id]:
-                if sigma[node_id]:
-                    delta[predecessor_id] += (
-                        sigma[predecessor_id] / sigma[node_id]
-                    ) * (1.0 + delta[node_id])
-            if node_id != source_id:
-                scores[node_id] += delta[node_id]
-    count = len(nodes)
-    if count > 2:
-        scale = 1.0 / ((count - 1) * (count - 2))
-        for node_id in scores:
-            scores[node_id] *= scale
-    return scores
-
-
-def _harmonic_closeness(
-    nodes: list[uuid.UUID],
-    adjacency: dict[uuid.UUID, list[uuid.UUID]],
-) -> dict[uuid.UUID, float]:
-    scores: dict[uuid.UUID, float] = {}
-    for source_id in nodes:
-        _order, _predecessors, _sigma, distance = _shortest_paths_unweighted(
-            adjacency,
-            source_id,
-        )
-        scores[source_id] = sum(
-            1.0 / dist
-            for node_id, dist in distance.items()
-            if node_id != source_id and dist > 0
-        )
-    return scores
-
-
-def _normalize_scores(scores: dict[uuid.UUID, float]) -> dict[uuid.UUID, float]:
-    if not scores:
-        return {}
-    max_value = max(scores.values()) or 0.0
-    if max_value <= 0.0:
-        return {node_id: 0.0 for node_id in scores}
-    return {node_id: float(value) / float(max_value) for node_id, value in scores.items()}
 
 
 async def _load_graph_records(
@@ -720,602 +349,23 @@ async def _load_graph_records(
     )
 
 
-def _build_rel_type_analysis(
-    nodes: list[NodeRecord],
-    relationships: list[RelationshipRecord],
-    *,
-    rel_type: str,
-    min_edge_strength: float = 0.2,
-    min_community_size: int = 2,
-    max_anchors: int = 12,
-    max_path_depth: int = 4,
-    max_connector_paths: int = 20,
-    max_relationship_weight: int | None = None,
-) -> dict[str, Any]:
-    max_weight = max_relationship_weight or settings.graph_rag_max_relationship_weight
-    node_names = {node.id: node.name for node in nodes}
-    rels = [rel for rel in relationships if (rel.rel_type or "RELATES_TO") == rel_type]
-    if not rels:
-        return {
-            "rel_type": rel_type,
-            "parameters": {
-                "min_edge_strength": min_edge_strength,
-                "min_community_size": min_community_size,
-                "max_anchors": max_anchors,
-                "max_path_depth": max_path_depth,
-                "max_connector_paths": max_connector_paths,
-                "max_relationship_weight": max_weight,
-            },
-            "totals": {
-                "entities": 0,
-                "relationships": 0,
-                "directed_pairs": 0,
-                "undirected_pairs": 0,
-                "strong_pairs": 0,
-                "communities": 0,
-            },
-            "node_metrics": [],
-            "communities": [],
-            "top_anchors": [],
-            "bridge_nodes": [],
-            "connector_paths": [],
-        }
-
-    by_pair: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
-    by_direction: dict[tuple[uuid.UUID, uuid.UUID], dict[str, Any]] = {}
-    for rel in rels:
-        pair = _pair_key(rel.source_id, rel.target_id)
-        bucket = by_pair.setdefault(
-            pair,
-            {
-                "total_weight": 0,
-                "rel_types": set(),
-                "relationship_ids": [],
-            },
-        )
-        bucket["total_weight"] += max(0, int(rel.weight))
-        bucket["rel_types"].add(rel.rel_type)
-        bucket["relationship_ids"].append(str(rel.id))
-        directed = by_direction.setdefault(
-            (rel.source_id, rel.target_id),
-            {
-                "total_weight": 0,
-                "relationship_ids": [],
-            },
-        )
-        directed["total_weight"] += max(0, int(rel.weight))
-        directed["relationship_ids"].append(str(rel.id))
-
-    full_adjacency: dict[uuid.UUID, dict[uuid.UUID, EdgeAggregate]] = defaultdict(dict)
-    directed_adjacency: dict[
-        uuid.UUID, dict[uuid.UUID, DirectedEdgeAggregate]
-    ] = defaultdict(dict)
-    all_edges: list[EdgeAggregate] = []
-    for (left_id, right_id), bucket in by_pair.items():
-        aggregate = EdgeAggregate(
-            node_a=left_id,
-            node_b=right_id,
-            strength=_edge_strength(bucket["total_weight"], max_weight),
-            total_weight=int(bucket["total_weight"]),
-            rel_types=tuple(sorted(bucket["rel_types"])),
-            relationship_ids=tuple(sorted(bucket["relationship_ids"])),
-        )
-        full_adjacency[left_id][right_id] = aggregate
-        full_adjacency[right_id][left_id] = aggregate
-        all_edges.append(aggregate)
-    for (source_id, target_id), bucket in by_direction.items():
-        directed_adjacency[source_id][target_id] = DirectedEdgeAggregate(
-            source_id=source_id,
-            target_id=target_id,
-            strength=_edge_strength(bucket["total_weight"], max_weight),
-            total_weight=int(bucket["total_weight"]),
-            rel_type=rel_type,
-            relationship_ids=tuple(sorted(bucket["relationship_ids"])),
-        )
-
-    strong_adjacency: dict[
-        uuid.UUID, dict[uuid.UUID, EdgeAggregate]
-    ] = defaultdict(dict)
-    for edge in all_edges:
-        if edge.strength < min_edge_strength:
-            continue
-        strong_adjacency[edge.node_a][edge.node_b] = edge
-        strong_adjacency[edge.node_b][edge.node_a] = edge
-
-    active_node_ids = sorted(
-        {rel.source_id for rel in rels} | {rel.target_id for rel in rels},
-        key=lambda node_id: node_id.hex,
-    )
-    active_nodes = [node for node in nodes if node.id in set(active_node_ids)]
-    node_ids = active_node_ids
-    out_edges_weighted: dict[uuid.UUID, list[tuple[uuid.UUID, float]]] = defaultdict(list)
-    in_edges_weighted: dict[uuid.UUID, list[tuple[uuid.UUID, float]]] = defaultdict(list)
-    directed_neighbors: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
-    undirected_neighbors_weighted: dict[
-        uuid.UUID, list[tuple[uuid.UUID, float]]
-    ] = defaultdict(list)
-    for source_id, targets in directed_adjacency.items():
-        for target_id, edge in targets.items():
-            weight = max(edge.strength, 1e-6)
-            out_edges_weighted[source_id].append((target_id, weight))
-            in_edges_weighted[target_id].append((source_id, weight))
-            directed_neighbors[source_id].append(target_id)
-    for node_id, neighbors in full_adjacency.items():
-        for neighbor_id, edge in neighbors.items():
-            undirected_neighbors_weighted[node_id].append(
-                (neighbor_id, max(edge.strength, 1e-6))
-            )
-
-    pagerank = _power_pagerank(node_ids, out_edges_weighted, in_edges_weighted)
-    authority_score, hub_score = _power_hits(
-        node_ids,
-        out_edges_weighted,
-        in_edges_weighted,
-    )
-    eigenvector_score = _power_eigenvector_undirected(
-        node_ids,
-        undirected_neighbors_weighted,
-    )
-    betweenness = _betweenness_directed(node_ids, directed_neighbors)
-    closeness = _harmonic_closeness(node_ids, directed_neighbors)
-    closeness_norm = _normalize_scores(closeness)
-
-    communities = _connected_components(node_ids, strong_adjacency)
-    communities = _merge_small_communities(
-        communities,
-        full_adjacency,
-        min_size=min_community_size,
-    )
-
-    community_of: dict[uuid.UUID, int] = {}
-    for idx, members in enumerate(communities):
-        for node_id in members:
-            community_of[node_id] = idx
-
-    articulation = _articulation_points(strong_adjacency)
-
-    metrics: list[NodeMetrics] = []
-    for node in active_nodes:
-        outbound_strength = sum(
-            edge.strength for edge in directed_adjacency.get(node.id, {}).values()
-        )
-        inbound_strength = sum(
-            edge.strength
-            for neighbors in directed_adjacency.values()
-            for target_id, edge in neighbors.items()
-            if target_id == node.id
-        )
-        weighted_degree = sum(
-            edge.strength for edge in full_adjacency.get(node.id, {}).values()
-        )
-        external_strength = 0.0
-        external_communities: set[int] = set()
-        for neighbor_id, edge in full_adjacency.get(node.id, {}).items():
-            neighbor_community = community_of.get(neighbor_id, -1)
-            if neighbor_community != community_of.get(node.id, -1):
-                external_communities.add(neighbor_community)
-                external_strength += edge.strength
-        anchor_score = (
-            (2.0 * pagerank.get(node.id, 0.0))
-            + (2.0 * authority_score.get(node.id, 0.0))
-            + (2.0 * hub_score.get(node.id, 0.0))
-            + (1.5 * eigenvector_score.get(node.id, 0.0))
-            + (6.0 * betweenness.get(node.id, 0.0))
-            + (2.5 * closeness_norm.get(node.id, 0.0))
-            + outbound_strength
-            + inbound_strength
-            + weighted_degree
-            + (2.0 * len(external_communities))
-            + (1.5 * external_strength)
-            + (3.0 if node.id in articulation else 0.0)
-        )
-        metrics.append(
-            NodeMetrics(
-                node_id=node.id,
-                name=node.name,
-                community_id=community_of.get(node.id, -1),
-                rel_type=rel_type,
-                pagerank=round(pagerank.get(node.id, 0.0), 6),
-                authority_score=round(authority_score.get(node.id, 0.0), 6),
-                hub_score=round(hub_score.get(node.id, 0.0), 6),
-                eigenvector_score=round(eigenvector_score.get(node.id, 0.0), 6),
-                betweenness=round(betweenness.get(node.id, 0.0), 6),
-                closeness=round(closeness_norm.get(node.id, 0.0), 6),
-                inbound_strength=round(inbound_strength, 4),
-                outbound_strength=round(outbound_strength, 4),
-                weighted_degree=round(weighted_degree, 4),
-                external_communities=tuple(sorted(external_communities)),
-                external_strength=round(external_strength, 4),
-                is_articulation=node.id in articulation,
-                anchor_score=round(anchor_score, 4),
-            )
-        )
-
-    top_anchors = sorted(
-        metrics,
-        key=lambda item: (
-            item.anchor_score,
-            item.betweenness,
-            item.closeness,
-            item.hub_score + item.authority_score,
-            item.outbound_strength + item.inbound_strength,
-            item.weighted_degree,
-            len(item.external_communities),
-            item.name,
-        ),
-        reverse=True,
-    )[:max_anchors]
-
-    connector_paths: list[dict[str, Any]] = []
-    seen_paths: set[tuple[str, ...]] = set()
-    for left_anchor, right_anchor in permutations(top_anchors, 2):
-        if len(connector_paths) >= max_connector_paths:
-            break
-        path = _shortest_directed_path(
-            left_anchor.node_id,
-            right_anchor.node_id,
-            directed_adjacency,
-            max_depth=max_path_depth,
-        )
-        if not path or len(path) < 2:
-            continue
-        path_names = tuple(node_names[node_id] for node_id in path)
-        if path_names in seen_paths:
-            continue
-        seen_paths.add(path_names)
-        hops: list[dict[str, Any]] = []
-        path_score = 0.0
-        for current_id, next_id in zip(path, path[1:], strict=False):
-            edge = directed_adjacency[current_id][next_id]
-            path_score += edge.strength
-            hops.append(
-                {
-                    "source_id": str(current_id),
-                    "source": node_names[current_id],
-                    "target_id": str(next_id),
-                    "target": node_names[next_id],
-                    "strength": round(edge.strength, 4),
-                    "rel_types": [edge.rel_type],
-                    "relationship_ids": list(edge.relationship_ids),
-                }
-            )
-        connector_paths.append(
-            {
-                "rel_type": rel_type,
-                "from_anchor": left_anchor.name,
-                "to_anchor": right_anchor.name,
-                "source_community": left_anchor.community_id,
-                "target_community": right_anchor.community_id,
-                "nodes": list(path_names),
-                "hop_count": len(path) - 1,
-                "path_score": round(path_score, 4),
-                "hops": hops,
-            }
-        )
-
-    connector_paths.sort(
-        key=lambda item: (
-            item["source_community"] != item["target_community"],
-            item["path_score"],
-            -item["hop_count"],
-        ),
-        reverse=True,
-    )
-
-    community_summaries: list[dict[str, Any]] = []
-    for idx, members in enumerate(communities):
-        member_metrics = [metric for metric in metrics if metric.community_id == idx]
-        internal_edges: list[EdgeAggregate] = []
-        member_set = set(members)
-        for node_id in members:
-            for neighbor_id, edge in strong_adjacency.get(node_id, {}).items():
-                if neighbor_id not in member_set or node_id.hex > neighbor_id.hex:
-                    continue
-                internal_edges.append(edge)
-        anchor_preview = [
-            metric.name
-            for metric in sorted(
-                member_metrics,
-                key=lambda metric: metric.anchor_score,
-                reverse=True,
-            )[:3]
-        ]
-        community_summaries.append(
-            {
-                "rel_type": rel_type,
-                "community_id": idx,
-                "size": len(members),
-                "node_ids": [str(node_id) for node_id in members],
-                "node_names": sorted(node_names[node_id] for node_id in members),
-                "strong_edge_count": len(internal_edges),
-                "average_strong_edge_strength": round(
-                    (
-                        sum(edge.strength for edge in internal_edges)
-                        / len(internal_edges)
-                    )
-                    if internal_edges
-                    else 0.0,
-                    4,
-                ),
-                "anchor_preview": anchor_preview,
-            }
-        )
-
-    return {
-        "rel_type": rel_type,
-        "parameters": {
-            "min_edge_strength": min_edge_strength,
-            "min_community_size": min_community_size,
-            "max_anchors": max_anchors,
-            "max_path_depth": max_path_depth,
-            "max_connector_paths": max_connector_paths,
-            "max_relationship_weight": max_weight,
-        },
-        "totals": {
-            "entities": len(active_nodes),
-            "relationships": len(rels),
-            "directed_pairs": len(by_direction),
-            "undirected_pairs": len(all_edges),
-            "strong_pairs": sum(
-                1 for edge in all_edges if edge.strength >= min_edge_strength
-            ),
-            "communities": len(communities),
-        },
-        "node_metrics": [
-            {
-                "node_id": str(metric.node_id),
-                "name": metric.name,
-                "community_id": metric.community_id,
-                "rel_type": metric.rel_type,
-                "anchor_score": metric.anchor_score,
-                "pagerank": metric.pagerank,
-                "authority_score": metric.authority_score,
-                "hub_score": metric.hub_score,
-                "eigenvector_score": metric.eigenvector_score,
-                "betweenness": metric.betweenness,
-                "closeness": metric.closeness,
-                "inbound_strength": metric.inbound_strength,
-                "outbound_strength": metric.outbound_strength,
-                "weighted_degree": metric.weighted_degree,
-                "external_communities": list(metric.external_communities),
-                "external_strength": metric.external_strength,
-                "is_articulation": metric.is_articulation,
-            }
-            for metric in metrics
-        ],
-        "communities": community_summaries,
-        "top_anchors": [
-            {
-                "node_id": str(metric.node_id),
-                "name": metric.name,
-                "community_id": metric.community_id,
-                "rel_type": metric.rel_type,
-                "anchor_score": metric.anchor_score,
-                "pagerank": metric.pagerank,
-                "authority_score": metric.authority_score,
-                "hub_score": metric.hub_score,
-                "eigenvector_score": metric.eigenvector_score,
-                "betweenness": metric.betweenness,
-                "closeness": metric.closeness,
-                "inbound_strength": metric.inbound_strength,
-                "outbound_strength": metric.outbound_strength,
-                "weighted_degree": metric.weighted_degree,
-                "external_communities": list(metric.external_communities),
-                "external_strength": metric.external_strength,
-                "is_articulation": metric.is_articulation,
-            }
-            for metric in top_anchors
-        ],
-        "bridge_nodes": [
-            {
-                "node_id": str(metric.node_id),
-                "name": metric.name,
-                "community_id": metric.community_id,
-                "rel_type": metric.rel_type,
-                "anchor_score": metric.anchor_score,
-                "pagerank": metric.pagerank,
-                "authority_score": metric.authority_score,
-                "hub_score": metric.hub_score,
-                "eigenvector_score": metric.eigenvector_score,
-                "betweenness": metric.betweenness,
-                "closeness": metric.closeness,
-                "inbound_strength": metric.inbound_strength,
-                "outbound_strength": metric.outbound_strength,
-                "weighted_degree": metric.weighted_degree,
-                "external_communities": list(metric.external_communities),
-                "external_strength": metric.external_strength,
-                "is_articulation": metric.is_articulation,
-            }
-            for metric in sorted(
-                (
-                    metric
-                    for metric in metrics
-                    if metric.is_articulation or metric.external_communities
-                ),
-                key=lambda metric: (
-                    metric.is_articulation,
-                    len(metric.external_communities),
-                    metric.anchor_score,
-                ),
-                reverse=True,
-            )[: max(10, max_anchors)]
-        ],
-        "connector_paths": connector_paths[:max_connector_paths],
-    }
-
-
 def build_collection_analysis(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
-    *,
-    min_edge_strength: float = 0.2,
-    min_community_size: int = 2,
-    max_anchors: int = 12,
-    max_path_depth: int = 4,
-    max_connector_paths: int = 20,
-    max_relationship_weight: int | None = None,
 ) -> dict[str, Any]:
-    rel_types = _top_rel_types(relationships)
-    analyses = [
-        _build_rel_type_analysis(
-            nodes,
-            relationships,
-            rel_type=rel_type,
-            min_edge_strength=min_edge_strength,
-            min_community_size=min_community_size,
-            max_anchors=max_anchors,
-            max_path_depth=max_path_depth,
-            max_connector_paths=max_connector_paths,
-            max_relationship_weight=max_relationship_weight,
-        )
-        for rel_type in rel_types
-    ]
-
-    anchor_totals: dict[str, dict[str, Any]] = {}
-    bridge_totals: dict[str, dict[str, Any]] = {}
-    structural_components: list[dict[str, Any]] = []
-    connector_paths: list[dict[str, Any]] = []
-    total_strong_pairs = 0
-    total_directed_pairs = 0
-    total_undirected_pairs = 0
-    for analysis in analyses:
-        total_strong_pairs += int(analysis["totals"]["strong_pairs"])
-        total_directed_pairs += int(analysis["totals"]["directed_pairs"])
-        total_undirected_pairs += int(analysis["totals"]["undirected_pairs"])
-        structural_components.extend(analysis["communities"])
-        connector_paths.extend(analysis["connector_paths"])
-        for bucket, items in (
-            (anchor_totals, analysis["top_anchors"]),
-            (bridge_totals, analysis["bridge_nodes"]),
-        ):
-            for item in items:
-                entry = bucket.setdefault(
-                    item["node_id"],
-                    {
-                        **item,
-                        "rel_types": [],
-                        "anchor_score": 0.0,
-                        "pagerank": 0.0,
-                        "authority_score": 0.0,
-                        "hub_score": 0.0,
-                        "eigenvector_score": 0.0,
-                        "betweenness": 0.0,
-                        "closeness": 0.0,
-                        "inbound_strength": 0.0,
-                        "outbound_strength": 0.0,
-                        "weighted_degree": 0.0,
-                        "external_strength": 0.0,
-                    },
-                )
-                entry["rel_types"].append(item["rel_type"])
-                entry["anchor_score"] += float(item["anchor_score"])
-                entry["pagerank"] += float(item.get("pagerank", 0.0))
-                entry["authority_score"] += float(item.get("authority_score", 0.0))
-                entry["hub_score"] += float(item.get("hub_score", 0.0))
-                entry["eigenvector_score"] += float(item.get("eigenvector_score", 0.0))
-                entry["betweenness"] += float(item.get("betweenness", 0.0))
-                entry["closeness"] += float(item.get("closeness", 0.0))
-                entry["inbound_strength"] += float(item["inbound_strength"])
-                entry["outbound_strength"] += float(item["outbound_strength"])
-                entry["weighted_degree"] += float(item["weighted_degree"])
-                entry["external_strength"] += float(item["external_strength"])
-                entry["is_articulation"] = (
-                    bool(entry.get("is_articulation")) or bool(item["is_articulation"])
-                )
-                entry["external_communities"] = sorted(
-                    set(entry.get("external_communities", []))
-                    | set(item.get("external_communities", []))
-                )
-
-    def _finalize_entries(items: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-        rows = list(items.values())
-        for row in rows:
-            row["rel_types"] = sorted(set(row["rel_types"]))
-            for key in (
-                "anchor_score",
-                "pagerank",
-                "authority_score",
-                "hub_score",
-                "eigenvector_score",
-                "betweenness",
-                "closeness",
-                "inbound_strength",
-                "outbound_strength",
-                "weighted_degree",
-                "external_strength",
-            ):
-                row[key] = round(float(row[key]), 4)
-        rows.sort(
-            key=lambda item: (
-                item["anchor_score"],
-                item["betweenness"],
-                item["closeness"],
-                item["hub_score"] + item["authority_score"],
-                item["outbound_strength"] + item["inbound_strength"],
-                item["weighted_degree"],
-                len(item["rel_types"]),
-                item["name"],
-            ),
-            reverse=True,
-        )
-        return rows
-
-    structural_components.sort(
-        key=lambda item: (
-            item["strong_edge_count"],
-            item["average_strong_edge_strength"],
-            item["size"],
-        ),
-        reverse=True,
-    )
-    connector_paths.sort(
-        key=lambda item: (
-            item["source_community"] != item["target_community"],
-            item["path_score"],
-            -item["hop_count"],
-        ),
-        reverse=True,
-    )
-
     louvain_communities = _build_louvain_communities(nodes, relationships)
-
     return {
-        "parameters": {
-            "min_edge_strength": min_edge_strength,
-            "min_community_size": min_community_size,
-            "max_anchors": max_anchors,
-            "max_path_depth": max_path_depth,
-            "max_connector_paths": max_connector_paths,
-            "max_relationship_weight": (
-                max_relationship_weight or settings.graph_rag_max_relationship_weight
-            ),
-        },
         "totals": {
             "entities": len(nodes),
             "relationships": len(relationships),
-            "directed_pairs": total_directed_pairs,
-            "undirected_pairs": total_undirected_pairs,
-            "strong_pairs": total_strong_pairs,
             "communities": len(louvain_communities),
-            "rel_types": len(rel_types),
         },
-        "rel_type_analyses": analyses,
         "communities": louvain_communities,
-        "structural_components": structural_components,
-        "top_anchors": _finalize_entries(anchor_totals)[:max_anchors],
-        "bridge_nodes": _finalize_entries(bridge_totals)[: max(10, max_anchors)],
-        "connector_paths": connector_paths[:max_connector_paths],
     }
 
 
 async def analyze_collection_graph(
     collection_id: uuid.UUID,
-    *,
-    min_edge_strength: float = 0.2,
-    min_community_size: int = 2,
-    max_anchors: int = 12,
-    max_path_depth: int = 4,
-    max_connector_paths: int = 20,
 ) -> dict[str, Any]:
     collection, nodes, relationships, aliases_by_entity_id = await _load_graph_records(
         collection_id
@@ -1323,11 +373,6 @@ async def analyze_collection_graph(
     analysis = build_collection_analysis(
         nodes,
         relationships,
-        min_edge_strength=min_edge_strength,
-        min_community_size=min_community_size,
-        max_anchors=max_anchors,
-        max_path_depth=max_path_depth,
-        max_connector_paths=max_connector_paths,
     )
     analysis["collection"] = {
         "id": str(collection.id),
@@ -1373,6 +418,7 @@ async def build_collection_understanding(
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
+    seen_edge_ids: set[str] = set()
     seen_entity_refs: set[str] = set()
 
     def derived_chunk_hash(*parts: object) -> str:
@@ -1438,8 +484,9 @@ async def build_collection_understanding(
         keywords: list[str] | None = None,
     ) -> None:
         edge_id = f"{source_id}__{rel_type}__{target_id}"
-        if any(edge["id"] == edge_id for edge in edges):
+        if edge_id in seen_edge_ids:
             return
+        seen_edge_ids.add(edge_id)
         edges.append(
             {
                 "source_id": source_id,
@@ -1527,7 +574,7 @@ async def build_collection_understanding(
             "type": "object",
             "properties": {
                 "label": {"type": "string"},
-                "concept_type": {"type": "string"},
+                "concept_type": {"type": "string", "enum": ["theme", "process", "role", "pattern", "tension", "flow", "concept"]},
                 "description": {"type": "string"},
                 "aliases": {
                     "type": "array",
@@ -1605,6 +652,7 @@ async def build_collection_understanding(
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}
     concept_labels_by_id: dict[str, str] = {}
+    concept_descriptions_by_id: dict[str, str] = {}
     concept_region_ids_by_id: dict[str, list[str]] = {}
     for concept in induced_concepts:
         label = str(concept.get("label") or "").strip()
@@ -1671,6 +719,7 @@ async def build_collection_understanding(
         )
         concept_id_by_label[label] = node_id
         concept_labels_by_id[node_id] = label
+        concept_descriptions_by_id[node_id] = description
         concept_source_ids[node_id] = source_ids
         concept_region_ids_by_id[node_id] = evidence_ids
         member_names = [
@@ -1776,8 +825,8 @@ async def build_collection_understanding(
             max_depth=4,
             limit=6,
         )
-        bridge_counter: Counter[str] = Counter()
-        path_rel_counter: Counter[str] = Counter()
+        bridge_counter = Counter()
+        path_rel_counter = Counter()
         path_source_ids: set[str] = set()
         for path in paths:
             node_ids = [str(node_id) for node_id in path.get("nodes", [])]
@@ -1788,21 +837,22 @@ async def build_collection_understanding(
                 path_rel_counter[str(rel_type)] += 1
             path_source_ids.update(node_ids)
 
-        combined_rel_counter: Counter[str] = Counter(bucket["rel_counter"])
+        combined_rel_counter = Counter(bucket["rel_counter"])
         combined_rel_counter.update(path_rel_counter)
         top_rel_types = [rel_type for rel_type, _ in combined_rel_counter.most_common(3)]
         if not top_rel_types:
             continue
-        rel_type = "+".join(top_rel_types)[:64]
         boundary_names = [name for name, _ in bucket["boundary_counter"].most_common(4) if name]
         bridge_names = [name for name, _ in bridge_counter.most_common(4) if name]
         source_label = concept_labels_by_id.get(source_concept_id, source_concept_id)
         target_label = concept_labels_by_id.get(target_concept_id, target_concept_id)
+        source_desc = concept_descriptions_by_id.get(source_concept_id, "")
+        target_desc = concept_descriptions_by_id.get(target_concept_id, "")
         path_count = len(paths)
         path_score = round(sum(float(path["path_score"]) for path in paths), 6) if paths else 0.0
         description_parts = [
-            f"{source_label} connects to {target_label} through {bucket['direct_count']} direct cross-edge(s)",
-            f"dominated by relation types {', '.join(top_rel_types)}",
+            f"{source_label} ({source_desc}) connects to {target_label} ({target_desc}) "
+            f"through {bucket['direct_count']} direct cross-edge(s) dominated by {', '.join(top_rel_types)}"
         ]
         if path_count:
             description_parts.append(
@@ -1825,8 +875,8 @@ async def build_collection_understanding(
         add_edge(
             source_concept_id,
             target_concept_id,
-            rel_type=rel_type,
-            description=". ".join(description_parts).strip() + ".",
+            rel_type="CONNECTS_TO",
+            description="; ".join(description_parts).strip() + ".",
             source_ids=edge_source_ids,
             keywords=top_rel_types,
         )
