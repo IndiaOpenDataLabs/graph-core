@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from itertools import permutations
 from typing import Any
@@ -104,79 +104,135 @@ def _build_louvain_communities(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
 ) -> list[dict[str, Any]]:
-    graph = nx.Graph()
     name_by_id = {node.id: node.name for node in nodes}
-    for node in nodes:
-        graph.add_node(str(node.id), name=node.name)
-
-    edge_rel_types: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
-    for rel in relationships:
-        left = str(rel.source_id)
-        right = str(rel.target_id)
-        if graph.has_edge(left, right):
-            graph[left][right]["weight"] += float(rel.weight or 0)
-            graph[left][right]["count"] += 1
-        else:
-            graph.add_edge(
-                left,
-                right,
-                weight=float(rel.weight or 0),
-                count=1,
-            )
-        key = tuple(sorted((left, right)))
-        edge_rel_types[key][str(rel.rel_type or "RELATES_TO")] += 1
-
-    if graph.number_of_nodes() == 0:
-        return []
-
-    communities = nx.algorithms.community.louvain_communities(
-        graph,
-        weight="weight",
-        seed=42,
-    )
-
     ranked: list[dict[str, Any]] = []
-    for idx, members in enumerate(communities):
-        subgraph = graph.subgraph(members)
-        internal_weight = sum(
-            float(data.get("weight", 0.0)) for _, _, data in subgraph.edges(data=True)
+    relationships_by_type: dict[str, list[RelationshipRecord]] = defaultdict(list)
+    for rel in relationships:
+        relationships_by_type[str(rel.rel_type or "RELATES_TO")].append(rel)
+
+    for rel_type, rels in relationships_by_type.items():
+        graph = nx.DiGraph()
+        relationship_ids_by_edge: dict[tuple[str, str], list[str]] = defaultdict(list)
+        edge_count_by_pair: Counter[tuple[str, str]] = Counter()
+
+        for rel in rels:
+            left = str(rel.source_id)
+            right = str(rel.target_id)
+            graph.add_node(left, name=rel.source_name)
+            graph.add_node(right, name=rel.target_name)
+            if graph.has_edge(left, right):
+                graph[left][right]["weight"] += float(rel.weight or 0)
+            else:
+                graph.add_edge(left, right, weight=float(rel.weight or 0))
+            relationship_ids_by_edge[(left, right)].append(str(rel.id))
+            edge_count_by_pair[(left, right)] += 1
+
+        if graph.number_of_nodes() == 0:
+            continue
+
+        communities = nx.algorithms.community.louvain_communities(
+            graph,
+            weight="weight",
+            seed=42,
         )
-        weighted_degree: dict[str, float] = {
-            node_id: float(subgraph.degree(node_id, weight="weight"))
-            for node_id in subgraph.nodes
-        }
-        external_weight = 0.0
-        rel_counter: Counter[str] = Counter()
-        for node_id in members:
-            for neighbor, data in graph[node_id].items():
-                if neighbor not in members:
-                    external_weight += float(data.get("weight", 0.0))
-        for left, right in subgraph.edges():
-            rel_counter.update(edge_rel_types[tuple(sorted((left, right)))])
-        size = len(members)
-        possible_edges = max(1, size * (size - 1) / 2)
-        density = subgraph.number_of_edges() / possible_edges
-        score = (internal_weight * max(density, 0.001)) + (size * 0.5)
-        ranked.append(
-            {
-                "community_id": idx,
-                "size": size,
-                "score": round(score, 6),
-                "internal_weight": round(internal_weight, 6),
-                "external_weight": round(external_weight, 6),
-                "density": round(float(density), 6),
-                "node_ids": sorted(members),
-                "node_names": [
-                    name_by_id[uuid.UUID(node_id)]
-                    for node_id, _ in sorted(
-                        weighted_degree.items(),
-                        key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
-                        reverse=True,
-                    )
-                ],
-                "top_rel_types": [name for name, _ in rel_counter.most_common(6)],
+
+        for idx, members in enumerate(communities):
+            subgraph = graph.subgraph(members).copy()
+            internal_weight = sum(
+                float(data.get("weight", 0.0)) for _, _, data in subgraph.edges(data=True)
+            )
+            external_in_weight = 0.0
+            external_out_weight = 0.0
+            for node_id in members:
+                for source_id, _, data in graph.in_edges(node_id, data=True):
+                    if source_id not in members:
+                        external_in_weight += float(data.get("weight", 0.0))
+                for _, target_id, data in graph.out_edges(node_id, data=True):
+                    if target_id not in members:
+                        external_out_weight += float(data.get("weight", 0.0))
+
+            size = len(members)
+            possible_edges = max(1, size * max(1, size - 1))
+            density = subgraph.number_of_edges() / possible_edges
+            score = (internal_weight * max(density, 0.001)) + (size * 0.5)
+
+            weighted_in_degree: dict[str, float] = {
+                node_id: float(subgraph.in_degree(node_id, weight="weight"))
+                for node_id in subgraph.nodes
             }
-        )
+            weighted_out_degree: dict[str, float] = {
+                node_id: float(subgraph.out_degree(node_id, weight="weight"))
+                for node_id in subgraph.nodes
+            }
+            representative_edges = sorted(
+                (
+                    (
+                        float(data.get("weight", 0.0)),
+                        source_id,
+                        target_id,
+                        relationship_ids_by_edge.get((source_id, target_id), []),
+                        int(edge_count_by_pair.get((source_id, target_id), 0)),
+                    )
+                    for source_id, target_id, data in subgraph.edges(data=True)
+                ),
+                reverse=True,
+            )[:6]
+
+            ranked.append(
+                {
+                    "community_id": f"{rel_type}:{idx}",
+                    "rel_type": rel_type,
+                    "size": size,
+                    "score": round(score, 6),
+                    "internal_weight": round(internal_weight, 6),
+                    "external_in_weight": round(external_in_weight, 6),
+                    "external_out_weight": round(external_out_weight, 6),
+                    "density": round(float(density), 6),
+                    "node_ids": sorted(members),
+                    "node_names": [
+                        name_by_id[uuid.UUID(node_id)]
+                        for node_id, _ in sorted(
+                            (
+                                (
+                                    node_id,
+                                    weighted_in_degree.get(node_id, 0.0)
+                                    + weighted_out_degree.get(node_id, 0.0),
+                                )
+                                for node_id in members
+                            ),
+                            key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
+                            reverse=True,
+                        )
+                    ],
+                    "top_inbound_names": [
+                        name_by_id[uuid.UUID(node_id)]
+                        for node_id, _ in sorted(
+                            weighted_in_degree.items(),
+                            key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
+                            reverse=True,
+                        )[:6]
+                    ],
+                    "top_outbound_names": [
+                        name_by_id[uuid.UUID(node_id)]
+                        for node_id, _ in sorted(
+                            weighted_out_degree.items(),
+                            key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
+                            reverse=True,
+                        )[:6]
+                    ],
+                    "representative_edges": [
+                        {
+                            "source_name": name_by_id[uuid.UUID(source_id)],
+                            "target_name": name_by_id[uuid.UUID(target_id)],
+                            "weight": round(weight, 6),
+                            "relationship_count": relationship_count,
+                            "relationship_ids": relationship_ids[:8],
+                        }
+                        for weight, source_id, target_id, relationship_ids, relationship_count in representative_edges
+                    ],
+                    "top_rel_types": [rel_type],
+                }
+            )
 
     ranked.sort(
         key=lambda item: (
@@ -1298,20 +1354,26 @@ async def build_collection_understanding(
         ranked_communities[:max_candidate_communities],
         start=1,
     ):
+        representative_edges = community.get("representative_edges", [])
         candidate_regions.append(
             {
                 "region_id": f"community_{idx}",
                 "kind": "community",
-                "title": f"Community {community['community_id']}",
+                "title": f"{community['rel_type']} Community {community['community_id']}",
                 "description": (
-                    f"Weighted Louvain community of size {community['size']} with score "
+                    f"Directed Louvain community for relation type {community['rel_type']} "
+                    f"of size {community['size']} with score "
                     f"{community['score']}, internal weight {community['internal_weight']}, "
-                    f"external weight {community['external_weight']}, density {community['density']}. "
-                    f"Top relation types: {', '.join(community.get('top_rel_types', [])) or 'none'}."
+                    f"external inbound weight {community['external_in_weight']}, "
+                    f"external outbound weight {community['external_out_weight']}, "
+                    f"density {community['density']}. "
+                    f"Top inbound nodes: {', '.join(community.get('top_inbound_names', [])) or 'none'}. "
+                    f"Top outbound nodes: {', '.join(community.get('top_outbound_names', [])) or 'none'}."
                 ),
                 "source_ids": list(community.get("node_ids", [])),
                 "entity_names": list(community.get("node_names", []))[:16],
                 "rel_types": list(community.get("top_rel_types", [])),
+                "representative_edges": representative_edges,
             }
         )
 
@@ -1387,14 +1449,27 @@ async def build_collection_understanding(
                 f"- {region['region_id']} [{region['kind']}] {region['title']}: "
                 f"{region['description']} "
                 f"Entities: {', '.join(region['entity_names'][:8]) or 'none'}. "
-                f"Rel types: {', '.join(region['rel_types']) or 'none'}."
+                f"Rel types: {', '.join(region['rel_types']) or 'none'}. "
+                "Representative directed edges: "
+                + (
+                    "; ".join(
+                        (
+                            f"{edge['source_name']} -[{region['rel_types'][0] if region['rel_types'] else 'RELATES_TO'}]-> "
+                            f"{edge['target_name']} (weight={edge['weight']}, count={edge['relationship_count']})"
+                        )
+                        for edge in region.get("representative_edges", [])[:5]
+                    )
+                    or "none"
+                )
             )
             for region in candidate_regions
         )
         prompt = (
-            "You are inducing reusable semantic concepts from structural graph candidates.\n"
-            "Do not return mechanical labels like community, connector, or bridge.\n"
-            "Create a small set of higher-level concepts that explain what these regions collectively mean.\n"
+            "You are inducing reusable semantic concepts from directed relation-type-specific graph communities.\n"
+            "Do not return mechanical labels like community, connector, bridge, cluster, or graph region.\n"
+            "Create a small set of higher-level concepts that explain what these communities collectively mean.\n"
+            "Pay close attention to edge direction and relation type. Infer roles, flows, abstractions, tensions, "
+            "or unifying concepts from the representative directed edges and member entities.\n"
             "Then create semantic meta-edges between concepts using only these relation types: "
             + ", ".join(sorted(semantic_edge_types))
             + ".\n"
