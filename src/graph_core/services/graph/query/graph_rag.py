@@ -207,6 +207,14 @@ class DerivedRouteProfile:
     rel_type_scores: dict[str, float]
 
 
+@dataclass
+class DerivedGraphState:
+    discovered_node_ids: set[str]
+    node_relevance: dict[str, float]
+    traversed_edge_ids: list[str]
+    edge_relevance: dict[str, float]
+
+
 def _format_retrieval_query(instruction: str, query: str) -> str:
     return f"<Instruct>: {instruction}\n<Query>: {query}"
 
@@ -251,6 +259,97 @@ async def _embed_derived_query(
     return await embedding_provider.embed_query(
         _format_retrieval_query(_DERIVED_RETRIEVAL_INSTRUCTION, query)
     )
+
+
+async def _top_derived_candidates(
+    collection: Collection,
+    derived_query_embedding: list[float],
+    storage: FalkorDBGraphStorage,
+    *,
+    top_k: int = 40,
+) -> list[tuple[str, str, float, str]]:
+    hits = await _vector_store.query_chunks(
+        collection_id=collection.id,
+        query_embedding=derived_query_embedding,
+        top_k=top_k,
+        metadata_filters={"memory_type": "derived_graph", "derived_kind": "concept"},
+    )
+    candidates: list[tuple[str, str, float, str]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        metadata = hit.get("metadata") or {}
+        derived_id = str(metadata.get("derived_id") or "").strip()
+        if not derived_id or derived_id in seen:
+            continue
+        seen.add(derived_id)
+        name = str(metadata.get("canonical_name") or "").strip()
+        if not name:
+            node = await storage.get_node(derived_id)
+            name = str(node.get("canonical_name") or node.get("name") or "").strip() if node else ""
+        if not name:
+            continue
+        candidates.append(
+            (
+                name,
+                str(hit.get("content") or "").strip(),
+                float(hit.get("score") or 0.0),
+                derived_id,
+            )
+        )
+    return candidates
+
+
+async def _search_derived_seeds(
+    question: str,
+    collection: Collection,
+    derived_query_embedding: list[float],
+    storage: FalkorDBGraphStorage,
+) -> tuple[list[str], dict[str, float], list[tuple[str, str, float, str]]]:
+    candidates = await _top_derived_candidates(
+        collection,
+        derived_query_embedding,
+        storage,
+        top_k=40,
+    )
+    seed_node_ids: list[str] = []
+    node_relevance: dict[str, float] = {}
+    for name, description, score, derived_id in candidates[:12]:
+        _ = name, description
+        if derived_id not in seed_node_ids:
+            seed_node_ids.append(derived_id)
+            node_relevance[derived_id] = score
+
+    for kw in _extract_query_keywords(question)[:5]:
+        for node in await storage.find_nodes_by_name_or_alias(kw, limit=8):
+            derived_id = str(node.get("id") or "").strip()
+            if (
+                not derived_id
+                or str(node.get("type") or "") != "derived_concept"
+            ):
+                continue
+            if derived_id not in seed_node_ids:
+                seed_node_ids.append(derived_id)
+            node_relevance[derived_id] = max(node_relevance.get(derived_id, 0.0), 1.0)
+
+    return seed_node_ids, node_relevance, candidates
+
+
+def _score_derived_edge(
+    edge_props: dict[str, Any],
+    query_tokens: set[str],
+    route_profile: DerivedRouteProfile,
+) -> float:
+    rel_type = str(edge_props.get("rel_type") or "RELATES_TO").upper()
+    description = str(edge_props.get("description") or "").lower()
+    alias_blob = " ".join(str(v) for v in (edge_props.get("aliases") or []))
+    haystack = f"{rel_type.lower()} {description} {alias_blob.lower()}".strip()
+    if query_tokens and haystack:
+        hits = sum(1 for token in query_tokens if token and token in haystack)
+        lexical = min(1.0, hits / max(1, min(len(query_tokens), 6)))
+    else:
+        lexical = 0.0
+    route_bonus = route_profile.rel_type_scores.get(rel_type, 0.0)
+    return (0.65 * lexical) + (0.35 * route_bonus)
 
 
 async def _resolve_credential(
@@ -1163,76 +1262,115 @@ async def _derive_route_profile(
 async def _load_derived_context(
     question: str,
     collection: Collection,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
     embedding_provider: EmbeddingProvider,
     route_profile: DerivedRouteProfile,
 ) -> DerivedContext:
     storage = FalkorDBGraphStorage(derived_graph_name(collection.id))
     derived_query_embedding = await _embed_derived_query(embedding_provider, question)
-    hits = await _vector_store.query_chunks(
-        collection_id=collection.id,
-        query_embedding=derived_query_embedding,
-        top_k=12,
-        metadata_filters={"memory_type": "derived_graph"},
+    query_tokens = _query_token_set(question)
+    seed_node_ids, seed_scores, candidates = await _search_derived_seeds(
+        question,
+        collection,
+        derived_query_embedding,
+        storage,
     )
-    keyword_hits: list[dict[str, Any]] = []
-    seen_keyword_nodes: set[str] = set()
-    for kw in _extract_query_keywords(question)[:5]:
-        for node in await storage.find_nodes_by_name_or_alias(kw, limit=8):
-            derived_id = str(node.get("id") or "").strip()
-            if (
-                not derived_id
-                or derived_id in seen_keyword_nodes
-                or str(node.get("object_type") or "") != "entity"
-            ):
-                continue
-            seen_keyword_nodes.add(derived_id)
-            keyword_hits.append(
-                {
-                    "content": str(node.get("description") or node.get("name") or derived_id),
-                    "score": 1.0,
-                    "metadata": {
-                        "memory_type": "derived_graph",
-                        "derived_kind": "concept"
-                        if str(node.get("type") or "") == "derived_concept"
-                        else "entity_ref",
-                        "derived_id": derived_id,
-                        "canonical_name": str(
-                            node.get("canonical_name") or node.get("name") or ""
-                        ),
-                        "object_type": str(node.get("object_type") or "entity"),
-                        "aliases": node.get("aliases") or [],
-                    },
-                }
-            )
-    hits = [*hits, *keyword_hits]
-    if not hits:
+    if not seed_node_ids:
         return DerivedContext(
             context="",
             base_entity_ids={},
             derived_nodes_used=[],
             derived_edges_used=[],
         )
+    llm_provider = await _resolve_llm_provider(
+        namespace_id=namespace_id,
+        llm_profile_id=llm_profile_id,
+    )
+    candidate_rows = [
+        (name, description, score)
+        for name, description, score, _ in candidates
+    ]
+    interpretation = await _interpret_mix_queries(question, candidate_rows, llm_provider)
 
-    kind_weights = {
-        "hub": {"concept": 1.2, "bridge": 1.1, "connector": 1.0},
-        "authority": {"concept": 1.2, "bridge": 1.05, "connector": 1.0},
-        "bridge": {"concept": 1.1, "bridge": 1.2, "connector": 1.05},
-        "central": {"concept": 1.2, "connector": 1.05, "bridge": 1.0},
-        "importance": {"concept": 1.2, "bridge": 1.05, "connector": 1.0},
-    }.get(route_profile.primary_route, {})
-    scored_hits = []
-    for hit in hits:
-        metadata = hit.get("metadata") or {}
-        base_score = float(hit.get("score") or 0.0)
-        derived_kind = str(metadata.get("derived_kind") or "").strip()
-        rel_type = str(metadata.get("rel_type") or "").strip().upper()
-        score = base_score * kind_weights.get(derived_kind, 1.0)
-        if rel_type:
-            score *= 1.0 + (0.2 * route_profile.rel_type_scores.get(rel_type, 0.0))
-        if str(metadata.get("object_type") or "") == "entity":
-            score *= 1.1
-        scored_hits.append((score, hit))
-    scored_hits.sort(key=lambda item: item[0], reverse=True)
+    async def _derive_state_for(subquery: str) -> DerivedGraphState:
+        subquery_embedding = await _embed_derived_query(embedding_provider, subquery)
+        local_seed_ids, local_seed_scores, _ = await _search_derived_seeds(
+            subquery,
+            collection,
+            subquery_embedding,
+            storage,
+        )
+        local_query_tokens = query_tokens | _query_token_set(subquery)
+        visited = set(local_seed_ids)
+        discovered_node_ids = set(local_seed_ids)
+        node_relevance = dict(local_seed_scores)
+        traversed_edge_ids: list[str] = []
+        edge_relevance: dict[str, float] = {}
+        stack = [(node_id, 0) for node_id in local_seed_ids[:16]]
+        max_depth = 4
+        energy = 6.0
+        while stack and energy > 0:
+            node_id, depth = stack.pop()
+            if depth >= max_depth:
+                continue
+            edges = await storage.get_node_edges(node_id)
+            scored_edges: list[tuple[float, str, str]] = []
+            for source_id, target_id in edges:
+                neighbor = target_id if source_id == node_id else source_id
+                if neighbor in visited:
+                    continue
+                edge_props = await storage.get_edge(source_id, target_id)
+                if edge_props is None:
+                    edge_props = await storage.get_edge(target_id, source_id)
+                if not edge_props:
+                    continue
+                edge_id = str(edge_props.get("id") or f"{source_id}__{target_id}")
+                combined = _score_derived_edge(
+                    edge_props,
+                    local_query_tokens,
+                    route_profile,
+                )
+                if combined <= 0.0:
+                    continue
+                scored_edges.append((combined, neighbor, edge_id))
+            for combined, neighbor, edge_id in sorted(scored_edges, key=lambda item: item[0]):
+                cost = max(0.05, 1.0 - combined)
+                if energy - cost <= 0:
+                    continue
+                energy -= cost
+                visited.add(neighbor)
+                stack.append((neighbor, depth + 1))
+                discovered_node_ids.add(neighbor)
+                if edge_id not in traversed_edge_ids:
+                    traversed_edge_ids.append(edge_id)
+                edge_relevance[edge_id] = max(edge_relevance.get(edge_id, 0.0), combined)
+                if combined > node_relevance.get(neighbor, 0.0):
+                    node_relevance[neighbor] = combined
+        return DerivedGraphState(
+            discovered_node_ids=discovered_node_ids,
+            node_relevance=node_relevance,
+            traversed_edge_ids=traversed_edge_ids,
+            edge_relevance=edge_relevance,
+        )
+
+    subqueries = interpretation.retrieval_subqueries or [question]
+    sub_states = await asyncio.gather(
+        *(_derive_state_for(subquery) for subquery in subqueries[:4])
+    )
+    discovered_node_ids: set[str] = set()
+    node_relevance: dict[str, float] = {}
+    traversed_edge_ids: list[str] = []
+    edge_relevance: dict[str, float] = {}
+    for sub_state in sub_states:
+        discovered_node_ids.update(sub_state.discovered_node_ids)
+        for node_id, score in sub_state.node_relevance.items():
+            node_relevance[node_id] = max(node_relevance.get(node_id, 0.0), score)
+        for edge_id in sub_state.traversed_edge_ids:
+            if edge_id not in traversed_edge_ids:
+                traversed_edge_ids.append(edge_id)
+        for edge_id, score in sub_state.edge_relevance.items():
+            edge_relevance[edge_id] = max(edge_relevance.get(edge_id, 0.0), score)
 
     summary_lines: list[str] = []
     graph_lines: list[str] = []
@@ -1241,96 +1379,76 @@ async def _load_derived_context(
     derived_edges_used: list[str] = []
     seen_nodes: set[str] = set()
     seen_edges: set[str] = set()
-
-    async def _expand_hit(score: float, hit: dict[str, Any]) -> dict[str, Any] | None:
-        metadata = hit.get("metadata") or {}
-        derived_id = str(metadata.get("derived_id") or "").strip()
-        if not derived_id:
-            return None
+    ranked_node_ids = sorted(
+        discovered_node_ids,
+        key=lambda node_id: node_relevance.get(node_id, 0.0),
+        reverse=True,
+    )[:18]
+    for derived_id in ranked_node_ids:
         node = await storage.get_node(derived_id)
         if not node:
-            return {
-                "derived_id": derived_id,
-                "summary": f"- {hit['content']}",
-                "base_entity_scores": {},
-                "graph_lines": [],
-                "edge_ids": [],
-            }
-        local_base_entity_ids: dict[str, float] = {}
+            continue
+        score = node_relevance.get(derived_id, 0.0)
+        if derived_id not in seen_nodes:
+            seen_nodes.add(derived_id)
+            derived_nodes_used.append(derived_id)
+        aliases = node.get("aliases") or []
+        alias_suffix = f" (aliases: {', '.join(aliases[:4])})" if aliases else ""
+        summary_lines.append(
+            f"- {str(node.get('canonical_name') or node.get('name') or derived_id)}{alias_suffix}: "
+            f"{str(node.get('description') or '').strip()}"
+        )
         for source_id in _parse_source_ids(node.get("source_ids")):
             maybe_uuid = _maybe_uuid_string(source_id)
             if maybe_uuid:
-                local_base_entity_ids[maybe_uuid] = score
+                base_entity_ids[maybe_uuid] = max(base_entity_ids.get(maybe_uuid, 0.0), score)
 
-        graph_lines_local: list[str] = []
-        edge_ids_local: list[str] = []
         node_edges = await storage.get_node_edges(derived_id)
-        for source_id, target_id in node_edges[:6]:
+        for source_id, target_id in node_edges[:8]:
             edge_props = await storage.get_edge(source_id, target_id)
             if edge_props is None:
                 edge_props = await storage.get_edge(target_id, source_id)
             if not edge_props:
                 continue
             edge_id = str(edge_props.get("id") or f"{source_id}__{target_id}")
-            edge_ids_local.append(edge_id)
+            if edge_id not in edge_relevance:
+                continue
+            if edge_id in seen_edges:
+                continue
+            seen_edges.add(edge_id)
+            derived_edges_used.append(edge_id)
             target_node_id = target_id if source_id == derived_id else source_id
             target_node = await storage.get_node(target_node_id)
             target_name = (
-                str(target_node.get("name") or target_node_id)
+                str(target_node.get("canonical_name") or target_node.get("name") or target_node_id)
                 if target_node
                 else target_node_id
             )
             rel_type = str(edge_props.get("rel_type") or "RELATES_TO")
             description = str(edge_props.get("description") or "").strip()
             line = (
-                f"- {str(node.get('name') or derived_id)} "
+                f"- {str(node.get('canonical_name') or node.get('name') or derived_id)} "
                 f"-[{rel_type}]-> {target_name}"
             )
             if description:
                 line += f": {description}"
-            graph_lines_local.append(line)
+            if line not in graph_lines:
+                graph_lines.append(line)
             for source_ref in _parse_source_ids(edge_props.get("source_ids")):
                 maybe_uuid = _maybe_uuid_string(source_ref)
                 if maybe_uuid:
-                    local_base_entity_ids[maybe_uuid] = score
+                    base_entity_ids[maybe_uuid] = max(
+                        base_entity_ids.get(maybe_uuid, 0.0),
+                        edge_relevance.get(edge_id, score),
+                    )
             if target_node:
                 for source_ref in _parse_source_ids(target_node.get("source_ids")):
                     maybe_uuid = _maybe_uuid_string(source_ref)
                     if maybe_uuid:
-                        local_base_entity_ids[maybe_uuid] = score
-        return {
-            "derived_id": derived_id,
-            "summary": f"- {hit['content']}",
-            "base_entity_scores": local_base_entity_ids,
-            "graph_lines": graph_lines_local,
-            "edge_ids": edge_ids_local,
-        }
-
-    expanded_hits = await asyncio.gather(
-        *(_expand_hit(score, hit) for score, hit in scored_hits[:6])
-    )
-    for expanded in expanded_hits:
-        if not expanded:
-            continue
-        derived_id = str(expanded["derived_id"])
-        if derived_id not in seen_nodes:
-            seen_nodes.add(derived_id)
-            derived_nodes_used.append(derived_id)
-        summary_lines.append(str(expanded["summary"]))
-        for maybe_uuid, score in dict(expanded["base_entity_scores"]).items():
-            if (
-                maybe_uuid not in base_entity_ids
-                or score > base_entity_ids[maybe_uuid]
-            ):
-                base_entity_ids[maybe_uuid] = score
-        for edge_id in list(expanded["edge_ids"]):
-            if edge_id in seen_edges:
-                continue
-            seen_edges.add(edge_id)
-            derived_edges_used.append(edge_id)
-        for line in list(expanded["graph_lines"]):
-            if line not in graph_lines:
-                graph_lines.append(line)
+                        base_entity_ids[maybe_uuid] = max(
+                            base_entity_ids.get(maybe_uuid, 0.0),
+                            edge_relevance.get(edge_id, score),
+                        )
 
     logger.info(
         "graph_rag derived context collection=%s route=%s summaries=%d derived_nodes=%d derived_edges=%d base_entities=%d",
@@ -1605,6 +1723,8 @@ async def graph_rag_query(
     derived = await _load_derived_context(
         question,
         collection,
+        namespace_id,
+        llm_profile_id,
         embedding_provider,
         route_profile,
     )
