@@ -72,6 +72,7 @@ _MODE_ALIASES = {
     "hybrid": "hybrid",
     "mix": "mix",
 }
+_MAX_QUERY_DIMENSIONS = 8
 
 
 async def _active_dimensions(collection: Collection) -> list[str]:
@@ -134,6 +135,46 @@ async def _fan_out_per_dimension(
     if not states:
         return None
     return _merge_states(*states)
+
+
+async def _rank_dimensions(
+    collection: Collection,
+    embedding_provider: EmbeddingProvider,
+    question: str,
+    dimensions: list[str],
+    *,
+    top_k: int = _MAX_QUERY_DIMENSIONS,
+) -> list[str]:
+    if len(dimensions) <= top_k:
+        return dimensions
+
+    async def _score_dimension(rel_type: str) -> tuple[str, float, float]:
+        query_embedding = await _embed_relationship_query(
+            embedding_provider,
+            question,
+            rel_type=rel_type,
+        )
+        hits = await _graph_rag_vectors.search_relationship_embeddings(
+            collection_id=collection.id,
+            query_embedding=query_embedding,
+            top_k=3,
+        )
+        sims = [1.0 - hit.distance for hit in hits]
+        top1 = sims[0] if sims else 0.0
+        top3_mean = sum(sims[:3]) / min(len(sims), 3) if sims else 0.0
+        return rel_type, top1 + top3_mean, top1
+
+    scored = await asyncio.gather(*(_score_dimension(rel_type) for rel_type in dimensions))
+    scored.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
+    selected = [rel_type for rel_type, _, _ in scored[:top_k]]
+    logger.info(
+        "graph_rag dimension gating collection=%s total=%d selected=%d top=%s",
+        collection.name,
+        len(dimensions),
+        len(selected),
+        [(rel_type, round(score, 6)) for rel_type, score, _ in scored[:top_k]],
+    )
+    return selected
 
 
 @dataclass
@@ -1452,6 +1493,12 @@ async def graph_rag_query(
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
     dimensions = await _active_dimensions(collection)
+    dimensions = await _rank_dimensions(
+        collection,
+        embedding_provider,
+        question,
+        dimensions,
+    )
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
         relationship_query_embedding = await _embed_relationship_query(
