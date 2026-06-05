@@ -1277,6 +1277,13 @@ class GraphService:
         relationship_vectors: list[dict[str, Any]] = []
 
         async with AsyncSessionLocal() as session:
+            existing_aliases = await session.execute(
+                select(EntityAlias.alias_name).where(
+                    EntityAlias.collection_id == meta_collection.id
+                )
+            )
+            seen_aliases = {row[0] for row in existing_aliases}
+
             for node in nodes:
                 old_node_id = str(node.get("id") or "").strip()
                 canonical_name = str(
@@ -1322,6 +1329,9 @@ class GraphService:
                     }
                 )
                 for alias in aliases:
+                    if alias in seen_aliases:
+                        continue
+                    seen_aliases.add(alias)
                     session.add(
                         EntityAlias(
                             id=uuid.uuid4(),
