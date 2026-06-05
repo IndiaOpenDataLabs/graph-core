@@ -1182,11 +1182,11 @@ async def _load_derived_context(
         )
 
     kind_weights = {
-        "hub": {"bridge": 1.15, "connector": 1.05, "community": 1.0},
-        "authority": {"community": 1.15, "bridge": 1.05, "connector": 1.0},
-        "bridge": {"bridge": 1.2, "connector": 1.15, "community": 1.0},
-        "central": {"connector": 1.15, "community": 1.1, "bridge": 1.0},
-        "importance": {"community": 1.1, "bridge": 1.05, "connector": 1.0},
+        "hub": {"concept": 1.2, "bridge": 1.1, "connector": 1.0},
+        "authority": {"concept": 1.2, "bridge": 1.05, "connector": 1.0},
+        "bridge": {"concept": 1.1, "bridge": 1.2, "connector": 1.05},
+        "central": {"concept": 1.2, "connector": 1.05, "bridge": 1.0},
+        "importance": {"concept": 1.2, "bridge": 1.05, "connector": 1.0},
     }.get(route_profile.primary_route, {})
     scored_hits = []
     for hit in hits:

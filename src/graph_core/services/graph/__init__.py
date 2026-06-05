@@ -1253,7 +1253,11 @@ class GraphService:
             max_path_depth=max_path_depth,
             max_connector_paths=max_connector_paths,
         )
-        understanding = build_collection_understanding(analysis)
+        llm_provider = await self._resolve_collection_llm_provider(collection, None)
+        understanding = await build_collection_understanding(
+            analysis,
+            llm_provider=llm_provider,
+        )
         derived_storage = self._derived_graph_storage(collection_id)
         await derived_storage.drop()
         if understanding["nodes"]:
