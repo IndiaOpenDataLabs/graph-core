@@ -27,7 +27,7 @@ from graph_core.database import AsyncSessionLocal
 from graph_core.llm import LocalEchoLLMProvider
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
-from graph_core.models.graph_rag import GraphEntity, GraphRelationship
+from graph_core.models.graph_rag import EntityAlias, GraphEntity, GraphRelationship
 
 
 @dataclass(slots=True)
@@ -567,7 +567,12 @@ def _normalize_scores(scores: dict[uuid.UUID, float]) -> dict[uuid.UUID, float]:
 
 async def _load_graph_records(
     collection_id: uuid.UUID,
-) -> tuple[Collection, list[NodeRecord], list[RelationshipRecord]]:
+) -> tuple[
+    Collection,
+    list[NodeRecord],
+    list[RelationshipRecord],
+    dict[str, list[str]],
+]:
     async with AsyncSessionLocal() as session:
         collection = await session.get(Collection, collection_id)
         if not collection:
@@ -606,6 +611,21 @@ async def _load_graph_records(
             )
         ).all()
 
+        alias_rows = (
+            await session.execute(
+                select(EntityAlias.entity_id, EntityAlias.alias_name).where(
+                    EntityAlias.collection_id == collection_id
+                )
+            )
+        ).all()
+
+    aliases_by_entity_id: dict[str, list[str]] = defaultdict(list)
+    for entity_id, alias_name in alias_rows:
+        alias = str(alias_name or "").strip()
+        if not alias:
+            continue
+        aliases_by_entity_id[str(entity_id)].append(alias)
+
     return (
         collection,
         [NodeRecord(id=node_id, name=name) for node_id, name in nodes],
@@ -629,6 +649,10 @@ async def _load_graph_records(
                 weight,
             ) in relationships
         ],
+        {
+            entity_id: sorted({alias for alias in aliases})
+            for entity_id, aliases in aliases_by_entity_id.items()
+        },
     )
 
 
@@ -1229,7 +1253,9 @@ async def analyze_collection_graph(
     max_path_depth: int = 4,
     max_connector_paths: int = 20,
 ) -> dict[str, Any]:
-    collection, nodes, relationships = await _load_graph_records(collection_id)
+    collection, nodes, relationships, aliases_by_entity_id = await _load_graph_records(
+        collection_id
+    )
     analysis = build_collection_analysis(
         nodes,
         relationships,
@@ -1245,6 +1271,7 @@ async def analyze_collection_graph(
         "namespace_id": str(collection.namespace_id),
         "strategy": str(collection.strategy),
     }
+    analysis["entity_aliases_by_id"] = aliases_by_entity_id
     return analysis
 
 
@@ -1255,6 +1282,9 @@ async def build_collection_understanding(
     collection = analysis["collection"]
     max_candidate_communities_per_rel_type = 5
     min_candidate_community_size = 8
+    entity_aliases_by_id: dict[str, list[str]] = dict(
+        analysis.get("entity_aliases_by_id") or {}
+    )
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
@@ -1288,14 +1318,27 @@ async def build_collection_understanding(
         if node_id in seen_entity_refs:
             return node_id
         seen_entity_refs.add(node_id)
+        supporting_ids = supporting_ids or []
+        aliases = sorted(
+            {
+                str(alias).strip()
+                for source_id in supporting_ids
+                for alias in entity_aliases_by_id.get(str(source_id), [])
+                if str(alias).strip()
+            }
+        )
         nodes.append(
             {
                 "id": node_id,
                 "name": name,
+                "canonical_name": name,
                 "collection_id": collection["id"],
+                "object_type": "entity",
+                "primary_type": "base_entity_ref",
                 "type": "base_entity_ref",
                 "description": f"Reference to base graph entity: {name}.",
-                "source_ids": supporting_ids or [],
+                "aliases": aliases,
+                "source_ids": supporting_ids,
             }
         )
         return node_id
@@ -1328,6 +1371,7 @@ async def build_collection_understanding(
                 "target_id": target_id,
                 "id": edge_id,
                 "collection_id": collection["id"],
+                "object_type": "relationship",
                 "rel_type": rel_type,
                 "description": description,
                 "source_ids": source_ids or [],
@@ -1394,6 +1438,7 @@ async def build_collection_understanding(
                 "label": region["title"],
                 "concept_type": region["kind"],
                 "description": region["description"],
+                "aliases": [],
                 "importance_reason": f"Derived from {region['kind']} candidate {region['region_id']}.",
                 "evidence_region_ids": [region["region_id"]],
                 "member_entity_names": region["entity_names"][:8],
@@ -1409,6 +1454,10 @@ async def build_collection_understanding(
                 "label": {"type": "string"},
                 "concept_type": {"type": "string"},
                 "description": {"type": "string"},
+                "aliases": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
                 "importance_reason": {"type": "string"},
                 "member_entity_names": {
                     "type": "array",
@@ -1419,6 +1468,7 @@ async def build_collection_understanding(
                 "label",
                 "concept_type",
                 "description",
+                "aliases",
                 "importance_reason",
                 "member_entity_names",
             ],
@@ -1441,6 +1491,7 @@ async def build_collection_understanding(
                 "Do not return a mechanical label like community, cluster, graph region, connector, or bridge.\n"
                 "Pay close attention to edge direction and relation type. Infer a higher-level abstraction, role, flow, "
                 "tension, or unifying concept from the member entities and representative directed edges.\n\n"
+                "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
                 f"Collection: {collection['name']}\n"
                 f"Candidate id: {region['region_id']}\n"
                 f"Candidate title: {region['title']}\n"
@@ -1461,6 +1512,7 @@ async def build_collection_understanding(
                     "label": region["title"],
                     "concept_type": region["kind"],
                     "description": region["description"],
+                    "aliases": [],
                     "importance_reason": (
                         f"Fallback concept for relation type {rel_type} "
                         f"from candidate {region['region_id']}."
@@ -1553,26 +1605,43 @@ async def build_collection_understanding(
             f"{str(concept.get('description') or '').strip()} "
             f"Why it matters: {str(concept.get('importance_reason') or '').strip()}"
         ).strip()
+        concept_aliases = sorted(
+            {
+                str(value).strip()
+                for value in concept.get("aliases", [])
+                if str(value).strip()
+            }
+        )
         nodes.append(
             {
                 "id": node_id,
                 "name": label,
+                "canonical_name": label,
                 "collection_id": collection["id"],
+                "object_type": "entity",
+                "primary_type": str(concept.get("concept_type") or "concept"),
                 "type": "derived_concept",
                 "description": description,
+                "aliases": concept_aliases,
                 "source_ids": source_ids,
             }
         )
+        chunk_content = description
+        if concept_aliases:
+            chunk_content = f"{description}\nAliases: {', '.join(concept_aliases)}".strip()
         chunks.append(
             {
                 "chunk_hash": derived_chunk_hash(collection["id"], "concept", label),
                 "chunk_index": next_chunk_index(),
-                "content": description,
+                "content": chunk_content,
                 "metadata": {
                     "memory_type": "derived_graph",
                     "derived_kind": "concept",
                     "derived_id": node_id,
+                    "object_type": "entity",
+                    "canonical_name": label,
                     "concept_type": str(concept.get("concept_type") or "concept"),
+                    "aliases": concept_aliases,
                     "collection_id": collection["id"],
                 },
             }

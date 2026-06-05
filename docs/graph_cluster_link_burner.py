@@ -111,7 +111,9 @@ async def main() -> None:
             await session.execute(select(Collection).where(Collection.name == args.collection))
         ).scalar_one()
 
-    _, nodes, relationships = await _load_graph_records(collection.id)
+    _, nodes, relationships, _aliases_by_entity_id = await _load_graph_records(
+        collection.id
+    )
     communities = _build_louvain_communities(nodes, relationships)
     community_by_id = {str(item["community_id"]): item for item in communities}
 
