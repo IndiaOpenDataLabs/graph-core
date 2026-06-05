@@ -1268,10 +1268,46 @@ class GraphService:
         )
         graph_storage = self._graph_storage(meta_collection.id)
 
-        nodes = understanding.get("nodes", [])
+        raw_nodes = understanding.get("nodes", [])
         edges = understanding.get("edges", [])
+        merged_nodes_by_name: dict[str, dict[str, Any]] = {}
+        merged_node_order: list[str] = []
+        old_node_to_name: dict[str, str] = {}
+        for node in raw_nodes:
+            old_node_id = str(node.get("id") or "").strip()
+            canonical_name = str(
+                node.get("canonical_name") or node.get("name") or old_node_id
+            ).strip()
+            if not old_node_id or not canonical_name:
+                continue
+            old_node_to_name[old_node_id] = canonical_name
+            merged = merged_nodes_by_name.get(canonical_name)
+            if merged is None:
+                merged = {
+                    "canonical_name": canonical_name,
+                    "primary_type": str(
+                        node.get("primary_type") or node.get("type") or "concept"
+                    ).strip() or "concept",
+                    "descriptions": [],
+                    "aliases": set(),
+                    "source_ids": set(),
+                }
+                merged_nodes_by_name[canonical_name] = merged
+                merged_node_order.append(canonical_name)
+            description = str(node.get("description") or "").strip()
+            if description:
+                merged["descriptions"].append(description)
+            for alias in node.get("aliases") or []:
+                alias_text = str(alias).strip()
+                if alias_text and alias_text != canonical_name:
+                    merged["aliases"].add(alias_text)
+            for source_id in node.get("source_ids") or []:
+                source_text = str(source_id).strip()
+                if source_text:
+                    merged["source_ids"].add(source_text)
+
         node_id_map: dict[str, uuid.UUID] = {}
-        canonical_name_by_old_id: dict[str, str] = {}
+        canonical_name_to_entity_id: dict[str, uuid.UUID] = {}
         node_rows: list[dict[str, Any]] = []
         edge_rows: list[dict[str, Any]] = []
         relationship_vectors: list[dict[str, Any]] = []
@@ -1284,23 +1320,24 @@ class GraphService:
             )
             seen_aliases = {row[0] for row in existing_aliases}
 
-            for node in nodes:
-                old_node_id = str(node.get("id") or "").strip()
-                canonical_name = str(
-                    node.get("canonical_name") or node.get("name") or old_node_id
-                ).strip()
-                if not old_node_id or not canonical_name:
-                    continue
+            for canonical_name in merged_node_order:
+                node = merged_nodes_by_name[canonical_name]
                 entity_id = uuid.uuid4()
-                node_id_map[old_node_id] = entity_id
-                canonical_name_by_old_id[old_node_id] = canonical_name
-                primary_type = str(
-                    node.get("primary_type") or node.get("type") or "concept"
-                ).strip() or "concept"
-                description = str(node.get("description") or "").strip() or canonical_name
-                source_ids = node.get("source_ids")
-                if not isinstance(source_ids, list):
-                    source_ids = []
+                canonical_name_to_entity_id[canonical_name] = entity_id
+                primary_type = str(node.get("primary_type") or "concept").strip() or "concept"
+                descriptions = [
+                    str(value).strip()
+                    for value in node.get("descriptions", [])
+                    if str(value).strip()
+                ]
+                description = max(descriptions, key=len) if descriptions else canonical_name
+                source_ids = sorted(
+                    {
+                        str(value).strip()
+                        for value in node.get("source_ids", set())
+                        if str(value).strip()
+                    }
+                )
 
                 session.add(
                     GraphEntity(
@@ -1324,7 +1361,7 @@ class GraphService:
                 aliases = sorted(
                     {
                         str(value).strip()
-                        for value in (node.get("aliases") or [])
+                        for value in node.get("aliases", set())
                         if str(value).strip() and str(value).strip() != canonical_name
                     }
                 )
@@ -1363,12 +1400,17 @@ class GraphService:
                 await self._graph_rag_vectors.upsert_entity_centroid(
                     entity_id=entity_id,
                     collection_id=meta_collection.id,
-                    canonical_name=canonical_name,
-                    primary_type=primary_type,
-                    description_count=1,
-                    embedding=embedding,
-                    session=session,
-                )
+                        canonical_name=canonical_name,
+                        primary_type=primary_type,
+                        description_count=1,
+                        embedding=embedding,
+                        session=session,
+                    )
+
+            for old_node_id, canonical_name in old_node_to_name.items():
+                entity_id = canonical_name_to_entity_id.get(canonical_name)
+                if entity_id is not None:
+                    node_id_map[old_node_id] = entity_id
 
             await session.flush()
 
@@ -1427,10 +1469,10 @@ class GraphService:
                 relationship_vectors.append(
                     {
                         "relationship_id": relationship_id,
-                        "source_name": canonical_name_by_old_id.get(
+                        "source_name": old_node_to_name.get(
                             source_old_id, str(source_entity_id)
                         ),
-                        "target_name": canonical_name_by_old_id.get(
+                        "target_name": old_node_to_name.get(
                             target_old_id, str(target_entity_id)
                         ),
                         "description": description,
