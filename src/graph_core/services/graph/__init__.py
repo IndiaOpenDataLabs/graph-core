@@ -19,17 +19,10 @@ from graph_core.llm import get_llm_provider
 from graph_core.models.chat import ChatMessage, ChatSession
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
-from graph_core.models.graph_rag import (
-    EntityAlias,
-    EntityDescription,
-    GraphEntity,
-    GraphRelationship,
-    RelationshipDescription,
-)
+from graph_core.models.graph_rag import GraphRelationship
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
-from graph_core.models.rel_types import relationship_embedding_text
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
@@ -66,6 +59,7 @@ from graph_core.services.graph.query.vector import (
     QueryResult,
     vector_query,
 )
+from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
 from graph_core.services.graph_rag.extractor import (
     ExtractedRelationship,
     LLMGraphExtractor,
@@ -1308,22 +1302,14 @@ class GraphService:
 
         node_id_map: dict[str, uuid.UUID] = {}
         canonical_name_to_entity_id: dict[str, uuid.UUID] = {}
-        node_rows: list[dict[str, Any]] = []
-        edge_rows: list[dict[str, Any]] = []
-        relationship_vectors: list[dict[str, Any]] = []
+        canonical_name_by_entity_id: dict[uuid.UUID, str] = {}
+        node_rows_by_id: dict[str, dict[str, Any]] = {}
+        edge_rows_by_id: dict[str, dict[str, Any]] = {}
+        resolver = IncrementalEntityResolver(embedding_provider, meta_collection.id)
 
         async with AsyncSessionLocal() as session:
-            existing_aliases = await session.execute(
-                select(EntityAlias.alias_name).where(
-                    EntityAlias.collection_id == meta_collection.id
-                )
-            )
-            seen_aliases = {row[0] for row in existing_aliases}
-
             for canonical_name in merged_node_order:
                 node = merged_nodes_by_name[canonical_name]
-                entity_id = uuid.uuid4()
-                canonical_name_to_entity_id[canonical_name] = entity_id
                 primary_type = str(node.get("primary_type") or "concept").strip() or "concept"
                 descriptions = [
                     str(value).strip()
@@ -1338,81 +1324,41 @@ class GraphService:
                         if str(value).strip()
                     }
                 )
-
-                session.add(
-                    GraphEntity(
-                        id=entity_id,
-                        collection_id=meta_collection.id,
-                        canonical_name=canonical_name,
-                        primary_type=primary_type,
-                        description_count=1,
-                    )
+                source_chunk_hash = (
+                    hashlib.md5("::".join(source_ids or [canonical_name]).encode("utf-8")).hexdigest()
                 )
-                description_id = uuid.uuid4()
-                session.add(
-                    EntityDescription(
-                        id=description_id,
-                        entity_id=entity_id,
-                        description=description,
-                        weight=1,
-                        source_chunk_hashes=source_ids,
-                    )
+                resolved = await resolver.resolve_entity(
+                    session=session,
+                    name=canonical_name,
+                    entity_type=primary_type,
+                    description=description,
+                    source_chunk_hash=source_chunk_hash,
                 )
-                aliases = sorted(
+                canonical_name_to_entity_id[canonical_name] = resolved.entity_id
+                canonical_name_by_entity_id[resolved.entity_id] = resolved.canonical_name
+                for alias in sorted(
                     {
                         str(value).strip()
                         for value in node.get("aliases", set())
-                        if str(value).strip() and str(value).strip() != canonical_name
+                        if str(value).strip()
                     }
-                )
-                for alias in aliases:
-                    if alias in seen_aliases:
-                        continue
-                    seen_aliases.add(alias)
-                    session.add(
-                        EntityAlias(
-                            id=uuid.uuid4(),
-                            collection_id=meta_collection.id,
-                            entity_id=entity_id,
-                            alias_name=alias,
-                            source_chunk_hash="meta",
-                        )
+                ):
+                    await resolver._add_alias(
+                        session,
+                        resolved.entity_id,
+                        alias,
+                        source_chunk_hash,
                     )
-                node_rows.append(
-                    {
-                        "id": str(entity_id),
-                        "name": canonical_name,
-                        "collection_id": str(meta_collection.id),
-                    }
-                )
-                await session.flush()
-                embed_text = f"{canonical_name}: {description}"
-                embedding = await embedding_provider.embed_query(embed_text)
-                await self._graph_rag_vectors.upsert_entity_embedding(
-                    entity_id=entity_id,
-                    collection_id=meta_collection.id,
-                    name=canonical_name,
-                    description=description,
-                    description_id=description_id,
-                    embedding=embedding,
-                    session=session,
-                )
-                await self._graph_rag_vectors.upsert_entity_centroid(
-                    entity_id=entity_id,
-                    collection_id=meta_collection.id,
-                        canonical_name=canonical_name,
-                        primary_type=primary_type,
-                        description_count=1,
-                        embedding=embedding,
-                        session=session,
-                    )
+                node_rows_by_id[str(resolved.entity_id)] = {
+                    "id": str(resolved.entity_id),
+                    "name": resolved.canonical_name,
+                    "collection_id": str(meta_collection.id),
+                }
 
             for old_node_id, canonical_name in old_node_to_name.items():
                 entity_id = canonical_name_to_entity_id.get(canonical_name)
                 if entity_id is not None:
                     node_id_map[old_node_id] = entity_id
-
-            await session.flush()
 
             for edge in edges:
                 source_old_id = str(edge.get("source_id") or "").strip()
@@ -1421,90 +1367,58 @@ class GraphService:
                 target_entity_id = node_id_map.get(target_old_id)
                 if source_entity_id is None or target_entity_id is None:
                     continue
-                relationship_id = uuid.uuid4()
                 rel_type = str(edge.get("rel_type") or "RELATES_TO").strip().upper()
                 keywords = edge.get("keywords")
                 if not isinstance(keywords, list):
                     keywords = []
                 try:
-                    weight = int(edge.get("weight") or 1)
+                    weight = float(edge.get("weight") or 1)
                 except (TypeError, ValueError):
-                    weight = 1
-                session.add(
-                    GraphRelationship(
-                        id=relationship_id,
-                        source_entity_id=source_entity_id,
-                        target_entity_id=target_entity_id,
-                        weight=weight,
-                        keywords=keywords,
-                        rel_type=rel_type,
-                        collection_id=meta_collection.id,
-                    )
-                )
+                    weight = 1.0
                 description = str(edge.get("description") or "").strip() or rel_type
                 source_ids = edge.get("source_ids")
                 if not isinstance(source_ids, list):
                     source_ids = []
-                session.add(
-                    RelationshipDescription(
-                        id=uuid.uuid4(),
-                        relationship_id=relationship_id,
-                        description=description,
-                        keywords=keywords,
-                        weight=max(1, weight),
-                        source_chunk_hashes=source_ids,
-                    )
+                source_chunk_hash = (
+                    hashlib.md5(
+                        "::".join(
+                            [str(value).strip() for value in source_ids if str(value).strip()]
+                            or [description, str(source_entity_id), str(target_entity_id), rel_type]
+                        ).encode("utf-8")
+                    ).hexdigest()
                 )
-                edge_rows.append(
-                    {
-                        "source_id": str(source_entity_id),
-                        "target_id": str(target_entity_id),
-                        "id": str(relationship_id),
-                        "weight": weight,
-                        "keywords": keywords,
-                        "rel_type": rel_type,
-                        "collection_id": str(meta_collection.id),
-                    }
+                rel_result = await resolver.resolve_relationship(
+                    session=session,
+                    source_entity_id=source_entity_id,
+                    target_entity_id=target_entity_id,
+                    description=description,
+                    keywords=keywords,
+                    weight=weight,
+                    source_chunk_hash=source_chunk_hash,
+                    rel_type=rel_type,
                 )
-                relationship_vectors.append(
-                    {
-                        "relationship_id": relationship_id,
-                        "source_name": old_node_to_name.get(
-                            source_old_id, str(source_entity_id)
-                        ),
-                        "target_name": old_node_to_name.get(
-                            target_old_id, str(target_entity_id)
-                        ),
-                        "description": description,
-                        "rel_type": rel_type,
-                        "keywords": keywords,
-                    }
+                persisted_rel = await session.get(
+                    GraphRelationship,
+                    rel_result.relationship_id,
                 )
+                if persisted_rel is None:
+                    continue
+                edge_rows_by_id[str(rel_result.relationship_id)] = {
+                    "source_id": str(persisted_rel.source_entity_id),
+                    "target_id": str(persisted_rel.target_entity_id),
+                    "id": str(rel_result.relationship_id),
+                    "weight": int(persisted_rel.weight or 1),
+                    "keywords": persisted_rel.keywords or [],
+                    "rel_type": persisted_rel.rel_type,
+                    "collection_id": str(meta_collection.id),
+                }
 
             await session.commit()
 
-        if node_rows:
-            await graph_storage.upsert_nodes(node_rows)
-        if edge_rows:
-            await graph_storage.upsert_edges(edge_rows)
-        for vector in relationship_vectors:
-            embedding = await embedding_provider.embed_query(
-                relationship_embedding_text(
-                    vector["source_name"],
-                    vector["target_name"],
-                    vector["rel_type"],
-                    vector["description"],
-                    vector["keywords"],
-                )
-            )
-            await self._graph_rag_vectors.upsert_relationship_embedding(
-                relationship_id=vector["relationship_id"],
-                collection_id=meta_collection.id,
-                source_name=vector["source_name"],
-                target_name=vector["target_name"],
-                description=vector["description"],
-                embedding=embedding,
-            )
+        if node_rows_by_id:
+            await graph_storage.upsert_nodes(list(node_rows_by_id.values()))
+        if edge_rows_by_id:
+            await graph_storage.upsert_edges(list(edge_rows_by_id.values()))
 
     async def build_collection_understanding(
         self,
