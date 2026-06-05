@@ -38,7 +38,7 @@ class GraphCoreClient:
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
             },
-            timeout=120.0,
+            timeout=360.0,
         )
 
     @property

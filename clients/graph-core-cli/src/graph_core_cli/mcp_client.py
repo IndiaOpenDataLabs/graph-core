@@ -28,6 +28,7 @@ class AuthenticatedMCPClient:
                 "Authorization": f"Bearer {self._api_key}",
             },
             follow_redirects=True,
+            timeout=360.0,
         )
         await self._http_client.__aenter__()
 
