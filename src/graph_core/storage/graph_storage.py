@@ -157,6 +157,49 @@ class FalkorDBGraphStorage:
                 return props
         return None
 
+    async def find_nodes_by_name_or_alias(
+        self,
+        keyword: str,
+        *,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        graph = await self._get_graph()
+        keyword_norm = str(keyword or "").strip().lower()
+        if not keyword_norm:
+            return []
+        result = await graph.query(
+            """
+            MATCH (n:Entity)
+            WHERE toLower(coalesce(n.name, "")) CONTAINS $keyword
+               OR toLower(coalesce(n.canonical_name, "")) CONTAINS $keyword
+               OR toLower(coalesce(n.aliases, "")) CONTAINS $keyword
+            RETURN n
+            LIMIT $limit
+            """,
+            {"keyword": keyword_norm, "limit": int(limit)},
+        )
+        rows: list[dict[str, Any]] = []
+        if result and result.result_set:
+            for row in result.result_set:
+                node = row[0]
+                if not node:
+                    continue
+                props = dict(node.properties)
+                for list_field in (
+                    "aliases",
+                    "source_ids",
+                    "source_message_ids",
+                    "source_roles",
+                ):
+                    val = props.get(list_field)
+                    if isinstance(val, str):
+                        try:
+                            props[list_field] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            props[list_field] = []
+                rows.append(props)
+        return rows
+
     async def upsert_nodes(self, nodes: list[dict[str, Any]]) -> None:
         if not nodes:
             return

@@ -1166,6 +1166,7 @@ async def _load_derived_context(
     embedding_provider: EmbeddingProvider,
     route_profile: DerivedRouteProfile,
 ) -> DerivedContext:
+    storage = FalkorDBGraphStorage(derived_graph_name(collection.id))
     derived_query_embedding = await _embed_derived_query(embedding_provider, question)
     hits = await _vector_store.query_chunks(
         collection_id=collection.id,
@@ -1173,6 +1174,37 @@ async def _load_derived_context(
         top_k=12,
         metadata_filters={"memory_type": "derived_graph"},
     )
+    keyword_hits: list[dict[str, Any]] = []
+    seen_keyword_nodes: set[str] = set()
+    for kw in _extract_query_keywords(question)[:5]:
+        for node in await storage.find_nodes_by_name_or_alias(kw, limit=8):
+            derived_id = str(node.get("id") or "").strip()
+            if (
+                not derived_id
+                or derived_id in seen_keyword_nodes
+                or str(node.get("object_type") or "") != "entity"
+            ):
+                continue
+            seen_keyword_nodes.add(derived_id)
+            keyword_hits.append(
+                {
+                    "content": str(node.get("description") or node.get("name") or derived_id),
+                    "score": 1.0,
+                    "metadata": {
+                        "memory_type": "derived_graph",
+                        "derived_kind": "concept"
+                        if str(node.get("type") or "") == "derived_concept"
+                        else "entity_ref",
+                        "derived_id": derived_id,
+                        "canonical_name": str(
+                            node.get("canonical_name") or node.get("name") or ""
+                        ),
+                        "object_type": str(node.get("object_type") or "entity"),
+                        "aliases": node.get("aliases") or [],
+                    },
+                }
+            )
+    hits = [*hits, *keyword_hits]
     if not hits:
         return DerivedContext(
             context="",
@@ -1197,10 +1229,11 @@ async def _load_derived_context(
         score = base_score * kind_weights.get(derived_kind, 1.0)
         if rel_type:
             score *= 1.0 + (0.2 * route_profile.rel_type_scores.get(rel_type, 0.0))
+        if str(metadata.get("object_type") or "") == "entity":
+            score *= 1.1
         scored_hits.append((score, hit))
     scored_hits.sort(key=lambda item: item[0], reverse=True)
 
-    storage = FalkorDBGraphStorage(derived_graph_name(collection.id))
     summary_lines: list[str] = []
     graph_lines: list[str] = []
     base_entity_ids: dict[str, float] = {}
