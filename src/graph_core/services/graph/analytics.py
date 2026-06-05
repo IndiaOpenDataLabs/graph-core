@@ -382,6 +382,70 @@ def _shortest_directed_path(
     return None
 
 
+def _shortest_paths_between_sets(
+    adjacency: dict[uuid.UUID, list[tuple[uuid.UUID, str, float]]],
+    starts: set[uuid.UUID],
+    targets: set[uuid.UUID],
+    *,
+    max_depth: int = 4,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for start in starts:
+        queue: deque[tuple[uuid.UUID, list[uuid.UUID], list[str], float]] = deque(
+            [(start, [start], [], 0.0)]
+        )
+        seen_depth: dict[uuid.UUID, int] = {start: 0}
+        while queue:
+            current, path_nodes, path_rels, score = queue.popleft()
+            depth = len(path_rels)
+            if depth >= max_depth:
+                continue
+            for neighbor, rel_type, weight in adjacency.get(current, []):
+                next_nodes = [*path_nodes, neighbor]
+                next_rels = [*path_rels, rel_type]
+                next_score = score + float(weight)
+                if neighbor in targets:
+                    results.append(
+                        {
+                            "start": start,
+                            "end": neighbor,
+                            "nodes": next_nodes,
+                            "rel_types": next_rels,
+                            "hop_count": len(next_rels),
+                            "path_score": round(next_score, 6),
+                        }
+                    )
+                    continue
+                next_depth = depth + 1
+                if next_depth >= max_depth:
+                    continue
+                if neighbor not in seen_depth or next_depth < seen_depth[neighbor]:
+                    seen_depth[neighbor] = next_depth
+                    queue.append((neighbor, next_nodes, next_rels, next_score))
+    results.sort(
+        key=lambda item: (
+            -float(item["path_score"]),
+            int(item["hop_count"]),
+            tuple(str(value) for value in item["rel_types"]),
+            tuple(str(value) for value in item["nodes"]),
+        )
+    )
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for result in results:
+        key = tuple(str(value) for value in result["nodes"]) + tuple(
+            str(value) for value in result["rel_types"]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(result)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
 def _top_rel_types(relationships: list[RelationshipRecord]) -> list[str]:
     return sorted({rel.rel_type or "RELATES_TO" for rel in relationships})
 
@@ -1272,6 +1336,18 @@ async def analyze_collection_graph(
         "strategy": str(collection.strategy),
     }
     analysis["entity_aliases_by_id"] = aliases_by_entity_id
+    analysis["relationship_records"] = [
+        {
+            "id": str(rel.id),
+            "source_id": str(rel.source_id),
+            "source_name": rel.source_name,
+            "target_id": str(rel.target_id),
+            "target_name": rel.target_name,
+            "rel_type": rel.rel_type,
+            "weight": rel.weight,
+        }
+        for rel in relationships
+    ]
     return analysis
 
 
@@ -1282,24 +1358,22 @@ async def build_collection_understanding(
     collection = analysis["collection"]
     max_candidate_communities_per_rel_type = 5
     min_candidate_community_size = 8
+    max_deterministic_link_pairs = 64
+    max_deterministic_meta_edges = 96
     entity_aliases_by_id: dict[str, list[str]] = dict(
         analysis.get("entity_aliases_by_id") or {}
     )
+    relationship_records: list[dict[str, Any]] = list(
+        analysis.get("relationship_records") or []
+    )
+    node_name_by_id: dict[str, str] = {}
+    for rel in relationship_records:
+        node_name_by_id[str(rel["source_id"])] = str(rel["source_name"])
+        node_name_by_id[str(rel["target_id"])] = str(rel["target_name"])
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
     seen_entity_refs: set[str] = set()
-    semantic_edge_types = {
-        "SUPPORTS",
-        "JUSTIFIES",
-        "QUALIFIES",
-        "LIMITS",
-        "DISTINGUISHES",
-        "CONTRADICTS",
-        "CAUSES",
-        "IMPLIES",
-        "DEPENDS_ON",
-    }
 
     def derived_chunk_hash(*parts: object) -> str:
         raw = "::".join(str(part) for part in parts)
@@ -1361,6 +1435,7 @@ async def build_collection_understanding(
         rel_type: str,
         description: str,
         source_ids: list[str] | None = None,
+        keywords: list[str] | None = None,
     ) -> None:
         edge_id = f"{source_id}__{rel_type}__{target_id}"
         if any(edge["id"] == edge_id for edge in edges):
@@ -1374,6 +1449,7 @@ async def build_collection_understanding(
                 "object_type": "relationship",
                 "rel_type": rel_type,
                 "description": description,
+                "keywords": keywords or [],
                 "source_ids": source_ids or [],
             }
         )
@@ -1446,7 +1522,6 @@ async def build_collection_understanding(
         )
 
     induced_concepts = list(fallback_concepts)
-    induced_meta_edges: list[dict[str, Any]] = []
     if llm_provider and not isinstance(llm_provider, LocalEchoLLMProvider) and candidate_regions:
         concept_schema = {
             "type": "object",
@@ -1526,63 +1601,11 @@ async def build_collection_understanding(
                 *(induce_region_concept(region) for region in candidate_regions)
             )
         )
-
-        meta_edge_schema = {
-            "type": "object",
-            "properties": {
-                "meta_edges": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source_label": {"type": "string"},
-                            "target_label": {"type": "string"},
-                            "rel_type": {"type": "string"},
-                            "description": {"type": "string"},
-                        },
-                        "required": [
-                            "source_label",
-                            "target_label",
-                            "rel_type",
-                            "description",
-                        ],
-                    },
-                }
-            },
-            "required": ["meta_edges"],
-        }
-        concept_text = "\n".join(
-            (
-                f"- {concept.get('label', '').strip()}: "
-                f"{concept.get('description', '').strip()} "
-                f"Members: {', '.join(concept.get('member_entity_names', [])[:8]) or 'none'}."
-            )
-            for concept in induced_concepts
-            if str(concept.get("label") or "").strip()
-        )
-        if concept_text:
-            prompt = (
-                "You are relating induced semantic concepts from a collection graph.\n"
-                "Create only high-confidence semantic edges between concepts using these relation types: "
-                + ", ".join(sorted(semantic_edge_types))
-                + ".\n"
-                "Only emit edges when there is a clear semantic relation such as support, qualification, "
-                "distinction, implication, causation, or dependency.\n\n"
-                f"Collection: {collection['name']}\n\n"
-                f"Concepts:\n{concept_text}\n"
-            )
-            try:
-                induced_meta_edges = (
-                    await llm_provider.structured_extract(
-                        prompt=prompt,
-                        schema=meta_edge_schema,
-                    )
-                ).get("meta_edges", [])
-            except Exception:
-                induced_meta_edges = []
     region_lookup = {region["region_id"]: region for region in candidate_regions}
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}
+    concept_labels_by_id: dict[str, str] = {}
+    concept_region_ids_by_id: dict[str, list[str]] = {}
     for concept in induced_concepts:
         label = str(concept.get("label") or "").strip()
         if not label:
@@ -1647,7 +1670,9 @@ async def build_collection_understanding(
             }
         )
         concept_id_by_label[label] = node_id
+        concept_labels_by_id[node_id] = label
         concept_source_ids[node_id] = source_ids
+        concept_region_ids_by_id[node_id] = evidence_ids
         member_names = [
             str(value).strip()
             for value in concept.get("member_entity_names", [])
@@ -1663,30 +1688,151 @@ async def build_collection_understanding(
                 source_ids=source_ids,
             )
 
-    for edge in induced_meta_edges[:48]:
-        source_label = str(edge.get("source_label") or "").strip()
-        target_label = str(edge.get("target_label") or "").strip()
-        rel_type = str(edge.get("rel_type") or "").strip().upper()
-        if (
-            not source_label
-            or not target_label
-            or rel_type not in semantic_edge_types
-            or source_label not in concept_id_by_label
-            or target_label not in concept_id_by_label
-        ):
+    node_sets_by_concept: dict[str, set[str]] = {
+        concept_id: set(source_ids)
+        for concept_id, source_ids in concept_source_ids.items()
+        if source_ids
+    }
+    memberships_by_node_id: dict[str, list[str]] = defaultdict(list)
+    for concept_id, source_ids in node_sets_by_concept.items():
+        for source_id in source_ids:
+            memberships_by_node_id[source_id].append(concept_id)
+
+    pair_aggregates: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def pair_bucket(source_id: str, target_id: str) -> dict[str, Any]:
+        key = (source_id, target_id)
+        bucket = pair_aggregates.get(key)
+        if bucket is None:
+            bucket = {
+                "source_id": source_id,
+                "target_id": target_id,
+                "direct_count": 0,
+                "direct_weight": 0.0,
+                "rel_counter": Counter(),
+                "boundary_counter": Counter(),
+                "source_ids": set(),
+            }
+            pair_aggregates[key] = bucket
+        return bucket
+
+    for rel in relationship_records:
+        source_members = memberships_by_node_id.get(str(rel["source_id"]), [])
+        target_members = memberships_by_node_id.get(str(rel["target_id"]), [])
+        if not source_members or not target_members:
             continue
-        source_id = concept_id_by_label[source_label]
-        target_id = concept_id_by_label[target_label]
+        for source_concept_id in source_members:
+            for target_concept_id in target_members:
+                if source_concept_id == target_concept_id:
+                    continue
+                bucket = pair_bucket(source_concept_id, target_concept_id)
+                weight = float(rel.get("weight") or 0.0)
+                rel_type = str(rel.get("rel_type") or "RELATES_TO").upper()
+                bucket["direct_count"] += 1
+                bucket["direct_weight"] += weight
+                bucket["rel_counter"][rel_type] += 1
+                bucket["boundary_counter"][str(rel.get("source_name") or "")] += 1
+                bucket["boundary_counter"][str(rel.get("target_name") or "")] += 1
+                bucket["source_ids"].add(str(rel["source_id"]))
+                bucket["source_ids"].add(str(rel["target_id"]))
+
+    path_adjacency: dict[uuid.UUID, list[tuple[uuid.UUID, str, float]]] = defaultdict(list)
+    for rel in relationship_records:
+        path_adjacency[uuid.UUID(str(rel["source_id"]))].append(
+            (
+                uuid.UUID(str(rel["target_id"])),
+                str(rel.get("rel_type") or "RELATES_TO").upper(),
+                float(rel.get("weight") or 0.0),
+            )
+        )
+
+    ranked_pairs = sorted(
+        pair_aggregates.values(),
+        key=lambda item: (
+            item["direct_weight"],
+            item["direct_count"],
+            len(item["rel_counter"]),
+        ),
+        reverse=True,
+    )[:max_deterministic_link_pairs]
+
+    for bucket in ranked_pairs:
+        source_concept_id = str(bucket["source_id"])
+        target_concept_id = str(bucket["target_id"])
+        source_nodes = {
+            uuid.UUID(node_id)
+            for node_id in node_sets_by_concept.get(source_concept_id, set())
+        }
+        target_nodes = {
+            uuid.UUID(node_id)
+            for node_id in node_sets_by_concept.get(target_concept_id, set())
+        }
+        if not source_nodes or not target_nodes:
+            continue
+        paths = _shortest_paths_between_sets(
+            path_adjacency,
+            source_nodes,
+            target_nodes,
+            max_depth=4,
+            limit=6,
+        )
+        bridge_counter: Counter[str] = Counter()
+        path_rel_counter: Counter[str] = Counter()
+        path_source_ids: set[str] = set()
+        for path in paths:
+            node_ids = [str(node_id) for node_id in path.get("nodes", [])]
+            for node_id in node_ids[1:-1]:
+                bridge_counter[node_name_by_id.get(node_id, node_id)] += 1
+                path_source_ids.add(node_id)
+            for rel_type in path.get("rel_types", []):
+                path_rel_counter[str(rel_type)] += 1
+            path_source_ids.update(node_ids)
+
+        combined_rel_counter: Counter[str] = Counter(bucket["rel_counter"])
+        combined_rel_counter.update(path_rel_counter)
+        top_rel_types = [rel_type for rel_type, _ in combined_rel_counter.most_common(3)]
+        if not top_rel_types:
+            continue
+        rel_type = "+".join(top_rel_types)[:64]
+        boundary_names = [name for name, _ in bucket["boundary_counter"].most_common(4) if name]
+        bridge_names = [name for name, _ in bridge_counter.most_common(4) if name]
+        source_label = concept_labels_by_id.get(source_concept_id, source_concept_id)
+        target_label = concept_labels_by_id.get(target_concept_id, target_concept_id)
+        path_count = len(paths)
+        path_score = round(sum(float(path["path_score"]) for path in paths), 6) if paths else 0.0
+        description_parts = [
+            f"{source_label} connects to {target_label} through {bucket['direct_count']} direct cross-edge(s)",
+            f"dominated by relation types {', '.join(top_rel_types)}",
+        ]
+        if path_count:
+            description_parts.append(
+                f"and {path_count} short directed path(s) with cumulative path score {path_score}"
+            )
+        if boundary_names:
+            description_parts.append(
+                f"boundary entities: {', '.join(boundary_names)}"
+            )
+        if bridge_names:
+            description_parts.append(
+                f"bridge entities: {', '.join(bridge_names)}"
+            )
         edge_source_ids = sorted(
-            set(concept_source_ids.get(source_id, []))
-            | set(concept_source_ids.get(target_id, []))
+            set(concept_source_ids.get(source_concept_id, []))
+            | set(concept_source_ids.get(target_concept_id, []))
+            | set(str(value) for value in bucket["source_ids"])
+            | path_source_ids
         )
         add_edge(
-            source_id,
-            target_id,
+            source_concept_id,
+            target_concept_id,
             rel_type=rel_type,
-            description=str(edge.get("description") or "").strip(),
+            description=". ".join(description_parts).strip() + ".",
             source_ids=edge_source_ids,
+            keywords=top_rel_types,
         )
+        if len(
+            [edge for edge in edges if "__EVIDENCED_BY__" not in edge["id"]]
+        ) >= max_deterministic_meta_edges:
+            break
 
     return {"nodes": nodes, "edges": edges, "chunks": chunks}
