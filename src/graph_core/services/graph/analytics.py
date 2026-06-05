@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from itertools import permutations
 from typing import Any
 
+import networkx as nx
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
@@ -97,6 +98,96 @@ def _edge_strength(weight_sum: int, max_weight: int) -> float:
 
 def derived_graph_name(collection_id: uuid.UUID) -> str:
     return f"collection_{str(collection_id).replace('-', '')}_derived"
+
+
+def _build_louvain_communities(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+) -> list[dict[str, Any]]:
+    graph = nx.Graph()
+    name_by_id = {node.id: node.name for node in nodes}
+    for node in nodes:
+        graph.add_node(str(node.id), name=node.name)
+
+    edge_rel_types: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    for rel in relationships:
+        left = str(rel.source_id)
+        right = str(rel.target_id)
+        if graph.has_edge(left, right):
+            graph[left][right]["weight"] += float(rel.weight or 0)
+            graph[left][right]["count"] += 1
+        else:
+            graph.add_edge(
+                left,
+                right,
+                weight=float(rel.weight or 0),
+                count=1,
+            )
+        key = tuple(sorted((left, right)))
+        edge_rel_types[key][str(rel.rel_type or "RELATES_TO")] += 1
+
+    if graph.number_of_nodes() == 0:
+        return []
+
+    communities = nx.algorithms.community.louvain_communities(
+        graph,
+        weight="weight",
+        seed=42,
+    )
+
+    ranked: list[dict[str, Any]] = []
+    for idx, members in enumerate(communities):
+        subgraph = graph.subgraph(members)
+        internal_weight = sum(
+            float(data.get("weight", 0.0)) for _, _, data in subgraph.edges(data=True)
+        )
+        weighted_degree: dict[str, float] = {
+            node_id: float(subgraph.degree(node_id, weight="weight"))
+            for node_id in subgraph.nodes
+        }
+        external_weight = 0.0
+        rel_counter: Counter[str] = Counter()
+        for node_id in members:
+            for neighbor, data in graph[node_id].items():
+                if neighbor not in members:
+                    external_weight += float(data.get("weight", 0.0))
+        for left, right in subgraph.edges():
+            rel_counter.update(edge_rel_types[tuple(sorted((left, right)))])
+        size = len(members)
+        possible_edges = max(1, size * (size - 1) / 2)
+        density = subgraph.number_of_edges() / possible_edges
+        score = (internal_weight * max(density, 0.001)) + (size * 0.5)
+        ranked.append(
+            {
+                "community_id": idx,
+                "size": size,
+                "score": round(score, 6),
+                "internal_weight": round(internal_weight, 6),
+                "external_weight": round(external_weight, 6),
+                "density": round(float(density), 6),
+                "node_ids": sorted(members),
+                "node_names": [
+                    name_by_id[uuid.UUID(node_id)]
+                    for node_id, _ in sorted(
+                        weighted_degree.items(),
+                        key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
+                        reverse=True,
+                    )
+                ],
+                "top_rel_types": [name for name, _ in rel_counter.most_common(6)],
+            }
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            item["score"],
+            item["internal_weight"],
+            item["density"],
+            item["size"],
+        ),
+        reverse=True,
+    )
+    return ranked
 
 
 def _connected_components(
@@ -937,7 +1028,7 @@ def build_collection_analysis(
 
     anchor_totals: dict[str, dict[str, Any]] = {}
     bridge_totals: dict[str, dict[str, Any]] = {}
-    communities: list[dict[str, Any]] = []
+    structural_components: list[dict[str, Any]] = []
     connector_paths: list[dict[str, Any]] = []
     total_strong_pairs = 0
     total_directed_pairs = 0
@@ -946,7 +1037,7 @@ def build_collection_analysis(
         total_strong_pairs += int(analysis["totals"]["strong_pairs"])
         total_directed_pairs += int(analysis["totals"]["directed_pairs"])
         total_undirected_pairs += int(analysis["totals"]["undirected_pairs"])
-        communities.extend(analysis["communities"])
+        structural_components.extend(analysis["communities"])
         connector_paths.extend(analysis["connector_paths"])
         for bucket, items in (
             (anchor_totals, analysis["top_anchors"]),
@@ -1024,7 +1115,7 @@ def build_collection_analysis(
         )
         return rows
 
-    communities.sort(
+    structural_components.sort(
         key=lambda item: (
             item["strong_edge_count"],
             item["average_strong_edge_strength"],
@@ -1040,6 +1131,8 @@ def build_collection_analysis(
         ),
         reverse=True,
     )
+
+    louvain_communities = _build_louvain_communities(nodes, relationships)
 
     return {
         "parameters": {
@@ -1058,11 +1151,12 @@ def build_collection_analysis(
             "directed_pairs": total_directed_pairs,
             "undirected_pairs": total_undirected_pairs,
             "strong_pairs": total_strong_pairs,
-            "communities": len(communities),
+            "communities": len(louvain_communities),
             "rel_types": len(rel_types),
         },
         "rel_type_analyses": analyses,
-        "communities": communities,
+        "communities": louvain_communities,
+        "structural_components": structural_components,
         "top_anchors": _finalize_entries(anchor_totals)[:max_anchors],
         "bridge_nodes": _finalize_entries(bridge_totals)[: max(10, max_anchors)],
         "connector_paths": connector_paths[:max_connector_paths],
@@ -1102,6 +1196,8 @@ async def build_collection_understanding(
     llm_provider: LLMProvider | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
+    max_candidate_communities = 8
+    min_candidate_community_size = 5
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
@@ -1189,94 +1285,38 @@ async def build_collection_understanding(
             return {key: 0.0 for key in scores}
         return {key: float(value) / float(max_value) for key, value in scores.items()}
 
+    ranked_communities = [
+        community
+        for community in analysis.get("communities", [])
+        if int(community.get("size", 0)) >= min_candidate_community_size
+    ]
+    if not ranked_communities:
+        ranked_communities = list(analysis.get("communities", []))
+
     candidate_regions: list[dict[str, Any]] = []
-    for idx, bridge in enumerate(analysis.get("bridge_nodes", [])[:8], start=1):
-        rel_types = list(bridge.get("rel_types") or [])
-        candidate_regions.append(
-            {
-                "region_id": f"bridge_{idx}",
-                "kind": "bridge",
-                "title": bridge["name"],
-                "description": (
-                    f"{bridge['name']} bridges relation types {', '.join(rel_types) or 'unknown'} "
-                    f"with betweenness {bridge['betweenness']} and closeness {bridge['closeness']}. "
-                    f"It touches external communities {bridge['external_communities']}."
-                ),
-                "source_ids": [str(bridge.get("node_id"))] if bridge.get("node_id") else [],
-                "entity_names": [bridge["name"]],
-                "rel_types": rel_types,
-            }
-        )
-
-    for idx, path in enumerate(analysis.get("connector_paths", [])[:8], start=1):
-        path_nodes = [str(node) for node in path.get("nodes", []) if str(node).strip()]
-        supporting_rel_ids = [
-            str(rel_id)
-            for hop in path.get("hops", [])
-            for rel_id in hop.get("relationship_ids", [])
-        ]
-        candidate_regions.append(
-            {
-                "region_id": f"path_{idx}",
-                "kind": "path",
-                "title": f"{path.get('from_anchor', '?')} -> {path.get('to_anchor', '?')}",
-                "description": (
-                    f"{path.get('rel_type', 'RELATES_TO')} path across {path.get('hop_count', 0)} hops: "
-                    f"{' -> '.join(path_nodes[:8])}. Path score {path.get('path_score', 0.0)}."
-                ),
-                "source_ids": supporting_rel_ids,
-                "entity_names": path_nodes[:12],
-                "rel_types": [str(path.get("rel_type") or "RELATES_TO")],
-            }
-        )
-
-    rel_type_strengths: dict[str, float] = {}
-    for rel_analysis in analysis.get("rel_type_analyses", []):
-        rel_type = str(rel_analysis.get("rel_type") or "RELATES_TO")
-        rows = rel_analysis.get("node_metrics", [])
-        rel_type_strengths[rel_type] = sum(
-            (
-                float(row.get("pagerank", 0.0))
-                + float(row.get("hub_score", 0.0))
-                + float(row.get("authority_score", 0.0))
-                + float(row.get("betweenness", 0.0))
-            )
-            for row in rows
-        )
-    for idx, (rel_type, score) in enumerate(
-        sorted(rel_type_strengths.items(), key=lambda item: item[1], reverse=True)[:6],
+    for idx, community in enumerate(
+        ranked_communities[:max_candidate_communities],
         start=1,
     ):
-        rel_analysis = next(
-            (
-                item
-                for item in analysis.get("rel_type_analyses", [])
-                if str(item.get("rel_type") or "RELATES_TO") == rel_type
-            ),
-            {},
-        )
-        top_names = [
-            str(row.get("name") or "")
-            for row in (rel_analysis.get("top_anchors") or [])[:6]
-            if str(row.get("name") or "").strip()
-        ]
         candidate_regions.append(
             {
-                "region_id": f"reltype_{idx}",
-                "kind": "rel_type",
-                "title": rel_type,
+                "region_id": f"community_{idx}",
+                "kind": "community",
+                "title": f"Community {community['community_id']}",
                 "description": (
-                    f"Relation type {rel_type} has structural weight {round(score, 6)} "
-                    f"with anchors: {', '.join(top_names) or 'none'}."
+                    f"Weighted Louvain community of size {community['size']} with score "
+                    f"{community['score']}, internal weight {community['internal_weight']}, "
+                    f"external weight {community['external_weight']}, density {community['density']}. "
+                    f"Top relation types: {', '.join(community.get('top_rel_types', [])) or 'none'}."
                 ),
-                "source_ids": [],
-                "entity_names": top_names,
-                "rel_types": [rel_type],
+                "source_ids": list(community.get("node_ids", [])),
+                "entity_names": list(community.get("node_names", []))[:16],
+                "rel_types": list(community.get("top_rel_types", [])),
             }
         )
 
     fallback_concepts = []
-    for region in candidate_regions[:8]:
+    for region in candidate_regions:
         fallback_concepts.append(
             {
                 "label": region["title"],
@@ -1349,7 +1389,7 @@ async def build_collection_understanding(
                 f"Entities: {', '.join(region['entity_names'][:8]) or 'none'}. "
                 f"Rel types: {', '.join(region['rel_types']) or 'none'}."
             )
-            for region in candidate_regions[:20]
+            for region in candidate_regions
         )
         prompt = (
             "You are inducing reusable semantic concepts from structural graph candidates.\n"
@@ -1370,7 +1410,7 @@ async def build_collection_understanding(
     region_lookup = {region["region_id"]: region for region in candidate_regions}
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}
-    for concept in induced.get("concepts", [])[:12]:
+    for concept in induced.get("concepts", [])[:max_candidate_communities]:
         label = str(concept.get("label") or "").strip()
         if not label:
             continue
