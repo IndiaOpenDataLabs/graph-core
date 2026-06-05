@@ -41,11 +41,6 @@ class RelationshipRecord:
     rel_type: str
     weight: int
 
-
-def derived_graph_name(collection_id: uuid.UUID) -> str:
-    return f"collection_{str(collection_id).replace('-', '')}_derived"
-
-
 def _build_louvain_communities(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],

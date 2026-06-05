@@ -27,7 +27,6 @@ from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
     build_collection_understanding,
-    derived_graph_name,
 )
 from graph_core.services.graph.ingestion import (
     deterministic_uuid,
@@ -1464,7 +1463,6 @@ class GraphService:
             analysis,
             llm_provider=llm_provider,
         )
-        await FalkorDBGraphStorage(derived_graph_name(collection_id)).drop()
         await self._vector_store.delete_chunks_by_metadata(
             collection_id,
             {"memory_type": "derived_graph"},
