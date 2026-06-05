@@ -10,6 +10,7 @@ It is intentionally dependency-free for now.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from collections import Counter, defaultdict, deque
@@ -1252,8 +1253,8 @@ async def build_collection_understanding(
     llm_provider: LLMProvider | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
-    max_candidate_communities = 8
-    min_candidate_community_size = 5
+    max_candidate_communities_per_rel_type = 5
+    min_candidate_community_size = 8
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
@@ -1341,19 +1342,28 @@ async def build_collection_understanding(
             return {key: 0.0 for key in scores}
         return {key: float(value) / float(max_value) for key, value in scores.items()}
 
-    ranked_communities = [
-        community
-        for community in analysis.get("communities", [])
-        if int(community.get("size", 0)) >= min_candidate_community_size
-    ]
-    if not ranked_communities:
-        ranked_communities = list(analysis.get("communities", []))
-
     candidate_regions: list[dict[str, Any]] = []
-    for idx, community in enumerate(
-        ranked_communities[:max_candidate_communities],
-        start=1,
-    ):
+    communities_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    fallback_communities: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for community in analysis.get("communities", []):
+        rel_type = str(community.get("rel_type") or "RELATES_TO")
+        if int(community.get("size", 0)) >= min_candidate_community_size:
+            communities_by_type[rel_type].append(community)
+        else:
+            fallback_communities[rel_type].append(community)
+
+    selected_communities: list[dict[str, Any]] = []
+    rel_types_in_order = sorted(
+        {
+            str(community.get("rel_type") or "RELATES_TO")
+            for community in analysis.get("communities", [])
+        }
+    )
+    for rel_type in rel_types_in_order:
+        chosen = communities_by_type.get(rel_type) or fallback_communities.get(rel_type, [])
+        selected_communities.extend(chosen[:max_candidate_communities_per_rel_type])
+
+    for idx, community in enumerate(selected_communities, start=1):
         representative_edges = community.get("representative_edges", [])
         candidate_regions.append(
             {
@@ -1390,39 +1400,84 @@ async def build_collection_understanding(
             }
         )
 
-    induced: dict[str, Any] = {"concepts": fallback_concepts, "meta_edges": []}
+    induced_concepts = list(fallback_concepts)
+    induced_meta_edges: list[dict[str, Any]] = []
     if llm_provider and not isinstance(llm_provider, LocalEchoLLMProvider) and candidate_regions:
-        schema = {
+        concept_schema = {
             "type": "object",
             "properties": {
-                "concepts": {
+                "label": {"type": "string"},
+                "concept_type": {"type": "string"},
+                "description": {"type": "string"},
+                "importance_reason": {"type": "string"},
+                "member_entity_names": {
                     "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "concept_type": {"type": "string"},
-                            "description": {"type": "string"},
-                            "importance_reason": {"type": "string"},
-                            "evidence_region_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            "member_entity_names": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": [
-                            "label",
-                            "concept_type",
-                            "description",
-                            "importance_reason",
-                            "evidence_region_ids",
-                            "member_entity_names",
-                        ],
-                    },
+                    "items": {"type": "string"},
                 },
+            },
+            "required": [
+                "label",
+                "concept_type",
+                "description",
+                "importance_reason",
+                "member_entity_names",
+            ],
+        }
+
+        async def induce_region_concept(region: dict[str, Any]) -> dict[str, Any]:
+            rel_type = region["rel_types"][0] if region["rel_types"] else "RELATES_TO"
+            directed_edges = (
+                "; ".join(
+                    (
+                        f"{edge['source_name']} -[{rel_type}]-> "
+                        f"{edge['target_name']} (weight={edge['weight']}, count={edge['relationship_count']})"
+                    )
+                    for edge in region.get("representative_edges", [])[:5]
+                )
+                or "none"
+            )
+            prompt = (
+                "You are inducing one reusable semantic concept from a directed relation-type-specific graph community.\n"
+                "Do not return a mechanical label like community, cluster, graph region, connector, or bridge.\n"
+                "Pay close attention to edge direction and relation type. Infer a higher-level abstraction, role, flow, "
+                "tension, or unifying concept from the member entities and representative directed edges.\n\n"
+                f"Collection: {collection['name']}\n"
+                f"Candidate id: {region['region_id']}\n"
+                f"Candidate title: {region['title']}\n"
+                f"Candidate description: {region['description']}\n"
+                f"Entities: {', '.join(region['entity_names'][:12]) or 'none'}\n"
+                f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
+                f"Representative directed edges: {directed_edges}\n"
+            )
+            try:
+                concept = await llm_provider.structured_extract(
+                    prompt=prompt,
+                    schema=concept_schema,
+                )
+                concept["evidence_region_ids"] = [region["region_id"]]
+                return concept
+            except Exception:
+                return {
+                    "label": region["title"],
+                    "concept_type": region["kind"],
+                    "description": region["description"],
+                    "importance_reason": (
+                        f"Fallback concept for relation type {rel_type} "
+                        f"from candidate {region['region_id']}."
+                    ),
+                    "evidence_region_ids": [region["region_id"]],
+                    "member_entity_names": region["entity_names"][:8],
+                }
+
+        induced_concepts = list(
+            await asyncio.gather(
+                *(induce_region_concept(region) for region in candidate_regions)
+            )
+        )
+
+        meta_edge_schema = {
+            "type": "object",
+            "properties": {
                 "meta_edges": {
                     "type": "array",
                     "items": {
@@ -1440,52 +1495,43 @@ async def build_collection_understanding(
                             "description",
                         ],
                     },
-                },
+                }
             },
-            "required": ["concepts", "meta_edges"],
+            "required": ["meta_edges"],
         }
-        candidate_text = "\n".join(
+        concept_text = "\n".join(
             (
-                f"- {region['region_id']} [{region['kind']}] {region['title']}: "
-                f"{region['description']} "
-                f"Entities: {', '.join(region['entity_names'][:8]) or 'none'}. "
-                f"Rel types: {', '.join(region['rel_types']) or 'none'}. "
-                "Representative directed edges: "
-                + (
-                    "; ".join(
-                        (
-                            f"{edge['source_name']} -[{region['rel_types'][0] if region['rel_types'] else 'RELATES_TO'}]-> "
-                            f"{edge['target_name']} (weight={edge['weight']}, count={edge['relationship_count']})"
-                        )
-                        for edge in region.get("representative_edges", [])[:5]
-                    )
-                    or "none"
-                )
+                f"- {concept.get('label', '').strip()}: "
+                f"{concept.get('description', '').strip()} "
+                f"Members: {', '.join(concept.get('member_entity_names', [])[:8]) or 'none'}."
             )
-            for region in candidate_regions
+            for concept in induced_concepts
+            if str(concept.get("label") or "").strip()
         )
-        prompt = (
-            "You are inducing reusable semantic concepts from directed relation-type-specific graph communities.\n"
-            "Do not return mechanical labels like community, connector, bridge, cluster, or graph region.\n"
-            "Create a small set of higher-level concepts that explain what these communities collectively mean.\n"
-            "Pay close attention to edge direction and relation type. Infer roles, flows, abstractions, tensions, "
-            "or unifying concepts from the representative directed edges and member entities.\n"
-            "Then create semantic meta-edges between concepts using only these relation types: "
-            + ", ".join(sorted(semantic_edge_types))
-            + ".\n"
-            "Favor abstractions, roles, flows, tensions, and constraints over graph mechanics.\n\n"
-            f"Collection: {collection['name']}\n\n"
-            f"Candidates:\n{candidate_text}\n"
-        )
-        try:
-            induced = await llm_provider.structured_extract(prompt=prompt, schema=schema)
-        except Exception:
-            induced = {"concepts": fallback_concepts, "meta_edges": []}
-
+        if concept_text:
+            prompt = (
+                "You are relating induced semantic concepts from a collection graph.\n"
+                "Create only high-confidence semantic edges between concepts using these relation types: "
+                + ", ".join(sorted(semantic_edge_types))
+                + ".\n"
+                "Only emit edges when there is a clear semantic relation such as support, qualification, "
+                "distinction, implication, causation, or dependency.\n\n"
+                f"Collection: {collection['name']}\n\n"
+                f"Concepts:\n{concept_text}\n"
+            )
+            try:
+                induced_meta_edges = (
+                    await llm_provider.structured_extract(
+                        prompt=prompt,
+                        schema=meta_edge_schema,
+                    )
+                ).get("meta_edges", [])
+            except Exception:
+                induced_meta_edges = []
     region_lookup = {region["region_id"]: region for region in candidate_regions}
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}
-    for concept in induced.get("concepts", [])[:max_candidate_communities]:
+    for concept in induced_concepts:
         label = str(concept.get("label") or "").strip()
         if not label:
             continue
@@ -1548,7 +1594,7 @@ async def build_collection_understanding(
                 source_ids=source_ids,
             )
 
-    for edge in induced.get("meta_edges", [])[:24]:
+    for edge in induced_meta_edges[:48]:
         source_label = str(edge.get("source_label") or "").strip()
         target_label = str(edge.get("target_label") or "").strip()
         rel_type = str(edge.get("rel_type") or "").strip().upper()
