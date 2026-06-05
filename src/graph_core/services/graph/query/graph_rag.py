@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import string
 import uuid
@@ -126,11 +127,10 @@ async def _fan_out_per_dimension(
     dims = dimensions if dimensions is not None else []
     if not dims:
         return await build_state(None)
-    states: list[GraphQueryState] = []
-    for rel_type in dims:
-        s = await build_state(rel_type)
-        if s is not None:
-            states.append(s)
+    results = await asyncio.gather(
+        *(build_state(rel_type) for rel_type in dims)
+    )
+    states = [state for state in results if state is not None]
     if not states:
         return None
     return _merge_states(*states)
@@ -977,27 +977,30 @@ async def _mix_state(
         llm_profile_id=llm_profile_id,
     )
     interpretation = await _interpret_mix_queries(question, candidates, llm_provider)
-
-    states: list[GraphQueryState] = []
-    for subquery in interpretation.retrieval_subqueries:
+    async def _build_subquery_state(subquery: str) -> GraphQueryState:
         subquery_embedding = await _embed_relationship_query(
             embedding_provider,
             subquery,
             rel_type=rel_types[0] if rel_types else None,
         )
         subquery_tokens = query_tokens | _query_token_set(subquery)
-        states.append(
-            await _relationship_seed_state(
-                collection,
-                subquery_embedding,
-                top_k=8,
-                max_endpoints=16,
-                max_pairs=20,
-                query_tokens=subquery_tokens,
-                rel_types=rel_types,
-                dimension_weight=dimension_weight,
-            )
+        return await _relationship_seed_state(
+            collection,
+            subquery_embedding,
+            top_k=8,
+            max_endpoints=16,
+            max_pairs=20,
+            query_tokens=subquery_tokens,
+            rel_types=rel_types,
+            dimension_weight=dimension_weight,
         )
+
+    states = await asyncio.gather(
+        *(
+            _build_subquery_state(subquery)
+            for subquery in interpretation.retrieval_subqueries
+        )
+    )
 
     if not states:
         return await _relationship_first_state(
@@ -1165,29 +1168,28 @@ async def _load_derived_context(
     seen_nodes: set[str] = set()
     seen_edges: set[str] = set()
 
-    for score, hit in scored_hits[:6]:
+    async def _expand_hit(score: float, hit: dict[str, Any]) -> dict[str, Any] | None:
         metadata = hit.get("metadata") or {}
         derived_id = str(metadata.get("derived_id") or "").strip()
         if not derived_id:
-            continue
-        if derived_id not in seen_nodes:
-            seen_nodes.add(derived_id)
-            derived_nodes_used.append(derived_id)
-        summary_lines.append(f"- {hit['content']}")
-
+            return None
         node = await storage.get_node(derived_id)
         if not node:
-            continue
+            return {
+                "derived_id": derived_id,
+                "summary": f"- {hit['content']}",
+                "base_entity_scores": {},
+                "graph_lines": [],
+                "edge_ids": [],
+            }
+        local_base_entity_ids: dict[str, float] = {}
         for source_id in _parse_source_ids(node.get("source_ids")):
             maybe_uuid = _maybe_uuid_string(source_id)
-            if not maybe_uuid:
-                continue
-            if (
-                maybe_uuid not in base_entity_ids
-                or score > base_entity_ids[maybe_uuid]
-            ):
-                base_entity_ids[maybe_uuid] = score
+            if maybe_uuid:
+                local_base_entity_ids[maybe_uuid] = score
 
+        graph_lines_local: list[str] = []
+        edge_ids_local: list[str] = []
         node_edges = await storage.get_node_edges(derived_id)
         for source_id, target_id in node_edges[:6]:
             edge_props = await storage.get_edge(source_id, target_id)
@@ -1196,10 +1198,7 @@ async def _load_derived_context(
             if not edge_props:
                 continue
             edge_id = str(edge_props.get("id") or f"{source_id}__{target_id}")
-            if edge_id in seen_edges:
-                continue
-            seen_edges.add(edge_id)
-            derived_edges_used.append(edge_id)
+            edge_ids_local.append(edge_id)
             target_node_id = target_id if source_id == derived_id else source_id
             target_node = await storage.get_node(target_node_id)
             target_name = (
@@ -1215,26 +1214,49 @@ async def _load_derived_context(
             )
             if description:
                 line += f": {description}"
-            graph_lines.append(line)
+            graph_lines_local.append(line)
             for source_ref in _parse_source_ids(edge_props.get("source_ids")):
                 maybe_uuid = _maybe_uuid_string(source_ref)
-                if not maybe_uuid:
-                    continue
-                if (
-                    maybe_uuid not in base_entity_ids
-                    or score > base_entity_ids[maybe_uuid]
-                ):
-                    base_entity_ids[maybe_uuid] = score
+                if maybe_uuid:
+                    local_base_entity_ids[maybe_uuid] = score
             if target_node:
                 for source_ref in _parse_source_ids(target_node.get("source_ids")):
                     maybe_uuid = _maybe_uuid_string(source_ref)
-                    if not maybe_uuid:
-                        continue
-                    if (
-                        maybe_uuid not in base_entity_ids
-                        or score > base_entity_ids[maybe_uuid]
-                    ):
-                        base_entity_ids[maybe_uuid] = score
+                    if maybe_uuid:
+                        local_base_entity_ids[maybe_uuid] = score
+        return {
+            "derived_id": derived_id,
+            "summary": f"- {hit['content']}",
+            "base_entity_scores": local_base_entity_ids,
+            "graph_lines": graph_lines_local,
+            "edge_ids": edge_ids_local,
+        }
+
+    expanded_hits = await asyncio.gather(
+        *(_expand_hit(score, hit) for score, hit in scored_hits[:6])
+    )
+    for expanded in expanded_hits:
+        if not expanded:
+            continue
+        derived_id = str(expanded["derived_id"])
+        if derived_id not in seen_nodes:
+            seen_nodes.add(derived_id)
+            derived_nodes_used.append(derived_id)
+        summary_lines.append(str(expanded["summary"]))
+        for maybe_uuid, score in dict(expanded["base_entity_scores"]).items():
+            if (
+                maybe_uuid not in base_entity_ids
+                or score > base_entity_ids[maybe_uuid]
+            ):
+                base_entity_ids[maybe_uuid] = score
+        for edge_id in list(expanded["edge_ids"]):
+            if edge_id in seen_edges:
+                continue
+            seen_edges.add(edge_id)
+            derived_edges_used.append(edge_id)
+        for line in list(expanded["graph_lines"]):
+            if line not in graph_lines:
+                graph_lines.append(line)
 
     logger.info(
         "graph_rag derived context collection=%s route=%s summaries=%d derived_nodes=%d derived_edges=%d base_entities=%d",
