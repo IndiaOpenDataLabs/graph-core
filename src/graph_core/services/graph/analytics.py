@@ -1134,6 +1134,72 @@ def build_collection_understanding(
         return node_id
 
     chunk_index = 0
+
+    def next_chunk_index() -> int:
+        nonlocal chunk_index
+        current = chunk_index
+        chunk_index += 1
+        return current
+
+    def ensure_meta_node(
+        node_id: str,
+        *,
+        name: str,
+        node_type: str,
+        description: str,
+        source_ids: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        if not any(node["id"] == node_id for node in nodes):
+            nodes.append(
+                {
+                    "id": node_id,
+                    "name": name,
+                    "collection_id": collection["id"],
+                    "type": node_type,
+                    "description": description,
+                    "source_ids": source_ids or [],
+                }
+            )
+            chunks.append(
+                {
+                    "chunk_hash": derived_chunk_hash(collection["id"], "meta", node_id),
+                    "chunk_index": next_chunk_index(),
+                    "content": description,
+                    "metadata": {
+                        "memory_type": "derived_graph",
+                        "derived_kind": "meta",
+                        "derived_id": node_id,
+                        "collection_id": collection["id"],
+                        **(metadata or {}),
+                    },
+                }
+            )
+        return node_id
+
+    def add_edge(
+        source_id: str,
+        target_id: str,
+        *,
+        rel_type: str,
+        description: str,
+        source_ids: list[str] | None = None,
+    ) -> None:
+        edge_id = f"{source_id}__{rel_type}__{target_id}"
+        if any(edge["id"] == edge_id for edge in edges):
+            return
+        edges.append(
+            {
+                "source_id": source_id,
+                "target_id": target_id,
+                "id": edge_id,
+                "collection_id": collection["id"],
+                "rel_type": rel_type,
+                "description": description,
+                "source_ids": source_ids or [],
+            }
+        )
+
     for community in analysis["communities"]:
         rel_type = str(community.get("rel_type") or "RELATES_TO")
         node_id = f"derived:community:{rel_type.lower()}:{community['community_id']}"
@@ -1166,7 +1232,7 @@ def build_collection_understanding(
                     rel_type,
                     community["community_id"],
                 ),
-                "chunk_index": chunk_index,
+                "chunk_index": next_chunk_index(),
                 "content": description,
                 "metadata": {
                     "memory_type": "derived_graph",
@@ -1177,7 +1243,6 @@ def build_collection_understanding(
                 },
             }
         )
-        chunk_index += 1
         for name in anchor_preview:
             ref_id = ensure_entity_ref(name, supporting_ids=source_ids)
             edges.append(
@@ -1235,7 +1300,7 @@ def build_collection_understanding(
                     bridge["name"],
                     "_".join(rel_type_list),
                 ),
-                "chunk_index": chunk_index,
+                "chunk_index": next_chunk_index(),
                 "content": description,
                 "metadata": {
                     "memory_type": "derived_graph",
@@ -1246,7 +1311,6 @@ def build_collection_understanding(
                 },
             }
         )
-        chunk_index += 1
         ref_id = ensure_entity_ref(bridge["name"], supporting_ids=source_ids)
         edges.append(
             {
@@ -1300,7 +1364,7 @@ def build_collection_understanding(
                     rel_type,
                     idx,
                 ),
-                "chunk_index": chunk_index,
+                "chunk_index": next_chunk_index(),
                 "content": description,
                 "metadata": {
                     "memory_type": "derived_graph",
@@ -1311,7 +1375,6 @@ def build_collection_understanding(
                 },
             }
         )
-        chunk_index += 1
         for name in path_nodes:
             ref_id = ensure_entity_ref(name)
             edges.append(
@@ -1347,5 +1410,271 @@ def build_collection_understanding(
                         "source_ids": supporting_rel_ids,
                     }
                 )
+
+    rel_family_map = {
+        "CALLS": "behavior",
+        "USES": "behavior",
+        "DEPENDS_ON": "behavior",
+        "REFERENCES": "behavior",
+        "IMPORTS": "behavior",
+        "DEFINES": "structure",
+        "EXTENDS": "structure",
+        "IMPLEMENTS": "structure",
+        "DOCUMENTS": "evidence",
+        "TESTS": "evidence",
+        "RELATES_TO": "generic",
+    }
+
+    def rel_family(rel_type: str) -> str:
+        return rel_family_map.get(rel_type, "other")
+
+    rel_type_totals: dict[str, float] = {}
+    route_scores = {
+        "hub": 0.0,
+        "authority": 0.0,
+        "bridge": 0.0,
+        "central": 0.0,
+        "importance": 0.0,
+    }
+    for rel_analysis in analysis.get("rel_type_analyses", []):
+        rel_type = str(rel_analysis.get("rel_type") or "RELATES_TO")
+        rows = rel_analysis.get("node_metrics", [])
+        if not rows:
+            continue
+        total = 0.0
+        for row in rows:
+            hub = float(row.get("hub_score", 0.0))
+            authority = float(row.get("authority_score", 0.0))
+            bridge = float(row.get("betweenness", 0.0))
+            central = float(row.get("closeness", 0.0))
+            importance = (
+                float(row.get("pagerank", 0.0))
+                + float(row.get("eigenvector_score", 0.0))
+            ) / 2.0
+            route_scores["hub"] += hub
+            route_scores["authority"] += authority
+            route_scores["bridge"] += bridge
+            route_scores["central"] += central
+            route_scores["importance"] += importance
+            total += hub + authority + bridge + central + importance
+        rel_type_totals[rel_type] = total
+
+    def normalize_map(scores: dict[str, float]) -> dict[str, float]:
+        if not scores:
+            return {}
+        max_value = max(scores.values()) or 0.0
+        if max_value <= 0.0:
+            return {key: 0.0 for key in scores}
+        return {key: float(value) / float(max_value) for key, value in scores.items()}
+
+    normalized_routes = normalize_map(route_scores)
+    normalized_rel_types = normalize_map(rel_type_totals)
+    sorted_routes = sorted(
+        normalized_routes.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    primary_route = sorted_routes[0][0] if sorted_routes else "central"
+
+    route_nodes: dict[str, str] = {}
+    for route_name, score in normalized_routes.items():
+        node_id = f"derived:meta:route:{route_name}"
+        route_nodes[route_name] = ensure_meta_node(
+            node_id,
+            name=f"Route {route_name.title()}",
+            node_type="derived_meta_route",
+            description=(
+                f"Meta route archetype {route_name} with normalized score {round(score, 6)}. "
+                "Represents one lens for expanding the derived graph."
+            ),
+            metadata={"route_name": route_name},
+        )
+
+    rel_type_nodes: dict[str, str] = {}
+    for rel_type, score in normalized_rel_types.items():
+        rel_type_nodes[rel_type] = ensure_meta_node(
+            f"derived:meta:rel_type:{rel_type.lower()}",
+            name=f"Relation Type {rel_type}",
+            node_type="derived_meta_rel_type",
+            description=(
+                f"Meta node for relation type {rel_type} in family {rel_family(rel_type)} "
+                f"with normalized weight {round(score, 6)} in this collection analysis."
+            ),
+            metadata={"rel_type": rel_type},
+        )
+
+    top_rel_types = sorted(
+        normalized_rel_types.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:5]
+    for rel_type, score in top_rel_types:
+        add_edge(
+            route_nodes[primary_route],
+            rel_type_nodes[rel_type],
+            rel_type="SUPPORTS",
+            description=(
+                f"Primary route {primary_route} is supported by high-signal relation type "
+                f"{rel_type} with normalized weight {round(score, 6)}."
+            ),
+        )
+
+    if len(sorted_routes) > 1 and (sorted_routes[0][1] - sorted_routes[1][1]) <= 0.2:
+        add_edge(
+            route_nodes[sorted_routes[1][0]],
+            route_nodes[sorted_routes[0][0]],
+            rel_type="QUALIFIES",
+            description=(
+                f"Secondary route {sorted_routes[1][0]} nearly matches primary route "
+                f"{sorted_routes[0][0]}, so it qualifies the expansion strategy."
+            ),
+        )
+
+    rel_rank = sorted(
+        normalized_rel_types.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if rel_rank:
+        top_rel_type, top_rel_score = rel_rank[0]
+        if top_rel_type == "RELATES_TO" and top_rel_score >= 0.75:
+            add_edge(
+                rel_type_nodes[top_rel_type],
+                route_nodes[primary_route],
+                rel_type="LIMITS",
+                description=(
+                    "Generic RELATES_TO edges dominate this collection slice, which limits "
+                    "the interpretability of the primary route."
+                ),
+            )
+
+        non_generic = [
+            (rel_type, score)
+            for rel_type, score in rel_rank
+            if rel_family(rel_type) != "generic"
+        ]
+        if non_generic:
+            top_non_generic_type, top_non_generic_score = non_generic[0]
+            if float(top_non_generic_score) >= 0.35:
+                add_edge(
+                    rel_type_nodes[top_non_generic_type],
+                    route_nodes[primary_route],
+                    rel_type="QUALIFIES",
+                    description=(
+                        f"Non-generic relation type {top_non_generic_type} sharpens the "
+                        f"otherwise broad {primary_route} route."
+                    ),
+                )
+        if len(non_generic) > 1:
+            a_rel, a_score = non_generic[0]
+            b_rel, b_score = non_generic[1]
+            if rel_family(a_rel) != rel_family(b_rel):
+                add_edge(
+                    rel_type_nodes[a_rel],
+                    rel_type_nodes[b_rel],
+                    rel_type="DISTINGUISHES",
+                    description=(
+                        f"{a_rel} and {b_rel} are both strong but come from different semantic "
+                        "families, so they distinguish different structural explanations."
+                    ),
+                )
+            elif abs(float(a_score) - float(b_score)) <= 0.05:
+                add_edge(
+                    rel_type_nodes[a_rel],
+                    rel_type_nodes[b_rel],
+                    rel_type="CONTRADICTS",
+                    description=(
+                        f"{a_rel} and {b_rel} carry nearly equal weight yet imply competing "
+                        "interpretations of the collection structure."
+                    ),
+                )
+
+    bridge_lookup = {
+        str(node.get("name") or ""): str(node["id"])
+        for node in nodes
+        if str(node.get("type") or "") == "derived_bridge"
+    }
+    for bridge in analysis.get("bridge_nodes", [])[: max(10, len(analysis.get("bridge_nodes", [])))]:
+        if (
+            len(bridge.get("external_communities", [])) >= 4
+            and float(bridge.get("betweenness", 0.0)) > 0.0
+        ):
+            bridge_name = f"Bridge: {bridge['name']}"
+            bridge_node_id = bridge_lookup.get(bridge_name)
+            if bridge_node_id:
+                add_edge(
+                    bridge_node_id,
+                    route_nodes["bridge"],
+                    rel_type="JUSTIFIES",
+                    description=(
+                        f"{bridge['name']} connects many external communities and therefore "
+                        "justifies a bridge-oriented reading of the graph."
+                    ),
+                    source_ids=[str(bridge.get("node_id") or "")] if bridge.get("node_id") else [],
+                )
+
+    connector_counter: dict[tuple[str, str], dict[str, Any]] = {}
+    for path in analysis.get("connector_paths", []):
+        rel_type = str(path.get("rel_type") or "RELATES_TO")
+        motif = " -> ".join((path.get("nodes") or [])[:3])
+        if not motif:
+            continue
+        key = (rel_type, motif)
+        bucket = connector_counter.setdefault(
+            key,
+            {
+                "count": 0,
+                "examples": [],
+                "source_ids": [],
+            },
+        )
+        bucket["count"] += 1
+        example = f"{path.get('from_anchor', '?')} -> {path.get('to_anchor', '?')}"
+        if len(bucket["examples"]) < 3:
+            bucket["examples"].append(example)
+        for hop in path.get("hops", []):
+            for rel_id in hop.get("relationship_ids", []):
+                if rel_id not in bucket["source_ids"]:
+                    bucket["source_ids"].append(rel_id)
+
+    for (rel_type, motif), bucket in sorted(
+        connector_counter.items(),
+        key=lambda item: item[1]["count"],
+        reverse=True,
+    )[:8]:
+        meta_node_id = ensure_meta_node(
+            f"derived:meta:connector:{rel_type.lower()}:{hashlib.md5(motif.encode('utf-8')).hexdigest()[:12]}",
+            name=f"Meta Connector {rel_type}",
+            node_type="derived_meta_connector",
+            description=(
+                f"Recurring connector motif for {rel_type}: {motif}. "
+                f"Observed {bucket['count']} times with examples: "
+                f"{', '.join(bucket['examples']) or 'none'}."
+            ),
+            source_ids=bucket["source_ids"],
+            metadata={"rel_type": rel_type, "motif": motif},
+        )
+        add_edge(
+            meta_node_id,
+            route_nodes[primary_route],
+            rel_type="SUPPORTS",
+            description=(
+                f"Recurring {rel_type} connector motif {motif} supports the "
+                f"{primary_route} route."
+            ),
+            source_ids=bucket["source_ids"],
+        )
+
+        if rel_type in rel_type_nodes:
+            add_edge(
+                meta_node_id,
+                rel_type_nodes[rel_type],
+                rel_type="JUSTIFIES",
+                description=(
+                    f"Recurring connector motif {motif} justifies the importance of "
+                    f"relation type {rel_type}."
+                ),
+                source_ids=bucket["source_ids"],
+            )
 
     return {"nodes": nodes, "edges": edges, "chunks": chunks}
