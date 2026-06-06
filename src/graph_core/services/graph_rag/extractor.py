@@ -135,6 +135,7 @@ entities and relationships from input text.
    - Each entry becomes its own edge in the graph; emitting an
      entry you cannot justify with a role-specific description
      produces duplicate noise.
+   - {domain_relationship_guidance}
    - Use third-person phrasing and avoid pronouns where possible.
    - Only extract entities and relationships explicitly supported by the text.
 """
@@ -167,6 +168,7 @@ formatted entities and relationships.
 4. Keep naming consistent with the previously extracted entities.
 5. Relationship descriptions must still explain the nature, context,
    and significance of the connection.
+5a. {domain_relationship_guidance}
 6. Each relationship's "rel_type" must be drawn EXACTLY from:
    {rel_type_vocab}. Do not invent new rel_types — any value
    outside this list will be rejected and the edge will fall back
@@ -319,12 +321,35 @@ class LLMGraphExtractor:
         return out
 
     @staticmethod
+    def _domain_relationship_guidance(domain: str | None) -> str:
+        if domain != "code":
+            return (
+                "Keep relationship descriptions concise and specific to the "
+                "actual role supported by the text."
+            )
+        return (
+            "For code-domain relationships, write the description in short "
+            "pseudo-code-flavored prose that captures execution semantics. "
+            "Mention guards, conditions, branches, loops, sequencing, fan-out, "
+            "or fan-in when the text supports them. Conditions may be written in "
+            "plain English, but keep the style compact and code-like using cues "
+            "such as IF, WHEN, THEN, ELSE, FOR EACH, WHILE, TRY/CATCH, RETURNS, "
+            "SPLITS INTO, or MERGES WITH. Do not invent control flow that is not "
+            "grounded in the text."
+        )
+
+    @staticmethod
     def _build_extraction_prompt(
-        text: str, entity_types: str, rel_type_vocab: list[str]
+        text: str,
+        entity_types: str,
+        rel_type_vocab: list[str],
+        domain: str | None,
     ) -> str:
         return (
             _EXTRACTION_SYSTEM_PROMPT.format(
-                entity_types=entity_types, rel_type_vocab=", ".join(rel_type_vocab)
+                entity_types=entity_types,
+                rel_type_vocab=", ".join(rel_type_vocab),
+                domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
             )
             + "\n\n"
             + _EXTRACTION_USER_PROMPT.format(text=text)
@@ -332,11 +357,17 @@ class LLMGraphExtractor:
 
     @staticmethod
     def _build_gleaning_prompt(
-        text: str, entity_types: str, existing_info: str, rel_type_vocab: list[str]
+        text: str,
+        entity_types: str,
+        existing_info: str,
+        rel_type_vocab: list[str],
+        domain: str | None,
     ) -> str:
         return (
             _GLEANING_SYSTEM_PROMPT.format(
-                entity_types=entity_types, rel_type_vocab=", ".join(rel_type_vocab)
+                entity_types=entity_types,
+                rel_type_vocab=", ".join(rel_type_vocab),
+                domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
             )
             + "\n\n"
             + _GLEANING_USER_PROMPT.format(existing_info=existing_info, text=text)
@@ -356,7 +387,10 @@ class LLMGraphExtractor:
         types_str = ", ".join(entity_types) if entity_types else "general"
         rel_vocab = rel_types_for_domain(domain)
         prompt = self._build_extraction_prompt(
-            text=text, entity_types=types_str, rel_type_vocab=rel_vocab
+            text=text,
+            entity_types=types_str,
+            rel_type_vocab=rel_vocab,
+            domain=domain,
         )
 
         try:
@@ -467,6 +501,7 @@ class LLMGraphExtractor:
                 entity_types=types_str,
                 existing_info=existing_info,
                 rel_type_vocab=rel_vocab,
+                domain=domain,
             )
 
             try:

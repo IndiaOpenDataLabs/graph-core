@@ -23,6 +23,7 @@ from graph_core.llm import LocalEchoLLMProvider
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
 from graph_core.models.graph_rag import EntityAlias, GraphEntity, GraphRelationship
+from graph_core.models.rel_types import rel_types_for_domain
 
 
 @dataclass(slots=True)
@@ -40,6 +41,106 @@ class RelationshipRecord:
     target_name: str
     rel_type: str
     weight: int
+
+
+_CODE_REL_TYPES = {value.upper() for value in rel_types_for_domain("code")}
+_NON_CODE_REL_TYPES = {
+    value.upper()
+    for domain in ("general", "books", "personal")
+    for value in rel_types_for_domain(domain)
+}
+_CODE_ONLY_REL_TYPES = _CODE_REL_TYPES - _NON_CODE_REL_TYPES
+
+
+def _is_code_like_collection(relationship_records: list[dict[str, Any]]) -> bool:
+    rel_types = {
+        str(rel.get("rel_type") or "").upper()
+        for rel in relationship_records
+        if str(rel.get("rel_type") or "").strip()
+    }
+    if not rel_types:
+        return False
+    if rel_types & _CODE_ONLY_REL_TYPES:
+        return True
+    code_like_common = {
+        "DEFINES",
+        "DEPENDS_ON",
+        "READS",
+        "WRITES",
+        "RETURNS",
+        "LOOPS_OVER",
+        "GUARDS",
+        "DECORATES",
+        "RAISES",
+        "CATCHES",
+    }
+    return len(rel_types & code_like_common) >= 3
+
+
+def _code_concept_prompt_guidance() -> str:
+    return (
+        "This is a code collection. Write the concept description in compact "
+        "pseudo-code-flavored prose that preserves execution semantics. Capture "
+        "conditions, decisions, ordering, loops, splits, merges, or retries when "
+        "the evidence supports them. Conditions may be English, but the wording "
+        "should feel code-like, using cues such as IF, WHEN, THEN, ELSE, FOR EACH, "
+        "WHILE, TRY/CATCH, RETURNS, SPLITS INTO, or MERGES WITH. Do not invent "
+        "control flow beyond the evidence."
+    )
+
+
+def _format_connects_to_description(
+    *,
+    source_label: str,
+    source_desc: str,
+    target_label: str,
+    target_desc: str,
+    top_rel_types: list[str],
+    direct_count: int,
+    path_count: int,
+    path_score: float,
+    boundary_names: list[str],
+    bridge_names: list[str],
+    code_like: bool,
+) -> str:
+    if not code_like:
+        description_parts = [
+            f"{source_label} ({source_desc}) connects to {target_label} ({target_desc}) "
+            f"through {direct_count} direct cross-edge(s) dominated by {', '.join(top_rel_types)}"
+        ]
+        if path_count:
+            description_parts.append(
+                f"and {path_count} short directed path(s) with cumulative path score {path_score}"
+            )
+        if boundary_names:
+            description_parts.append(
+                f"boundary entities: {', '.join(boundary_names)}"
+            )
+        if bridge_names:
+            description_parts.append(
+                f"bridge entities: {', '.join(bridge_names)}"
+            )
+        return "; ".join(description_parts).strip() + "."
+
+    steps = [
+        (
+            f"WHEN {source_label} is active, THEN flow reaches {target_label} "
+            f"mainly via {', '.join(top_rel_types)}; direct_cross_edges={direct_count}"
+        )
+    ]
+    if source_desc or target_desc:
+        steps.append(
+            f"CONTEXT: {source_label}={source_desc or 'n/a'}; {target_label}={target_desc or 'n/a'}"
+        )
+    if boundary_names:
+        steps.append(f"USING boundary_entities=[{', '.join(boundary_names)}]")
+    if path_count:
+        steps.append(
+            f"FOR short_paths in range({path_count}): cumulative_path_score={path_score}"
+        )
+    if bridge_names:
+        steps.append(f"BRIDGE VIA [{', '.join(bridge_names)}]")
+    return "; ".join(steps).strip() + "."
 
 def _build_louvain_communities(
     nodes: list[NodeRecord],
@@ -406,6 +507,7 @@ async def build_collection_understanding(
     relationship_records: list[dict[str, Any]] = list(
         analysis.get("relationship_records") or []
     )
+    is_code_like = _is_code_like_collection(relationship_records)
     node_name_by_id: dict[str, str] = {}
     for rel in relationship_records:
         node_name_by_id[str(rel["source_id"])] = str(rel["source_name"])
@@ -603,11 +705,13 @@ async def build_collection_understanding(
                 )
                 or "none"
             )
+            code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
             prompt = (
                 "You are inducing one reusable semantic concept from a directed relation-type-specific graph community.\n"
                 "Do not return a mechanical label like community, cluster, graph region, connector, or bridge.\n"
                 "Pay close attention to edge direction and relation type. Infer a higher-level abstraction, role, flow, "
                 "tension, or unifying concept from the member entities and representative directed edges.\n\n"
+                f"{code_guidance}"
                 "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
                 f"Collection: {collection['name']}\n"
                 f"Candidate id: {region['region_id']}\n"
@@ -845,22 +949,6 @@ async def build_collection_understanding(
         target_desc = concept_descriptions_by_id.get(target_concept_id, "")
         path_count = len(paths)
         path_score = round(sum(float(path["path_score"]) for path in paths), 6) if paths else 0.0
-        description_parts = [
-            f"{source_label} ({source_desc}) connects to {target_label} ({target_desc}) "
-            f"through {bucket['direct_count']} direct cross-edge(s) dominated by {', '.join(top_rel_types)}"
-        ]
-        if path_count:
-            description_parts.append(
-                f"and {path_count} short directed path(s) with cumulative path score {path_score}"
-            )
-        if boundary_names:
-            description_parts.append(
-                f"boundary entities: {', '.join(boundary_names)}"
-            )
-        if bridge_names:
-            description_parts.append(
-                f"bridge entities: {', '.join(bridge_names)}"
-            )
         edge_source_ids = sorted(
             set(concept_source_ids.get(source_concept_id, []))
             | set(concept_source_ids.get(target_concept_id, []))
@@ -871,7 +959,19 @@ async def build_collection_understanding(
             source_concept_id,
             target_concept_id,
             rel_type="CONNECTS_TO",
-            description="; ".join(description_parts).strip() + ".",
+            description=_format_connects_to_description(
+                source_label=source_label,
+                source_desc=source_desc,
+                target_label=target_label,
+                target_desc=target_desc,
+                top_rel_types=top_rel_types,
+                direct_count=int(bucket["direct_count"]),
+                path_count=path_count,
+                path_score=path_score,
+                boundary_names=boundary_names,
+                bridge_names=bridge_names,
+                code_like=is_code_like,
+            ),
             source_ids=edge_source_ids,
             keywords=top_rel_types,
         )
