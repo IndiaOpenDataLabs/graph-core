@@ -22,6 +22,8 @@ dependencies = [
     "cryptography>=44.0.0",
     "python-multipart>=0.0.18",
     "passlib[bcrypt]>=1.7.4",
+    "langchain-text-splitters>=1.1.2",
+    "chonkie[code]>=1.6.8",
 ]
 
 [project.optional-dependencies]

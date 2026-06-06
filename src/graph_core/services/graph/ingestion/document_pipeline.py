@@ -16,12 +16,12 @@ from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.profile import Profile
-from graph_core.services.chunking import TokenChunker
+from graph_core.services.chunking import DocumentChunker
 from graph_core.services.graph.ingestion.chunk_processor import ingest_collection_chunk
 
 UTC = UTC
 
-_chunker = TokenChunker(
+_chunker = DocumentChunker(
     chunk_size_tokens=settings.chunk_size_tokens,
     chunk_overlap_tokens=settings.chunk_overlap_tokens,
 )
@@ -127,7 +127,7 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
         text = str(job.payload["text"])
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
 
-    chunks = _chunker.chunk_text(text)
+    chunks = _chunker.chunk_text(text, domain=domain)
     total_chunks = max(len(chunks), 1)
 
     if not chunks:
