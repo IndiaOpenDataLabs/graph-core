@@ -65,7 +65,7 @@ services:
       - "6379:6379"
       - "3001:3000"
     environment:
-      FALKORDB_AOF: "yes"
+      REDIS_ARGS: "--appendonly yes"
     volumes:
       - falkordb_data:/var/lib/falkordb/data
     healthcheck:
