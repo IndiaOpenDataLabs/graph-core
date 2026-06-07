@@ -232,9 +232,8 @@ class LLMGraphExtractor:
 
         Each entry's name is normalized (uppercase, snake_case,
         alpha-leading) and optionally validated against the active
-        domain vocab. For ``code`` and ``books`` we allow new rel_types
-        to be introduced when the existing set is not expressive enough;
-        for other domains, unknown names fall back to ``DEFAULT_REL_TYPE``.
+        domain vocab. Unknown normalized rel_types are accepted when
+        the existing set is not expressive enough.
 
         Returns at least one entry; the fallback is
         ``[{"name": DEFAULT_REL_TYPE, "description": ..., "keywords": ..., "weight": ...}]``
@@ -255,7 +254,6 @@ class LLMGraphExtractor:
             raw_entries = [{"name": str(value)}]
 
         vocab_set = {v.upper() for v in vocab} if vocab else None
-        allow_new_rel_types = domain in {"code", "books"}
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         for entry in raw_entries:
@@ -266,21 +264,12 @@ class LLMGraphExtractor:
                 continue
             name = normalize_rel_type(raw_name)
             if vocab_set is not None and name not in vocab_set:
-                if allow_new_rel_types:
-                    logger.info(
-                        "LLM emitted new rel_type=%r outside active %s vocab; accepting normalized type %s",
-                        raw_name,
-                        domain,
-                        name,
-                    )
-                else:
-                    logger.warning(
-                        "LLM emitted rel_type=%r not in active domain vocab; "
-                        "falling back to %s. Add it to DOMAIN_VOCAB if intentional.",
-                        raw_name,
-                        DEFAULT_REL_TYPE,
-                    )
-                    name = DEFAULT_REL_TYPE
+                logger.info(
+                    "LLM emitted new rel_type=%r outside active %s vocab; accepting normalized type %s",
+                    raw_name,
+                    domain,
+                    name,
+                )
             if name in seen:
                 continue
             seen.add(name)
