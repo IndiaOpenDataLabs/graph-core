@@ -19,7 +19,7 @@ from graph_core.llm import get_llm_provider
 from graph_core.models.chat import ChatMessage, ChatSession
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
-from graph_core.models.graph_rag import GraphRelationship
+from graph_core.models.graph_rag import GraphEntity, GraphRelationship
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
