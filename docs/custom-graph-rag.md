@@ -1,59 +1,40 @@
 # Custom Graph RAG
 
-This document explains how `custom_graph_rag` works today:
+This document describes the current `custom_graph_rag` implementation in this repo:
 
-- what gets extracted and stored during ingestion
-- how the base graph is queried
-- what the multi-dimensional relationship model changes
-- how the derived graph layer is built and used
+- how the base graph is ingested and queried
+- how the meta graph is built today
+- how base and meta graphs are stored
+- how query uses both layers
 
-It focuses on the current implementation in this repo, not an abstract design.
+It reflects the code after the move away from community-based derived graphs.
 
 ## Overview
 
-`custom_graph_rag` has two graph layers:
+`custom_graph_rag` now works with two normal collections:
 
-1. **Base graph**
-   - canonical entities
-   - canonical relationships
-   - relationship descriptions
-   - per-collection relationship/entity embeddings
-   - FalkorDB graph for traversal
+1. **Base collection**
+   - the canonical extracted graph from source documents
 
-2. **Derived graph**
-   - higher-level summaries built from the base graph
-   - typed community summaries
-   - typed bridge-node summaries
-   - directed typed connector-path summaries
-   - separate FalkorDB graph plus derived summary vectors
+2. **Meta collection**
+   - a sibling collection named:
+     - `<base_name>__meta`
+   - built from the base graph
+   - stores higher-level concepts and concept-to-concept relationships
 
-The base graph is the source of truth.
-The derived graph is a synthesized routing and summarization layer on top.
+Both are real collections. Both use the same persistence/query machinery:
 
-## Base Graph Ingestion
+- Postgres canonical graph tables
+- vector storage
+- FalkorDB graph storage
 
-### 1. Chunk extraction
+The difference is only in how the meta collection is generated.
 
-Each document is split into chunks.
-Each chunk goes through LLM-based extraction with optional gleaning passes.
+## Base Graph
 
-Extraction returns:
+### Ingestion
 
-- entities
-- relationships
-
-Relationships include:
-
-- `source_name`
-- `target_name`
-- `description`
-- `keywords`
-- `weight`
-- `rel_type`
-
-### 2. Canonicalization and merge
-
-Chunk-local entities and relationships are merged into canonical collection-level records in Postgres:
+Documents are chunked, extracted, canonicalized, and merged into:
 
 - `graph_entities`
 - `entity_descriptions`
@@ -61,494 +42,322 @@ Chunk-local entities and relationships are merged into canonical collection-leve
 - `graph_relationships`
 - `relationship_descriptions`
 
-Important details:
+Base relationships are canonicalized by:
 
-- entities are resolved across chunks into canonical entities
-- relationships are canonicalized by:
-  - source entity
-  - target entity
-  - `rel_type`
-- repeated relationship evidence increases canonical relationship weight
-- descriptions accumulate as supporting evidence
+- source entity
+- target entity
+- `rel_type`
 
-### 3. Base graph storage
+Relationship descriptions, keywords, and weights are retained as evidence.
 
-The base graph is stored in two places:
+### Storage
+
+The base collection is stored in:
 
 - **Postgres**
-  - canonical entities and relationships
-  - relationship weights and descriptions
+  - canonical entities, aliases, descriptions, relationships
 - **FalkorDB**
-  - one graph per collection
-  - graph name:
+  - one graph per collection:
     - `collection_<collection_id_without_dashes>`
 
-In Falkor:
+### Embeddings
 
-- nodes are `:Entity`
-- edges are typed by `rel_type`
-- edge properties also store:
-  - `id`
-  - `weight`
-  - `keywords`
-  - `collection_id`
-  - `rel_type`
+Per collection, we store embeddings for:
 
-### 4. Embeddings
+- raw chunks
+- entity descriptions / centroids
+- relationship descriptions
 
-Per collection, we store:
-
-- entity description embeddings
-- relationship description embeddings
-- entity centroid embeddings
-- raw chunk embeddings
-
-Relationship embedding text is rel-type-aware. It includes:
-
-- source
-- target
-- `rel_type`
-- description
-- keywords
-
-That matters because retrieval should distinguish:
+Relationship embedding text is `rel_type`-aware, so:
 
 - `CAUSES`
-- `EXPLAINS`
 - `SUPPORTS`
 - `IS_AN_EXAMPLE_OF`
+- `DEPENDS_ON`
 
-instead of treating every edge as generic prose.
+remain meaningfully distinct during retrieval.
 
-## Multi-Dimensional Relationships
+## Query Modes
 
-The important change in the base graph is that relationships are not just:
-
-- `A -> B`
-
-They are:
-
-- `A -[REL_TYPE]-> B`
-
-The same pair can exist with multiple meanings.
-
-Example:
-
-- `Pranayama -[EXPLAINS]-> Ojas`
-- `Pranayama -[AFFECTS]-> Ojas`
-- `Pranayama -[REQUIRES]-> Ojas`
-
-This matters in three places:
-
-1. **Storage**
-   - separate canonical relationships per `rel_type`
-
-2. **Embedding retrieval**
-   - relationship embedding text includes `rel_type`
-
-3. **Final context**
-   - relationship evidence is grouped under `Relationships By Type`
-
-## Base Query Flow
-
-The main query implementation is in:
+The main query implementation is:
 
 - `src/graph_core/services/graph/query/graph_rag.py`
 
-### Supported modes
-
-`custom_graph_rag` supports:
+Supported modes:
 
 - `entity-first`
 - `relationship-first`
 - `hybrid`
 - `mix`
 
-Current default is `mix`.
+`mix` is still the most capable mode.
 
-### Query-side embeddings
+Base query flow remains:
 
-Query embeddings are instruction-formatted before retrieval:
+1. retrieve entity and/or relationship seeds
+2. traverse the Falkor graph
+3. score and merge graph evidence
+4. answer from grounded entity/relationship context
 
-- entity retrieval prompt
-- relationship retrieval prompt
-- derived graph retrieval prompt
+The final answer prompt is grounded in:
 
-This improves embedding behavior for models like `Qwen3-Embedding-8B`.
-
-### Base retrieval strategies
-
-#### Entity-first
-
-- retrieve entity seeds from entity embeddings and aliases
-- traverse outward in Falkor
-- score edges using:
-  - relationship similarity
-  - canonical edge weight
-  - keyword overlap
-  - dimension weight
-
-#### Relationship-first
-
-- retrieve relationship seeds first
-- take endpoint entities
-- connect endpoints using bounded path search
-- use those paths as the main evidence
-
-#### Hybrid
-
-- merge entity-first and relationship-first states
-
-#### Mix
-
-- first-pass entity candidate read
-- optional rewrite into longer retrieval subqueries
-- relationship-first retrieval on those subqueries
-- merge resulting states
-
-The rewrite is gated by first-pass entity confidence.
-
-## Relationship Scoring
-
-Relationship relevance is not just cosine similarity.
-
-The combined score uses:
-
-- raw relationship embedding similarity
-- canonical relationship weight
-- keyword overlap with query
-- dimension weight for the active `rel_type`
-
-Important implementation detail:
-
-- raw relationship similarity and combined relationship score are stored separately
-- path expansion uses raw similarity as input, then applies weighting cleanly
-- final relation ordering uses combined score
-
-This avoids double-applying weight effects during path search.
-
-## Final Prompt for Base Graph
-
-The answer LLM does not see retrieval internals.
-
-It sees:
-
-- `Derived Understanding` if available
-- `Entities`
-- `Relationships By Type`
-- original user question
-
-The relationship section is formatted as:
-
-- `SRC -[REL_TYPE]-> TGT: description`
-
-This lets the model see multiple meanings between the same endpoints.
-
-## Derived Graph
-
-The derived graph is a second-pass structural summary over the canonical base graph.
-
-It is not extracted directly from chunks.
-It is built from the merged collection graph.
-
-### Why it exists
-
-The base graph is good at local facts.
-The derived graph is meant to capture higher-order structure, such as:
-
-- subsystem-like regions
-- bridge entities
-- small connector flows between important anchors
-
-This is the layer that should eventually support more genuine “understanding” instead of only chunk-local extraction.
-
-## Derived Graph Build: First Pass
-
-The first pass is structural analysis over the base graph.
-
-Current implementation is **rel-type-aware** and partly **direction-aware**:
-
-1. Split canonical relationships by `rel_type`
-2. For each `rel_type`:
-   - build a weighted undirected projection for community detection
-   - build a directed adjacency view for path and metric analysis
-3. Compute strong-edge communities using `min_edge_strength`
-4. Merge very small communities into stronger neighbors
-5. Compute per-node graph metrics for each `rel_type`:
-   - `PageRank`
-   - `HITS` authority / hub
-   - `eigenvector centrality`
-   - directed `betweenness`
-   - directed harmonic `closeness`
-   - articulation behavior
-   - cross-community connectivity
-   - inbound / outbound strength
-6. Select typed anchors and typed bridge nodes
-7. Build bounded **directed** connector paths between anchors for that `rel_type`
-8. Aggregate the per-type analyses into a collection-level summary
-
-This runs over canonical collection-level relationships, not chunk-local raw extractions.
-
-### Output of first pass
-
-The analysis returns:
-
-- `rel_type`-specific communities
-- `rel_type`-specific node metrics
-- aggregated top anchors
-- aggregated bridge nodes
-- directed connector paths
-
-This is a structural view, not yet a natural-language summary layer.
-
-## Derived Graph Build: Second Pass
-
-The second pass turns the first-pass structures into stored derived knowledge.
-
-Current derived node types:
-
-- `derived_community`
-- `derived_bridge`
-- `derived_connector`
-- `base_entity_ref`
-
-Current derived edge types:
-
-- `SUMMARIZES`
-- `FOCUSES_ON`
-- `USES`
-- `CONNECTS`
-
-### Storage
-
-The derived layer is persisted in two places:
-
-1. **Derived Falkor graph**
-   - one graph per collection
-   - graph name:
-     - `collection_<collection_id_without_dashes>_derived`
-
-2. **Derived vector summaries**
-   - stored in the collection vector table
-   - tagged with:
-     - `memory_type=derived_graph`
-
-### Rebuild behavior
-
-When derived understanding is rebuilt:
-
-- the derived Falkor graph is dropped and recreated
-- previous `memory_type=derived_graph` vector chunks are deleted
-- new summaries are embedded and inserted
-
-So the derived layer is treated as canonical generated state, not append-only memory.
-
-## What the Derived Graph Currently Stores
-
-### Community summaries
-
-Each strong community becomes a summary node scoped to a specific `rel_type`.
-
-The summary includes:
-
-- `rel_type`
-- size
-- strong edge count
-- anchor preview
-- representative entity names
-
-### Bridge summaries
-
-Each important bridge node becomes a derived summary node describing:
-
-- its community
-- the `rel_type`s in which it is important
-- which other communities it connects to
-- external connection strength
-- weighted degree
-- inbound / outbound strength
-- graph metrics such as:
-  - betweenness
-  - closeness
-  - hub score
-  - authority score
-
-### Connector summaries
-
-Each bounded connector path becomes a derived summary node describing:
-
-- `rel_type`
-- start anchor
-- end anchor
-- hop count
-- path score
-- directed flow of entities and edges
-
-## How Queries Use the Derived Graph
-
-Derived graph usage is now integrated into `custom_graph_rag` query flow.
-
-### 1. Initial base-graph retrieval
-
-At query time, the normal `custom_graph_rag` retrieval runs first:
-
-- entity-first, relationship-first, hybrid, or mix
-- rel-type-aware graph traversal
-- combined relationship scoring using similarity, weight, keywords, and dimension weight
-
-This builds the initial matched graph footprint.
-
-### 2. Graph-grounded route profiling
-
-The matched footprint is then compared against offline graph metrics from the enhanced analysis.
-
-From the matched nodes, the query layer derives a route profile across:
-
-- `hub`
-- `authority`
-- `bridge`
-- `central`
-- `importance`
-
-This routing is **graph-grounded**, not keyword-routed:
-
-- it uses the metric profile of the actually matched nodes
-- it also tracks dominant matched `rel_type`s
-
-### 3. Route-aware derived summary retrieval
-
-The user question is embedded with a derived-retrieval instruction and vector search is run against collection chunks filtered by:
-
-- `memory_type=derived_graph`
-
-But the resulting derived summaries are no longer treated equally.
-They are reranked by:
-
-- route kind
-  - e.g. hub-like questions slightly prefer bridge/connector derived nodes
-  - authority-like questions slightly prefer community summaries
-  - bridge-like questions strongly prefer bridge/connector summaries
-  - central questions prefer connector/community summaries
-- matched `rel_type` profile
-
-So the derived layer is used differently depending on the graph shape of the query.
-
-### 4. Derived graph expansion
-
-For each matched derived summary:
-
-- load the derived Falkor node
-- expand one hop in the derived graph
-- collect:
-  - linked derived edges
-  - linked target nodes
-  - base graph provenance from `source_ids`
-
-### 5. Seeding base graph retrieval
-
-Base entity IDs recovered from derived provenance are injected into the base graph query state as additional relevant entities.
-
-So the derived layer does not replace base retrieval.
-It nudges the base retrieval toward the right part of the graph.
-
-### 6. Final answer context
-
-The final prompt now includes:
-
-- `Derived Understanding`
 - `Entities`
 - `Relationships By Type`
 
-The LLM is explicitly instructed:
+and uses the base graph as the evidence layer.
 
-- use derived understanding as high-level guidance
-- ground specific claims in base entity and relationship evidence
+## Meta Graph
 
-## Operational Commands
+### What it is
 
-### Analyze first-pass structure
+The old special `_derived` graph is gone.
 
-```bash
-PYTHONPATH=src .venv/bin/python docs/HELPER.py graph-analysis <collection_id>
+The meta layer is now just another collection:
+
+- `<base_name>__meta`
+
+It is materialized using the same models as base:
+
+- `GraphEntity`
+- `EntityAlias`
+- `EntityDescription`
+- `GraphRelationship`
+- `RelationshipDescription`
+
+So meta concepts are first-class graph objects, not special-case Falkor-only nodes.
+
+### How it is built
+
+The meta collection is built from the base graph in two stages:
+
+1. **Concept candidate mining**
+2. **Concept materialization + deterministic concept linking**
+
+## Concept Candidate Mining
+
+The current candidate generator is **role similarity**, not Louvain communities.
+
+### Role-similarity construction
+
+For each base entity, we build a typed signature from its neighborhood:
+
+- outgoing tokens:
+  - `(rel_type, target)`
+- incoming tokens:
+  - `(source, rel_type)`
+
+This gives each node a typed in/out structural signature.
+
+### Pair similarity
+
+We compare entity pairs using standard measures:
+
+- **overlap count**
+- **cosine similarity**
+- **Jaccard similarity**
+
+Current thresholds in analytics:
+
+- overlap `>= 3`
+- cosine `>= 0.2`
+- Jaccard `>= 0.1`
+
+If a pair clears those thresholds, it becomes an edge in a **role-similarity graph**.
+
+### Groups
+
+From that similarity graph we extract **maximal cliques**.
+
+These cliques can be:
+
+- pairs
+- triplets
+- larger groups
+
+Those groups are the current concept candidates.
+
+This is the key change:
+
+- we no longer treat dense graph fragments as concepts
+- we treat **entities with similar typed graph roles** as concept candidates
+
+That makes the meta layer much closer to:
+
+- `Vata`, `Pitta`, `Kapha` -> `Dosha`
+- `Heaviness`, `Inertia`, `Stagnation` -> `Tamasic Qualities`
+
+instead of producing one concept per `rel_type` fragment.
+
+## Concept Induction
+
+Each role-similarity clique is sent to the collection LLM as one candidate region.
+
+The prompt gives the LLM:
+
+- member entities
+- dominant relation types
+- pairwise role-similarity evidence
+- representative neighborhood edges
+
+The LLM returns one concept object:
+
+- `label`
+- `concept_type`
+- `description`
+- `aliases`
+- `importance_reason`
+- `member_entity_names`
+
+The `label` becomes the canonical name of the meta entity.
+
+Example:
+
+```json
+{
+  "anchor": "Heaviness",
+  "label": "Tamasic Qualities",
+  "concept_type": "Guna/Energetic State"
+}
 ```
 
-or
+In that case:
 
-```bash
-uv run python -m graph_core.scripts.graph_analysis <collection_id>
-```
+- `Tamasic Qualities` is the meta entity name
+- `Heaviness` is evidence grounding, not the meta entity name
 
-### Build and persist derived understanding
+## Meta Relationship Construction
 
-```bash
-PYTHONPATH=src .venv/bin/python docs/HELPER.py graph-understanding <collection_id>
-```
+Concept-to-concept edges are **not** produced by a second LLM pass.
 
-or
+They are built deterministically from the **base graph**.
 
-```bash
-uv run python -m graph_core.scripts.graph_understanding <collection_id> <namespace_id>
-```
+After concepts are grounded to base `source_ids`, concept pairs are linked using:
+
+- direct cross-concept base edges
+- dominant cross-concept `rel_type`s
+- short directed paths between grounded base node sets
+- boundary entities
+- bridge/intermediate entities
+
+The current persisted concept-to-concept edge type is:
+
+- `CONNECTS_TO`
+
+Its description and keywords summarize:
+
+- dominant base `rel_type`s
+- path evidence
+- boundary / bridge entities
+
+So:
+
+- concept nodes are LLM-induced
+- concept-to-concept edges are base-graph-derived
+
+## Meta Collection Materialization
+
+The meta collection is materialized through the same resolver/update path as base ingestion.
+
+That means:
+
+- canonical-name matching
+- alias matching
+- normal entity/relationship persistence
+
+There is no separate special-case meta storage model anymore.
+
+Meta entities also carry:
+
+- aliases
+- type
+- base evidence IDs via metadata/source IDs
+
+## Query Behavior
+
+Query now treats base and meta collections the same way operationally.
+
+When querying a base collection:
+
+1. run `custom_graph_rag` on the base collection using the user-selected mode
+2. if `<base_name>__meta` exists:
+   - run the same `custom_graph_rag` logic on the meta collection with the same mode
+3. combine both contexts into the final answer prompt
+
+So there is no special shallow meta retrieval path anymore.
+
+### Important constraint
+
+The final answer is instructed to:
+
+- use meta concepts only as internal higher-level context
+- ground the actual answer in base entities and base relationships
+- avoid framing the answer around meta concepts unless the same idea is directly supported by base evidence
+
+So:
+
+- meta graph helps with abstraction
+- base graph remains the grounding/evidence layer
+
+## Chunking
+
+Chunking is now structure-aware.
+
+### Text
+
+Non-code text uses recursive character splitting rather than fixed token windows.
+
+### Code
+
+Code uses code-aware chunking first, with fallback to language-aware recursive splitting.
+
+This is meant to reduce:
+
+- mid-function splits
+- mid-class splits
+- broken code context
+
+## Current Shape of the Meta Graph
+
+For a typical collection, the meta graph now looks like:
+
+- a relatively small number of concept candidates from role cliques
+- grounded `base_entity_ref` nodes as evidence
+- deterministic `CONNECTS_TO` edges between concepts
+- `EVIDENCED_BY` edges from concepts to grounded base entities
+
+This is much smaller and cleaner than the old community/bridge/connector derived graph.
 
 ## Current Limitations
 
-### 1. Derived summaries are heuristic, not LLM-authored
+### 1. Role similarity still needs tuning
 
-The derived layer is currently built from graph structure with deterministic summaries.
+Current thresholds are fixed:
 
-That is useful, but still limited.
-Later it can grow into:
+- overlap `>= 3`
+- cosine `>= 0.2`
+- Jaccard `>= 0.1`
 
-- richer subgraph summaries
-- subsystem naming
-- invariants
-- failure modes
-- code-flow understanding
+These are reasonable, but not final.
 
-### 2. Query routing is metric-aware, but still lightweight
+The important part is the method:
 
-Current query usage is stronger than before:
+- role similarity over typed signatures
 
-- retrieve base graph footprint first
-- derive a metric-based route profile from matched nodes
-- rerank derived summaries by route kind and `rel_type`
-- expand one hop
-- seed base entity IDs
-- prepend derived understanding to the final prompt
+not the exact numeric thresholds.
 
-This is better than uniform derived retrieval, but it is still lightweight.
+### 2. Clique induction can still over-fragment
 
-It does **not** yet:
+Some collections produce many small exact-match pairs/triplets.
 
-- run full metric-specific traversal policies
-- construct different detailed subgraphs for hub vs authority vs bridge questions
-- use the derived graph as the primary planner for the entire retrieval path
+This is still better than the old community pipeline, but there is more work to do on:
 
-A later version can make routing more aggressive and subgraph-aware.
+- larger group induction
+- merging nearby concepts
+- concept deduplication beyond simple resolver behavior
 
-### 3. No background build pipeline yet
+### 3. Sparse semantic edges still matter
 
-Derived understanding is built explicitly today.
-It is not yet an automatic background pass on ingest completion.
-
-### 4. Cross-chunk logic is still limited
-
-The base graph already merges entities and relationships across chunks, but true cross-chunk understanding is still mostly indirect.
-
-The derived graph is the beginning of that layer, not the end state.
-
-### 5. Sparse semantic analyses are still missing
-
-The current enhanced graph is best at structural architecture questions.
-
-It is still weaker on sparse semantic questions that need special edge families, such as:
-
-- exception redundancy
-- field write/read usage
-- auth gating
-- config propagation
-
-Those cases will require richer base graph edges such as:
+For some questions, the base graph still needs richer edge families such as:
 
 - `RAISES`
 - `CATCHES`
@@ -556,16 +365,18 @@ Those cases will require richer base graph edges such as:
 - `WRITES`
 - `GUARDS`
 
+Without those, neither base nor meta graph can fully answer some semantic questions.
+
 ## Mental Model
 
-The simplest way to think about `custom_graph_rag` now is:
+The current mental model is:
 
-- **base graph** = grounded extracted facts
-- **derived graph** = typed structural summaries and routing hints over important regions and flows
+- **base graph** = grounded facts and evidence
+- **meta graph** = higher-level concepts induced from role-similar entities, linked deterministically through base-graph structure
 
-Querying now uses both:
+And query uses both:
 
-- derived graph for metric-aware guidance
+- meta graph for abstraction
 - base graph for evidence
 
-That is the current architecture. It is already more expressive than chunk-only retrieval, but it is still an intermediate step toward richer graph reasoning.
+That is the current architecture.
