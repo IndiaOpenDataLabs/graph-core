@@ -28,6 +28,7 @@ from typing import Any
 
 import httpx
 import networkx as nx
+import numpy as np
 
 from graph_core.services.graph.analytics import _load_graph_records
 
@@ -207,15 +208,6 @@ async def _embed_texts(
         return [list(item["embedding"]) for item in data]
 
 
-def _vector_cosine(left: list[float], right: list[float]) -> float:
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if left_norm == 0.0 or right_norm == 0.0:
-        return 0.0
-    return dot / (left_norm * right_norm)
-
-
 async def _group_rel_types(
     raw_rel_type_counts: Counter[str],
     *,
@@ -231,12 +223,18 @@ async def _group_rel_types(
         base_url=base_url,
         model=model,
     )
+    matrix = np.asarray(embeddings, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    normalized = matrix / norms
+    cosine_matrix = normalized @ normalized.T
+
     graph = nx.Graph()
     graph.add_nodes_from(rel_types)
     for i, left in enumerate(rel_types):
         for j in range(i + 1, len(rel_types)):
             right = rel_types[j]
-            cosine = _vector_cosine(embeddings[i], embeddings[j])
+            cosine = float(cosine_matrix[i, j])
             if cosine >= cosine_min:
                 graph.add_edge(left, right, cosine=cosine)
     mapping: dict[str, str] = {}
