@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import networkx as nx
 
 from graph_core.services.graph.analytics import _load_graph_records
 
