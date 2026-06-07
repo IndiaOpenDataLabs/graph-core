@@ -1,8 +1,9 @@
-"""Burner for triplet concept induction from role-similarity structure.
+"""Burner for clique concept induction from role-similarity structure.
 
 Build a typed-signature similarity graph over base entities, keep pair edges
-that satisfy overlap/similarity thresholds, enumerate triangles (3-cliques),
-and optionally ask an OpenAI-compatible LLM to induce one concept per triplet.
+that satisfy overlap/similarity thresholds, enumerate maximal cliques of size
+>= 2, and optionally ask an OpenAI-compatible LLM to induce one concept per
+clique.
 
 Usage:
   PYTHONPATH=src .venv/bin/python docs/role_triplet_burner.py \
@@ -56,10 +57,10 @@ def _parse_args() -> argparse.Namespace:
         help="Minimum typed-signature size to keep a node",
     )
     parser.add_argument(
-        "--max-triplets",
+        "--max-cliques",
         type=int,
         default=20,
-        help="Maximum triplets to keep after ranking",
+        help="Maximum cliques to keep after ranking",
     )
     parser.add_argument(
         "--base-url",
@@ -76,7 +77,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="docs/triplet_burner_output",
-        help="Directory to write triplet concept JSON files into",
+        help="Directory to write clique concept JSON files into",
     )
     return parser.parse_args()
 
@@ -168,57 +169,55 @@ async def _build_similarity_structures(
     return collection.name, signatures, pair_metrics, similarity_edges
 
 
-def _enumerate_triplets(
+def _enumerate_cliques(
     pair_metrics: dict[tuple[str, str], dict[str, Any]],
-    max_triplets: int,
+    max_cliques: int,
 ) -> list[dict[str, Any]]:
-    adjacency: dict[str, set[str]] = defaultdict(set)
+    graph = nx.Graph()
     for a, b in pair_metrics:
-        adjacency[a].add(b)
-        adjacency[b].add(a)
+        graph.add_edge(a, b)
 
-    triplets: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for a in sorted(adjacency):
-        for b, c in combinations(sorted(adjacency[a]), 2):
-            if b not in adjacency[c]:
-                continue
-            triplet = tuple(sorted((a, b, c)))
-            if triplet in seen:
-                continue
-            seen.add(triplet)
-            ab = pair_metrics[tuple(sorted((triplet[0], triplet[1])))]
-            ac = pair_metrics[tuple(sorted((triplet[0], triplet[2])))]
-            bc = pair_metrics[tuple(sorted((triplet[1], triplet[2])))]
-            avg_cosine = (ab["cosine"] + ac["cosine"] + bc["cosine"]) / 3.0
-            avg_jaccard = (ab["jaccard"] + ac["jaccard"] + bc["jaccard"]) / 3.0
-            total_overlap = ab["overlap"] + ac["overlap"] + bc["overlap"]
-            triplets.append(
-                {
-                    "nodes": list(triplet),
-                    "avg_cosine": avg_cosine,
-                    "avg_jaccard": avg_jaccard,
-                    "total_overlap": total_overlap,
-                    "pair_metrics": [ab, ac, bc],
-                }
-            )
-    triplets.sort(
+    cliques: list[dict[str, Any]] = []
+    for clique in nx.find_cliques(graph):
+        if len(clique) < 2:
+            continue
+        clique_nodes = sorted(clique)
+        metrics = [
+            pair_metrics[tuple(sorted((left, right)))]
+            for left, right in combinations(clique_nodes, 2)
+        ]
+        avg_cosine = sum(metric["cosine"] for metric in metrics) / len(metrics)
+        avg_jaccard = sum(metric["jaccard"] for metric in metrics) / len(metrics)
+        total_overlap = sum(metric["overlap"] for metric in metrics)
+        cliques.append(
+            {
+                "clique_id": f"clique_{len(cliques) + 1}",
+                "nodes": clique_nodes,
+                "size": len(clique_nodes),
+                "avg_cosine": avg_cosine,
+                "avg_jaccard": avg_jaccard,
+                "total_overlap": total_overlap,
+                "pair_metrics": metrics,
+            }
+        )
+    cliques.sort(
         key=lambda item: (
+            item["size"],
             item["avg_cosine"],
             item["avg_jaccard"],
             item["total_overlap"],
         ),
         reverse=True,
     )
-    return triplets[:max_triplets]
+    return cliques[:max_cliques]
 
 
-async def _build_triplet_payloads(
+async def _build_clique_payloads(
     collection_id: uuid.UUID,
-    triplets: list[dict[str, Any]],
+    cliques: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     _collection, _nodes, relationships, _aliases = await _load_graph_records(collection_id)
-    memberships = {node for triplet in triplets for node in triplet["nodes"]}
+    memberships = {node for clique in cliques for node in clique["nodes"]}
     ego_rels: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for rel in relationships:
         source_name = str(rel.source_name)
@@ -247,9 +246,9 @@ async def _build_triplet_payloads(
                 )
 
     payloads: list[dict[str, Any]] = []
-    for idx, triplet in enumerate(triplets, start=1):
+    for idx, clique in enumerate(cliques, start=1):
         representative: list[dict[str, Any]] = []
-        for node in triplet["nodes"]:
+        for node in clique["nodes"]:
             by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for rel in ego_rels[node]:
                 by_type[rel["rel_type"]].append(rel)
@@ -266,19 +265,20 @@ async def _build_triplet_payloads(
             deduped.append(rel)
         payloads.append(
             {
-                "triplet_id": f"triplet_{idx}",
-                "nodes": triplet["nodes"],
-                "avg_cosine": triplet["avg_cosine"],
-                "avg_jaccard": triplet["avg_jaccard"],
-                "total_overlap": triplet["total_overlap"],
-                "pair_metrics": triplet["pair_metrics"],
+                "clique_id": clique.get("clique_id") or f"clique_{idx}",
+                "nodes": clique["nodes"],
+                "size": clique["size"],
+                "avg_cosine": clique["avg_cosine"],
+                "avg_jaccard": clique["avg_jaccard"],
+                "total_overlap": clique["total_overlap"],
+                "pair_metrics": clique["pair_metrics"],
                 "representative_relationships": deduped,
             }
         )
     return payloads
 
 
-async def _induce_triplet_concepts(
+async def _induce_clique_concepts(
     collection_name: str,
     payloads: list[dict[str, Any]],
     *,
@@ -287,13 +287,13 @@ async def _induce_triplet_concepts(
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
     system = (
-        "You are inducing reusable higher-level concepts from triplets of role-similar entities in a knowledge graph. "
-        "Each triplet is a candidate shared concept because the three entities occupy similar typed graph positions. "
-        "Return only valid JSON: an array of objects with keys triplet_id, nodes, label, concept_type, description, aliases, rationale."
+        "You are inducing reusable higher-level concepts from cliques of role-similar entities in a knowledge graph. "
+        "Each clique is a candidate shared concept because its entities occupy similar typed graph positions. "
+        "Return only valid JSON: an array of objects with keys clique_id, nodes, label, concept_type, description, aliases, rationale."
     )
     user = (
         f"Collection: {collection_name}\n"
-        "For each triplet below, produce one shared concept object.\n\n"
+        "For each clique below, produce one shared concept object.\n\n"
         + json.dumps(payloads, ensure_ascii=True)
     )
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
@@ -331,7 +331,7 @@ async def main() -> None:
         cosine_min=args.cosine_min,
         jaccard_min=args.jaccard_min,
     )
-    triplets = _enumerate_triplets(pair_metrics, args.max_triplets)
+    cliques = _enumerate_cliques(pair_metrics, args.max_cliques)
 
     print(
         json.dumps(
@@ -339,19 +339,19 @@ async def main() -> None:
                 "collection": collection_name,
                 "nodes_with_signatures": len(signatures),
                 "similarity_edges": len(similarity_edges),
-                "triplets": len(triplets),
-                "top_triplets": triplets[:10],
+                "cliques": len(cliques),
+                "top_cliques": cliques[:10],
             },
             ensure_ascii=True,
             indent=2,
         )
     )
 
-    if not args.base_url or not args.model or not triplets:
+    if not args.base_url or not args.model or not cliques:
         return
 
-    payloads = await _build_triplet_payloads(collection_id, triplets)
-    concepts = await _induce_triplet_concepts(
+    payloads = await _build_clique_payloads(collection_id, cliques)
+    concepts = await _induce_clique_concepts(
         collection_name,
         payloads,
         base_url=args.base_url,
@@ -362,8 +362,8 @@ async def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for concept in concepts:
-        triplet_id = str(concept["triplet_id"])
-        out_path = output_dir / f"{triplet_id}.json"
+        clique_id = str(concept["clique_id"])
+        out_path = output_dir / f"{clique_id}.json"
         out_path.write_text(
             json.dumps(concept, ensure_ascii=True, indent=2) + "\n",
             encoding="utf-8",
