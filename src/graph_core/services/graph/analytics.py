@@ -497,7 +497,6 @@ async def build_collection_understanding(
     llm_provider: LLMProvider | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
-    max_candidate_communities_per_rel_type = 5
     min_candidate_community_size = 5
     max_deterministic_link_pairs = 64
     max_deterministic_meta_edges = 96
@@ -613,16 +612,11 @@ async def build_collection_understanding(
         if int(community.get("size", 0)) >= min_candidate_community_size:
             communities_by_type[rel_type].append(community)
 
-    selected_communities: list[dict[str, Any]] = []
-    rel_types_in_order = sorted(
-        {
-            str(community.get("rel_type") or "RELATES_TO")
-            for community in analysis.get("communities", [])
-        }
-    )
-    for rel_type in rel_types_in_order:
-        chosen = communities_by_type.get(rel_type, [])
-        selected_communities.extend(chosen[:max_candidate_communities_per_rel_type])
+    selected_communities = [
+        community
+        for rel_type in sorted(communities_by_type)
+        for community in communities_by_type[rel_type]
+    ]
 
     for idx, community in enumerate(selected_communities, start=1):
         representative_edges = community.get("representative_edges", [])
