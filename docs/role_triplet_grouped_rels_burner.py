@@ -33,6 +33,13 @@ import numpy as np
 from graph_core.services.graph.analytics import _load_graph_records
 
 
+_REL_TYPE_GROUPING_INSTRUCTION = (
+    "Embed this relationship type label for semantic clustering. "
+    "Focus on the role, direction, and meaning the label conveys in a knowledge graph. "
+    "Labels that express nearly the same relationship semantics should be close even if worded differently."
+)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--collection-id", required=True, help="Collection UUID")
@@ -109,6 +116,10 @@ def _jaccard(a: set[Any], b: set[Any]) -> float:
 
 def _cosine_binary(a: set[Any], b: set[Any]) -> float:
     return len(a & b) / math.sqrt(len(a) * len(b)) if a and b else 0.0
+
+
+def _format_retrieval_query(instruction: str, query: str) -> str:
+    return f"<Instruct>: {instruction}\n<Query>: {query}"
 
 
 async def _build_similarity_structures(
@@ -201,7 +212,13 @@ async def _embed_texts(
     async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
             f"{base_url.rstrip('/')}/embeddings",
-            json={"model": model, "input": texts},
+            json={
+                "model": model,
+                "input": [
+                    _format_retrieval_query(_REL_TYPE_GROUPING_INSTRUCTION, text)
+                    for text in texts
+                ],
+            },
         )
         response.raise_for_status()
         data = response.json()["data"]
