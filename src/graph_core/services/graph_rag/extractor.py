@@ -173,8 +173,7 @@ formatted entities and relationships.
    {rel_type_vocab}. {domain_rel_type_guidance} DEFAULT TO A SINGLE rel_type PER PAIR; only
    emit multiple when the text genuinely supports distinct,
    simultaneously-true roles and you can write a meaningfully
-   different description for each. Pick the best single fit; use
-   "RELATES_TO" only if nothing more specific applies.
+   different description for each. Pick the best single fit.
 8. Preserve multiple genuinely distinct rel_type entries for the same
    source/target pair when the text supports them; do not collapse them
    to one generic edge unless the evidence really supports only one.
