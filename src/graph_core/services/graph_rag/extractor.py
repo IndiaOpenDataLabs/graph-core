@@ -331,18 +331,12 @@ class LLMGraphExtractor:
     @staticmethod
     def _domain_relationship_guidance(domain: str | None) -> str:
         if domain != "code":
-            if domain == "books":
-                return (
-                    "For books-domain relationships, let rel_type labels capture "
-                    "the ideas, argumentative logic, causal logic, explanatory "
-                    "logic, or conceptual roles in the text. Reuse an existing "
-                    "rel_type from the current set when it fits; if none fits, "
-                    "create a concise new upper-snake rel_type that reflects the "
-                    "idea or logical role precisely."
-                )
             return (
-                "Keep relationship descriptions concise and specific to the "
-                "actual role supported by the text."
+                "For non-code relationships, let rel_type labels capture the "
+                "ideas, reasoning, causal or explanatory logic, and conceptual "
+                "roles in the text. Reuse an existing rel_type from the current "
+                "set when it fits; if none fits, create a concise new upper-snake "
+                "rel_type that reflects the idea or logical role precisely."
             )
         return (
             "For code-domain relationships, write the description in short "
@@ -360,11 +354,19 @@ class LLMGraphExtractor:
 
     @staticmethod
     def _domain_rel_type_guidance(domain: str | None) -> str:
-        if domain in {"code", "books"}:
+        if domain == "code":
             return (
                 "Prefer an existing rel_type from this current set when it truly "
                 "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
-                "that is semantically precise for this domain."
+                "that captures the architecture, data flow, or execution role "
+                "more precisely."
+            )
+        if domain is not None:
+            return (
+                "Prefer an existing rel_type from this current set when it truly "
+                "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
+                "that captures the underlying idea, logic, or conceptual role "
+                "more precisely."
             )
         return (
             "Do not invent names outside this current set; any unknown rel_type "
