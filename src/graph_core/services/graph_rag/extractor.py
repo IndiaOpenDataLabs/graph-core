@@ -120,7 +120,7 @@ entities and relationships from input text.
    - Each entity must have: name, type, description.
    - Each relationship must have: source, target, rel_type.
    - "rel_type" is a list of one or more objects, each with:
-       name        (string, guided by: {rel_type_vocab})
+       name        (string)
        description (string, role-specific: explains the connection
                     in the semantic role of THIS rel_type entry)
        keywords    (array of strings, role-specific)
@@ -170,7 +170,7 @@ formatted entities and relationships.
    and significance of the connection.
 6a. {domain_relationship_guidance}
 7. Each relationship's "rel_type" must follow this guidance:
-   {rel_type_vocab}. {domain_rel_type_guidance} DEFAULT TO A SINGLE rel_type PER PAIR; only
+   {domain_rel_type_guidance} DEFAULT TO A SINGLE rel_type PER PAIR; only
    emit multiple when the text genuinely supports distinct,
    simultaneously-true roles and you can write a meaningfully
    different description for each. Pick the best single fit.
