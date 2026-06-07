@@ -498,7 +498,7 @@ async def build_collection_understanding(
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
     max_candidate_communities_per_rel_type = 5
-    min_candidate_community_size = 8
+    min_candidate_community_size = 5
     max_deterministic_link_pairs = 64
     max_deterministic_meta_edges = 96
     entity_aliases_by_id: dict[str, list[str]] = dict(
@@ -608,13 +608,10 @@ async def build_collection_understanding(
 
     candidate_regions: list[dict[str, Any]] = []
     communities_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    fallback_communities: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for community in analysis.get("communities", []):
         rel_type = str(community.get("rel_type") or "RELATES_TO")
         if int(community.get("size", 0)) >= min_candidate_community_size:
             communities_by_type[rel_type].append(community)
-        else:
-            fallback_communities[rel_type].append(community)
 
     selected_communities: list[dict[str, Any]] = []
     rel_types_in_order = sorted(
@@ -624,7 +621,7 @@ async def build_collection_understanding(
         }
     )
     for rel_type in rel_types_in_order:
-        chosen = communities_by_type.get(rel_type) or fallback_communities.get(rel_type, [])
+        chosen = communities_by_type.get(rel_type, [])
         selected_communities.extend(chosen[:max_candidate_communities_per_rel_type])
 
     for idx, community in enumerate(selected_communities, start=1):
