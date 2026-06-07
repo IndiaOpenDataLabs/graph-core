@@ -1,7 +1,7 @@
 """Offline analytics over the canonical collection graph.
 
-Builds structural candidate regions over the base graph and induces semantic
-concepts from them via LLM or deterministic fallback.
+Builds role-similarity candidate regions over the base graph and induces
+semantic concepts from them via LLM or deterministic fallback.
 """
 
 from __future__ import annotations
@@ -142,152 +142,6 @@ def _format_connects_to_description(
     if bridge_names:
         steps.append(f"BRIDGE VIA [{', '.join(bridge_names)}]")
     return "; ".join(steps).strip() + "."
-
-def _build_louvain_communities(
-    nodes: list[NodeRecord],
-    relationships: list[RelationshipRecord],
-) -> list[dict[str, Any]]:
-    name_by_id = {node.id: node.name for node in nodes}
-    ranked: list[dict[str, Any]] = []
-    relationships_by_type: dict[str, list[RelationshipRecord]] = defaultdict(list)
-    for rel in relationships:
-        relationships_by_type[str(rel.rel_type or "RELATES_TO")].append(rel)
-
-    for rel_type, rels in relationships_by_type.items():
-        graph = nx.DiGraph()
-        relationship_ids_by_edge: dict[tuple[str, str], list[str]] = defaultdict(list)
-        edge_count_by_pair = Counter()
-
-        for rel in rels:
-            left = str(rel.source_id)
-            right = str(rel.target_id)
-            graph.add_node(left, name=rel.source_name)
-            graph.add_node(right, name=rel.target_name)
-            if graph.has_edge(left, right):
-                graph[left][right]["weight"] += float(rel.weight or 0)
-            else:
-                graph.add_edge(left, right, weight=float(rel.weight or 0))
-            relationship_ids_by_edge[(left, right)].append(str(rel.id))
-            edge_count_by_pair[(left, right)] += 1
-
-        if graph.number_of_nodes() == 0:
-            continue
-
-        communities = nx.algorithms.community.louvain_communities(
-            graph,
-            weight="weight",
-            seed=42,
-        )
-
-        for idx, members in enumerate(communities):
-            subgraph = graph.subgraph(members).copy()
-            internal_weight = sum(
-                float(data.get("weight", 0.0)) for _, _, data in subgraph.edges(data=True)
-            )
-            external_in_weight = 0.0
-            external_out_weight = 0.0
-            for node_id in members:
-                for source_id, _, data in graph.in_edges(node_id, data=True):
-                    if source_id not in members:
-                        external_in_weight += float(data.get("weight", 0.0))
-                for _, target_id, data in graph.out_edges(node_id, data=True):
-                    if target_id not in members:
-                        external_out_weight += float(data.get("weight", 0.0))
-
-            size = len(members)
-            possible_edges = max(1, size * max(1, size - 1))
-            density = subgraph.number_of_edges() / possible_edges
-            score = (internal_weight * max(density, 0.001)) + (size * 0.5)
-
-            weighted_in_degree: dict[str, float] = {
-                node_id: float(subgraph.in_degree(node_id, weight="weight"))
-                for node_id in subgraph.nodes
-            }
-            weighted_out_degree: dict[str, float] = {
-                node_id: float(subgraph.out_degree(node_id, weight="weight"))
-                for node_id in subgraph.nodes
-            }
-            representative_edges = sorted(
-                (
-                    (
-                        float(data.get("weight", 0.0)),
-                        source_id,
-                        target_id,
-                        relationship_ids_by_edge.get((source_id, target_id), []),
-                        int(edge_count_by_pair.get((source_id, target_id), 0)),
-                    )
-                    for source_id, target_id, data in subgraph.edges(data=True)
-                ),
-                reverse=True,
-            )[:6]
-
-            ranked.append(
-                {
-                    "community_id": f"{rel_type}:{idx}",
-                    "rel_type": rel_type,
-                    "size": size,
-                    "score": round(score, 6),
-                    "internal_weight": round(internal_weight, 6),
-                    "external_in_weight": round(external_in_weight, 6),
-                    "external_out_weight": round(external_out_weight, 6),
-                    "density": round(float(density), 6),
-                    "node_ids": sorted(members),
-                    "node_names": [
-                        name_by_id[uuid.UUID(node_id)]
-                        for node_id, _ in sorted(
-                            (
-                                (
-                                    node_id,
-                                    weighted_in_degree.get(node_id, 0.0)
-                                    + weighted_out_degree.get(node_id, 0.0),
-                                )
-                                for node_id in members
-                            ),
-                            key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
-                            reverse=True,
-                        )
-                    ],
-                    "top_inbound_names": [
-                        name_by_id[uuid.UUID(node_id)]
-                        for node_id, _ in sorted(
-                            weighted_in_degree.items(),
-                            key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
-                            reverse=True,
-                        )[:6]
-                    ],
-                    "top_outbound_names": [
-                        name_by_id[uuid.UUID(node_id)]
-                        for node_id, _ in sorted(
-                            weighted_out_degree.items(),
-                            key=lambda item: (item[1], name_by_id[uuid.UUID(item[0])]),
-                            reverse=True,
-                        )[:6]
-                    ],
-                    "representative_edges": [
-                        {
-                            "source_name": name_by_id[uuid.UUID(source_id)],
-                            "target_name": name_by_id[uuid.UUID(target_id)],
-                            "weight": round(weight, 6),
-                            "relationship_count": relationship_count,
-                            "relationship_ids": relationship_ids[:8],
-                        }
-                        for weight, source_id, target_id, relationship_ids, relationship_count in representative_edges
-                    ],
-                    "top_rel_types": [rel_type],
-                }
-            )
-
-    ranked.sort(
-        key=lambda item: (
-            item["score"],
-            item["internal_weight"],
-            item["density"],
-            item["size"],
-        ),
-        reverse=True,
-    )
-    return ranked
-
 
 def _build_role_similarity_groups(
     nodes: list[NodeRecord],
@@ -618,16 +472,13 @@ def build_collection_analysis(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
 ) -> dict[str, Any]:
-    louvain_communities = _build_louvain_communities(nodes, relationships)
     role_groups = _build_role_similarity_groups(nodes, relationships)
     return {
         "totals": {
             "entities": len(nodes),
             "relationships": len(relationships),
-            "communities": len(louvain_communities),
             "role_groups": len(role_groups),
         },
-        "communities": louvain_communities,
         "role_groups": role_groups,
     }
 
@@ -669,7 +520,6 @@ async def build_collection_understanding(
     llm_provider: LLMProvider | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
-    min_candidate_community_size = 5
     max_deterministic_link_pairs = 64
     max_deterministic_meta_edges = 96
     entity_aliases_by_id: dict[str, list[str]] = dict(
@@ -806,43 +656,6 @@ async def build_collection_understanding(
             }
         )
 
-    if not candidate_regions:
-        communities_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for community in analysis.get("communities", []):
-            rel_type = str(community.get("rel_type") or "RELATES_TO")
-            if int(community.get("size", 0)) >= min_candidate_community_size:
-                communities_by_type[rel_type].append(community)
-
-        selected_communities = [
-            community
-            for rel_type in sorted(communities_by_type)
-            for community in communities_by_type[rel_type]
-        ]
-
-        for idx, community in enumerate(selected_communities, start=1):
-            representative_edges = community.get("representative_edges", [])
-            candidate_regions.append(
-                {
-                    "region_id": f"community_{idx}",
-                    "kind": "community",
-                    "title": f"{community['rel_type']} Community {community['community_id']}",
-                    "description": (
-                        f"Directed Louvain community for relation type {community['rel_type']} "
-                        f"of size {community['size']} with score "
-                        f"{community['score']}, internal weight {community['internal_weight']}, "
-                        f"external inbound weight {community['external_in_weight']}, "
-                        f"external outbound weight {community['external_out_weight']}, "
-                        f"density {community['density']}. "
-                        f"Top inbound nodes: {', '.join(community.get('top_inbound_names', [])) or 'none'}. "
-                        f"Top outbound nodes: {', '.join(community.get('top_outbound_names', [])) or 'none'}."
-                    ),
-                    "source_ids": list(community.get("node_ids", [])),
-                    "entity_names": list(community.get("node_names", []))[:16],
-                    "rel_types": list(community.get("top_rel_types", [])),
-                    "representative_edges": representative_edges,
-                }
-            )
-
     fallback_concepts = []
     for region in candidate_regions:
         fallback_concepts.append(
@@ -909,39 +722,22 @@ async def build_collection_understanding(
                 or "none"
             )
             code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
-            if region.get("kind") == "role_clique":
-                prompt = (
-                    "You are inducing one reusable semantic concept from a role-similarity clique in a knowledge graph.\n"
-                    "The member entities are grouped because they occupy similar typed graph positions.\n"
-                    "Do not return a mechanical label like community, cluster, graph region, connector, bridge, or clique.\n"
-                    "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n\n"
-                    f"{code_guidance}"
-                    "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
-                    f"Collection: {collection['name']}\n"
-                    f"Candidate id: {region['region_id']}\n"
-                    f"Candidate title: {region['title']}\n"
-                    f"Candidate description: {region['description']}\n"
-                    f"Entities: {', '.join(region['entity_names'][:16]) or 'none'}\n"
-                    f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
-                    f"Pairwise role-similarity evidence: {pair_metrics_text}\n"
-                    f"Representative neighborhood edges: {directed_edges}\n"
-                )
-            else:
-                prompt = (
-                    "You are inducing one reusable semantic concept from a directed relation-type-specific graph community.\n"
-                    "Do not return a mechanical label like community, cluster, graph region, connector, or bridge.\n"
-                    "Pay close attention to edge direction and relation type. Infer a higher-level abstraction, role, flow, "
-                    "tension, or unifying concept from the member entities and representative directed edges.\n\n"
-                    f"{code_guidance}"
-                    "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
-                    f"Collection: {collection['name']}\n"
-                    f"Candidate id: {region['region_id']}\n"
-                    f"Candidate title: {region['title']}\n"
-                    f"Candidate description: {region['description']}\n"
-                    f"Entities: {', '.join(region['entity_names'][:12]) or 'none'}\n"
-                    f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
-                    f"Representative directed edges: {directed_edges}\n"
-                )
+            prompt = (
+                "You are inducing one reusable semantic concept from a role-similarity clique in a knowledge graph.\n"
+                "The member entities are grouped because they occupy similar typed graph positions.\n"
+                "Do not return a mechanical label like cluster, graph region, connector, bridge, or clique.\n"
+                "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n\n"
+                f"{code_guidance}"
+                "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
+                f"Collection: {collection['name']}\n"
+                f"Candidate id: {region['region_id']}\n"
+                f"Candidate title: {region['title']}\n"
+                f"Candidate description: {region['description']}\n"
+                f"Entities: {', '.join(region['entity_names'][:16]) or 'none'}\n"
+                f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
+                f"Pairwise role-similarity evidence: {pair_metrics_text}\n"
+                f"Representative neighborhood edges: {directed_edges}\n"
+            )
             try:
                 concept = await llm_provider.structured_extract(
                     prompt=prompt,
