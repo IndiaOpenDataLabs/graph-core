@@ -1,17 +1,18 @@
 """Offline analytics over the canonical collection graph.
 
-Builds Louvain communities per relation type, computes node centrality metrics
-(pagerank, authority, hub, eigenvector, betweenness, closeness), and induces
-semantic concepts from communities via LLM or deterministic fallback.
+Builds structural candidate regions over the base graph and induces semantic
+concepts from them via LLM or deterministic fallback.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any
 
 import networkx as nx
@@ -288,6 +289,174 @@ def _build_louvain_communities(
     return ranked
 
 
+def _build_role_similarity_groups(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+    *,
+    overlap_min: int = 3,
+    cosine_min: float = 0.2,
+    jaccard_min: float = 0.1,
+    min_signature: int = 1,
+) -> list[dict[str, Any]]:
+    if not relationships:
+        return []
+
+    out_pairs: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    in_pairs: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    node_name_by_id = {str(node.id): node.name for node in nodes}
+    relationship_records_by_node: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    all_node_ids: set[str] = set()
+
+    for rel in relationships:
+        source_id = str(rel.source_id)
+        target_id = str(rel.target_id)
+        rel_type = str(rel.rel_type or "RELATES_TO").upper()
+        all_node_ids.add(source_id)
+        all_node_ids.add(target_id)
+        out_pairs[source_id].add((rel_type, target_id))
+        in_pairs[target_id].add((source_id, rel_type))
+        relationship_records_by_node[source_id].append(
+            {
+                "source_id": source_id,
+                "source_name": rel.source_name,
+                "target_id": target_id,
+                "target_name": rel.target_name,
+                "rel_type": rel_type,
+                "weight": float(rel.weight or 0.0),
+                "direction": "out",
+                "relationship_id": str(rel.id),
+            }
+        )
+        relationship_records_by_node[target_id].append(
+            {
+                "source_id": source_id,
+                "source_name": rel.source_name,
+                "target_id": target_id,
+                "target_name": rel.target_name,
+                "rel_type": rel_type,
+                "weight": float(rel.weight or 0.0),
+                "direction": "in",
+                "relationship_id": str(rel.id),
+            }
+        )
+
+    signatures: dict[str, set[tuple[str, str]]] = {}
+    token_index: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for node_id in all_node_ids:
+        signature = out_pairs[node_id] | in_pairs[node_id]
+        if len(signature) < min_signature:
+            continue
+        signatures[node_id] = signature
+        for token in signature:
+            token_index[token].add(node_id)
+
+    overlap_counts: Counter[tuple[str, str]] = Counter()
+    for nodes_with_token in token_index.values():
+        members = sorted(nodes_with_token)
+        for left, right in combinations(members, 2):
+            overlap_counts[(left, right)] += 1
+
+    similarity_graph = nx.Graph()
+    similarity_graph.add_nodes_from(signatures.keys())
+    pair_metrics: dict[tuple[str, str], dict[str, Any]] = {}
+    for (left, right), overlap in overlap_counts.items():
+        if overlap < overlap_min:
+            continue
+        left_signature = signatures[left]
+        right_signature = signatures[right]
+        union = left_signature | right_signature
+        cosine = overlap / math.sqrt(len(left_signature) * len(right_signature))
+        jaccard = overlap / len(union) if union else 0.0
+        if cosine < cosine_min or jaccard < jaccard_min:
+            continue
+        pair_metrics[(left, right)] = {
+            "a": left,
+            "b": right,
+            "overlap": overlap,
+            "cosine": round(cosine, 6),
+            "jaccard": round(jaccard, 6),
+            "size_a": len(left_signature),
+            "size_b": len(right_signature),
+        }
+        similarity_graph.add_edge(
+            left,
+            right,
+            overlap=overlap,
+            cosine=cosine,
+            jaccard=jaccard,
+        )
+
+    if similarity_graph.number_of_edges() == 0:
+        return []
+
+    ranked_groups: list[dict[str, Any]] = []
+    for idx, clique in enumerate(nx.find_cliques(similarity_graph)):
+        if len(clique) < 2:
+            continue
+        clique_ids = sorted(clique)
+        metrics = []
+        for left, right in combinations(clique_ids, 2):
+            metrics.append(pair_metrics[tuple(sorted((left, right)))])
+        avg_cosine = sum(float(metric["cosine"]) for metric in metrics) / len(metrics)
+        avg_jaccard = sum(float(metric["jaccard"]) for metric in metrics) / len(metrics)
+        total_overlap = sum(int(metric["overlap"]) for metric in metrics)
+        node_names = [node_name_by_id.get(node_id, node_id) for node_id in clique_ids]
+
+        rel_counter: Counter[str] = Counter()
+        representative_relationships: list[dict[str, Any]] = []
+        seen_relationships: set[str] = set()
+        for node_id in clique_ids:
+            grouped_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for rel in relationship_records_by_node.get(node_id, []):
+                grouped_by_type[str(rel["rel_type"])].append(rel)
+                rel_counter[str(rel["rel_type"])] += 1
+            for rel_type, items in sorted(
+                grouped_by_type.items(),
+                key=lambda kv: (-len(kv[1]), kv[0]),
+            ):
+                items = sorted(
+                    items,
+                    key=lambda item: (
+                        -float(item["weight"]),
+                        str(item["source_name"]),
+                        str(item["target_name"]),
+                    ),
+                )
+                rel = items[0]
+                relationship_id = str(rel["relationship_id"])
+                if relationship_id in seen_relationships:
+                    continue
+                seen_relationships.add(relationship_id)
+                representative_relationships.append(rel)
+
+        ranked_groups.append(
+            {
+                "group_id": f"role:{idx}",
+                "kind": "role_clique",
+                "size": len(clique_ids),
+                "node_ids": clique_ids,
+                "node_names": node_names,
+                "avg_cosine": round(avg_cosine, 6),
+                "avg_jaccard": round(avg_jaccard, 6),
+                "total_overlap": total_overlap,
+                "pair_metrics": metrics,
+                "top_rel_types": [rel_type for rel_type, _ in rel_counter.most_common(8)],
+                "representative_edges": representative_relationships[:24],
+            }
+        )
+
+    ranked_groups.sort(
+        key=lambda item: (
+            int(item["size"]),
+            float(item["avg_cosine"]),
+            float(item["avg_jaccard"]),
+            int(item["total_overlap"]),
+        ),
+        reverse=True,
+    )
+    return ranked_groups
+
+
 def _shortest_paths_between_sets(
     adjacency: dict[uuid.UUID, list[tuple[uuid.UUID, str, float]]],
     starts: set[uuid.UUID],
@@ -450,13 +619,16 @@ def build_collection_analysis(
     relationships: list[RelationshipRecord],
 ) -> dict[str, Any]:
     louvain_communities = _build_louvain_communities(nodes, relationships)
+    role_groups = _build_role_similarity_groups(nodes, relationships)
     return {
         "totals": {
             "entities": len(nodes),
             "relationships": len(relationships),
             "communities": len(louvain_communities),
+            "role_groups": len(role_groups),
         },
         "communities": louvain_communities,
+        "role_groups": role_groups,
     }
 
 
@@ -606,41 +778,70 @@ async def build_collection_understanding(
         return {key: float(value) / float(max_value) for key, value in scores.items()}
 
     candidate_regions: list[dict[str, Any]] = []
-    communities_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for community in analysis.get("communities", []):
-        rel_type = str(community.get("rel_type") or "RELATES_TO")
-        if int(community.get("size", 0)) >= min_candidate_community_size:
-            communities_by_type[rel_type].append(community)
-
-    selected_communities = [
-        community
-        for rel_type in sorted(communities_by_type)
-        for community in communities_by_type[rel_type]
-    ]
-
-    for idx, community in enumerate(selected_communities, start=1):
-        representative_edges = community.get("representative_edges", [])
+    role_groups = list(analysis.get("role_groups") or [])
+    for idx, group in enumerate(role_groups, start=1):
+        if int(group.get("size", 0)) < 2:
+            continue
+        representative_edges = group.get("representative_edges", [])
+        entity_names = list(group.get("node_names", []))[:24]
+        rel_types = list(group.get("top_rel_types", []))
+        pair_metrics = list(group.get("pair_metrics", []))
         candidate_regions.append(
             {
-                "region_id": f"community_{idx}",
-                "kind": "community",
-                "title": f"{community['rel_type']} Community {community['community_id']}",
+                "region_id": f"role_group_{idx}",
+                "kind": "role_clique",
+                "title": f"Role clique of size {group['size']}: {', '.join(entity_names[:6])}",
                 "description": (
-                    f"Directed Louvain community for relation type {community['rel_type']} "
-                    f"of size {community['size']} with score "
-                    f"{community['score']}, internal weight {community['internal_weight']}, "
-                    f"external inbound weight {community['external_in_weight']}, "
-                    f"external outbound weight {community['external_out_weight']}, "
-                    f"density {community['density']}. "
-                    f"Top inbound nodes: {', '.join(community.get('top_inbound_names', [])) or 'none'}. "
-                    f"Top outbound nodes: {', '.join(community.get('top_outbound_names', [])) or 'none'}."
+                    f"Role-similarity clique of size {group['size']} with average cosine "
+                    f"{group['avg_cosine']} and average jaccard {group['avg_jaccard']}; "
+                    f"total typed-signature overlap {group['total_overlap']}. "
+                    f"Members: {', '.join(entity_names) or 'none'}. "
+                    f"Dominant relation types: {', '.join(rel_types) or 'none'}."
                 ),
-                "source_ids": list(community.get("node_ids", [])),
-                "entity_names": list(community.get("node_names", []))[:16],
-                "rel_types": list(community.get("top_rel_types", [])),
+                "source_ids": list(group.get("node_ids", [])),
+                "entity_names": entity_names,
+                "rel_types": rel_types,
                 "representative_edges": representative_edges,
+                "pair_metrics": pair_metrics,
             }
         )
+
+    if not candidate_regions:
+        communities_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for community in analysis.get("communities", []):
+            rel_type = str(community.get("rel_type") or "RELATES_TO")
+            if int(community.get("size", 0)) >= min_candidate_community_size:
+                communities_by_type[rel_type].append(community)
+
+        selected_communities = [
+            community
+            for rel_type in sorted(communities_by_type)
+            for community in communities_by_type[rel_type]
+        ]
+
+        for idx, community in enumerate(selected_communities, start=1):
+            representative_edges = community.get("representative_edges", [])
+            candidate_regions.append(
+                {
+                    "region_id": f"community_{idx}",
+                    "kind": "community",
+                    "title": f"{community['rel_type']} Community {community['community_id']}",
+                    "description": (
+                        f"Directed Louvain community for relation type {community['rel_type']} "
+                        f"of size {community['size']} with score "
+                        f"{community['score']}, internal weight {community['internal_weight']}, "
+                        f"external inbound weight {community['external_in_weight']}, "
+                        f"external outbound weight {community['external_out_weight']}, "
+                        f"density {community['density']}. "
+                        f"Top inbound nodes: {', '.join(community.get('top_inbound_names', [])) or 'none'}. "
+                        f"Top outbound nodes: {', '.join(community.get('top_outbound_names', [])) or 'none'}."
+                    ),
+                    "source_ids": list(community.get("node_ids", [])),
+                    "entity_names": list(community.get("node_names", []))[:16],
+                    "rel_types": list(community.get("top_rel_types", [])),
+                    "representative_edges": representative_edges,
+                }
+            )
 
     fallback_concepts = []
     for region in candidate_regions:
@@ -696,22 +897,51 @@ async def build_collection_understanding(
                 )
                 or "none"
             )
-            code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
-            prompt = (
-                "You are inducing one reusable semantic concept from a directed relation-type-specific graph community.\n"
-                "Do not return a mechanical label like community, cluster, graph region, connector, or bridge.\n"
-                "Pay close attention to edge direction and relation type. Infer a higher-level abstraction, role, flow, "
-                "tension, or unifying concept from the member entities and representative directed edges.\n\n"
-                f"{code_guidance}"
-                "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
-                f"Collection: {collection['name']}\n"
-                f"Candidate id: {region['region_id']}\n"
-                f"Candidate title: {region['title']}\n"
-                f"Candidate description: {region['description']}\n"
-                f"Entities: {', '.join(region['entity_names'][:12]) or 'none'}\n"
-                f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
-                f"Representative directed edges: {directed_edges}\n"
+            pair_metrics_text = (
+                "; ".join(
+                    (
+                        f"{metric['a']}~{metric['b']} "
+                        f"(overlap={metric['overlap']}, cosine={metric['cosine']}, "
+                        f"jaccard={metric['jaccard']})"
+                    )
+                    for metric in region.get("pair_metrics", [])[:12]
+                )
+                or "none"
             )
+            code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
+            if region.get("kind") == "role_clique":
+                prompt = (
+                    "You are inducing one reusable semantic concept from a role-similarity clique in a knowledge graph.\n"
+                    "The member entities are grouped because they occupy similar typed graph positions.\n"
+                    "Do not return a mechanical label like community, cluster, graph region, connector, bridge, or clique.\n"
+                    "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n\n"
+                    f"{code_guidance}"
+                    "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
+                    f"Collection: {collection['name']}\n"
+                    f"Candidate id: {region['region_id']}\n"
+                    f"Candidate title: {region['title']}\n"
+                    f"Candidate description: {region['description']}\n"
+                    f"Entities: {', '.join(region['entity_names'][:16]) or 'none'}\n"
+                    f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
+                    f"Pairwise role-similarity evidence: {pair_metrics_text}\n"
+                    f"Representative neighborhood edges: {directed_edges}\n"
+                )
+            else:
+                prompt = (
+                    "You are inducing one reusable semantic concept from a directed relation-type-specific graph community.\n"
+                    "Do not return a mechanical label like community, cluster, graph region, connector, or bridge.\n"
+                    "Pay close attention to edge direction and relation type. Infer a higher-level abstraction, role, flow, "
+                    "tension, or unifying concept from the member entities and representative directed edges.\n\n"
+                    f"{code_guidance}"
+                    "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
+                    f"Collection: {collection['name']}\n"
+                    f"Candidate id: {region['region_id']}\n"
+                    f"Candidate title: {region['title']}\n"
+                    f"Candidate description: {region['description']}\n"
+                    f"Entities: {', '.join(region['entity_names'][:12]) or 'none'}\n"
+                    f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
+                    f"Representative directed edges: {directed_edges}\n"
+                )
             try:
                 concept = await llm_provider.structured_extract(
                     prompt=prompt,
