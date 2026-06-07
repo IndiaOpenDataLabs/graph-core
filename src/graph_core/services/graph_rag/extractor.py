@@ -102,7 +102,7 @@ entities and relationships from input text.
      explicitly supported by the text.
    - For each entity, extract: name, type, description.
    - Entity types to consider: {entity_types}. If none apply, use "Other".
-   - Use concise title case names and keep naming consistent across the extraction.
+   - {domain_entity_guidance}
    - Do not extract generic filler terms or vague concepts that are
      not functioning as real entities in context.
 
@@ -165,11 +165,12 @@ formatted entities and relationships.
    - relationships missed in the first pass
    - items that need correction to match the required structure
 3. Entity types to consider: {entity_types}. If none apply, use "Other".
-4. Keep naming consistent with the previously extracted entities.
-5. Relationship descriptions must still explain the nature, context,
+4. {domain_entity_guidance}
+5. Keep naming consistent with the previously extracted entities.
+6. Relationship descriptions must still explain the nature, context,
    and significance of the connection.
-5a. {domain_relationship_guidance}
-6. Each relationship's "rel_type" must be drawn EXACTLY from:
+6a. {domain_relationship_guidance}
+7. Each relationship's "rel_type" must be drawn EXACTLY from:
    {rel_type_vocab}. Do not invent new rel_types — any value
    outside this list will be rejected and the edge will fall back
    to "RELATES_TO". DEFAULT TO A SINGLE rel_type PER PAIR; only
@@ -177,12 +178,12 @@ formatted entities and relationships.
    simultaneously-true roles and you can write a meaningfully
    different description for each. Pick the best single fit; use
    "RELATES_TO" only if nothing more specific applies.
-7. Preserve multiple genuinely distinct rel_type entries for the same
+8. Preserve multiple genuinely distinct rel_type entries for the same
    source/target pair when the text supports them; do not collapse them
    to one generic edge unless the evidence really supports only one.
-8. Return only new or corrected items in the same JSON structure as
+9. Return only new or corrected items in the same JSON structure as
    the main extraction.
-9. Only include items explicitly supported by the text.
+10. Only include items explicitly supported by the text.
 """
 
 
@@ -339,6 +340,23 @@ class LLMGraphExtractor:
         )
 
     @staticmethod
+    def _domain_entity_guidance(domain: str | None) -> str:
+        if domain != "code":
+            return (
+                "Use concise title case names and keep naming consistent across "
+                "the extraction."
+            )
+        return (
+            "For code-domain entities, prefer the exact symbol names that appear "
+            "in the source whenever the entity is a concrete class, function, "
+            "method, module, variable, exception, or config symbol. Preserve the "
+            "source casing and punctuation style for those symbols instead of "
+            "rewriting them into generic title case. Use broader natural-language "
+            "names only for genuinely higher-level code concepts that are not "
+            "named symbols in the source."
+        )
+
+    @staticmethod
     def _build_extraction_prompt(
         text: str,
         entity_types: str,
@@ -349,6 +367,7 @@ class LLMGraphExtractor:
             _EXTRACTION_SYSTEM_PROMPT.format(
                 entity_types=entity_types,
                 rel_type_vocab=", ".join(rel_type_vocab),
+                domain_entity_guidance=LLMGraphExtractor._domain_entity_guidance(domain),
                 domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
             )
             + "\n\n"
@@ -367,6 +386,7 @@ class LLMGraphExtractor:
             _GLEANING_SYSTEM_PROMPT.format(
                 entity_types=entity_types,
                 rel_type_vocab=", ".join(rel_type_vocab),
+                domain_entity_guidance=LLMGraphExtractor._domain_entity_guidance(domain),
                 domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
             )
             + "\n\n"
