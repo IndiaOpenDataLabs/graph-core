@@ -368,8 +368,9 @@ class LLMGraphExtractor:
                 "more precisely."
             )
         return (
-            "Do not invent names outside this current set; any unknown rel_type "
-            "will fall back to RELATES_TO."
+            "Prefer an existing rel_type from this current set when it truly "
+            "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
+            "that is semantically precise."
         )
 
     @staticmethod
