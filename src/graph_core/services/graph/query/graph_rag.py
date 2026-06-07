@@ -1265,11 +1265,14 @@ async def _answer_from_context(
             "Write in natural prose. If the context is insufficient "
             "for part of the "
             "question, acknowledge it briefly without making it the focus."
-            "\n\nIf a Meta Concepts section is present, it contains a"
-            " higher-level concept layer built from the same graph"
-            " machinery as the base collection. Use it as high-level"
-            " guidance, but ground specific claims in the entity and"
-            " relationship evidence below."
+            "\n\nIf an Internal Higher-Level Context section is present,"
+            " treat it as private reasoning support only. Use it to"
+            " find themes, abstractions, or organizing structure, but do"
+            " not frame the final answer around those meta concepts or"
+            " cite them explicitly unless the same idea is directly"
+            " supported in the base Entities or Relationships By Type"
+            " sections. Prefer answering in terms of the base entities,"
+            " base relationships, and their concrete descriptions."
             "\n\nThe Relationships By Type section groups edges by"
             " semantic role. Each edge is listed in the form"
             " 'SRC -[REL_TYPE]-> TGT: description'. REL_TYPE is the"
@@ -1438,7 +1441,7 @@ async def graph_rag_query(
 
     if meta is not None:
         context = (
-            "Meta Concepts:\n"
+            "Internal Higher-Level Context:\n"
             f"{_strip_context_label(meta.context)}\n\n"
             "Base Evidence:\n"
             f"{_strip_context_label(base.context)}"
