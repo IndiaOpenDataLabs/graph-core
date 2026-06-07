@@ -120,13 +120,12 @@ entities and relationships from input text.
    - Each entity must have: name, type, description.
    - Each relationship must have: source, target, rel_type.
    - "rel_type" is a list of one or more objects, each with:
-       name        (string, drawn EXACTLY from: {rel_type_vocab})
+       name        (string, guided by: {rel_type_vocab})
        description (string, role-specific: explains the connection
                     in the semantic role of THIS rel_type entry)
        keywords    (array of strings, role-specific)
        weight      (float 0..1, role-specific confidence)
-     Do not invent names outside the vocab — any unknown name will
-     be rejected and that entry will fall back to "RELATES_TO".
+     {domain_rel_type_guidance}
    - Emit every distinct rel_type that is genuinely supported for the
      pair. Multi-entry rel_type lists are expected when the same pair
      carries different semantic roles. Each entry must have its own
@@ -170,10 +169,8 @@ formatted entities and relationships.
 6. Relationship descriptions must still explain the nature, context,
    and significance of the connection.
 6a. {domain_relationship_guidance}
-7. Each relationship's "rel_type" must be drawn EXACTLY from:
-   {rel_type_vocab}. Do not invent new rel_types — any value
-   outside this list will be rejected and the edge will fall back
-   to "RELATES_TO". DEFAULT TO A SINGLE rel_type PER PAIR; only
+7. Each relationship's "rel_type" must follow this guidance:
+   {rel_type_vocab}. {domain_rel_type_guidance} DEFAULT TO A SINGLE rel_type PER PAIR; only
    emit multiple when the text genuinely supports distinct,
    simultaneously-true roles and you can write a meaningfully
    different description for each. Pick the best single fit; use
@@ -221,6 +218,7 @@ class LLMGraphExtractor:
         fallback_keywords: list[str],
         fallback_weight: float,
         vocab: list[str] | None = None,
+        domain: str | None = None,
     ) -> list[dict[str, Any]]:
         """Normalize the LLM's ``rel_type`` field into a list of per-edge
         dicts, each carrying its own validated name, description,
@@ -234,10 +232,10 @@ class LLMGraphExtractor:
         3. A single string (very old shape): wrapped into a single entry
 
         Each entry's name is normalized (uppercase, snake_case,
-        alpha-leading) and validated against the active domain vocab
-        when one is supplied. An unknown name is replaced with
-        ``DEFAULT_REL_TYPE`` and a warning is logged so the LLM can
-        never silently introduce a new dimension.
+        alpha-leading) and optionally validated against the active
+        domain vocab. For ``code`` and ``books`` we allow new rel_types
+        to be introduced when the existing set is not expressive enough;
+        for other domains, unknown names fall back to ``DEFAULT_REL_TYPE``.
 
         Returns at least one entry; the fallback is
         ``[{"name": DEFAULT_REL_TYPE, "description": ..., "keywords": ..., "weight": ...}]``
@@ -258,6 +256,7 @@ class LLMGraphExtractor:
             raw_entries = [{"name": str(value)}]
 
         vocab_set = {v.upper() for v in vocab} if vocab else None
+        allow_new_rel_types = domain in {"code", "books"}
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         for entry in raw_entries:
@@ -268,13 +267,21 @@ class LLMGraphExtractor:
                 continue
             name = normalize_rel_type(raw_name)
             if vocab_set is not None and name not in vocab_set:
-                logger.warning(
-                    "LLM emitted rel_type=%r not in active domain vocab; "
-                    "falling back to %s. Add it to DOMAIN_VOCAB if intentional.",
-                    raw_name,
-                    DEFAULT_REL_TYPE,
-                )
-                name = DEFAULT_REL_TYPE
+                if allow_new_rel_types:
+                    logger.info(
+                        "LLM emitted new rel_type=%r outside active %s vocab; accepting normalized type %s",
+                        raw_name,
+                        domain,
+                        name,
+                    )
+                else:
+                    logger.warning(
+                        "LLM emitted rel_type=%r not in active domain vocab; "
+                        "falling back to %s. Add it to DOMAIN_VOCAB if intentional.",
+                        raw_name,
+                        DEFAULT_REL_TYPE,
+                    )
+                    name = DEFAULT_REL_TYPE
             if name in seen:
                 continue
             seen.add(name)
@@ -324,6 +331,15 @@ class LLMGraphExtractor:
     @staticmethod
     def _domain_relationship_guidance(domain: str | None) -> str:
         if domain != "code":
+            if domain == "books":
+                return (
+                    "For books-domain relationships, let rel_type labels capture "
+                    "the ideas, argumentative logic, causal logic, explanatory "
+                    "logic, or conceptual roles in the text. Reuse an existing "
+                    "rel_type from the current set when it fits; if none fits, "
+                    "create a concise new upper-snake rel_type that reflects the "
+                    "idea or logical role precisely."
+                )
             return (
                 "Keep relationship descriptions concise and specific to the "
                 "actual role supported by the text."
@@ -336,7 +352,23 @@ class LLMGraphExtractor:
             "plain English, but keep the style compact and code-like using cues "
             "such as IF, WHEN, THEN, ELSE, FOR EACH, WHILE, TRY/CATCH, RETURNS, "
             "SPLITS INTO, or MERGES WITH. Do not invent control flow that is not "
-            "grounded in the text."
+            "grounded in the text. When choosing rel_type labels, prefer the "
+            "current set if one is relevant; otherwise create a concise new "
+            "upper-snake rel_type that captures the architecture, data flow, or "
+            "execution role more precisely."
+        )
+
+    @staticmethod
+    def _domain_rel_type_guidance(domain: str | None) -> str:
+        if domain in {"code", "books"}:
+            return (
+                "Prefer an existing rel_type from this current set when it truly "
+                "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
+                "that is semantically precise for this domain."
+            )
+        return (
+            "Do not invent names outside this current set; any unknown rel_type "
+            "will fall back to RELATES_TO."
         )
 
     @staticmethod
@@ -368,6 +400,7 @@ class LLMGraphExtractor:
                 entity_types=entity_types,
                 rel_type_vocab=", ".join(rel_type_vocab),
                 domain_entity_guidance=LLMGraphExtractor._domain_entity_guidance(domain),
+                domain_rel_type_guidance=LLMGraphExtractor._domain_rel_type_guidance(domain),
                 domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
             )
             + "\n\n"
@@ -387,6 +420,7 @@ class LLMGraphExtractor:
                 entity_types=entity_types,
                 rel_type_vocab=", ".join(rel_type_vocab),
                 domain_entity_guidance=LLMGraphExtractor._domain_entity_guidance(domain),
+                domain_rel_type_guidance=LLMGraphExtractor._domain_rel_type_guidance(domain),
                 domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
             )
             + "\n\n"
@@ -465,6 +499,7 @@ class LLMGraphExtractor:
                 fallback_keywords=rel_keywords_list,
                 fallback_weight=rel_weight,
                 vocab=rel_vocab,
+                domain=domain,
             ):
                 relationships.append(ExtractedRelationship(
                     source_name=source,
@@ -573,6 +608,7 @@ class LLMGraphExtractor:
                     fallback_keywords=rel_keywords_list,
                     fallback_weight=rel_weight,
                     vocab=rel_vocab,
+                    domain=domain,
                 ):
                     current_relationships.append(ExtractedRelationship(
                         source_name=source,
