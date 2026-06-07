@@ -60,8 +60,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-cliques",
         type=int,
-        default=20,
-        help="Maximum cliques to keep after ranking",
+        default=0,
+        help="Maximum cliques to keep after ranking; 0 means no limit",
     )
     parser.add_argument(
         "--base-url",
@@ -210,7 +210,9 @@ def _enumerate_cliques(
         ),
         reverse=True,
     )
-    return cliques[:max_cliques]
+    if max_cliques > 0:
+        return cliques[:max_cliques]
+    return cliques
 
 
 async def _build_clique_payloads(
@@ -341,7 +343,7 @@ async def main() -> None:
                 "nodes_with_signatures": len(signatures),
                 "similarity_edges": len(similarity_edges),
                 "cliques": len(cliques),
-                "top_cliques": cliques[:10],
+                "cliques_detail": cliques,
             },
             ensure_ascii=True,
             indent=2,
