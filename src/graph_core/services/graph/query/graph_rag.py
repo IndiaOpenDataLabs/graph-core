@@ -146,109 +146,83 @@ async def _rank_dimensions(
     if len(dimensions) <= top_k:
         return dimensions
 
-    # When there are many dimensions, a single broad vector search is far
-    # cheaper than one search per dimension.  Pull a generous candidate set,
-    # discover which rel_types appear, then score only those.
-    broad_embedding = await _embed_relationship_query(
+    # Step 1: Embed the query once (without rel_type focus).
+    query_embedding = await _embed_relationship_query(
         embedding_provider, question, rel_type=None
     )
-    broad_hits = await _graph_rag_vectors.search_relationship_embeddings(
-        collection_id=collection.id,
-        query_embedding=broad_embedding,
-        top_k=100,
+
+    # Step 2: Load pre-computed prefix embeddings from storage.  These are
+    # computed at ingestion time when each rel_type is first encountered.
+    await _graph_rag_vectors.ensure_prefix_embeddings_table(collection.id)
+    stored_prefixes = await _graph_rag_vectors.load_all_prefix_embeddings(
+        collection.id
     )
 
-    # Collect rel_types that appear in the broad results.
-    dimension_set = set(dimensions)
-    candidate_dims = []
-    seen = set()
-    for hit in broad_hits:
-        rt = hit.metadata.get("rel_type")
-        if rt and rt in dimension_set and rt not in seen:
-            candidate_dims.append(rt)
-            seen.add(rt)
-
-    # If the broad search didn't surface enough distinct rel_types, fall back
-    # to scoring all dimensions (expensive but correct for small vocabularies).
-    if len(candidate_dims) < top_k and len(dimensions) <= 200:
-        candidate_dims = None
-
-    if candidate_dims:
-        # Score only the rel_types that appeared in the broad search.
-        embeddings = await _embed_relationship_queries_batch(
-            embedding_provider,
-            [question] * len(candidate_dims),
-            candidate_dims,
+    # For dimensions missing from storage, embed on the fly.
+    missing_dims = [d for d in dimensions if d not in stored_prefixes]
+    if missing_dims:
+        missing_embeddings = await embedding_provider.embed_documents(
+            [normalize_dim(d) for d in missing_dims]
         )
-
-        async def _score_dimension(
-            rel_type: str, embedding: list[float]
-        ) -> tuple[str, float, float]:
-            hits = await _graph_rag_vectors.search_relationship_embeddings(
-                collection_id=collection.id,
-                query_embedding=embedding,
-                top_k=3,
+        for dim, emb in zip(missing_dims, missing_embeddings):
+            stored_prefixes[dim] = emb
+            await _graph_rag_vectors.upsert_prefix_embedding(
+                collection.id, dim, emb
             )
-            sims = [1.0 - hit.distance for hit in hits]
-            top1 = sims[0] if sims else 0.0
-            top3_mean = sum(sims[:3]) / min(len(sims), 3) if sims else 0.0
-            return rel_type, top1 + top3_mean, top1
 
-        scored = await asyncio.gather(
-            *(_score_dimension(rt, emb) for rt, emb in zip(candidate_dims, embeddings))
-        )
-        scored.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
-        selected = [rel_type for rel_type, _, _ in scored[:top_k]]
-        logger.info(
-            "graph_rag dimension gating collection=%s total=%d broad_candidates=%d selected=%d top=%s",
-            collection.name,
-            len(dimensions),
-            len(candidate_dims),
-            len(selected),
-            [(rel_type, round(score, 6)) for rel_type, score, _ in scored[:top_k]],
-        )
-        return selected
-    else:
-        # Fallback: batch-embed and score all dimensions.
-        embeddings = await _embed_relationship_queries_batch(
-            embedding_provider,
-            [question] * len(dimensions),
-            dimensions,
-        )
+    # Step 3: Rank all dimensions by cosine similarity (pure CPU).
+    def _cosine(a: list[float], b: list[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
 
-        async def _score_dimension(
-            rel_type: str, embedding: list[float]
-        ) -> tuple[str, float, float]:
-            hits = await _graph_rag_vectors.search_relationship_embeddings(
-                collection_id=collection.id,
-                query_embedding=embedding,
-                top_k=3,
-            )
-            sims = [1.0 - hit.distance for hit in hits]
-            top1 = sims[0] if sims else 0.0
-            top3_mean = sum(sims[:3]) / min(len(sims), 3) if sims else 0.0
-            return rel_type, top1 + top3_mean, top1
+    ranked = sorted(
+        [(d, stored_prefixes[d]) for d in dimensions if d in stored_prefixes],
+        key=lambda item: _cosine(query_embedding, item[1]),
+        reverse=True,
+    )
+    candidate_dims = [rel_type for rel_type, _ in ranked[:50]]
 
-        concurrency = settings.graph_rag_query_embedding_concurrency
-        sem = asyncio.Semaphore(concurrency)
+    # Step 4: Score only the top-50 candidates with the original vector-search
+    # approach (embed question with each dim's focus, search relationship vectors).
+    embeddings = await _embed_relationship_queries_batch(
+        embedding_provider,
+        [question] * len(candidate_dims),
+        candidate_dims,
+    )
 
-        async def _gated_score(rel_type: str, emb: list[float]):
-            async with sem:
-                return await _score_dimension(rel_type, emb)
-
-        scored = await asyncio.gather(
-            *(_gated_score(rel_type, emb) for rel_type, emb in zip(dimensions, embeddings))
+    async def _score_dimension(
+        rel_type: str, embedding: list[float]
+    ) -> tuple[str, float, float]:
+        hits = await _graph_rag_vectors.search_relationship_embeddings(
+            collection_id=collection.id,
+            query_embedding=embedding,
+            top_k=3,
         )
-        scored.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
-        selected = [rel_type for rel_type, _, _ in scored[:top_k]]
-        logger.info(
-            "graph_rag dimension gating collection=%s total=%d selected=%d top=%s",
-            collection.name,
-            len(dimensions),
-            len(selected),
-            [(rel_type, round(score, 6)) for rel_type, score, _ in scored[:top_k]],
-        )
-        return selected
+        sims = [1.0 - hit.distance for hit in hits]
+        top1 = sims[0] if sims else 0.0
+        top3_mean = sum(sims[:3]) / min(len(sims), 3) if sims else 0.0
+        return rel_type, top1 + top3_mean, top1
+
+    scored = await asyncio.gather(
+        *(_score_dimension(rt, emb) for rt, emb in zip(candidate_dims, embeddings))
+    )
+    scored.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
+    selected = [rel_type for rel_type, _, _ in scored[:top_k]]
+    logger.info(
+        "graph_rag dimension gating collection=%s total=%d stored=%d missing=%d candidates=%d selected=%d top=%s",
+        collection.name,
+        len(dimensions),
+        len(stored_prefixes) - len(missing_dims),
+        len(missing_dims),
+        len(candidate_dims),
+        len(selected),
+        [(rel_type, round(score, 6)) for rel_type, score, _ in scored[:top_k]],
+    )
+    return selected
 
 
 @dataclass
@@ -1443,27 +1417,18 @@ async def _build_graph_query_artifacts(
     mode: str | None = None,
     llm_profile_id: uuid.UUID | None = None,
 ) -> GraphQueryArtifacts:
-    import time as _time
-    _t0 = _time.monotonic()
-    _bt = {}
-
-    _t = _time.monotonic()
     embedding_provider = await _resolve_embedding_provider(collection)
     entity_query_embedding = await _embed_entity_query(embedding_provider, question)
-    _bt["entity_embed"] = _time.monotonic() - _t
 
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
     dimensions = await _active_dimensions(collection)
-
-    _t = _time.monotonic()
     dimensions = await _rank_dimensions(
         collection,
         embedding_provider,
         question,
         dimensions,
     )
-    _bt["rank_dimensions"] = _time.monotonic() - _t
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
         relationship_query_embedding = await _embed_relationship_query(
@@ -1518,9 +1483,7 @@ async def _build_graph_query_artifacts(
             **kwargs,
         )
 
-    _t = _time.monotonic()
     state = await _fan_out_per_dimension(_build_state_for, dimensions)
-    _bt["fan_out"] = _time.monotonic() - _t
     if state is None:
         state = GraphQueryState(
             discovered_entity_ids=set(),
@@ -1533,24 +1496,16 @@ async def _build_graph_query_artifacts(
         effective_mode = "entity-first"
 
     route_profile = await _derive_route_profile(collection, state)
-    _t = _time.monotonic()
     context, entities_used, relationships_used, rel_context = await _build_context(
         state,
         collection,
     )
-    _bt["build_context"] = _time.monotonic() - _t
-    _total = _time.monotonic() - _t0
     logger.info(
-        "graph_rag context collection=%s route=%s entities=%d relationships=%d timings=%.1fs(entity_embed=%.2fs rank=%.2fs fan_out=%.2fs context=%.2fs)",
+        "graph_rag context collection=%s route=%s entities=%d relationships=%d",
         collection.name,
         route_profile.primary_route,
         len(entities_used),
         len(relationships_used),
-        _total,
-        _bt.get("entity_embed", 0),
-        _bt.get("rank_dimensions", 0),
-        _bt.get("fan_out", 0),
-        _bt.get("build_context", 0),
     )
     return GraphQueryArtifacts(
         context=context,
@@ -1568,11 +1523,6 @@ async def graph_rag_query(
     mode: str | None = None,
     llm_profile_id: uuid.UUID | None = None,
 ) -> QueryResult:
-    import time as _time
-    _t0 = _time.monotonic()
-    _timings = {}
-
-    _t = _time.monotonic()
     base = await _build_graph_query_artifacts(
         question,
         collection,
@@ -1580,12 +1530,9 @@ async def graph_rag_query(
         mode,
         llm_profile_id,
     )
-    _timings["base_artifacts"] = _time.monotonic() - _t
-
     meta = None
     meta_collection = await _load_meta_collection(collection)
     if meta_collection is not None:
-        _t = _time.monotonic()
         meta = await _build_graph_query_artifacts(
             question,
             meta_collection,
@@ -1593,7 +1540,6 @@ async def graph_rag_query(
             mode,
             llm_profile_id,
         )
-        _timings["meta_artifacts"] = _time.monotonic() - _t
 
     if meta is not None:
         context = (
@@ -1620,8 +1566,6 @@ async def graph_rag_query(
         if meta is not None and meta.context
         else base.rel_context or entity_fallback
     )
-
-    _t = _time.monotonic()
     response = await _answer_from_context(
         question,
         namespace_id,
@@ -1629,19 +1573,6 @@ async def graph_rag_query(
         context,
         fallback_text,
     )
-    _timings["answer_from_context"] = _time.monotonic() - _t
-
-    _total = _time.monotonic() - _t0
-    _timings["total"] = _total
-    logger.info(
-        "graph_rag timings collection=%s total=%.1fs base=%.1fs meta=%.1fs answer=%.1fs",
-        collection.name,
-        _total,
-        _timings.get("base_artifacts", 0),
-        _timings.get("meta_artifacts", 0),
-        _timings.get("answer_from_context", 0),
-    )
-
     return QueryResult(
         response=response,
         entities_used=list(

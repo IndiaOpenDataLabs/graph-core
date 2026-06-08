@@ -201,20 +201,18 @@ class GraphRAGVectorStore:
             "qemb": _embedding_literal(query_embedding),
         }
         if relationship_id:
-            where_extra = "AND v.relationship_id = :rel_id"
+            where_extra = "AND relationship_id = :rel_id"
             params["rel_id"] = _uuid_for_sql(relationship_id)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
-                    SELECT v.id::text, v.relationship_id::text, v.source_name, v.target_name,
-                           v.description, g.rel_type,
-                           1 - (v.embedding <=> (:qemb){cast}) as score,
-                           v.embedding <=> (:qemb){cast} as distance
-                    FROM {tbl} v
-                    LEFT JOIN graph_relationships g ON g.id = v.relationship_id
-                    WHERE v.collection_id = :cid {where_extra}
+                    SELECT id::text, relationship_id::text, source_name, target_name, description,
+                           1 - (embedding <=> (:qemb){cast}) as score,
+                           embedding <=> (:qemb){cast} as distance
+                    FROM {tbl}
+                    WHERE collection_id = :cid {where_extra}
                     ORDER BY distance
                     LIMIT :top_k
                     """
@@ -224,13 +222,12 @@ class GraphRAGVectorStore:
             return [
                 VectorSearchHit(
                     id=row[0],
-                    distance=float(row[7]),
+                    distance=float(row[6]),
                     content=row[4],
                     metadata={
                         "relationship_id": row[1],
                         "source_name": row[2],
                         "target_name": row[3],
-                        "rel_type": row[5],
                         "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
@@ -462,3 +459,82 @@ class GraphRAGVectorStore:
                 )
                 for row in result
             ]
+
+    # ── Prefix (rel_type) Embeddings ──
+
+    async def ensure_prefix_embeddings_table(
+        self,
+        collection_id: uuid.UUID,
+    ) -> None:
+        """Create the prefix_embeddings table if it doesn't exist."""
+        tbl = table_name(collection_id, "prefix_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            return
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text(
+                    f"CREATE TABLE IF NOT EXISTS {tbl} ("
+                    f"  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+                    f"  collection_id UUID NOT NULL REFERENCES collections(id) ON DELETE CASCADE,"
+                    f"  rel_type VARCHAR(256) NOT NULL,"
+                    f"  embedding vector({dimensions}) NOT NULL,"
+                    f"  created_at TIMESTAMPTZ DEFAULT now(),"
+                    f"  CONSTRAINT uq_{tbl}_rel_type UNIQUE (collection_id, rel_type)"
+                    f")"
+                )
+            )
+            await session.commit()
+
+    async def upsert_prefix_embedding(
+        self,
+        collection_id: uuid.UUID,
+        rel_type: str,
+        embedding: list[float],
+    ) -> None:
+        tbl = table_name(collection_id, "prefix_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            return
+        cast = _vector_cast_sql(dimensions)
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text(
+                    f"INSERT INTO {tbl} (collection_id, rel_type, embedding) "
+                    f"VALUES (:cid, :rt, (:emb){cast}) "
+                    f"ON CONFLICT (collection_id, rel_type) "
+                    f"DO UPDATE SET embedding = EXCLUDED.embedding"
+                ),
+                {
+                    "cid": _uuid_for_sql(collection_id),
+                    "rt": rel_type,
+                    "emb": _embedding_literal(embedding),
+                },
+            )
+            await session.commit()
+
+    async def load_all_prefix_embeddings(
+        self,
+        collection_id: uuid.UUID,
+    ) -> dict[str, list[float]]:
+        """Return {rel_type: embedding} for all stored prefix embeddings."""
+        tbl = table_name(collection_id, "prefix_embeddings")
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    f"SELECT rel_type, embedding FROM {tbl} WHERE collection_id = :cid"
+                ),
+                {"cid": _uuid_for_sql(collection_id)},
+            )
+            rows = result.fetchall()
+        result_dict: dict[str, list[float]] = {}
+        for row in rows:
+            emb = row[1]
+            if emb is not None:
+                if isinstance(emb, list):
+                    result_dict[row[0]] = [float(v) for v in emb]
+                elif isinstance(emb, str):
+                    # pgvector returns vectors as "[0.1,0.2,...]" strings
+                    inner = emb.strip("[]")
+                    result_dict[row[0]] = [float(v) for v in inner.split(",") if v.strip()]
+        return result_dict
