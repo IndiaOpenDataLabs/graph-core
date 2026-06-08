@@ -50,6 +50,8 @@ class _RedisSemaphore:
             return None
         token = str(uuid.uuid4())
         key = f"{self._key_prefix}:{scope}"
+        timeout = max(settings.provider_semaphore_acquire_timeout_seconds, 1)
+        deadline = time.monotonic() + timeout
         while True:
             now_ms = int(time.time() * 1000)
             acquired = await self._redis.eval(
@@ -63,7 +65,14 @@ class _RedisSemaphore:
             )
             if acquired:
                 return token
-            await asyncio.sleep(self._poll_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out after {timeout}s waiting for provider semaphore "
+                    f"slot on {key} (limit={limit})"
+                )
+            wait = min(self._poll_seconds, remaining)
+            await asyncio.sleep(wait)
 
     async def release(self, scope: str, token: str | None, limit: int) -> None:
         if limit <= 0 or not token:

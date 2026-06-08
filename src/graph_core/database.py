@@ -24,7 +24,14 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(settings.database_url, echo=False)
+engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    pool_size=settings.sqlalchemy_pool_size,
+    max_overflow=settings.sqlalchemy_max_overflow,
+    pool_timeout=settings.sqlalchemy_pool_timeout,
+    pool_recycle=300,
+)
 
 # Request-scoped namespace context — set by API middleware or dependency.
 # When populated, every new session automatically sets the Postgres

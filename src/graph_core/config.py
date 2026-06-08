@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     embedding_max_concurrent_calls: int = 10
     provider_semaphore_lease_seconds: int = 1800
     provider_semaphore_poll_interval_ms: int = 100
+    provider_semaphore_acquire_timeout_seconds: float = 60
     ingest_chunk_time_limit_ms: int = 7200000
     ingest_chunk_max_age_ms: int = 28800000
 
@@ -44,6 +45,10 @@ class Settings(BaseSettings):
     # Graph RAG settings
     falkordb_graph_name: str = "knowledge_graph"
     graph_rag_max_concurrent_workers: int = 5
+    graph_rag_query_embedding_concurrency: int = 4
+    sqlalchemy_pool_size: int = 10
+    sqlalchemy_max_overflow: int = 20
+    sqlalchemy_pool_timeout: float = 30
     graph_rag_high_confidence_threshold: float = 0.3
     graph_rag_medium_confidence_threshold: float = 0.7
     graph_rag_fuzzy_name_threshold: float = 0.8

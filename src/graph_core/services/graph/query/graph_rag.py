@@ -120,9 +120,15 @@ async def _fan_out_per_dimension(
     dims = dimensions if dimensions is not None else []
     if not dims:
         return await build_state(None)
-    results = await asyncio.gather(
-        *(build_state(rel_type) for rel_type in dims)
-    )
+
+    concurrency = settings.graph_rag_query_embedding_concurrency
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _gated(rel_type: str):
+        async with sem:
+            return await build_state(rel_type)
+
+    results = await asyncio.gather(*(_gated(rel_type) for rel_type in dims))
     states = [state for state in results if state is not None]
     if not states:
         return None
@@ -140,15 +146,19 @@ async def _rank_dimensions(
     if len(dimensions) <= top_k:
         return dimensions
 
-    async def _score_dimension(rel_type: str) -> tuple[str, float, float]:
-        query_embedding = await _embed_relationship_query(
-            embedding_provider,
-            question,
-            rel_type=rel_type,
-        )
+    # Batch-embed all dimension queries in a single API call.
+    embeddings = await _embed_relationship_queries_batch(
+        embedding_provider,
+        [question] * len(dimensions),
+        dimensions,
+    )
+
+    async def _score_dimension(
+        rel_type: str, embedding: list[float]
+    ) -> tuple[str, float, float]:
         hits = await _graph_rag_vectors.search_relationship_embeddings(
             collection_id=collection.id,
-            query_embedding=query_embedding,
+            query_embedding=embedding,
             top_k=3,
         )
         sims = [1.0 - hit.distance for hit in hits]
@@ -156,7 +166,16 @@ async def _rank_dimensions(
         top3_mean = sum(sims[:3]) / min(len(sims), 3) if sims else 0.0
         return rel_type, top1 + top3_mean, top1
 
-    scored = await asyncio.gather(*(_score_dimension(rel_type) for rel_type in dimensions))
+    concurrency = settings.graph_rag_query_embedding_concurrency
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _gated_score(rel_type: str, emb: list[float]):
+        async with sem:
+            return await _score_dimension(rel_type, emb)
+
+    scored = await asyncio.gather(
+        *(_gated_score(rel_type, emb) for rel_type, emb in zip(dimensions, embeddings))
+    )
     scored.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
     selected = [rel_type for rel_type, _, _ in scored[:top_k]]
     logger.info(
@@ -235,6 +254,38 @@ async def _embed_relationship_query(
             ),
         )
     )
+
+
+async def _embed_relationship_queries_batch(
+    embedding_provider: EmbeddingProvider,
+    queries: list[str],
+    rel_types: list[str | None],
+) -> list[list[float]]:
+    """Embed multiple relationship queries in a single API call.
+
+    Each query gets its own rel_type focus prefix, but all are sent to
+    the embedding model in one batched request, reducing round-trips.
+    """
+    texts = []
+    for query, rel_type in zip(queries, rel_types):
+        focus = ""
+        if rel_type:
+            focus = (
+                f" Focus on relationships whose semantic role is {normalize_dim(rel_type)}."
+            )
+        texts.append(
+            _format_retrieval_query(
+                _RELATIONSHIP_RETRIEVAL_INSTRUCTION + focus,
+                relationship_embedding_text(
+                    source_name="user-question",
+                    target_name="graph-answer",
+                    rel_type=rel_type,
+                    description=query,
+                    keywords=[],
+                ),
+            )
+        )
+    return await embedding_provider.embed_documents(texts)
 
 
 async def _resolve_credential(
@@ -1002,16 +1053,26 @@ async def _mix_state(
         llm_profile_id=llm_profile_id,
     )
     interpretation = await _interpret_mix_queries(question, candidates, llm_provider)
-    async def _build_subquery_state(subquery: str) -> GraphQueryState:
-        subquery_embedding = await _embed_relationship_query(
+
+    # Batch-embed all subquery relationship queries in one API call.
+    subqueries = interpretation.retrieval_subqueries
+    rel_type_for_sub = rel_types[0] if rel_types else None
+    if subqueries:
+        subquery_embeddings = await _embed_relationship_queries_batch(
             embedding_provider,
-            subquery,
-            rel_type=rel_types[0] if rel_types else None,
+            subqueries,
+            [rel_type_for_sub] * len(subqueries),
         )
+    else:
+        subquery_embeddings = []
+
+    async def _build_subquery_state(
+        subquery: str, embedding: list[float]
+    ) -> GraphQueryState:
         subquery_tokens = query_tokens | _query_token_set(subquery)
         return await _relationship_seed_state(
             collection,
-            subquery_embedding,
+            embedding,
             top_k=8,
             max_endpoints=16,
             max_pairs=20,
@@ -1020,11 +1081,15 @@ async def _mix_state(
             dimension_weight=dimension_weight,
         )
 
+    concurrency = settings.graph_rag_query_embedding_concurrency
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _gated(sq: str, emb: list[float]):
+        async with sem:
+            return await _build_subquery_state(sq, emb)
+
     states = await asyncio.gather(
-        *(
-            _build_subquery_state(subquery)
-            for subquery in interpretation.retrieval_subqueries
-        )
+        *(_gated(sq, emb) for sq, emb in zip(subqueries, subquery_embeddings))
     )
 
     if not states:
