@@ -201,18 +201,20 @@ class GraphRAGVectorStore:
             "qemb": _embedding_literal(query_embedding),
         }
         if relationship_id:
-            where_extra = "AND relationship_id = :rel_id"
+            where_extra = "AND v.relationship_id = :rel_id"
             params["rel_id"] = _uuid_for_sql(relationship_id)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
-                    SELECT id::text, relationship_id::text, source_name, target_name, description,
-                           1 - (embedding <=> (:qemb){cast}) as score,
-                           embedding <=> (:qemb){cast} as distance
-                    FROM {tbl}
-                    WHERE collection_id = :cid {where_extra}
+                    SELECT v.id::text, v.relationship_id::text, v.source_name, v.target_name,
+                           v.description, g.rel_type,
+                           1 - (v.embedding <=> (:qemb){cast}) as score,
+                           v.embedding <=> (:qemb){cast} as distance
+                    FROM {tbl} v
+                    LEFT JOIN graph_relationships g ON g.id = v.relationship_id
+                    WHERE v.collection_id = :cid {where_extra}
                     ORDER BY distance
                     LIMIT :top_k
                     """
@@ -222,12 +224,13 @@ class GraphRAGVectorStore:
             return [
                 VectorSearchHit(
                     id=row[0],
-                    distance=float(row[6]),
+                    distance=float(row[7]),
                     content=row[4],
                     metadata={
                         "relationship_id": row[1],
                         "source_name": row[2],
                         "target_name": row[3],
+                        "rel_type": row[5],
                         "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
