@@ -717,6 +717,35 @@ class FalkorDBGraphStorage:
                     edges.append((str(source), str(target)))
         return edges
 
+    async def get_node_edges_with_types(
+        self,
+        node_id: str,
+        rel_types: list[str] | None = None,
+    ) -> list[tuple[str, str, str]]:
+        """Like get_node_edges but returns (source, target, rel_type) triples."""
+        graph = await self._get_graph()
+        label_pat = _edge_label_pattern(rel_types)
+        if rel_types and not label_pat:
+            return []
+        if label_pat:
+            cypher = (
+                f"MATCH (n:Entity {{id: $node_id}})-[r{label_pat}]-(m:Entity)"
+                " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
+            )
+        else:
+            cypher = (
+                "MATCH (n:Entity {id: $node_id})-[r]-(m:Entity)"
+                " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
+            )
+        result = await graph.query(cypher, {"node_id": node_id})
+        edges: list[tuple[str, str, str]] = []
+        if result and result.result_set:
+            for row in result.result_set:
+                source, target, rel_type = row[0], row[1], row[2]
+                if source and target:
+                    edges.append((str(source), str(target), str(rel_type)))
+        return edges
+
     async def get_edge(
         self,
         source_id: str,

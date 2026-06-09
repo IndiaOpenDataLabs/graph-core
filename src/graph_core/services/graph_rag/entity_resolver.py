@@ -29,10 +29,7 @@ from graph_core.models.graph_rag import (
     GraphRelationship,
     RelationshipDescription,
 )
-from graph_core.models.rel_types import (
-    normalize_rel_type,
-    relationship_embedding_text,
-)
+from graph_core.models.rel_types import relationship_embedding_text
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
 logger = logging.getLogger(__name__)
@@ -303,15 +300,6 @@ class IncrementalEntityResolver:
             target_name=tgt_name,
             description=description,
             embedding=embedding,
-        )
-
-        # Store prefix embedding for this rel_type so dimension ranking at
-        # query time is a pure-CPU cosine similarity instead of N API calls.
-        normalized = normalize_rel_type(rel_type)
-        prefix_embedding = await self._embedding.embed_query(normalized)
-        await self._vstore.ensure_prefix_embeddings_table(self._collection_id)
-        await self._vstore.upsert_prefix_embedding(
-            self._collection_id, normalized, prefix_embedding
         )
 
         return RelationshipResolutionResult(is_new=True, relationship_id=new_rel_id)

@@ -63,7 +63,7 @@ _MODE_ALIASES = {
     "hybrid": "hybrid",
     "mix": "mix",
 }
-_MAX_QUERY_DIMENSIONS = 8
+_MAX_QUERY_DIMENSIONS = 25
 _META_COLLECTION_SUFFIX = "__meta"
 
 
@@ -146,48 +146,76 @@ async def _rank_dimensions(
     if len(dimensions) <= top_k:
         return dimensions
 
-    # Step 1: Embed the query once (without rel_type focus).
-    query_embedding = await _embed_relationship_query(
+    dimension_set = set(dimensions)
+
+    # Step 1: Find top entities relevant to the question (across all rel_types).
+    entity_query_embedding = await _embed_entity_query(
+        embedding_provider, question
+    )
+    seed_entity_ids, entity_relevance = await _search_entity_seeds(
+        question, collection, entity_query_embedding
+    )
+    top_entities = seed_entity_ids[:10]
+
+    if not top_entities:
+        return dimensions[:top_k]
+
+    # Step 2: Collect rel_types from edges incident to the top entities.
+    graph_storage = get_graph_storage(collection.id)
+    rel_type_counts: dict[str, int] = defaultdict(int)
+
+    for entity_id in top_entities:
+        edges = await graph_storage.get_node_edges_with_types(entity_id)
+        for _, _, rel_type in edges:
+            normalized = normalize_dim(rel_type)
+            if normalized in dimension_set:
+                rel_type_counts[normalized] += 1
+
+    # Step 3: Find paths between pairs of top entities and collect rel_types
+    # from those paths. This captures the "highway" rel_types that connect
+    # relevant entities.
+    rel_query_embedding = await _embed_relationship_query(
         embedding_provider, question, rel_type=None
     )
+    query_tokens = _query_token_set(question)
+    rel_score_cache: dict[str, float] = {}
 
-    # Step 2: Load pre-computed prefix embeddings from storage.  These are
-    # computed at ingestion time when each rel_type is first encountered.
-    await _graph_rag_vectors.ensure_prefix_embeddings_table(collection.id)
-    stored_prefixes = await _graph_rag_vectors.load_all_prefix_embeddings(
-        collection.id
-    )
+    pair_count = 0
+    max_pairs = 20
+    for source_id, target_id in combinations(top_entities, 2):
+        if pair_count >= max_pairs:
+            break
+        pair_count += 1
 
-    # For dimensions missing from storage, embed on the fly.
-    missing_dims = [d for d in dimensions if d not in stored_prefixes]
-    if missing_dims:
-        missing_embeddings = await embedding_provider.embed_documents(
-            [normalize_dim(d) for d in missing_dims]
+        path = await _find_relevant_path_for_ranking(
+            graph_storage,
+            collection,
+            rel_query_embedding,
+            source_id,
+            target_id,
+            rel_score_cache,
+            query_tokens=query_tokens,
         )
-        for dim, emb in zip(missing_dims, missing_embeddings):
-            stored_prefixes[dim] = emb
-            await _graph_rag_vectors.upsert_prefix_embedding(
-                collection.id, dim, emb
-            )
+        if not path:
+            continue
+        _, path_rels = path
+        for rel_id in path_rels:
+            rel_type_from_id = await _get_rel_type_from_id(rel_id)
+            if rel_type_from_id:
+                normalized = normalize_dim(rel_type_from_id)
+                if normalized in dimension_set:
+                    rel_type_counts[normalized] += 2
 
-    # Step 3: Rank all dimensions by cosine similarity (pure CPU).
-    def _cosine(a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(x * x for x in b) ** 0.5
-        if norm_a == 0.0 or norm_b == 0.0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+    if not rel_type_counts:
+        return dimensions[:top_k]
 
-    ranked = sorted(
-        [(d, stored_prefixes[d]) for d in dimensions if d in stored_prefixes],
-        key=lambda item: _cosine(query_embedding, item[1]),
-        reverse=True,
+    # Step 4: Rank candidates by graph-grounded frequency, then score with
+    # vector search for fine-grained ranking.
+    sorted_by_count = sorted(
+        rel_type_counts.items(), key=lambda x: x[1], reverse=True
     )
-    candidate_dims = [rel_type for rel_type, _ in ranked[:50]]
+    candidate_dims = [rt for rt, _ in sorted_by_count[:50]]
 
-    # Step 4: Score only the top-50 candidates with the original vector-search
-    # approach (embed question with each dim's focus, search relationship vectors).
     embeddings = await _embed_relationship_queries_batch(
         embedding_provider,
         [question] * len(candidate_dims),
@@ -213,16 +241,86 @@ async def _rank_dimensions(
     scored.sort(key=lambda item: (item[1], item[2], item[0]), reverse=True)
     selected = [rel_type for rel_type, _, _ in scored[:top_k]]
     logger.info(
-        "graph_rag dimension gating collection=%s total=%d stored=%d missing=%d candidates=%d selected=%d top=%s",
+        "graph_rag dimension gating collection=%s total=%d entities=%d edge_rels=%d path_rels=%d candidates=%d selected=%d top=%s",
         collection.name,
         len(dimensions),
-        len(stored_prefixes) - len(missing_dims),
-        len(missing_dims),
+        len(top_entities),
+        sum(1 for _, c in rel_type_counts.items() if c > 0),
+        pair_count,
         len(candidate_dims),
         len(selected),
         [(rel_type, round(score, 6)) for rel_type, score, _ in scored[:top_k]],
     )
     return selected
+
+
+async def _get_rel_type_from_id(rel_id: str) -> str | None:
+    """Look up the rel_type for a given relationship ID from the DB."""
+    async with AsyncSessionLocal() as session:
+        rel = await session.get(GraphRelationship, uuid.UUID(rel_id))
+        return rel.rel_type if rel else None
+
+
+async def _find_relevant_path_for_ranking(
+    graph_storage,
+    collection: Collection,
+    relationship_query_embedding: list[float],
+    source_id: str,
+    target_id: str,
+    rel_score_cache: dict[str, float],
+    *,
+    max_depth: int = 3,
+    beam_width: int = 4,
+    query_tokens: set[str] | None = None,
+) -> tuple[list[str], list[str]] | None:
+    """Beam-search path between two entities, collecting all rel_type edges.
+
+    Variant of _find_relevant_path that doesn't filter by rel_types,
+    used during dimension ranking to discover relevant relationship types.
+    """
+    if query_tokens is None:
+        query_tokens = set()
+
+    queue: deque[tuple[str, list[str], list[str], int]] = deque(
+        [(source_id, [source_id], [], 0)]
+    )
+
+    while queue:
+        node_id, path_nodes, path_rels, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+
+        edges = await graph_storage.get_node_edges_with_types(node_id)
+        candidates: list[tuple[float, str, str]] = []
+        for src, tgt, rel_type in edges:
+            neighbor = tgt if src == node_id else src
+            if neighbor in path_nodes:
+                continue
+
+            edge_props = await graph_storage.get_edge(src, tgt)
+            if not edge_props:
+                edge_props = await graph_storage.get_edge(tgt, src)
+            if not (edge_props and edge_props.get("id")):
+                continue
+
+            rel_id = str(edge_props["id"])
+            sim = await _score_relationship(
+                collection,
+                relationship_query_embedding,
+                rel_id,
+                rel_score_cache,
+            )
+            combined = _combined_edge_score(sim, edge_props, query_tokens)
+            candidates.append((combined, neighbor, rel_id))
+
+        for _, neighbor, rel_id in sorted(candidates, reverse=True)[:beam_width]:
+            next_nodes = path_nodes + [neighbor]
+            next_rels = path_rels + [rel_id]
+            if neighbor == target_id:
+                return next_nodes, next_rels
+            queue.append((neighbor, next_nodes, next_rels, depth + 1))
+
+    return None
 
 
 @dataclass
