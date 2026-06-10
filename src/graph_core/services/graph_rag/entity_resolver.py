@@ -66,16 +66,16 @@ class IncrementalEntityResolver:
         self._collection_id = collection_id
         self._vstore = GraphRAGVectorStore()
 
-    async def _resolve_rel_type(
-        self, session: AsyncSession, rel_type: str
-    ) -> str:
-        """Resolve a rel_type to its canonical form.
-        
-        Two-tier resolution:
-        1. Static alias table lookup (pre-populated from clustering)
-        2. Embedding similarity against stored rel_type embeddings (dynamic)
+    async def _resolve_rel_type(self, session: AsyncSession, rel_type: str) -> str:
+        """Resolve a rel_type to its canonical form using cluster-based matching.
+
+        Three-tier resolution:
+        1. Exact alias lookup in relationship_type_aliases (backfilled from clustering)
+        2. Prefix embedding similarity against all known rel_types — map to the
+           canonical of the matched cluster
+        3. Accept the rel_type as-is (truly novel)
         """
-        # Tier 1: Static alias table
+        # Tier 1: Static alias table (backfilled from clustering)
         resolved = await session.execute(
             select(RelationshipTypeAlias)
             .where(
@@ -87,55 +87,76 @@ class IncrementalEntityResolver:
         if alias_row:
             logger.debug("rel_type alias: %s -> %s", rel_type, alias_row.canonical_type)
             return alias_row.canonical_type
-        
-        # Tier 2: Embedding similarity against stored rel_types
-        from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
-        tbl = GraphRAGVectorStore.table_name(self._collection_id, "prefix_embeddings")
-        
-        result = await session.execute(
-            text(
-                f"SELECT rel_type, embedding FROM {tbl} "
-                f"WHERE collection_id = :cid AND rel_type = :rt"
-            ),
-            {"cid": str(self._collection_id), "rt": rel_type},
+
+        # Tier 2: Prefix embedding similarity — find cluster member, map to canonical
+        await self._vstore.ensure_prefix_embeddings_table(self._collection_id)
+
+        stored = await self._vstore.load_all_prefix_embeddings(self._collection_id)
+        if stored:
+            query_emb = await self._embedding.embed_query(rel_type)
+
+            best_match: str | None = None
+            best_dist: float = 1e9
+
+            for rt, emb in stored.items():
+                if rt == rel_type:
+                    continue
+                dot = sum(a * b for a, b in zip(query_emb, emb))
+                na = sum(a * a for a in query_emb) ** 0.5
+                nb = sum(b * b for b in emb) ** 0.5
+                if na > 0 and nb > 0:
+                    dist = 1.0 - dot / (na * nb)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_match = rt
+
+            if best_match and (1.0 - best_dist) >= self.HIGH_CONFIDENCE_SIMILARITY:
+                # best_match is a cluster member — look up its canonical
+                canon_result = await session.execute(
+                    select(RelationshipTypeAlias)
+                    .where(
+                        RelationshipTypeAlias.alias_type == best_match,
+                        RelationshipTypeAlias.collection_id == self._collection_id,
+                    )
+                )
+                canon_alias = canon_result.scalar_one_or_none()
+                canonical = canon_alias.canonical_type if canon_alias else best_match
+
+                # Store prefix embedding for future matching
+                await self._vstore.upsert_prefix_embedding(
+                    collection_id=self._collection_id,
+                    rel_type=rel_type,
+                    embedding=query_emb,
+                )
+
+                # Insert alias mapping
+                await session.execute(
+                    text(
+                        "INSERT INTO relationship_type_aliases "
+                        "(collection_id, canonical_type, alias_type) "
+                        "VALUES (:cid, :canonical, :alias) "
+                        "ON CONFLICT (collection_id, alias_type) DO NOTHING"
+                    ),
+                    {
+                        "cid": str(self._collection_id),
+                        "canonical": canonical,
+                        "alias": rel_type,
+                    },
+                )
+                logger.debug(
+                    "rel_type cluster match: %s -> %s (sim=%.4f, via %s)",
+                    rel_type, canonical, 1.0 - best_dist, best_match,
+                )
+                return canonical
+
+        # Novel rel_type — store prefix embedding for future matching
+        await self._vstore.ensure_prefix_embeddings_table(self._collection_id)
+        emb = await self._embedding.embed_query(rel_type)
+        await self._vstore.upsert_prefix_embedding(
+            collection_id=self._collection_id,
+            rel_type=rel_type,
+            embedding=emb,
         )
-        row = result.fetchone()
-        if row and row[1] is not None:
-            query_emb = row[1]
-            # Find closest canonical rel_type using cosine similarity
-            match = await session.execute(
-                text(
-                    f"SELECT rel_type, (embedding <=> :emb) as dist "
-                    f"FROM {tbl} WHERE collection_id = :cid "
-                    f"AND rel_type != :rt "
-                    f"ORDER BY dist ASC LIMIT 1"
-                ),
-                {"cid": str(self._collection_id), "emb": query_emb, "rt": rel_type},
-            )
-            best = match.fetchone()
-            if best:
-                similarity = 1.0 - best[1]
-                if similarity >= 0.80:
-                    # Insert alias on-the-fly
-                    await session.execute(
-                        text(
-                            "INSERT INTO relationship_type_aliases "
-                            "(collection_id, canonical_type, alias_type) "
-                            "VALUES (:cid, :canonical, :alias) "
-                            "ON CONFLICT (collection_id, alias_type) DO NOTHING"
-                        ),
-                        {
-                            "cid": str(self._collection_id),
-                            "canonical": best[0],
-                            "alias": rel_type,
-                        },
-                    )
-                    logger.debug(
-                        "rel_type embedding match: %s -> %s (sim=%.4f)",
-                        rel_type, best[0], similarity,
-                    )
-                    return best[0]
-        
         return rel_type
 
     async def resolve_entity(
