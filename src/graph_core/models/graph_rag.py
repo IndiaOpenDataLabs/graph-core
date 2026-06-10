@@ -124,6 +124,37 @@ class EntityAlias(Base):
         return f"<EntityAlias {self.alias_name}>"
 
 
+class RelationshipTypeAlias(Base):
+    __tablename__ = "relationship_type_aliases"
+
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collection_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("collections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    canonical_type = Column(String(64), nullable=False, index=True)
+    alias_type = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "collection_id",
+            "alias_type",
+            name="uq_relationship_type_aliases_collection_alias_type",
+        ),
+        Index(
+            "ix_relationship_type_aliases_canonical",
+            "collection_id",
+            "canonical_type",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<RelationshipTypeAlias {self.alias_type} -> {self.canonical_type}>"
+
+
 class EntityType(Base):
     __tablename__ = "entity_types"
 

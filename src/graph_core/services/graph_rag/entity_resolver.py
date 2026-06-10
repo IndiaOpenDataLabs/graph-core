@@ -28,6 +28,7 @@ from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
     RelationshipDescription,
+    RelationshipTypeAlias,
 )
 from graph_core.models.rel_types import relationship_embedding_text
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
@@ -64,6 +65,78 @@ class IncrementalEntityResolver:
         self._embedding = embedding_provider
         self._collection_id = collection_id
         self._vstore = GraphRAGVectorStore()
+
+    async def _resolve_rel_type(
+        self, session: AsyncSession, rel_type: str
+    ) -> str:
+        """Resolve a rel_type to its canonical form.
+        
+        Two-tier resolution:
+        1. Static alias table lookup (pre-populated from clustering)
+        2. Embedding similarity against stored rel_type embeddings (dynamic)
+        """
+        # Tier 1: Static alias table
+        resolved = await session.execute(
+            select(RelationshipTypeAlias)
+            .where(
+                RelationshipTypeAlias.alias_type == rel_type,
+                RelationshipTypeAlias.collection_id == self._collection_id,
+            )
+        )
+        alias_row = resolved.scalar_one_or_none()
+        if alias_row:
+            logger.debug("rel_type alias: %s -> %s", rel_type, alias_row.canonical_type)
+            return alias_row.canonical_type
+        
+        # Tier 2: Embedding similarity against stored rel_types
+        from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
+        tbl = GraphRAGVectorStore.table_name(self._collection_id, "prefix_embeddings")
+        
+        result = await session.execute(
+            text(
+                f"SELECT rel_type, embedding FROM {tbl} "
+                f"WHERE collection_id = :cid AND rel_type = :rt"
+            ),
+            {"cid": str(self._collection_id), "rt": rel_type},
+        )
+        row = result.fetchone()
+        if row and row[1] is not None:
+            query_emb = row[1]
+            # Find closest canonical rel_type using cosine similarity
+            match = await session.execute(
+                text(
+                    f"SELECT rel_type, (embedding <=> :emb) as dist "
+                    f"FROM {tbl} WHERE collection_id = :cid "
+                    f"AND rel_type != :rt "
+                    f"ORDER BY dist ASC LIMIT 1"
+                ),
+                {"cid": str(self._collection_id), "emb": query_emb, "rt": rel_type},
+            )
+            best = match.fetchone()
+            if best:
+                similarity = 1.0 - best[1]
+                if similarity >= 0.80:
+                    # Insert alias on-the-fly
+                    await session.execute(
+                        text(
+                            "INSERT INTO relationship_type_aliases "
+                            "(collection_id, canonical_type, alias_type) "
+                            "VALUES (:cid, :canonical, :alias) "
+                            "ON CONFLICT (collection_id, alias_type) DO NOTHING"
+                        ),
+                        {
+                            "cid": str(self._collection_id),
+                            "canonical": best[0],
+                            "alias": rel_type,
+                        },
+                    )
+                    logger.debug(
+                        "rel_type embedding match: %s -> %s (sim=%.4f)",
+                        rel_type, best[0], similarity,
+                    )
+                    return best[0]
+        
+        return rel_type
 
     async def resolve_entity(
         self,
@@ -209,6 +282,9 @@ class IncrementalEntityResolver:
         source_chunk_hash: str,
         rel_type: str = "RELATES_TO",
     ) -> RelationshipResolutionResult:
+        # Normalize rel_type using alias table
+        rel_type = await self._resolve_rel_type(session, rel_type)
+        
         # Check for existing relationship (bidirectional, scoped to rel_type).
         # Two rels between the same pair with different rel_types are
         # distinct edges (multi-dimensional graph) and must not merge.

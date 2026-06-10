@@ -33,6 +33,7 @@ via_collection_tables = [
     "graph_entities",
     "graph_relationships",
     "raw_chunk_extractions",
+    "relationship_type_aliases",
 ]
 
 # Tables scoped via entity_id -> graph_entities.collection_id -> collections.namespace_id

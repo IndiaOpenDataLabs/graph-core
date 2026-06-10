@@ -12,6 +12,7 @@ from graph_core.models.graph_rag import (
     GraphRelationship,
     RawChunkExtraction,
     RelationshipDescription,
+    RelationshipTypeAlias,
 )
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job, JobEvent
@@ -36,6 +37,7 @@ __all__ = [
     "EntityType",
     "GraphRelationship",
     "RelationshipDescription",
+    "RelationshipTypeAlias",
     "RawChunkExtraction",
     "RegisteredApp",
     "AppUserLink",
