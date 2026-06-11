@@ -205,7 +205,7 @@ class LLMGraphExtractor:
     def _normalize_entity_name(name: str) -> str:
         if not name:
             return ""
-        normalized = name.strip().title()
+        normalized = " ".join(name.strip().split())
         if len(normalized) > 256:
             normalized = normalized[:256]
         return normalized

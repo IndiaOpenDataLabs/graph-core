@@ -24,14 +24,22 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(
-    settings.database_url,
-    echo=False,
-    pool_size=settings.sqlalchemy_pool_size,
-    max_overflow=settings.sqlalchemy_max_overflow,
-    pool_timeout=settings.sqlalchemy_pool_timeout,
-    pool_recycle=300,
-)
+_engine_kwargs: dict[str, Any] = {
+    "echo": False,
+    "pool_recycle": 300,
+}
+if not settings.database_url.startswith("sqlite"):
+    _engine_kwargs.update(
+        pool_size=settings.sqlalchemy_pool_size,
+        max_overflow=settings.sqlalchemy_max_overflow,
+        pool_timeout=settings.sqlalchemy_pool_timeout,
+    )
+
+engine = create_async_engine(settings.database_url, **_engine_kwargs)
+
+
+def _supports_namespace_context() -> bool:
+    return engine.url.get_backend_name() == "postgresql"
 
 # Request-scoped namespace context — set by API middleware or dependency.
 # When populated, every new session automatically sets the Postgres
@@ -48,7 +56,7 @@ class NamespacedAsyncSession(AsyncSession):
     async def begin(self) -> Any:
         await super().begin()
         ns_id = current_namespace_id.get()
-        if ns_id is not None:
+        if ns_id is not None and _supports_namespace_context():
             await self.execute(
                 text("SET LOCAL app.current_namespace_id = :nsid"),
                 {"nsid": _uuid_for_sql(ns_id)},
@@ -70,10 +78,12 @@ async def set_namespace_context(session: AsyncSession, namespace_id: uuid.UUID) 
 
     Must be called inside an active transaction before any query runs.
     """
+    if not _supports_namespace_context():
+        return
     await session.execute(
-            text("SET LOCAL app.current_namespace_id = :nsid"),
-            {"nsid": _uuid_for_sql(namespace_id)},
-        )
+        text("SET LOCAL app.current_namespace_id = :nsid"),
+        {"nsid": _uuid_for_sql(namespace_id)},
+    )
 
 
 async def get_session() -> AsyncSession:

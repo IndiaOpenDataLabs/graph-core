@@ -15,7 +15,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -167,13 +167,14 @@ class IncrementalEntityResolver:
         description: str,
         source_chunk_hash: str,
     ) -> EntityResolutionResult:
-        normalized_name = name.strip().title()
+        normalized_name = self._normalize_entity_name(name)
+        lookup_name = normalized_name.lower()
 
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
             select(EntityAlias)
             .where(
-                EntityAlias.alias_name == normalized_name,
+                func.lower(EntityAlias.alias_name) == lookup_name,
                 EntityAlias.collection_id == self._collection_id,
             )
         )
@@ -188,7 +189,7 @@ class IncrementalEntityResolver:
                     session, entity_result.id, entity_result, description,
                     source_chunk_hash, context_embedding,
                 )
-                self._add_or_increment_type(session, entity_result.id, entity_type)
+                await self._add_or_increment_type(session, entity_result.id, entity_type)
                 return EntityResolutionResult(
                     is_new=False, entity_id=entity_result.id, canonical_name=entity_result.canonical_name
                 )
@@ -196,7 +197,7 @@ class IncrementalEntityResolver:
         # Check canonical name directly
         existing_result = await session.execute(
             select(GraphEntity).where(
-                GraphEntity.canonical_name == normalized_name,
+                func.lower(GraphEntity.canonical_name) == lookup_name,
                 GraphEntity.collection_id == self._collection_id,
             )
         )
@@ -208,7 +209,7 @@ class IncrementalEntityResolver:
             await self._add_description_and_update_centroid(
                 session, existing.id, existing, description, source_chunk_hash, context_embedding,
             )
-            self._add_or_increment_type(session, existing.id, entity_type)
+            await self._add_or_increment_type(session, existing.id, entity_type)
             return EntityResolutionResult(
                 is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
             )
@@ -228,7 +229,7 @@ class IncrementalEntityResolver:
                 await self._add_description_and_update_centroid(
                     session, entity_match.id, entity_match, description, source_chunk_hash, query_embedding,
                 )
-                self._add_or_increment_type(session, entity_match.id, entity_type)
+                await self._add_or_increment_type(session, entity_match.id, entity_type)
                 return EntityResolutionResult(
                     is_new=False, entity_id=entity_match.id, canonical_name=entity_match.canonical_name
                 )
@@ -266,7 +267,7 @@ class IncrementalEntityResolver:
                     source_chunk_hash,
                     query_embedding,
                 )
-                self._add_or_increment_type(session, entity_id, entity_type)
+                await self._add_or_increment_type(session, entity_id, entity_type)
                 logger.info("New entity created: %s (type=%s)", normalized_name, entity_type)
                 return EntityResolutionResult(
                     is_new=True, entity_id=entity_id, canonical_name=normalized_name
@@ -275,7 +276,7 @@ class IncrementalEntityResolver:
             # Conflict — another worker inserted it
             existing_result = await session.execute(
                 select(GraphEntity).where(
-                    GraphEntity.canonical_name == normalized_name,
+                    func.lower(GraphEntity.canonical_name) == lookup_name,
                     GraphEntity.collection_id == self._collection_id,
                 )
             )
@@ -285,7 +286,7 @@ class IncrementalEntityResolver:
                 await self._add_description_and_update_centroid(
                     session, existing.id, existing, description, source_chunk_hash, query_embedding,
                 )
-                self._add_or_increment_type(session, existing.id, entity_type)
+                await self._add_or_increment_type(session, existing.id, entity_type)
                 return EntityResolutionResult(
                     is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
                 )
@@ -649,7 +650,7 @@ class IncrementalEntityResolver:
         )
         await session.execute(stmt)
 
-    def _add_or_increment_type(
+    async def _add_or_increment_type(
         self, session: AsyncSession, entity_id: uuid.UUID, type_name: str
     ) -> None:
         if not type_name:
@@ -662,7 +663,7 @@ class IncrementalEntityResolver:
                 set_={"frequency": EntityType.frequency + 1},
             )
         )
-        session.execute(stmt)
+        await session.execute(stmt)
 
     def _types_compatible(self, type_a: str, type_b: str) -> bool:
         if not type_a or not type_b:
@@ -690,6 +691,15 @@ class IncrementalEntityResolver:
         text = re.sub(r"^(the|a|an)\s+", "", text)
         text = re.sub(r"[\s\-]", "", text)
         return text
+
+    @staticmethod
+    def _normalize_entity_name(name: str) -> str:
+        if not name:
+            return ""
+        normalized = " ".join(name.strip().split())
+        if len(normalized) > 256:
+            normalized = normalized[:256]
+        return normalized
 
     def _fuzzy_match(self, name1: str, name2: str) -> bool:
         if not name1 or not name2:

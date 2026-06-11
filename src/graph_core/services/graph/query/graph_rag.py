@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import distinct, or_, select
+from sqlalchemy import and_, distinct, func, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -27,6 +27,7 @@ from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
     RelationshipDescription,
+    RelationshipTypeAlias,
 )
 from graph_core.models.profile import Profile
 from graph_core.models.rel_types import (
@@ -81,9 +82,23 @@ async def _active_dimensions(collection: Collection) -> list[str]:
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(distinct(GraphRelationship.rel_type)).where(
-                GraphRelationship.collection_id == collection.id
+            select(
+                distinct(
+                    func.coalesce(
+                        RelationshipTypeAlias.canonical_type,
+                        GraphRelationship.rel_type,
+                    )
+                )
             )
+            .select_from(GraphRelationship)
+            .outerjoin(
+                RelationshipTypeAlias,
+                and_(
+                    RelationshipTypeAlias.collection_id == GraphRelationship.collection_id,
+                    RelationshipTypeAlias.alias_type == GraphRelationship.rel_type,
+                ),
+            )
+            .where(GraphRelationship.collection_id == collection.id)
         )
         found = [
             normalize_dim(str(value))
@@ -97,6 +112,31 @@ async def _active_dimensions(collection: Collection) -> list[str]:
     if DEFAULT_REL_TYPE not in types:
         types.insert(0, DEFAULT_REL_TYPE)
     return types
+
+
+async def _load_rel_type_alias_map(collection_id: uuid.UUID) -> dict[str, str]:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(
+                RelationshipTypeAlias.alias_type,
+                RelationshipTypeAlias.canonical_type,
+            ).where(RelationshipTypeAlias.collection_id == collection_id)
+        )
+        return {
+            normalize_dim(alias_type): normalize_dim(canonical_type)
+            for alias_type, canonical_type in result.all()
+            if alias_type and canonical_type
+        }
+
+
+def _canonicalize_rel_type(
+    rel_type: str | None,
+    alias_map: dict[str, str] | None = None,
+) -> str:
+    normalized = normalize_dim(rel_type)
+    if not alias_map:
+        return normalized
+    return alias_map.get(normalized, normalized)
 
 
 def _dimension_weight(rel_type: str | None) -> float:
@@ -162,12 +202,13 @@ async def _rank_dimensions(
 
     # Step 2: Collect rel_types from edges incident to the top entities.
     graph_storage = get_graph_storage(collection.id)
+    rel_type_alias_map = await _load_rel_type_alias_map(collection.id)
     rel_type_counts: dict[str, int] = defaultdict(int)
 
     for entity_id in top_entities:
         edges = await graph_storage.get_node_edges_with_types(entity_id)
         for _, _, rel_type in edges:
-            normalized = normalize_dim(rel_type)
+            normalized = _canonicalize_rel_type(rel_type, rel_type_alias_map)
             if normalized in dimension_set:
                 rel_type_counts[normalized] += 1
 
@@ -202,7 +243,10 @@ async def _rank_dimensions(
         for rel_id in path_rels:
             rel_type_from_id = await _get_rel_type_from_id(rel_id)
             if rel_type_from_id:
-                normalized = normalize_dim(rel_type_from_id)
+                normalized = _canonicalize_rel_type(
+                    rel_type_from_id,
+                    rel_type_alias_map,
+                )
                 if normalized in dimension_set:
                     rel_type_counts[normalized] += 2
 
@@ -1276,7 +1320,22 @@ async def _derive_route_profile(
     async with AsyncSessionLocal() as session:
         rel_rows = (
             await session.execute(
-                select(GraphRelationship.id, GraphRelationship.rel_type).where(
+                select(
+                    GraphRelationship.id,
+                    func.coalesce(
+                        RelationshipTypeAlias.canonical_type,
+                        GraphRelationship.rel_type,
+                    ),
+                )
+                .select_from(GraphRelationship)
+                .outerjoin(
+                    RelationshipTypeAlias,
+                    and_(
+                        RelationshipTypeAlias.collection_id == GraphRelationship.collection_id,
+                        RelationshipTypeAlias.alias_type == GraphRelationship.rel_type,
+                    )
+                )
+                .where(
                     GraphRelationship.id.in_(
                         [
                             uuid.UUID(rel_id)
@@ -1290,7 +1349,7 @@ async def _derive_route_profile(
 
     for rel_id, rel_type in rel_rows:
         rel_id_str = str(rel_id)
-        rel_type_norm = normalize_dim(rel_type or "RELATES_TO")
+        rel_type_norm = _canonicalize_rel_type(rel_type)
         score = float(state.rel_combined_score_cache.get(rel_id_str, 0.0) or 0.0)
         rel_type_scores[rel_type_norm] += score
         if rel_type_norm in {"CALLS", "USES", "EMITS", "SENDS", "SPAWNS"}:
