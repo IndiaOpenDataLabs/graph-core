@@ -11,6 +11,8 @@ from graph_core.models.graph_rag import (
     RelationshipTypeAlias,
 )
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
+from graph_core.services.graph import GraphService
+from graph_core.services.graph.analytics import analyze_collection_graph
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import GraphQueryState
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
@@ -234,3 +236,89 @@ async def test_resolve_rel_type_creates_canonical_relationship_type(
         )
     ).scalars().all()
     assert {row.alias_type for row in alias_rows} == {"INVOKES"}
+
+
+@pytest.mark.asyncio
+async def test_analyze_collection_graph_uses_canonical_relationship_types(
+    db_session,
+    test_graph_rag_collection,
+):
+    source = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Source",
+        primary_type="concept",
+        description_count=0,
+    )
+    target = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Target",
+        primary_type="concept",
+        description_count=0,
+    )
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="CALLS",
+    )
+    relationship = GraphRelationship(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        source_entity_id=source.id,
+        target_entity_id=target.id,
+        relationship_type_id=rel_type.id,
+        rel_type="CALLS",
+        weight=1,
+        keywords=[],
+    )
+    db_session.add_all([source, target, rel_type, relationship])
+    await db_session.commit()
+
+    analysis = await analyze_collection_graph(test_graph_rag_collection.id)
+
+    assert analysis["relationship_records"][0]["rel_type"] == "CALLS"
+
+
+@pytest.mark.asyncio
+async def test_materialize_meta_collection_persists_derived_chunks(
+    test_graph_rag_collection,
+):
+    service = GraphService()
+    service._resolve_collection_embedding_provider = AsyncMock(
+        return_value=_FakeEmbeddingProvider()
+    )
+    graph_storage = type(
+        "_GraphStorage",
+        (),
+        {
+            "upsert_nodes": AsyncMock(),
+            "upsert_edges": AsyncMock(),
+        },
+    )()
+    service._graph_storage = lambda _collection_id: graph_storage
+    service._vector_store.upsert_chunks = AsyncMock()
+    service._graph_rag_vectors.upsert_chunk_embedding = AsyncMock()
+
+    understanding = {
+        "nodes": [],
+        "edges": [],
+        "chunks": [
+            {
+                "chunk_hash": "derived-1",
+                "chunk_index": 0,
+                "content": "Derived concept summary",
+                "metadata": {"memory_type": "derived_graph", "derived_kind": "concept"},
+            }
+        ],
+    }
+
+    await service._materialize_meta_collection(test_graph_rag_collection, understanding)
+
+    service._vector_store.upsert_chunks.assert_awaited_once()
+    upsert_kwargs = service._vector_store.upsert_chunks.await_args.kwargs
+    assert upsert_kwargs["collection_id"] == test_graph_rag_collection.id
+    assert upsert_kwargs["namespace_id"] == test_graph_rag_collection.namespace_id
+    assert upsert_kwargs["chunks"][0]["chunk_hash"] == "derived-1"
+    assert upsert_kwargs["chunks"][0]["metadata"]["memory_type"] == "derived_graph"
+    service._graph_rag_vectors.upsert_chunk_embedding.assert_awaited_once()

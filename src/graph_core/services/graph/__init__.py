@@ -1290,6 +1290,7 @@ class GraphService:
 
         raw_nodes = understanding.get("nodes", [])
         edges = understanding.get("edges", [])
+        chunks = understanding.get("chunks", [])
         merged_nodes_by_name: dict[str, dict[str, Any]] = {}
         merged_node_order: list[str] = []
         old_node_to_name: dict[str, str] = {}
@@ -1445,6 +1446,44 @@ class GraphService:
             await graph_storage.upsert_nodes(list(node_rows_by_id.values()))
         if edge_rows_by_id:
             await graph_storage.upsert_edges(list(edge_rows_by_id.values()))
+        if chunks:
+            vector_chunks: list[dict[str, Any]] = []
+            for chunk in chunks:
+                content = str(chunk.get("content") or "").strip()
+                chunk_hash = str(chunk.get("chunk_hash") or "").strip()
+                if not content or not chunk_hash:
+                    continue
+                try:
+                    chunk_index = int(chunk.get("chunk_index") or 0)
+                except (TypeError, ValueError):
+                    chunk_index = 0
+                embedding = await embedding_provider.embed_query(content)
+                metadata = dict(chunk.get("metadata") or {})
+                metadata.setdefault("memory_type", "derived_graph")
+                metadata.setdefault("collection_id", str(meta_collection.id))
+                vector_chunks.append(
+                    {
+                        "chunk_hash": chunk_hash,
+                        "chunk_index": chunk_index,
+                        "content": content,
+                        "token_count": len(content.split()),
+                        "metadata": metadata,
+                        "embedding": embedding,
+                    }
+                )
+                await self._graph_rag_vectors.upsert_chunk_embedding(
+                    collection_id=meta_collection.id,
+                    chunk_hash=chunk_hash,
+                    chunk_index=chunk_index,
+                    content=content,
+                    embedding=embedding,
+                )
+            if vector_chunks:
+                await self._vector_store.upsert_chunks(
+                    namespace_id=meta_collection.namespace_id,
+                    collection_id=meta_collection.id,
+                    chunks=vector_chunks,
+                )
 
     async def build_collection_understanding(
         self,
@@ -1462,10 +1501,6 @@ class GraphService:
         understanding = await build_collection_understanding(
             analysis,
             llm_provider=llm_provider,
-        )
-        await self._vector_store.delete_chunks_by_metadata(
-            collection_id,
-            {"memory_type": "derived_graph"},
         )
 
         old_meta = await self._get_collection_by_name(

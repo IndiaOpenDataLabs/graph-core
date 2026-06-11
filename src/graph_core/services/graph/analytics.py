@@ -23,7 +23,12 @@ from graph_core.database import AsyncSessionLocal
 from graph_core.llm import LocalEchoLLMProvider
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
-from graph_core.models.graph_rag import EntityAlias, GraphEntity, GraphRelationship
+from graph_core.models.graph_rag import (
+    EntityAlias,
+    GraphEntity,
+    GraphRelationship,
+    GraphRelationshipType,
+)
 from graph_core.models.rel_types import rel_types_for_domain
 
 
@@ -408,7 +413,7 @@ async def _load_graph_records(
                     source_entity.canonical_name,
                     GraphRelationship.target_entity_id,
                     target_entity.canonical_name,
-                    GraphRelationship.rel_type,
+                    GraphRelationshipType.canonical_type,
                     GraphRelationship.weight,
                 )
                 .join(
@@ -418,6 +423,10 @@ async def _load_graph_records(
                 .join(
                     target_entity,
                     target_entity.id == GraphRelationship.target_entity_id,
+                )
+                .join(
+                    GraphRelationshipType,
+                    GraphRelationshipType.id == GraphRelationship.relationship_type_id,
                 )
                 .where(GraphRelationship.collection_id == collection_id)
             )
