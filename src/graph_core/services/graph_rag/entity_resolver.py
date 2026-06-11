@@ -32,6 +32,7 @@ from graph_core.models.graph_rag import (
     RelationshipTypeAlias,
 )
 from graph_core.models.rel_types import normalize_rel_type, relationship_embedding_text
+from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,9 @@ class IncrementalEntityResolver:
         self._embedding = embedding_provider
         self._collection_id = collection_id
         self._vstore = GraphRAGVectorStore()
+        self._graph_storage = FalkorDBGraphStorage(
+            f"collection_{str(collection_id).replace('-', '')}"
+        )
 
     async def _resolve_rel_type(
         self,
@@ -94,6 +98,11 @@ class IncrementalEntityResolver:
             normalized_rel_type,
         )
         if relationship_type:
+            relationship_type = await self._record_relationship_type_observation(
+                session,
+                relationship_type,
+                normalized_rel_type,
+            )
             logger.debug(
                 "rel_type alias: %s -> %s",
                 normalized_rel_type,
@@ -152,6 +161,11 @@ class IncrementalEntityResolver:
                     relationship_type.canonical_type,
                     normalized_rel_type,
                 )
+                relationship_type = await self._record_relationship_type_observation(
+                    session,
+                    relationship_type,
+                    normalized_rel_type,
+                )
                 logger.debug(
                     "rel_type cluster match: %s -> %s (sim=%.4f, via %s)",
                     normalized_rel_type,
@@ -180,6 +194,11 @@ class IncrementalEntityResolver:
             session,
             relationship_type.id,
             relationship_type.canonical_type,
+            normalized_rel_type,
+        )
+        relationship_type = await self._record_relationship_type_observation(
+            session,
+            relationship_type,
             normalized_rel_type,
         )
         return RelationshipTypeResolutionResult(
@@ -753,10 +772,103 @@ class IncrementalEntityResolver:
                 relationship_type_id=relationship_type_id,
                 canonical_type=normalize_rel_type(canonical_type),
                 alias_type=normalized_alias,
+                frequency=1,
             )
-            .on_conflict_do_nothing()
+            .on_conflict_do_update(
+                constraint="uq_relationship_type_aliases_collection_alias_type",
+                set_={
+                    "relationship_type_id": relationship_type_id,
+                    "canonical_type": normalize_rel_type(canonical_type),
+                    "frequency": RelationshipTypeAlias.frequency + 1,
+                },
+            )
         )
         await session.execute(stmt)
+
+    async def _record_relationship_type_observation(
+        self,
+        session: AsyncSession,
+        relationship_type: GraphRelationshipType,
+        observed_label: str,
+    ) -> GraphRelationshipType:
+        await self._add_relationship_type_alias(
+            session,
+            relationship_type.id,
+            relationship_type.canonical_type,
+            observed_label,
+        )
+        updated = await session.get(GraphRelationshipType, relationship_type.id)
+        if updated is None:
+            updated = relationship_type
+        return await self._reelect_relationship_type_canonical(session, updated)
+
+    async def _reelect_relationship_type_canonical(
+        self,
+        session: AsyncSession,
+        relationship_type: GraphRelationshipType,
+    ) -> GraphRelationshipType:
+        alias_result = await session.execute(
+            select(RelationshipTypeAlias)
+            .where(RelationshipTypeAlias.relationship_type_id == relationship_type.id)
+            .order_by(
+                RelationshipTypeAlias.frequency.desc(),
+                RelationshipTypeAlias.alias_type.asc(),
+            )
+        )
+        aliases = alias_result.scalars().all()
+        if not aliases:
+            return relationship_type
+        best_alias = aliases[0]
+        best_canonical = normalize_rel_type(best_alias.alias_type)
+        old_canonical = normalize_rel_type(relationship_type.canonical_type)
+        if best_canonical == old_canonical:
+            return relationship_type
+
+        await session.execute(
+            update(GraphRelationshipType)
+            .where(GraphRelationshipType.id == relationship_type.id)
+            .values(canonical_type=best_canonical)
+        )
+        await session.execute(
+            update(RelationshipTypeAlias)
+            .where(RelationshipTypeAlias.relationship_type_id == relationship_type.id)
+            .values(canonical_type=best_canonical)
+        )
+
+        rel_rows = (
+            await session.execute(
+                select(GraphRelationship).where(
+                    GraphRelationship.relationship_type_id == relationship_type.id
+                )
+            )
+        ).scalars().all()
+
+        await session.execute(
+            update(GraphRelationship)
+            .where(GraphRelationship.relationship_type_id == relationship_type.id)
+            .values(rel_type=best_canonical)
+        )
+
+        if rel_rows:
+            await self._graph_storage.relabel_edges(
+                old_rel_type=old_canonical,
+                new_rel_type=best_canonical,
+                edges=[
+                    {
+                        "source_id": str(rel.source_entity_id),
+                        "target_id": str(rel.target_entity_id),
+                        "id": str(rel.id),
+                        "weight": int(rel.weight or 1),
+                        "keywords": rel.keywords or [],
+                        "collection_id": str(self._collection_id),
+                        "rel_type": best_canonical,
+                    }
+                    for rel in rel_rows
+                ],
+            )
+
+        relationship_type.canonical_type = best_canonical
+        return relationship_type
 
     async def _add_alias(
         self,

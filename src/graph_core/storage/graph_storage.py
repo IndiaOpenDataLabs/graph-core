@@ -270,6 +270,27 @@ class FalkorDBGraphStorage:
             ]
         )
 
+    async def relabel_edges(
+        self,
+        *,
+        old_rel_type: str,
+        new_rel_type: str,
+        edges: list[dict[str, Any]],
+    ) -> None:
+        if not edges:
+            return
+        old_label = _safe_label(old_rel_type)
+        new_label = _safe_label(new_rel_type)
+        if old_label == new_label:
+            await self.upsert_edges(edges)
+            return
+        await self.upsert_edges(edges)
+        graph = await self._get_graph()
+        await graph.query(
+            f"MATCH ()-[r:{old_label}]->() WHERE r.id IN $edge_ids DELETE r",
+            {"edge_ids": [str(edge["id"]) for edge in edges if edge.get("id")]},
+        )
+
     async def _merge_keywords_for_edges(
         self,
         edge_keyword_inputs: list[tuple[str, str, list[str], str | None]],

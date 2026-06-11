@@ -142,6 +142,7 @@ class RelationshipTypeAlias(Base):
     )
     canonical_type = Column(String(64), nullable=False, index=True)
     alias_type = Column(String(64), nullable=False, index=True)
+    frequency = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     relationship_type = relationship(

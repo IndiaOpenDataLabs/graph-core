@@ -239,6 +239,69 @@ async def test_resolve_rel_type_creates_canonical_relationship_type(
 
 
 @pytest.mark.asyncio
+async def test_relationship_type_canonical_is_reelected_by_frequency(
+    db_session,
+    test_graph_rag_collection,
+):
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        test_graph_rag_collection.id,
+    )
+    resolver._graph_storage.relabel_edges = AsyncMock()
+
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="EXPLAINS",
+    )
+    source = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Source",
+        primary_type="concept",
+        description_count=0,
+    )
+    target = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Target",
+        primary_type="concept",
+        description_count=0,
+    )
+    relationship = GraphRelationship(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        source_entity_id=source.id,
+        target_entity_id=target.id,
+        relationship_type_id=rel_type.id,
+        rel_type="EXPLAINS",
+        weight=1,
+        keywords=[],
+    )
+    db_session.add_all([rel_type, source, target, relationship])
+    await db_session.commit()
+
+    await resolver._add_relationship_type_alias(
+        db_session, rel_type.id, "EXPLAINS", "EXPLAINS"
+    )
+    await resolver._add_relationship_type_alias(
+        db_session, rel_type.id, "EXPLAINS", "CAUSES"
+    )
+    await resolver._add_relationship_type_alias(
+        db_session, rel_type.id, "EXPLAINS", "CAUSES"
+    )
+
+    updated = await resolver._reelect_relationship_type_canonical(db_session, rel_type)
+    await db_session.commit()
+
+    assert updated.canonical_type == "CAUSES"
+    refreshed = await db_session.get(GraphRelationship, relationship.id)
+    assert refreshed is not None
+    assert refreshed.rel_type == "CAUSES"
+    resolver._graph_storage.relabel_edges.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_analyze_collection_graph_uses_canonical_relationship_types(
     db_session,
     test_graph_rag_collection,
