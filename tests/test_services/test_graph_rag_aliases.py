@@ -40,6 +40,12 @@ class _SessionFactory:
         return False
 
 
+class _FakeHit:
+    def __init__(self, distance: float, metadata: dict[str, object] | None = None):
+        self.distance = distance
+        self.metadata = metadata or {}
+
+
 @pytest.mark.asyncio
 async def test_resolve_entity_reuses_case_insensitive_canonical_match(
     db_session,
@@ -151,6 +157,92 @@ async def test_active_dimensions_consolidates_aliases(
 
 
 @pytest.mark.asyncio
+async def test_rank_dimensions_canonicalizes_graph_edge_aliases(
+    db_session,
+    test_graph_rag_collection,
+    monkeypatch,
+):
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="CALLS",
+    )
+    relationship = GraphRelationship(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        source_entity_id=uuid.uuid4(),
+        target_entity_id=uuid.uuid4(),
+        relationship_type_id=rel_type.id,
+        rel_type="CALLS",
+        weight=1,
+        keywords=[],
+    )
+    db_session.add_all(
+        [
+            rel_type,
+            relationship,
+            RelationshipTypeAlias(
+                id=uuid.uuid4(),
+                collection_id=test_graph_rag_collection.id,
+                relationship_type_id=rel_type.id,
+                canonical_type="CALLS",
+                alias_type="INVOKES",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    class _GraphStorage:
+        async def get_node_edges_with_types(self, entity_id):
+            if entity_id == "seed-2":
+                return []
+            return [("seed-1", "other", "INVOKES")]
+
+    monkeypatch.setattr(graph_rag, "AsyncSessionLocal", _SessionFactory(db_session))
+    monkeypatch.setattr(graph_rag, "get_graph_storage", lambda _cid: _GraphStorage())
+    monkeypatch.setattr(
+        graph_rag,
+        "_embed_entity_query",
+        AsyncMock(return_value=[0.1, 0.2, 0.3]),
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_search_entity_seeds",
+        AsyncMock(return_value=(["seed-1", "seed-2"], {"seed-1": 0.9, "seed-2": 0.8})),
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_embed_relationship_query",
+        AsyncMock(return_value=[0.1, 0.2, 0.3]),
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_find_relevant_path_for_ranking",
+        AsyncMock(return_value=(["seed-1", "seed-2"], [str(relationship.id)])),
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_embed_relationship_queries_batch",
+        AsyncMock(return_value=[[0.1, 0.2, 0.3]]),
+    )
+    monkeypatch.setattr(
+        graph_rag._graph_rag_vectors,
+        "search_relationship_embeddings",
+        AsyncMock(return_value=[_FakeHit(distance=0.1)]),
+    )
+
+    ranked = await graph_rag._rank_dimensions(
+        test_graph_rag_collection,
+        _FakeEmbeddingProvider(),
+        "Which calls matter?",
+        ["CALLS", "RELATES_TO"],
+        top_k=1,
+    )
+
+    assert ranked == ["CALLS"]
+
+
+@pytest.mark.asyncio
 async def test_derive_route_profile_uses_canonical_rel_type_alias(
     db_session,
     test_graph_rag_collection,
@@ -201,6 +293,127 @@ async def test_derive_route_profile_uses_canonical_rel_type_alias(
     assert profile.primary_route == "hub"
     assert "CALLS" in profile.rel_type_scores
     assert "INVOKES" not in profile.rel_type_scores
+
+
+@pytest.mark.asyncio
+async def test_find_relevant_path_records_combined_scores_for_bridge_edges(
+    monkeypatch,
+):
+    first_rel_id = str(uuid.uuid4())
+    bridge_rel_id = str(uuid.uuid4())
+
+    class _GraphStorage:
+        async def get_node_edges(self, node_id, rel_types=None):
+            if node_id == "source":
+                return [("source", "mid")]
+            if node_id == "mid":
+                return [("source", "mid"), ("mid", "target")]
+            return []
+
+        async def get_edge(self, src, tgt, rel_types=None):
+            edge_ids = {
+                ("source", "mid"): first_rel_id,
+                ("mid", "target"): bridge_rel_id,
+            }
+            rel_id = edge_ids.get((src, tgt))
+            if rel_id is None:
+                return None
+            return {"id": rel_id, "weight": 1, "keywords": []}
+
+    monkeypatch.setattr(
+        graph_rag,
+        "_score_relationship",
+        AsyncMock(side_effect=lambda *args, **kwargs: 0.9),
+    )
+
+    rel_combined_score_cache: dict[str, float] = {}
+    path = await graph_rag._find_relevant_path(
+        _GraphStorage(),
+        collection=type("_Collection", (), {"id": uuid.uuid4()})(),
+        relationship_query_embedding=[0.1, 0.2, 0.3],
+        source_id="source",
+        target_id="target",
+        rel_score_cache={},
+        rel_combined_score_cache=rel_combined_score_cache,
+    )
+
+    assert path == (["source", "mid", "target"], [first_rel_id, bridge_rel_id])
+    assert rel_combined_score_cache[bridge_rel_id] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_entity_first_state_prioritizes_high_scoring_edges(
+    db_session,
+    test_graph_rag_collection,
+    monkeypatch,
+):
+    entity_ids = {"seed": uuid.uuid4(), "high": uuid.uuid4()}
+    for idx in range(6):
+        entity_ids[f"low-{idx}"] = uuid.uuid4()
+    db_session.add_all(
+        [
+            GraphEntity(
+                id=entity_id,
+                collection_id=test_graph_rag_collection.id,
+                canonical_name=name,
+                primary_type="concept",
+                description_count=0,
+            )
+            for name, entity_id in entity_ids.items()
+        ]
+    )
+    await db_session.commit()
+    monkeypatch.setattr(graph_rag, "AsyncSessionLocal", _SessionFactory(db_session))
+    monkeypatch.setattr(
+        graph_rag,
+        "_search_entity_seeds",
+        AsyncMock(return_value=([str(entity_ids["seed"])], {str(entity_ids["seed"]): 0.1})),
+    )
+    monkeypatch.setattr(
+        graph_rag._graph_rag_vectors,
+        "search_relationship_embeddings",
+        AsyncMock(return_value=[]),
+    )
+
+    high_rel_id = str(uuid.uuid4())
+    low_rel_ids = [str(uuid.uuid4()) for _ in range(6)]
+
+    class _GraphStorage:
+        async def get_node_edges(self, node_id, rel_types=None):
+            if node_id != str(entity_ids["seed"]):
+                return []
+            edges = [(str(entity_ids["seed"]), str(entity_ids["high"]))]
+            edges.extend(
+                (str(entity_ids["seed"]), str(entity_ids[f"low-{idx}"]))
+                for idx in range(6)
+            )
+            return edges
+
+        async def get_edge(self, src, tgt, rel_types=None):
+            if tgt == str(entity_ids["high"]):
+                return {"id": high_rel_id, "weight": 1, "keywords": []}
+            for idx in range(6):
+                if tgt == str(entity_ids[f"low-{idx}"]):
+                    return {"id": low_rel_ids[idx], "weight": 1, "keywords": []}
+            return None
+
+    async def _score_relationship(_collection, _embedding, rel_id, _cache, *, top_k=4):
+        if rel_id == high_rel_id:
+            return 0.95
+        return 0.51
+
+    monkeypatch.setattr(graph_rag, "get_graph_storage", lambda _cid: _GraphStorage())
+    monkeypatch.setattr(graph_rag, "_score_relationship", AsyncMock(side_effect=_score_relationship))
+    monkeypatch.setattr(graph_rag, "_combined_edge_score", lambda sim, _edge_props, _query_tokens: sim)
+
+    state = await graph_rag._entity_first_state(
+        question="Find the most important link",
+        collection=test_graph_rag_collection,
+        entity_query_embedding=[0.1, 0.2, 0.3],
+        relationship_query_embedding=[0.1, 0.2, 0.3],
+    )
+
+    assert high_rel_id in state.traversed_rel_ids
 
 
 @pytest.mark.asyncio

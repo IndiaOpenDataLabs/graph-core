@@ -28,6 +28,7 @@ from graph_core.models.graph_rag import (
     GraphRelationship,
     GraphRelationshipType,
     RelationshipDescription,
+    RelationshipTypeAlias,
 )
 from graph_core.models.profile import Profile
 from graph_core.models.rel_types import (
@@ -106,6 +107,31 @@ async def _active_dimensions(collection: Collection) -> list[str]:
     return types
 
 
+async def _load_rel_type_alias_map(collection_id: uuid.UUID) -> dict[str, str]:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(
+                RelationshipTypeAlias.alias_type,
+                RelationshipTypeAlias.canonical_type,
+            ).where(RelationshipTypeAlias.collection_id == collection_id)
+        )
+        return {
+            normalize_dim(alias_type): normalize_dim(canonical_type)
+            for alias_type, canonical_type in result.all()
+            if alias_type and canonical_type
+        }
+
+
+def _canonicalize_rel_type(
+    rel_type: str | None,
+    alias_map: dict[str, str] | None = None,
+) -> str:
+    normalized = normalize_dim(rel_type)
+    if not alias_map:
+        return normalized
+    return alias_map.get(normalized, normalized)
+
+
 def _dimension_weight(rel_type: str | None) -> float:
     weights = settings.graph_rag_dimension_weights or {}
     if not rel_type:
@@ -169,12 +195,13 @@ async def _rank_dimensions(
 
     # Step 2: Collect rel_types from edges incident to the top entities.
     graph_storage = get_graph_storage(collection.id)
+    rel_type_alias_map = await _load_rel_type_alias_map(collection.id)
     rel_type_counts: dict[str, int] = defaultdict(int)
 
     for entity_id in top_entities:
         edges = await graph_storage.get_node_edges_with_types(entity_id)
         for _, _, rel_type in edges:
-            normalized = normalize_dim(rel_type)
+            normalized = _canonicalize_rel_type(rel_type, rel_type_alias_map)
             if normalized in dimension_set:
                 rel_type_counts[normalized] += 1
 
@@ -209,7 +236,10 @@ async def _rank_dimensions(
         for rel_id in path_rels:
             rel_type_from_id = await _get_rel_type_from_id(rel_id)
             if rel_type_from_id:
-                normalized = normalize_dim(rel_type_from_id)
+                normalized = _canonicalize_rel_type(
+                    rel_type_from_id,
+                    rel_type_alias_map,
+                )
                 if normalized in dimension_set:
                     rel_type_counts[normalized] += 2
 
@@ -262,10 +292,18 @@ async def _rank_dimensions(
 
 
 async def _get_rel_type_from_id(rel_id: str) -> str | None:
-    """Look up the rel_type for a given relationship ID from the DB."""
+    """Look up the canonical rel_type for a given relationship ID from the DB."""
     async with AsyncSessionLocal() as session:
-        rel = await session.get(GraphRelationship, uuid.UUID(rel_id))
-        return rel.rel_type if rel else None
+        result = await session.execute(
+            select(GraphRelationshipType.canonical_type)
+            .select_from(GraphRelationship)
+            .join(
+                GraphRelationshipType,
+                GraphRelationshipType.id == GraphRelationship.relationship_type_id,
+            )
+            .where(GraphRelationship.id == uuid.UUID(rel_id))
+        )
+        return result.scalar_one_or_none()
 
 
 async def _find_relevant_path_for_ranking(
@@ -784,7 +822,11 @@ async def _entity_first_state(
             if combined >= effective_min_edge_sim:
                 scored_edges.append((combined, neighbor, rel_id_str))
 
-        for combined, neighbor, rel_id_str in sorted(scored_edges, key=lambda x: x[0]):
+        for combined, neighbor, rel_id_str in sorted(
+            scored_edges,
+            key=lambda x: x[0],
+            reverse=True,
+        ):
             cost = max(0.05, 1.0 - combined)
             if energy - cost <= 0:
                 continue
@@ -817,6 +859,7 @@ async def _find_relevant_path(
     source_id: str,
     target_id: str,
     rel_score_cache: dict[str, float],
+    rel_combined_score_cache: dict[str, float],
     *,
     max_depth: int = 3,
     beam_width: int = 4,
@@ -859,6 +902,9 @@ async def _find_relevant_path(
                 _combined_edge_score(sim, edge_props, query_tokens)
                 * dimension_weight
             )
+            previous = rel_combined_score_cache.get(rel_id)
+            if previous is None or combined > previous:
+                rel_combined_score_cache[rel_id] = combined
             candidates.append((combined, neighbor, rel_id))
 
         for _, neighbor, rel_id in sorted(candidates, reverse=True)[:beam_width]:
@@ -945,6 +991,7 @@ async def _relationship_seed_state(
             source_id,
             target_id,
             rel_score_cache,
+            rel_combined_score_cache,
             query_tokens=query_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
