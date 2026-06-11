@@ -134,9 +134,20 @@ class RelationshipTypeAlias(Base):
         nullable=False,
         index=True,
     )
+    relationship_type_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_relationship_types.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     canonical_type = Column(String(64), nullable=False, index=True)
     alias_type = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    relationship_type = relationship(
+        "GraphRelationshipType",
+        back_populates="aliases",
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -153,6 +164,41 @@ class RelationshipTypeAlias(Base):
 
     def __repr__(self) -> str:
         return f"<RelationshipTypeAlias {self.alias_type} -> {self.canonical_type}>"
+
+
+class GraphRelationshipType(Base):
+    __tablename__ = "graph_relationship_types"
+
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collection_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("collections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    canonical_type = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    aliases = relationship(
+        "RelationshipTypeAlias",
+        back_populates="relationship_type",
+        cascade="all, delete-orphan",
+    )
+    relationships = relationship(
+        "GraphRelationship",
+        back_populates="relationship_type",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "collection_id",
+            "canonical_type",
+            name="uq_graph_relationship_types_collection_canonical_type",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GraphRelationshipType {self.canonical_type}>"
 
 
 class EntityType(Base):
@@ -200,6 +246,12 @@ class GraphRelationship(Base):
     )
     weight = Column(Integer, default=1)
     keywords = Column(JSON, nullable=True)
+    relationship_type_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_relationship_types.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     rel_type = Column(String(64), nullable=False, default="RELATES_TO", index=True)
     collection_id = Column(
         UUIDType(as_uuid=True),
@@ -219,6 +271,10 @@ class GraphRelationship(Base):
         "RelationshipDescription",
         back_populates="relationship",
         cascade="all, delete-orphan",
+    )
+    relationship_type = relationship(
+        "GraphRelationshipType",
+        back_populates="relationships",
     )
 
     __table_args__ = (

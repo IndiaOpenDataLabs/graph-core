@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import and_, distinct, func, or_, select
+from sqlalchemy import distinct, func, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -26,6 +26,7 @@ from graph_core.models.graph_rag import (
     EntityDescription,
     GraphEntity,
     GraphRelationship,
+    GraphRelationshipType,
     RelationshipDescription,
     RelationshipTypeAlias,
 )
@@ -85,18 +86,15 @@ async def _active_dimensions(collection: Collection) -> list[str]:
             select(
                 distinct(
                     func.coalesce(
-                        RelationshipTypeAlias.canonical_type,
+                        GraphRelationshipType.canonical_type,
                         GraphRelationship.rel_type,
                     )
                 )
             )
             .select_from(GraphRelationship)
             .outerjoin(
-                RelationshipTypeAlias,
-                and_(
-                    RelationshipTypeAlias.collection_id == GraphRelationship.collection_id,
-                    RelationshipTypeAlias.alias_type == GraphRelationship.rel_type,
-                ),
+                GraphRelationshipType,
+                GraphRelationshipType.id == GraphRelationship.relationship_type_id,
             )
             .where(GraphRelationship.collection_id == collection.id)
         )
@@ -119,8 +117,12 @@ async def _load_rel_type_alias_map(collection_id: uuid.UUID) -> dict[str, str]:
         result = await session.execute(
             select(
                 RelationshipTypeAlias.alias_type,
-                RelationshipTypeAlias.canonical_type,
+                GraphRelationshipType.canonical_type,
             ).where(RelationshipTypeAlias.collection_id == collection_id)
+            .join(
+                GraphRelationshipType,
+                GraphRelationshipType.id == RelationshipTypeAlias.relationship_type_id,
+            )
         )
         return {
             normalize_dim(alias_type): normalize_dim(canonical_type)
@@ -1323,17 +1325,14 @@ async def _derive_route_profile(
                 select(
                     GraphRelationship.id,
                     func.coalesce(
-                        RelationshipTypeAlias.canonical_type,
+                        GraphRelationshipType.canonical_type,
                         GraphRelationship.rel_type,
                     ),
                 )
                 .select_from(GraphRelationship)
                 .outerjoin(
-                    RelationshipTypeAlias,
-                    and_(
-                        RelationshipTypeAlias.collection_id == GraphRelationship.collection_id,
-                        RelationshipTypeAlias.alias_type == GraphRelationship.rel_type,
-                    )
+                    GraphRelationshipType,
+                    GraphRelationshipType.id == GraphRelationship.relationship_type_id,
                 )
                 .where(
                     GraphRelationship.id.in_(

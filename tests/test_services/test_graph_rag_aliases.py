@@ -2,8 +2,14 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
-from graph_core.models.graph_rag import GraphEntity, GraphRelationship, RelationshipTypeAlias
+from graph_core.models.graph_rag import (
+    GraphEntity,
+    GraphRelationship,
+    GraphRelationshipType,
+    RelationshipTypeAlias,
+)
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import GraphQueryState
@@ -95,11 +101,18 @@ async def test_active_dimensions_consolidates_aliases(
     test_graph_rag_collection,
     monkeypatch,
 ):
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="CALLS",
+    )
     db_session.add_all(
         [
+            rel_type,
             RelationshipTypeAlias(
                 id=uuid.uuid4(),
                 collection_id=test_graph_rag_collection.id,
+                relationship_type_id=rel_type.id,
                 canonical_type="CALLS",
                 alias_type="INVOKES",
             ),
@@ -108,7 +121,8 @@ async def test_active_dimensions_consolidates_aliases(
                 collection_id=test_graph_rag_collection.id,
                 source_entity_id=uuid.uuid4(),
                 target_entity_id=uuid.uuid4(),
-                rel_type="INVOKES",
+                relationship_type_id=rel_type.id,
+                rel_type="CALLS",
                 weight=1,
                 keywords=[],
             ),
@@ -117,6 +131,7 @@ async def test_active_dimensions_consolidates_aliases(
                 collection_id=test_graph_rag_collection.id,
                 source_entity_id=uuid.uuid4(),
                 target_entity_id=uuid.uuid4(),
+                relationship_type_id=rel_type.id,
                 rel_type="CALLS",
                 weight=1,
                 keywords=[],
@@ -139,20 +154,28 @@ async def test_derive_route_profile_uses_canonical_rel_type_alias(
     test_graph_rag_collection,
     monkeypatch,
 ):
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="CALLS",
+    )
     relationship = GraphRelationship(
         id=uuid.uuid4(),
         collection_id=test_graph_rag_collection.id,
         source_entity_id=uuid.uuid4(),
         target_entity_id=uuid.uuid4(),
-        rel_type="INVOKES",
+        relationship_type_id=rel_type.id,
+        rel_type="CALLS",
         weight=1,
         keywords=[],
     )
     db_session.add_all(
         [
+            rel_type,
             RelationshipTypeAlias(
                 id=uuid.uuid4(),
                 collection_id=test_graph_rag_collection.id,
+                relationship_type_id=rel_type.id,
                 canonical_type="CALLS",
                 alias_type="INVOKES",
             ),
@@ -176,3 +199,38 @@ async def test_derive_route_profile_uses_canonical_rel_type_alias(
     assert profile.primary_route == "hub"
     assert "CALLS" in profile.rel_type_scores
     assert "INVOKES" not in profile.rel_type_scores
+
+
+@pytest.mark.asyncio
+async def test_resolve_rel_type_creates_canonical_relationship_type(
+    db_session,
+    test_graph_rag_collection,
+):
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        test_graph_rag_collection.id,
+    )
+    resolver._vstore.ensure_prefix_embeddings_table = AsyncMock()
+    resolver._vstore.load_all_prefix_embeddings = AsyncMock(return_value={})
+    resolver._vstore.upsert_prefix_embedding = AsyncMock()
+
+    result = await resolver._resolve_rel_type(db_session, "invokes")
+    await db_session.commit()
+
+    assert result.canonical_type == "INVOKES"
+    rows = (
+        await db_session.execute(
+            select(GraphRelationshipType).where(
+                GraphRelationshipType.id == result.relationship_type_id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    alias_rows = (
+        await db_session.execute(
+            select(RelationshipTypeAlias).where(
+                RelationshipTypeAlias.relationship_type_id == result.relationship_type_id
+            )
+        )
+    ).scalars().all()
+    assert {row.alias_type for row in alias_rows} == {"INVOKES"}

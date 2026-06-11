@@ -27,10 +27,11 @@ from graph_core.models.graph_rag import (
     EntityType,
     GraphEntity,
     GraphRelationship,
+    GraphRelationshipType,
     RelationshipDescription,
     RelationshipTypeAlias,
 )
-from graph_core.models.rel_types import relationship_embedding_text
+from graph_core.models.rel_types import normalize_rel_type, relationship_embedding_text
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,12 @@ class EntityResolutionResult:
 class RelationshipResolutionResult:
     is_new: bool
     relationship_id: uuid.UUID
+
+
+@dataclass
+class RelationshipTypeResolutionResult:
+    relationship_type_id: uuid.UUID
+    canonical_type: str
 
 
 class IncrementalEntityResolver:
@@ -66,7 +73,11 @@ class IncrementalEntityResolver:
         self._collection_id = collection_id
         self._vstore = GraphRAGVectorStore()
 
-    async def _resolve_rel_type(self, session: AsyncSession, rel_type: str) -> str:
+    async def _resolve_rel_type(
+        self,
+        session: AsyncSession,
+        rel_type: str,
+    ) -> RelationshipTypeResolutionResult:
         """Resolve a rel_type to its canonical form using cluster-based matching.
 
         Three-tier resolution:
@@ -76,30 +87,35 @@ class IncrementalEntityResolver:
         3. Accept the rel_type as-is (truly novel)
         """
         # Tier 1: Static alias table (backfilled from clustering)
-        resolved = await session.execute(
-            select(RelationshipTypeAlias)
-            .where(
-                RelationshipTypeAlias.alias_type == rel_type,
-                RelationshipTypeAlias.collection_id == self._collection_id,
-            )
+        normalized_rel_type = normalize_rel_type(rel_type)
+
+        relationship_type = await self._find_relationship_type_by_label(
+            session,
+            normalized_rel_type,
         )
-        alias_row = resolved.scalar_one_or_none()
-        if alias_row:
-            logger.debug("rel_type alias: %s -> %s", rel_type, alias_row.canonical_type)
-            return alias_row.canonical_type
+        if relationship_type:
+            logger.debug(
+                "rel_type alias: %s -> %s",
+                normalized_rel_type,
+                relationship_type.canonical_type,
+            )
+            return RelationshipTypeResolutionResult(
+                relationship_type_id=relationship_type.id,
+                canonical_type=relationship_type.canonical_type,
+            )
 
         # Tier 2: Prefix embedding similarity — find cluster member, map to canonical
         await self._vstore.ensure_prefix_embeddings_table(self._collection_id)
 
         stored = await self._vstore.load_all_prefix_embeddings(self._collection_id)
         if stored:
-            query_emb = await self._embedding.embed_query(rel_type)
+            query_emb = await self._embedding.embed_query(normalized_rel_type)
 
             best_match: str | None = None
             best_dist: float = 1e9
 
             for rt, emb in stored.items():
-                if rt == rel_type:
+                if rt == normalized_rel_type:
                     continue
                 dot = sum(a * b for a, b in zip(query_emb, emb))
                 na = sum(a * a for a in query_emb) ** 0.5
@@ -112,52 +128,64 @@ class IncrementalEntityResolver:
 
             if best_match and (1.0 - best_dist) >= self.HIGH_CONFIDENCE_SIMILARITY:
                 # best_match is a cluster member — look up its canonical
-                canon_result = await session.execute(
-                    select(RelationshipTypeAlias)
-                    .where(
-                        RelationshipTypeAlias.alias_type == best_match,
-                        RelationshipTypeAlias.collection_id == self._collection_id,
-                    )
+                relationship_type = await self._find_relationship_type_by_label(
+                    session,
+                    best_match,
                 )
-                canon_alias = canon_result.scalar_one_or_none()
-                canonical = canon_alias.canonical_type if canon_alias else best_match
+                if relationship_type is None:
+                    relationship_type = await self._resolve_or_create_relationship_type(
+                        session,
+                        best_match,
+                    )
 
                 # Store prefix embedding for future matching
                 await self._vstore.upsert_prefix_embedding(
                     collection_id=self._collection_id,
-                    rel_type=rel_type,
+                    rel_type=normalized_rel_type,
                     embedding=query_emb,
                 )
 
                 # Insert alias mapping
-                await session.execute(
-                    text(
-                        "INSERT INTO relationship_type_aliases "
-                        "(collection_id, canonical_type, alias_type) "
-                        "VALUES (:cid, :canonical, :alias) "
-                        "ON CONFLICT (collection_id, alias_type) DO NOTHING"
-                    ),
-                    {
-                        "cid": str(self._collection_id),
-                        "canonical": canonical,
-                        "alias": rel_type,
-                    },
+                await self._add_relationship_type_alias(
+                    session,
+                    relationship_type.id,
+                    relationship_type.canonical_type,
+                    normalized_rel_type,
                 )
                 logger.debug(
                     "rel_type cluster match: %s -> %s (sim=%.4f, via %s)",
-                    rel_type, canonical, 1.0 - best_dist, best_match,
+                    normalized_rel_type,
+                    relationship_type.canonical_type,
+                    1.0 - best_dist,
+                    best_match,
                 )
-                return canonical
+                return RelationshipTypeResolutionResult(
+                    relationship_type_id=relationship_type.id,
+                    canonical_type=relationship_type.canonical_type,
+                )
 
         # Novel rel_type — store prefix embedding for future matching
         await self._vstore.ensure_prefix_embeddings_table(self._collection_id)
-        emb = await self._embedding.embed_query(rel_type)
+        emb = await self._embedding.embed_query(normalized_rel_type)
         await self._vstore.upsert_prefix_embedding(
             collection_id=self._collection_id,
-            rel_type=rel_type,
+            rel_type=normalized_rel_type,
             embedding=emb,
         )
-        return rel_type
+        relationship_type = await self._resolve_or_create_relationship_type(
+            session,
+            normalized_rel_type,
+        )
+        await self._add_relationship_type_alias(
+            session,
+            relationship_type.id,
+            relationship_type.canonical_type,
+            normalized_rel_type,
+        )
+        return RelationshipTypeResolutionResult(
+            relationship_type_id=relationship_type.id,
+            canonical_type=relationship_type.canonical_type,
+        )
 
     async def resolve_entity(
         self,
@@ -305,14 +333,15 @@ class IncrementalEntityResolver:
         rel_type: str = "RELATES_TO",
     ) -> RelationshipResolutionResult:
         # Normalize rel_type using alias table
-        rel_type = await self._resolve_rel_type(session, rel_type)
+        rel_type_resolution = await self._resolve_rel_type(session, rel_type)
+        rel_type = rel_type_resolution.canonical_type
         
         # Check for existing relationship (bidirectional, scoped to rel_type).
         # Two rels between the same pair with different rel_types are
         # distinct edges (multi-dimensional graph) and must not merge.
         existing_result = await session.execute(
             select(GraphRelationship).where(
-                GraphRelationship.rel_type == rel_type,
+                GraphRelationship.relationship_type_id == rel_type_resolution.relationship_type_id,
             ).where(
                 (
                     (GraphRelationship.source_entity_id == source_entity_id)
@@ -360,6 +389,7 @@ class IncrementalEntityResolver:
             target_entity_id=target_entity_id,
             weight=int(weight * 10),
             keywords=keywords,
+            relationship_type_id=rel_type_resolution.relationship_type_id,
             rel_type=rel_type,
             collection_id=self._collection_id,
         )
@@ -629,6 +659,104 @@ class IncrementalEntityResolver:
             description=description,
             embedding=embedding,
         )
+
+    async def _resolve_or_create_relationship_type(
+        self,
+        session: AsyncSession,
+        canonical_type: str,
+    ) -> GraphRelationshipType:
+        normalized_type = normalize_rel_type(canonical_type)
+        existing_result = await session.execute(
+            select(GraphRelationshipType).where(
+                GraphRelationshipType.collection_id == self._collection_id,
+                GraphRelationshipType.canonical_type == normalized_type,
+            )
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing:
+            return existing
+
+        stmt = (
+            pg_insert(GraphRelationshipType)
+            .values(
+                id=uuid.uuid4(),
+                collection_id=self._collection_id,
+                canonical_type=normalized_type,
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_graph_relationship_types_collection_canonical_type"
+            )
+            .returning(GraphRelationshipType.id)
+        )
+        result = await session.execute(stmt)
+        row = result.fetchone()
+        if row:
+            created = await session.get(GraphRelationshipType, row[0])
+            if created:
+                return created
+
+        existing_result = await session.execute(
+            select(GraphRelationshipType).where(
+                GraphRelationshipType.collection_id == self._collection_id,
+                GraphRelationshipType.canonical_type == normalized_type,
+            )
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing:
+            return existing
+        raise RuntimeError(
+            f"Failed to resolve relationship type after retries: {normalized_type}"
+        )
+
+    async def _find_relationship_type_by_label(
+        self,
+        session: AsyncSession,
+        label: str,
+    ) -> GraphRelationshipType | None:
+        normalized_label = normalize_rel_type(label)
+        alias_result = await session.execute(
+            select(RelationshipTypeAlias).where(
+                RelationshipTypeAlias.collection_id == self._collection_id,
+                RelationshipTypeAlias.alias_type == normalized_label,
+            )
+        )
+        alias_row = alias_result.scalar_one_or_none()
+        if alias_row:
+            relationship_type = await session.get(
+                GraphRelationshipType,
+                alias_row.relationship_type_id,
+            )
+            if relationship_type:
+                return relationship_type
+
+        canonical_result = await session.execute(
+            select(GraphRelationshipType).where(
+                GraphRelationshipType.collection_id == self._collection_id,
+                GraphRelationshipType.canonical_type == normalized_label,
+            )
+        )
+        return canonical_result.scalar_one_or_none()
+
+    async def _add_relationship_type_alias(
+        self,
+        session: AsyncSession,
+        relationship_type_id: uuid.UUID,
+        canonical_type: str,
+        alias_type: str,
+    ) -> None:
+        normalized_alias = normalize_rel_type(alias_type)
+        stmt = (
+            pg_insert(RelationshipTypeAlias)
+            .values(
+                id=uuid.uuid4(),
+                collection_id=self._collection_id,
+                relationship_type_id=relationship_type_id,
+                canonical_type=normalize_rel_type(canonical_type),
+                alias_type=normalized_alias,
+            )
+            .on_conflict_do_nothing()
+        )
+        await session.execute(stmt)
 
     async def _add_alias(
         self,

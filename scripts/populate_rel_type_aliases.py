@@ -48,13 +48,32 @@ async def populate():
                 aliases = [a for a, _ in counts[1:]]
                 
                 if aliases:
+                    canonical_row = await session.execute(
+                        text(
+                            """
+                            INSERT INTO graph_relationship_types (collection_id, canonical_type)
+                            VALUES (:collection_id, :canonical_type)
+                            ON CONFLICT (collection_id, canonical_type) DO UPDATE
+                            SET canonical_type = EXCLUDED.canonical_type
+                            RETURNING id
+                            """
+                        ),
+                        {"collection_id": coll_id, "canonical_type": canonical},
+                    )
+                    relationship_type_id = canonical_row.scalar_one()
                     values = [
-                        {"collection_id": coll_id, "canonical_type": canonical, "alias_type": a}
+                        {
+                            "collection_id": coll_id,
+                            "relationship_type_id": relationship_type_id,
+                            "canonical_type": canonical,
+                            "alias_type": a,
+                        }
                         for a in aliases
                     ]
                     stmt = text(
-                        "INSERT INTO relationship_type_aliases (collection_id, canonical_type, alias_type) "
-                        "VALUES (:collection_id, :canonical_type, :alias_type) "
+                        "INSERT INTO relationship_type_aliases "
+                        "(collection_id, relationship_type_id, canonical_type, alias_type) "
+                        "VALUES (:collection_id, :relationship_type_id, :canonical_type, :alias_type) "
                         "ON CONFLICT (collection_id, alias_type) DO NOTHING"
                     )
                     for v in values:
