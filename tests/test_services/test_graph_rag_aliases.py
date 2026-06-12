@@ -120,6 +120,66 @@ async def test_add_or_increment_type_awaits_async_session_execute(
     session.execute.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_code_domain_resolver_keeps_distinct_symbol_names_separate(
+    db_session,
+    test_graph_rag_collection,
+):
+    existing = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="llm_query",
+        primary_type="FUNCTION",
+        description_count=0,
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        test_graph_rag_collection.id,
+        domain="code",
+    )
+    resolver._add_description_and_update_centroid = AsyncMock()
+    resolver._add_or_increment_type = AsyncMock()
+    resolver._vstore.search_entity_centroids = AsyncMock(
+        return_value=[
+            _FakeHit(
+                distance=0.01,
+                metadata={
+                    "entity_id": str(existing.id),
+                    "canonical_name": "llm_query",
+                },
+            )
+        ]
+    )
+
+    result = await resolver.resolve_entity(
+        db_session,
+        name="rlm_query",
+        entity_type="FUNCTION",
+        description="Recursive child RLM call for deeper reasoning.",
+        source_chunk_hash="chunk-1",
+    )
+
+    assert result.is_new is True
+    assert result.canonical_name == "rlm_query"
+    assert result.entity_id != existing.id
+    resolver._vstore.search_entity_centroids.assert_not_awaited()
+
+
+def test_code_domain_fuzzy_match_requires_exact_symbol_match():
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        uuid.uuid4(),
+        domain="code",
+    )
+
+    assert resolver._fuzzy_match("llm_query", "llm_query") is True
+    assert resolver._fuzzy_match("rlm_query", "llm_query") is False
+    assert resolver._fuzzy_match("self._rlm_query", "self._llm_query") is False
+
+
 def test_extractor_normalize_entity_name_preserves_casing():
     assert LLMGraphExtractor._normalize_entity_name("  OAuth SDK  ") == "OAuth SDK"
     assert LLMGraphExtractor._normalize_entity_name("iOS") == "iOS"

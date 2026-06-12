@@ -260,6 +260,7 @@ async def _ingest_graph_chunk(
     resolver = IncrementalEntityResolver(
         embedding_provider=embedding_provider,
         collection_id=collection.id,
+        domain=domain,
     )
     name_cache = EntityNameCache(str(collection.id))
 

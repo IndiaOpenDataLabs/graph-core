@@ -69,9 +69,11 @@ class IncrementalEntityResolver:
         self,
         embedding_provider: EmbeddingProvider,
         collection_id: uuid.UUID,
+        domain: str | None = None,
     ) -> None:
         self._embedding = embedding_provider
         self._collection_id = collection_id
+        self._domain = (domain or "").strip().lower() or None
         self._vstore = GraphRAGVectorStore()
         self._graph_storage = FalkorDBGraphStorage(
             f"collection_{str(collection_id).replace('-', '')}"
@@ -266,7 +268,13 @@ class IncrementalEntityResolver:
         query_embedding = await self._embedding.embed_query(search_text)
 
         # For now, skip centroid search if using hash embeddings (dimensions < 100)
-        if self._embedding.dimensions >= 100:
+        if (
+            self._embedding.dimensions >= 100
+            and not self._requires_exact_name_resolution(
+                normalized_name,
+                entity_type,
+            )
+        ):
             entity_match = await self._find_similar_entity(
                 session, query_embedding, normalized_name, entity_type
             )
@@ -944,9 +952,45 @@ class IncrementalEntityResolver:
     def _fuzzy_match(self, name1: str, name2: str) -> bool:
         if not name1 or not name2:
             return False
+        if self._requires_exact_name_resolution(name1) or self._requires_exact_name_resolution(name2):
+            return self._normalize_for_comparison(name1) == self._normalize_for_comparison(name2)
         n1 = self._normalize_for_comparison(name1)
         n2 = self._normalize_for_comparison(name2)
         if n1 == n2:
             return True
         ratio = difflib.SequenceMatcher(None, n1, n2).ratio()
         return ratio >= self.FUZZY_NAME_THRESHOLD
+
+    def _requires_exact_name_resolution(
+        self,
+        name: str,
+        entity_type: str | None = None,
+    ) -> bool:
+        if self._domain != "code":
+            return False
+        normalized_type = (entity_type or "").strip().upper()
+        if normalized_type in {
+            "FUNCTION",
+            "METHOD",
+            "CLASS",
+            "MODULE",
+            "PACKAGE",
+            "VARIABLE",
+            "INTERFACE",
+            "EXCEPTION",
+            "CONFIG",
+        }:
+            return True
+        return self._looks_like_code_symbol(name)
+
+    @staticmethod
+    def _looks_like_code_symbol(name: str) -> bool:
+        if not name:
+            return False
+        if any(ch in name for ch in "._[](){}'\"`:/\\"):
+            return True
+        if "_" in name:
+            return True
+        if re.search(r"\bself\.", name):
+            return True
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
