@@ -6,12 +6,17 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import select
 
+from graph_core.database import AsyncSessionLocal
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job
 from graph_core.models.profile import Profile
 from graph_core.services.graph import (
     ChunkIngestionResult,
     DocumentIngestionResult,
+)
+from graph_core.services.graph.ingestion.document_pipeline import (
+    process_single_chunk,
+    update_chunk_status,
 )
 
 
@@ -198,6 +203,28 @@ async def test_update_and_get_job(service):
     await service.update_job_status(job_id, "running", progress_percent=50)
     # Note: job doesn't exist yet, update is a no-op in current impl
     # This tests the update path without crash
+
+
+@pytest.mark.asyncio
+async def test_process_single_chunk_ignores_missing_chunk_row(service, test_collection):
+    async with AsyncSessionLocal() as session:
+        job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            payload={"text": "ignored"},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+
+    await process_single_chunk(str(job.id), 99)
+
+
+@pytest.mark.asyncio
+async def test_update_chunk_status_ignores_missing_chunk_row(service):
+    await update_chunk_status(uuid.uuid4(), 42, "failed", error="stale")
 
 
 @pytest.mark.asyncio
