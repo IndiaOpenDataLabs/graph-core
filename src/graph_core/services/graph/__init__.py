@@ -1531,7 +1531,6 @@ class GraphService:
             "analysis": analysis,
             "derived_graph": {
                 "graph_name": self._graph_name(meta_collection.id),
-                "graph_display_name": meta_collection.name,
                 "collection_id": str(meta_collection.id),
                 "collection_name": meta_collection.name,
                 "node_count": len(understanding["nodes"]),
