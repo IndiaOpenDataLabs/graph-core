@@ -56,6 +56,9 @@ via_job_tables = [
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
     # Helper function: when app.current_namespace_id is set (via SET LOCAL),
     # enforce namespace filter. When not set (workers, admin connections),
     # allow all rows — app-layer isolation still applies.
@@ -99,11 +102,15 @@ def upgrade() -> None:
         + via_relationship_tables
         + via_job_tables
     ):
+        if not inspector.has_table(table):
+            continue
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
         op.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
 
     # --- Policies for tables with direct namespace_id ---
     for table in direct_tables:
+        if not inspector.has_table(table):
+            continue
         _create_policy(op, table, "ns_select", "SELECT", "ns_check(namespace_id)")
         _create_policy(op, table, "ns_insert", "INSERT", "ns_check(namespace_id)")
         _create_policy(op, table, "ns_update", "UPDATE", "ns_check(namespace_id)")
@@ -111,6 +118,8 @@ def upgrade() -> None:
 
     # --- Policies for tables scoped via collection_id ---
     for table in via_collection_tables:
+        if not inspector.has_table(table):
+            continue
         _create_policy(op, table, "ns_select", "SELECT", "ns_check_via_collection(collection_id)")
         _create_policy(op, table, "ns_insert", "INSERT", "ns_check_via_collection(collection_id)")
         _create_policy(op, table, "ns_update", "UPDATE", "ns_check_via_collection(collection_id)")
@@ -242,6 +251,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
     # Drop all policies
     all_tables = (
         direct_tables
@@ -251,6 +263,8 @@ def downgrade() -> None:
         + via_job_tables
     )
     for table in all_tables:
+        if not inspector.has_table(table):
+            continue
         for suffix in ("ns_select", "ns_insert", "ns_update", "ns_delete"):
             try:
                 op.execute(f"DROP POLICY IF EXISTS {suffix} ON {table}")
@@ -259,6 +273,8 @@ def downgrade() -> None:
 
     # Disable RLS
     for table in all_tables:
+        if not inspector.has_table(table):
+            continue
         op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
 
     # Drop immutability trigger and function (I1, I6)
