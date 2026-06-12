@@ -217,13 +217,11 @@ class IncrementalEntityResolver:
         source_chunk_hash: str,
     ) -> EntityResolutionResult:
         normalized_name = self._normalize_entity_name(name)
-        lookup_name = normalized_name.lower()
-
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
             select(EntityAlias)
             .where(
-                func.lower(EntityAlias.alias_name) == lookup_name,
+                EntityAlias.alias_name == normalized_name,
                 EntityAlias.collection_id == self._collection_id,
             )
         )
@@ -246,7 +244,7 @@ class IncrementalEntityResolver:
         # Check canonical name directly
         existing_result = await session.execute(
             select(GraphEntity).where(
-                func.lower(GraphEntity.canonical_name) == lookup_name,
+                GraphEntity.canonical_name == normalized_name,
                 GraphEntity.collection_id == self._collection_id,
             )
         )
@@ -331,7 +329,7 @@ class IncrementalEntityResolver:
             # Conflict — another worker inserted it
             existing_result = await session.execute(
                 select(GraphEntity).where(
-                    func.lower(GraphEntity.canonical_name) == lookup_name,
+                    GraphEntity.canonical_name == normalized_name,
                     GraphEntity.collection_id == self._collection_id,
                 )
             )
