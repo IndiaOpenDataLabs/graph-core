@@ -183,12 +183,10 @@ async def create_collection(
         default_query_mode=default_query_mode,
         gleaning_passes=gleaning_passes,
     )
-    display_name = result.get("graph_display_name") or result["graph_name"]
     return (
         f"Created collection:\n"
         f"  id: {result['id']}\n"
         f"  name: {result['name']}\n"
-        f"  graph_name: {display_name}\n"
         f"  strategy: {result['strategy']}\n"
         f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
         f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
@@ -206,10 +204,7 @@ async def list_collections(ctx: Context) -> str:
         return "No collections found."
     lines = ["Collections:"]
     for col in collections:
-        display_name = col.get("graph_display_name") or col.get("graph_name") or col["name"]
-        lines.append(
-            f"  - {col['id']} | {col['name']} ({col['strategy']}) | graph={display_name}"
-        )
+        lines.append(f"  - {col['id']} | {col['name']} ({col['strategy']})")
     return "\n".join(lines)
 
 
@@ -240,12 +235,10 @@ async def update_collection(
         clear_llm_profile=clear_llm_profile,
         clear_default_query_mode=clear_default_query_mode,
     )
-    display_name = result.get("graph_display_name") or result["graph_name"]
     return (
         f"Updated collection:\n"
         f"  id: {result['id']}\n"
         f"  name: {result['name']}\n"
-        f"  graph_name: {display_name}\n"
         f"  strategy: {result['strategy']}\n"
         f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
         f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
