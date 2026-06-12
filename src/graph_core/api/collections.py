@@ -46,6 +46,7 @@ class EnhanceCollectionResponse(BaseModel):
     status: str
     collection_id: str
     graph_name: str
+    graph_display_name: str | None = None
     node_count: int
     edge_count: int
     chunk_count: int
@@ -158,6 +159,11 @@ async def enhance_collection(
             status="enhanced",
             collection_id=str(collection_id),
             graph_name=str(derived_graph["graph_name"]),
+            graph_display_name=(
+                str(derived_graph["graph_display_name"])
+                if derived_graph.get("graph_display_name") is not None
+                else None
+            ),
             node_count=int(derived_graph["node_count"]),
             edge_count=int(derived_graph["edge_count"]),
             chunk_count=int(derived_graph["chunk_count"]),

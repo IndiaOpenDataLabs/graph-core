@@ -261,6 +261,7 @@ async def enhance_collection(collection_id: str, ctx: Context) -> str:
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.enhance_collection(collection_id)
+    display_name = result.get("graph_display_name") or result["graph_name"]
     type_counts = result.get("node_type_counts", {})
     type_lines = "\n".join(
         f"  {key}: {value}" for key, value in sorted(type_counts.items())
@@ -268,7 +269,7 @@ async def enhance_collection(collection_id: str, ctx: Context) -> str:
     return (
         f"Enhanced collection:\n"
         f"  collection_id: {result['collection_id']}\n"
-        f"  graph_name: {result['graph_name']}\n"
+        f"  graph_name: {display_name}\n"
         f"  node_count: {result['node_count']}\n"
         f"  edge_count: {result['edge_count']}\n"
         f"  chunk_count: {result['chunk_count']}\n"
