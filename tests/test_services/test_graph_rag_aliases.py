@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
+from graph_core.llm.interface import LLMProvider
 from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
@@ -12,7 +13,10 @@ from graph_core.models.graph_rag import (
 )
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph import GraphService
-from graph_core.services.graph.analytics import analyze_collection_graph
+from graph_core.services.graph.analytics import (
+    analyze_collection_graph,
+    build_collection_understanding,
+)
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import GraphQueryState
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
@@ -24,6 +28,25 @@ class _FakeEmbeddingProvider:
 
     async def embed_query(self, text: str) -> list[float]:
         return [0.1, 0.2, 0.3]
+
+
+class _FakeLLMProvider(LLMProvider):
+    async def chat(self, messages: list[dict]) -> str:
+        return "ok"
+
+    async def chat_stream(self, messages: list[dict]):
+        if False:
+            yield ""
+
+    async def structured_extract(self, prompt: str, schema: dict) -> dict:
+        return {
+            "label": "Shared role",
+            "concept_type": "role",
+            "description": "Entities with similar graph roles.",
+            "aliases": ["role family"],
+            "importance_reason": "Useful for higher-level navigation.",
+            "member_entity_names": ["Source", "Target"],
+        }
 
 
 class _SessionFactory:
@@ -554,6 +577,67 @@ async def test_analyze_collection_graph_uses_canonical_relationship_types(
     analysis = await analyze_collection_graph(test_graph_rag_collection.id)
 
     assert analysis["relationship_records"][0]["rel_type"] == "CALLS"
+
+
+@pytest.mark.asyncio
+async def test_build_collection_understanding_tolerates_missing_relationship_count():
+    source_id = str(uuid.uuid4())
+    target_id = str(uuid.uuid4())
+    analysis = {
+        "collection": {
+            "id": str(uuid.uuid4()),
+            "name": "Test Collection",
+            "namespace_id": str(uuid.uuid4()),
+            "strategy": "graph_rag",
+        },
+        "relationship_records": [
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": source_id,
+                "source_name": "Source",
+                "target_id": target_id,
+                "target_name": "Target",
+                "rel_type": "CALLS",
+                "weight": 2,
+            }
+        ],
+        "role_groups": [
+            {
+                "group_id": "role:0",
+                "size": 2,
+                "node_ids": [source_id, target_id],
+                "node_names": ["Source", "Target"],
+                "avg_cosine": 0.5,
+                "avg_jaccard": 0.5,
+                "total_overlap": 1,
+                "pair_metrics": [
+                    {
+                        "a": source_id,
+                        "b": target_id,
+                        "overlap": 1,
+                        "cosine": 0.5,
+                        "jaccard": 0.5,
+                    }
+                ],
+                "top_rel_types": ["CALLS"],
+                "representative_edges": [
+                    {
+                        "source_name": "Source",
+                        "target_name": "Target",
+                        "weight": 2,
+                    }
+                ],
+            }
+        ],
+        "entity_aliases_by_id": {},
+    }
+
+    understanding = await build_collection_understanding(
+        analysis,
+        llm_provider=_FakeLLMProvider(),
+    )
+
+    assert understanding["nodes"]
 
 
 @pytest.mark.asyncio

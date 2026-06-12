@@ -713,7 +713,9 @@ async def build_collection_understanding(
                 "; ".join(
                     (
                         f"{edge['source_name']} -[{rel_type}]-> "
-                        f"{edge['target_name']} (weight={edge['weight']}, count={edge['relationship_count']})"
+                        f"{edge['target_name']} "
+                        f"(weight={edge.get('weight', 0)}, "
+                        f"count={edge.get('relationship_count', 1)})"
                     )
                     for edge in region.get("representative_edges", [])[:5]
                 )
