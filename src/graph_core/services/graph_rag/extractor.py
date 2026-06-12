@@ -45,12 +45,15 @@ class ExtractionResult:
 
 
 _EXTRACTION_SCHEMA: dict[str, Any] = {
+    "title": "graph_rag_extraction",
     "type": "object",
+    "additionalProperties": False,
     "properties": {
         "entities": {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "name": {"type": "string"},
                     "type": {"type": "string"},
@@ -63,13 +66,21 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "source": {"type": "string"},
                     "target": {"type": "string"},
+                    "description": {"type": "string"},
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "weight": {"type": "number"},
                     "rel_type": {
                         "type": "array",
                         "items": {
                             "type": "object",
+                            "additionalProperties": False,
                             "properties": {
                                 "name": {"type": "string"},
                                 "description": {"type": "string"},
@@ -84,7 +95,14 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
                         "minItems": 1,
                     },
                 },
-                "required": ["source", "target", "rel_type"],
+                "required": [
+                    "source",
+                    "target",
+                    "description",
+                    "keywords",
+                    "weight",
+                    "rel_type",
+                ],
             },
         },
     },
@@ -119,6 +137,10 @@ entities and relationships from input text.
    - Return structured JSON with two arrays: "entities" and "relationships".
    - Each entity must have: name, type, description.
    - Each relationship must have: source, target, rel_type.
+   - Each relationship must also have top-level:
+       description (string),
+       keywords    (array of strings),
+       weight      (float 0..1)
    - "rel_type" is a list of one or more objects, each with:
        name        (string)
        description (string, role-specific: explains the connection
@@ -334,20 +356,32 @@ class LLMGraphExtractor:
             "plain English, but keep the style compact and code-like using cues "
             "such as IF, WHEN, THEN, ELSE, FOR EACH, WHILE, TRY/CATCH, RETURNS, "
             "SPLITS INTO, or MERGES WITH. Do not invent control flow that is not "
-            "grounded in the text. When choosing rel_type labels, prefer the "
-            "current set if one is relevant; otherwise create a concise new "
-            "upper-snake rel_type that captures the architecture, data flow, or "
-            "execution role more precisely."
+            "grounded in the text. Focus on extracting logic in terms of: "
+            "what is happening, where it happens, why it happens, how it "
+            "happens, and when it starts, ends, or switches path. When two "
+            "symbols are contrasted, preserve both sides of the contrast "
+            "explicitly instead of collapsing them into one generic summary. "
+            "Always preserve exact explicit structural relationships that are "
+            "directly present in the code or docs, such as imports, calls, "
+            "returns, assignments, configuration, state updates, and fallback "
+            "branches. In addition to those direct edges, extract richer logical "
+            "relationships between the same entities when the text supports "
+            "them. Choose concise rel_type labels only after you have identified "
+            "the underlying logic, data flow, control flow, conditions, "
+            "lifecycle, or purpose described in the text."
         )
 
     @staticmethod
     def _domain_rel_type_guidance(domain: str | None) -> str:
         if domain == "code":
             return (
-                "Prefer an existing rel_type from this current set when it truly "
-                "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
-                "that captures the architecture, data flow, or execution role "
-                "more precisely."
+                "Do not optimize for any fixed vocabulary. Derive concise "
+                "UPPER_SNAKE rel_type labels from the logic actually present in "
+                "the text. Preserve exact direct relationships when they are "
+                "explicit, for example calls, imports, returns, assigns, "
+                "updates, or configures. Add richer rel_type labels only when "
+                "they capture additional supported logic such as purpose, "
+                "condition, contrast, lifecycle, task fit, or fallback."
             )
         if domain is not None:
             return (
@@ -375,8 +409,12 @@ class LLMGraphExtractor:
             "method, module, variable, exception, or config symbol. Preserve the "
             "source casing and punctuation style for those symbols instead of "
             "rewriting them into generic title case. Use broader natural-language "
-            "names only for genuinely higher-level code concepts that are not "
-            "named symbols in the source."
+            "names only for genuinely higher-level code concepts that are "
+            "explicitly named in the source text or documentation. Do not invent "
+            "new conceptual node names just to represent logic that can be "
+            "captured as a relationship between existing entities. Prefer to put "
+            "what/where/why/how/when semantics into relationship descriptions and "
+            "rel_type labels unless the concept itself is explicitly named."
         )
 
     @staticmethod
