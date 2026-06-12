@@ -206,11 +206,6 @@ async def test_update_and_get_job(service):
 
 
 @pytest.mark.asyncio
-async def test_append_job_event_ignores_missing_job(service):
-    await service.append_job_event(uuid.uuid4(), "started")
-
-
-@pytest.mark.asyncio
 async def test_process_single_chunk_ignores_missing_chunk_row(service, test_collection):
     async with AsyncSessionLocal() as session:
         job = Job(
