@@ -36,6 +36,8 @@ class CollectionResponse(BaseModel):
     name: str
     strategy: str
     namespace_id: str
+    graph_name: str
+    graph_display_name: str | None = None
     embedding_profile_id: str | None
     llm_profile_id: str | None
     default_query_mode: str | None
@@ -186,6 +188,8 @@ def _to_response(c) -> CollectionResponse:
         name=c.name,
         strategy=c.strategy,
         namespace_id=str(c.namespace_id),
+        graph_name=service._graph_name(c.id),
+        graph_display_name=c.name,
         embedding_profile_id=(
             str(c.embedding_profile_id) if c.embedding_profile_id else None
         ),
