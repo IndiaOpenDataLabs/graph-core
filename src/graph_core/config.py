@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     embedding_max_concurrent_calls: int = 10
     provider_semaphore_lease_seconds: int = 1800
     provider_semaphore_poll_interval_ms: int = 100
-    provider_semaphore_acquire_timeout_seconds: float = 60
+    provider_semaphore_acquire_timeout_seconds: float = 600
     ingest_chunk_time_limit_ms: int = 7200000
     ingest_chunk_max_age_ms: int = 28800000
 
