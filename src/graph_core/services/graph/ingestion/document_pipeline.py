@@ -17,10 +17,6 @@ from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.profile import Profile
-from graph_core.provider_semaphore import (
-    release_llm_dispatch_slot,
-    try_acquire_llm_dispatch_slot,
-)
 from graph_core.services.chunking import DocumentChunker
 from graph_core.services.graph.ingestion.chunk_processor import ingest_collection_chunk
 
@@ -209,43 +205,6 @@ def _resolve_chunk_dispatch_limit(
     return max(1, min(limits))
 
 
-def _llm_dispatch_scope_and_limit(
-    collection: Collection,
-    llm_profile: Profile | None,
-) -> tuple[str, int]:
-    limit = (
-        llm_profile.max_concurrent_calls
-        if llm_profile and llm_profile.max_concurrent_calls
-        else settings.llm_max_concurrent_calls
-    )
-    if collection.llm_profile_id is not None:
-        return str(collection.llm_profile_id), max(1, int(limit))
-    return "default", max(1, int(limit))
-
-
-async def release_chunk_dispatch_slot(job_id: uuid.UUID, chunk_index: int) -> None:
-    async with AsyncSessionLocal() as session:
-        job = await session.get(Job, job_id)
-        if not job or not job.collection_id:
-            return
-        collection = await session.get(Collection, job.collection_id)
-        if not collection:
-            return
-        llm_profile = None
-        if collection.llm_profile_id is not None:
-            llm_profile = await session.get(Profile, collection.llm_profile_id)
-
-    dispatch_scope, llm_dispatch_limit = _llm_dispatch_scope_and_limit(
-        collection,
-        llm_profile,
-    )
-    await release_llm_dispatch_slot(
-        dispatch_scope,
-        f"{job_id}:{chunk_index}",
-        max_concurrent_calls=llm_dispatch_limit,
-    )
-
-
 async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -> int:
     """Reserve and enqueue the next bounded window of pending chunks."""
     async with AsyncSessionLocal() as session:
@@ -273,11 +232,6 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
             embedding_profile,
             llm_profile,
         )
-        dispatch_scope, llm_dispatch_limit = _llm_dispatch_scope_and_limit(
-            collection,
-            llm_profile,
-        )
-
         active_count = await session.scalar(
             select(func.count())
             .select_from(IngestionChunk)
@@ -308,35 +262,10 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
         if not pending_chunks:
             return 0
 
-        dispatch_indices: list[int] = []
-        reserved_tokens: list[str] = []
         for chunk in pending_chunks:
-            token = f"{job_id}:{chunk.chunk_index}"
-            acquired = await try_acquire_llm_dispatch_slot(
-                dispatch_scope,
-                token,
-                max_concurrent_calls=llm_dispatch_limit,
-            )
-            if not acquired:
-                continue
             chunk.status = "processing"  # type: ignore[assignment]
-            dispatch_indices.append(chunk.chunk_index)
-            reserved_tokens.append(token)
-
-        if not dispatch_indices:
-            await session.rollback()
-            return 0
-
-        try:
-            await session.commit()
-        except Exception:
-            for token in reserved_tokens:
-                await release_llm_dispatch_slot(
-                    dispatch_scope,
-                    token,
-                    max_concurrent_calls=llm_dispatch_limit,
-                )
-            raise
+        await session.commit()
+        dispatch_indices = [chunk.chunk_index for chunk in pending_chunks]
 
     from graph_core.workers.ingestion import run_chunk
 
@@ -372,44 +301,28 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
         job = await session.get(Job, job_uuid)
         collection = await session.get(Collection, job.collection_id)
         text = chunk.text
-        llm_profile = None
-        if collection.llm_profile_id is not None:
-            llm_profile = await session.get(Profile, collection.llm_profile_id)
 
-    dispatch_scope, llm_dispatch_limit = _llm_dispatch_scope_and_limit(
-        collection,
-        llm_profile,
+    result = await ingest_collection_chunk(
+        text=text,
+        collection=collection,
+        namespace_id=collection.namespace_id,
+        chunk_index=chunk_index,
+        domain=job.payload.get("domain") if isinstance(job.payload, dict) else None,
     )
-    dispatch_token = f"{job_uuid}:{chunk_index}"
 
-    try:
-        result = await ingest_collection_chunk(
-            text=text,
-            collection=collection,
-            namespace_id=collection.namespace_id,
-            chunk_index=chunk_index,
-            domain=job.payload.get("domain") if isinstance(job.payload, dict) else None,
-        )
+    await update_chunk_status(job_uuid, chunk_index, "completed")
 
-        await update_chunk_status(job_uuid, chunk_index, "completed")
-
-        await increment_chunk_counter(job_uuid)
-        await _append_job_event(
-            job_uuid,
-            "chunk_completed",
-            {
-                "chunk_index": chunk_index,
-                "entity_count": result.entity_count,
-                "relationship_count": result.relationship_count,
-            },
-        )
-        await dispatch_pending_chunks(job_uuid, slots=1)
-    finally:
-        await release_llm_dispatch_slot(
-            dispatch_scope,
-            dispatch_token,
-            max_concurrent_calls=llm_dispatch_limit,
-        )
+    await increment_chunk_counter(job_uuid)
+    await _append_job_event(
+        job_uuid,
+        "chunk_completed",
+        {
+            "chunk_index": chunk_index,
+            "entity_count": result.entity_count,
+            "relationship_count": result.relationship_count,
+        },
+    )
+    await dispatch_pending_chunks(job_uuid, slots=1)
 
 
 # ── Chunk status tracking ──
