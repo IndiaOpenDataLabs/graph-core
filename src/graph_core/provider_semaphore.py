@@ -85,6 +85,7 @@ class _RedisSemaphore:
 
 _llm_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:llm")
 _embedding_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:embedding")
+_llm_chunk_semaphore = _RedisSemaphore(key_prefix="ingestion-semaphore:llm")
 
 
 @asynccontextmanager
@@ -121,3 +122,21 @@ async def embedding_call_slot(
         yield
     finally:
         await _embedding_semaphore.release(semaphore_scope, token, limit)
+
+
+@asynccontextmanager
+async def llm_chunk_slot(
+    scope: str | None = None,
+    max_concurrent_calls: int | None = None,
+) -> AsyncIterator[None]:
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    semaphore_scope = scope or "default"
+    token = await _llm_chunk_semaphore.acquire(semaphore_scope, limit)
+    try:
+        yield
+    finally:
+        await _llm_chunk_semaphore.release(semaphore_scope, token, limit)
