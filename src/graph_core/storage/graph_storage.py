@@ -876,8 +876,22 @@ class FalkorDBGraphStorage:
         return count
 
     async def drop(self) -> None:
+        graph_name = self._graph_name
+        if self._test_client is not None and hasattr(self._test_client, "execute_command"):
+            await self._test_client.execute_command("GRAPH.DELETE", graph_name)
+            self._graph = None
+            return
+
         graph = await self._get_graph()
+        client = self._client
+        if client is not None and hasattr(client, "execute_command"):
+            await client.execute_command("GRAPH.DELETE", graph_name)
+            self._graph = None
+            return
+
+        # Fallback for simple test doubles that expose only graph.query().
         await graph.query("MATCH (n:Entity) DETACH DELETE n")
+        self._graph = None
 
     async def close(self) -> None:
         pass
