@@ -53,6 +53,7 @@ _RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
     "especially causes, mechanisms, tensions, and energy depletion."
 )
 _MIX_REWRITE_MIN_SCORE = 0.55
+_REL_ENDPOINT_ENTITY_SCORE_MIN = 0.0
 _MODE_ALIASES = {
     "local": "entity-first",
     "ent": "entity-first",
@@ -643,6 +644,12 @@ async def _top_entity_candidates(
             continue
         seen.add(name)
         candidates.append((name, hit.content.strip(), 1.0 - hit.distance))
+    logger.info(
+        "graph_rag top_entity_candidates collection=%s count=%d top=%s",
+        collection.name,
+        len(candidates),
+        [(name, round(score, 6)) for name, _, score in candidates[:10]],
+    )
     return candidates
 
 
@@ -921,6 +928,7 @@ async def _relationship_seed_state(
     collection: Collection,
     relationship_query_embedding: list[float],
     *,
+    debug_label: str | None = None,
     top_k: int = 10,
     max_endpoints: int = 20,
     max_pairs: int = 30,
@@ -942,12 +950,35 @@ async def _relationship_seed_state(
     discovered_entity_ids: set[str] = set()
     entity_relevance: dict[str, float] = {}
     graph_storage = get_graph_storage(collection.id)
+    entity_name_by_id: dict[str, str] = {}
+    rel_debug_rows: list[dict[str, Any]] = []
+    raw_rel_seed_rows: list[dict[str, Any]] = []
 
     async with AsyncSessionLocal() as session:
+        entity_rows = await session.execute(
+            select(GraphEntity.id, GraphEntity.canonical_name).where(
+                GraphEntity.collection_id == collection.id
+            )
+        )
+        entity_name_by_id = {
+            str(entity_id): canonical_name
+            for entity_id, canonical_name in entity_rows.all()
+        }
         for rel_id_str, sim in rel_seeds[:top_k]:
             rel = await session.get(GraphRelationship, uuid.UUID(rel_id_str))
             if not rel:
                 continue
+            raw_rel_seed_rows.append(
+                {
+                    "rel_id": rel_id_str,
+                    "sim": round(sim, 6),
+                    "source_id": str(rel.source_entity_id),
+                    "source_name": entity_name_by_id.get(str(rel.source_entity_id)),
+                    "target_id": str(rel.target_entity_id),
+                    "target_name": entity_name_by_id.get(str(rel.target_entity_id)),
+                    "stored_rel_type": str(rel.rel_type or ""),
+                }
+            )
             edge_props = await graph_storage.get_edge(
                 str(rel.source_entity_id),
                 str(rel.target_entity_id),
@@ -964,6 +995,20 @@ async def _relationship_seed_state(
             combined = (
                 _combined_edge_score(sim, edge_props, query_tokens)
                 * dimension_weight
+            )
+            rel_debug_rows.append(
+                {
+                    "rel_id": rel_id_str,
+                    "sim": round(sim, 6),
+                    "combined": round(combined, 6),
+                    "source_id": str(rel.source_entity_id),
+                    "source_name": entity_name_by_id.get(str(rel.source_entity_id)),
+                    "target_id": str(rel.target_entity_id),
+                    "target_name": entity_name_by_id.get(str(rel.target_entity_id)),
+                    "rel_type": str(edge_props.get("rel_type") or rel.rel_type or ""),
+                    "weight": edge_props.get("weight"),
+                    "keywords": edge_props.get("keywords") or [],
+                }
             )
             traversed_rel_ids.append(rel_id_str)
             rel_score_cache[rel_id_str] = sim
@@ -1012,6 +1057,32 @@ async def _relationship_seed_state(
             if eid not in entity_relevance or path_score > entity_relevance[eid]:
                 entity_relevance[eid] = path_score
 
+    logger.info(
+        "graph_rag relationship_seed_state label=%r collection=%s rel_types=%s raw_rel_seeds=%s discovered=%d traversed=%d top_entities=%s top_rels=%s rel_debug=%s",
+        debug_label,
+        collection.name,
+        rel_types,
+        raw_rel_seed_rows[:10],
+        len(discovered_entity_ids),
+        len(traversed_rel_ids),
+        sorted(
+            (
+                (
+                    eid,
+                    entity_name_by_id.get(eid, eid),
+                    round(entity_relevance.get(eid, 0.0), 6),
+                )
+                for eid in discovered_entity_ids
+            ),
+            key=lambda item: item[2],
+            reverse=True,
+        )[:10],
+        [
+            (rel_id, round(rel_combined_score_cache.get(rel_id, 0.0), 6))
+            for rel_id in traversed_rel_ids[:10]
+        ],
+        rel_debug_rows[:10],
+    )
     return GraphQueryState(
         discovered_entity_ids=discovered_entity_ids,
         entity_relevance=entity_relevance,
@@ -1034,6 +1105,7 @@ async def _relationship_first_state(
     state = await _relationship_seed_state(
         collection,
         relationship_query_embedding,
+        debug_label=f"relationship_first:{question}",
         top_k=10,
         max_endpoints=20,
         max_pairs=30,
@@ -1041,21 +1113,163 @@ async def _relationship_first_state(
         rel_types=rel_types,
         dimension_weight=dimension_weight,
     )
+    return await _filter_relationship_state_by_entity_score(
+        collection,
+        state,
+        entity_query_embedding,
+        min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
+    )
 
-    seed_entity_ids, seed_scores = await _search_entity_seeds(
-        question,
+
+async def _filter_relationship_state_by_entity_score(
+    collection: Collection,
+    state: GraphQueryState,
+    entity_query_embedding: list[float],
+    *,
+    min_entity_score: float,
+    top_k: int = 50,
+) -> GraphQueryState:
+    if not state.discovered_entity_ids:
+        return state
+
+    candidates = await _top_entity_candidates(
         collection,
         entity_query_embedding,
+        top_k=top_k,
     )
-    for eid in seed_entity_ids[:5]:
-        state.discovered_entity_ids.add(eid)
-        if (
-            eid not in state.entity_relevance
-            or seed_scores[eid] > state.entity_relevance[eid]
-        ):
-            state.entity_relevance[eid] = seed_scores[eid]
+    entity_score_by_name = {
+        name.strip().lower(): score for name, _, score in candidates
+    }
 
-    return state
+    async with AsyncSessionLocal() as session:
+        entity_rows = await session.execute(
+            select(GraphEntity.id, GraphEntity.canonical_name).where(
+                GraphEntity.collection_id == collection.id,
+                GraphEntity.id.in_(
+                    [uuid.UUID(entity_id) for entity_id in state.discovered_entity_ids]
+                ),
+            )
+        )
+        entity_name_by_id = {
+            str(entity_id): canonical_name
+            for entity_id, canonical_name in entity_rows.all()
+        }
+
+        kept_entity_ids = {
+            entity_id
+            for entity_id, entity_name in entity_name_by_id.items()
+            if entity_score_by_name.get(entity_name.strip().lower(), 0.0)
+            >= min_entity_score
+        }
+        if not kept_entity_ids:
+            logger.info(
+                "graph_rag relationship_state_filter collection=%s threshold=%.3f kept=0 discovered=%d",
+                collection.name,
+                min_entity_score,
+                len(state.discovered_entity_ids),
+            )
+            return GraphQueryState(
+                discovered_entity_ids=set(),
+                entity_relevance={},
+                traversed_rel_ids=[],
+                rel_score_cache={},
+                rel_combined_score_cache={},
+            )
+
+        filtered_rel_ids: list[str] = []
+        filtered_rel_score_cache: dict[str, float] = {}
+        filtered_rel_combined_score_cache: dict[str, float] = {}
+
+        traversed_rel_uuids = [
+            uuid.UUID(rel_id) for rel_id in state.traversed_rel_ids if rel_id
+        ]
+        if traversed_rel_uuids:
+            rel_rows = await session.execute(
+                select(
+                    GraphRelationship.id,
+                    GraphRelationship.source_entity_id,
+                    GraphRelationship.target_entity_id,
+                ).where(GraphRelationship.id.in_(traversed_rel_uuids))
+            )
+            for rel_id, source_entity_id, target_entity_id in rel_rows.all():
+                rel_id_str = str(rel_id)
+                if (
+                    str(source_entity_id) in kept_entity_ids
+                    and str(target_entity_id) in kept_entity_ids
+                ):
+                    filtered_rel_ids.append(rel_id_str)
+                    if rel_id_str in state.rel_score_cache:
+                        filtered_rel_score_cache[rel_id_str] = state.rel_score_cache[
+                            rel_id_str
+                        ]
+                    if rel_id_str in state.rel_combined_score_cache:
+                        filtered_rel_combined_score_cache[rel_id_str] = (
+                            state.rel_combined_score_cache[rel_id_str]
+                        )
+
+        kept_rel_rows = await session.execute(
+            select(GraphRelationship).where(
+                GraphRelationship.collection_id == collection.id,
+                GraphRelationship.source_entity_id.in_(
+                    [uuid.UUID(entity_id) for entity_id in kept_entity_ids]
+                ),
+                GraphRelationship.target_entity_id.in_(
+                    [uuid.UUID(entity_id) for entity_id in kept_entity_ids]
+                ),
+            )
+        )
+        for rel in kept_rel_rows.scalars().all():
+            rel_id_str = str(rel.id)
+            if rel_id_str in filtered_rel_ids:
+                continue
+            filtered_rel_ids.append(rel_id_str)
+            filtered_rel_score_cache[rel_id_str] = state.rel_score_cache.get(
+                rel_id_str, 0.0
+            )
+            filtered_rel_combined_score_cache[rel_id_str] = (
+                state.rel_combined_score_cache.get(rel_id_str, 0.0)
+            )
+
+    filtered_entity_relevance = {
+        entity_id: max(
+            state.entity_relevance.get(entity_id, 0.0),
+            entity_score_by_name.get(
+                entity_name_by_id.get(entity_id, "").strip().lower(),
+                0.0,
+            ),
+        )
+        for entity_id in kept_entity_ids
+    }
+    filtered_rel_ids.sort(
+        key=lambda rel_id: filtered_rel_combined_score_cache.get(rel_id, 0.0),
+        reverse=True,
+    )
+    logger.info(
+        "graph_rag relationship_state_filter collection=%s threshold=%.3f kept=%d filtered_rels=%d kept_entities=%s",
+        collection.name,
+        min_entity_score,
+        len(kept_entity_ids),
+        len(filtered_rel_ids),
+        sorted(
+            (
+                (
+                    entity_id,
+                    entity_name_by_id.get(entity_id, entity_id),
+                    round(filtered_entity_relevance.get(entity_id, 0.0), 6),
+                )
+                for entity_id in kept_entity_ids
+            ),
+            key=lambda item: item[2],
+            reverse=True,
+        )[:10],
+    )
+    return GraphQueryState(
+        discovered_entity_ids=kept_entity_ids,
+        entity_relevance=filtered_entity_relevance,
+        traversed_rel_ids=filtered_rel_ids,
+        rel_score_cache=filtered_rel_score_cache,
+        rel_combined_score_cache=filtered_rel_combined_score_cache,
+    )
 
 
 def _merge_states(*states: GraphQueryState) -> GraphQueryState:
@@ -1141,6 +1355,11 @@ async def _interpret_mix_queries(
     candidates: list[tuple[str, str, float]],
     llm_provider: LLMProvider,
 ) -> MixInterpretation:
+    logger.info(
+        "graph_rag mix_interpretation_start question=%r candidates=%s",
+        question,
+        [(name, round(score, 6)) for name, _, score in candidates[:12]],
+    )
     if isinstance(llm_provider, LocalEchoLLMProvider):
         return _fallback_mix_interpretation(candidates)
 
@@ -1200,9 +1419,75 @@ async def _interpret_mix_queries(
     if not retrieval_subqueries:
         return _fallback_mix_interpretation(candidates)
 
+    logger.info(
+        "graph_rag mix_interpretation_done selected_entities=%s subqueries=%s",
+        selected_entities[:8],
+        retrieval_subqueries[:4],
+    )
     return MixInterpretation(
         selected_entities=selected_entities[:8],
         retrieval_subqueries=retrieval_subqueries[:4],
+    )
+
+
+def _diagnostic_entity_text(question: str) -> str:
+    normalized = question.strip().strip("?!.,:; ").lower()
+    prefixes = (
+        "what is ",
+        "who is ",
+        "what are ",
+        "who are ",
+        "tell me about ",
+        "explain ",
+    )
+    for prefix in prefixes:
+        if normalized.startswith(prefix):
+            candidate = normalized[len(prefix):].strip()
+            if candidate:
+                return candidate
+    return normalized
+
+
+async def _log_exact_name_hits(collection: Collection, question: str) -> None:
+    entity_text = _diagnostic_entity_text(question)
+    async with AsyncSessionLocal() as session:
+        entity_rows = (
+            await session.execute(
+                select(
+                    GraphEntity.id,
+                    GraphEntity.canonical_name,
+                    GraphEntity.primary_type,
+                ).where(
+                    GraphEntity.collection_id == collection.id,
+                    GraphEntity.canonical_name.ilike(entity_text),
+                )
+            )
+        ).all()
+        alias_rows = (
+            await session.execute(
+                select(
+                    EntityAlias.id,
+                    EntityAlias.entity_id,
+                    EntityAlias.alias_name,
+                ).where(
+                    EntityAlias.collection_id == collection.id,
+                    EntityAlias.alias_name.ilike(entity_text),
+                )
+            )
+        ).all()
+    logger.info(
+        "graph_rag exact_name_hits collection=%s question=%r entity_text=%r entities=%s aliases=%s",
+        collection.name,
+        question,
+        entity_text,
+        [
+            (str(entity_id), canonical_name, primary_type)
+            for entity_id, canonical_name, primary_type in entity_rows
+        ],
+        [
+            (str(alias_id), str(entity_id), alias_name)
+            for alias_id, entity_id, alias_name in alias_rows
+        ],
     )
 
 
@@ -1219,22 +1504,42 @@ async def _mix_state(
     dimension_weight: float = 1.0,
 ) -> GraphQueryState:
     query_tokens = _query_token_set(question)
+    await _log_exact_name_hits(collection, question)
     candidates = await _top_entity_candidates(
         collection,
         entity_query_embedding,
         top_k=50,
     )
     top_entity_score = candidates[0][2] if candidates else 0.0
+    logger.info(
+        "graph_rag mix_state_start collection=%s question=%r top_entity_score=%.6f threshold=%.6f rel_types=%s",
+        collection.name,
+        question,
+        top_entity_score,
+        _MIX_REWRITE_MIN_SCORE,
+        rel_types,
+    )
     if top_entity_score < _MIX_REWRITE_MIN_SCORE:
-        return await _relationship_seed_state(
+        logger.info(
+            "graph_rag mix_state_fallback collection=%s reason=top_entity_score_below_threshold",
+            collection.name,
+        )
+        fallback_state = await _relationship_seed_state(
             collection,
             relationship_query_embedding,
+            debug_label=f"mix_fallback:{question}",
             top_k=10,
             max_endpoints=20,
             max_pairs=30,
             query_tokens=query_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
+        )
+        return await _filter_relationship_state_by_entity_score(
+            collection,
+            fallback_state,
+            entity_query_embedding,
+            min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
         )
 
     llm_provider = await _resolve_llm_provider(
@@ -1245,12 +1550,11 @@ async def _mix_state(
 
     # Batch-embed all subquery relationship queries in one API call.
     subqueries = interpretation.retrieval_subqueries
-    rel_type_for_sub = rel_types[0] if rel_types else None
     if subqueries:
         subquery_embeddings = await _embed_relationship_queries_batch(
             embedding_provider,
             subqueries,
-            [rel_type_for_sub] * len(subqueries),
+            [None] * len(subqueries),
         )
     else:
         subquery_embeddings = []
@@ -1259,15 +1563,26 @@ async def _mix_state(
         subquery: str, embedding: list[float]
     ) -> GraphQueryState:
         subquery_tokens = query_tokens | _query_token_set(subquery)
-        return await _relationship_seed_state(
+        subquery_state = await _relationship_seed_state(
             collection,
             embedding,
+            debug_label=f"mix_subquery:{subquery}",
             top_k=8,
             max_endpoints=16,
             max_pairs=20,
             query_tokens=subquery_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
+        )
+        subquery_entity_embedding = await _embed_entity_query(
+            embedding_provider,
+            subquery,
+        )
+        return await _filter_relationship_state_by_entity_score(
+            collection,
+            subquery_state,
+            subquery_entity_embedding,
+            min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
         )
 
     concurrency = settings.graph_rag_query_embedding_concurrency
@@ -1279,6 +1594,16 @@ async def _mix_state(
 
     states = await asyncio.gather(
         *(_gated(sq, emb) for sq, emb in zip(subqueries, subquery_embeddings))
+    )
+    logger.info(
+        "graph_rag mix_state_subqueries collection=%s selected_entities=%s subqueries=%s discovered_counts=%s traversed_counts=%s discovered_entities=%s traversed_rel_ids=%s",
+        collection.name,
+        interpretation.selected_entities,
+        subqueries,
+        [len(state.discovered_entity_ids) for state in states],
+        [len(state.traversed_rel_ids) for state in states],
+        [sorted(state.discovered_entity_ids)[:20] for state in states],
+        [state.traversed_rel_ids[:20] for state in states],
     )
 
     if not states:
@@ -1583,23 +1908,23 @@ async def _build_graph_query_artifacts(
 
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
-    dimensions = await _active_dimensions(collection)
-    dimensions = await _rank_dimensions(
-        collection,
-        embedding_provider,
-        question,
-        dimensions,
+    dimensions: list[str] = []
+    logger.info(
+        "graph_rag dimension_gating_disabled collection=%s mode=%s threshold=%.3f",
+        collection.name,
+        effective_mode,
+        _REL_ENDPOINT_ENTITY_SCORE_MIN,
     )
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
         relationship_query_embedding = await _embed_relationship_query(
             embedding_provider,
             question,
-            rel_type=rel_type,
+            rel_type=None,
         )
         kwargs = {
-            "rel_types": [rel_type] if rel_type else None,
-            "dimension_weight": _dimension_weight(rel_type),
+            "rel_types": None,
+            "dimension_weight": 1.0,
         }
         if effective_mode == "relationship-first":
             return await _relationship_first_state(
@@ -1660,6 +1985,14 @@ async def _build_graph_query_artifacts(
     context, entities_used, relationships_used, rel_context = await _build_context(
         state,
         collection,
+    )
+    logger.info(
+        "graph_rag artifacts collection=%s mode=%s route=%s entities_used=%s relationships_used=%s",
+        collection.name,
+        effective_mode,
+        route_profile.primary_route,
+        entities_used[:20],
+        relationships_used[:20],
     )
     logger.info(
         "graph_rag context collection=%s route=%s entities=%d relationships=%d",
