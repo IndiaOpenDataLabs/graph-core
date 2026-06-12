@@ -83,8 +83,25 @@ class _RedisSemaphore:
         except Exception:
             logger.exception("Failed to release provider semaphore %s", key)
 
+    async def try_acquire(self, scope: str, limit: int, token: str) -> bool:
+        if limit <= 0:
+            return False
+        key = f"{self._key_prefix}:{scope}"
+        now_ms = int(time.time() * 1000)
+        acquired = await self._redis.eval(
+            _ACQUIRE_SCRIPT,
+            1,
+            key,
+            token,
+            now_ms,
+            now_ms + self._lease_ms,
+            limit,
+        )
+        return bool(acquired)
+
 _llm_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:llm")
 _embedding_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:embedding")
+_llm_dispatch_semaphore = _RedisSemaphore(key_prefix="dispatch-semaphore:llm")
 
 
 @asynccontextmanager
@@ -121,3 +138,35 @@ async def embedding_call_slot(
         yield
     finally:
         await _embedding_semaphore.release(semaphore_scope, token, limit)
+
+
+async def try_acquire_llm_dispatch_slot(
+    scope: str,
+    token: str,
+    max_concurrent_calls: int | None = None,
+) -> bool:
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    semaphore_scope = scope or "default"
+    return await _llm_dispatch_semaphore.try_acquire(
+        semaphore_scope,
+        limit,
+        token,
+    )
+
+
+async def release_llm_dispatch_slot(
+    scope: str,
+    token: str | None,
+    max_concurrent_calls: int | None = None,
+) -> None:
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    semaphore_scope = scope or "default"
+    await _llm_dispatch_semaphore.release(semaphore_scope, token, limit)
