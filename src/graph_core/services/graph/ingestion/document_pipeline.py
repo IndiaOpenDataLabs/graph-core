@@ -4,7 +4,6 @@ Module-level async functions that handle the full document ingestion lifecycle:
 job enqueueing, chunking, fan-out, per-chunk processing, and progress tracking.
 """
 
-import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,7 +29,6 @@ _chunker = DocumentChunker(
     chunk_size_tokens=settings.chunk_size_tokens,
     chunk_overlap_tokens=settings.chunk_overlap_tokens,
 )
-logger = logging.getLogger(__name__)
 
 
 # ── Result type ──
@@ -360,14 +358,7 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
                 IngestionChunk.chunk_index == chunk_index,
             )
         )
-        chunk = chunk.scalar_one_or_none()
-        if chunk is None:
-            logger.info(
-                "Skipping stale chunk message for missing row: job=%s chunk=%s",
-                job_uuid,
-                chunk_index,
-            )
-            return
+        chunk = chunk.scalar_one()
 
         job = await session.get(Job, job_uuid)
         collection = await session.get(Collection, job.collection_id)
@@ -425,15 +416,7 @@ async def update_chunk_status(
                 IngestionChunk.chunk_index == chunk_index,
             )
         )
-        chunk = chunk.scalar_one_or_none()
-        if chunk is None:
-            logger.info(
-                "Skipping chunk status update for missing row: job=%s chunk=%s status=%s",
-                job_id,
-                chunk_index,
-                status,
-            )
-            return
+        chunk = chunk.scalar_one()
         chunk.status = status  # type: ignore[assignment]
         if error:
             chunk.error = error  # type: ignore[attr-defined]
