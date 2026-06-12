@@ -152,9 +152,9 @@ def _build_role_similarity_groups(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
     *,
-    overlap_min: int = 3,
-    cosine_min: float = 0.2,
-    jaccard_min: float = 0.1,
+    overlap_min: int = 2,
+    cosine_min: float = 0.0,
+    jaccard_min: float = 0.0,
     min_signature: int = 1,
 ) -> list[dict[str, Any]]:
     if not relationships:
@@ -737,7 +737,12 @@ async def build_collection_understanding(
                 "You are inducing one reusable semantic concept from a role-similarity clique in a knowledge graph.\n"
                 "The member entities are grouped because they occupy similar typed graph positions.\n"
                 "Do not return a mechanical label like cluster, graph region, connector, bridge, or clique.\n"
-                "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n\n"
+                "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n"
+                "Prefer labels drawn directly from the collection's own terminology, especially source-language, tradition-specific, or text-native terms when they fit the evidence.\n"
+                "If a well-established corpus term fits the pattern, use that term as the label instead of inventing a generic English abstraction.\n"
+                "Only fall back to invented English labels when no source-grounded term is adequate.\n"
+                "Avoid generic labels like force-user, principle, framework, pattern, agent, or mediator unless the evidence truly does not support a more native term.\n"
+                "Use aliases to provide short alternate phrasings or English glosses when helpful, rather than putting the generic gloss in the primary label.\n\n"
                 f"{code_guidance}"
                 "Also provide a few short aliases or alternate phrasings for the concept when they would help later resolution.\n\n"
                 f"Collection: {collection['name']}\n"
