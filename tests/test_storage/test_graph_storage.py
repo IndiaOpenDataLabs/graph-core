@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from redis.exceptions import ResponseError
 
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
 
@@ -31,3 +32,19 @@ async def test_drop_deletes_graph_namespace_via_graph_delete():
         "collection_deadbeef",
     )
     client.graph.query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_drop_ignores_missing_graph_delete_error():
+    client = _FakeClient()
+    client.execute_command.side_effect = ResponseError(
+        "Invalid graph operation on empty key"
+    )
+    storage = FalkorDBGraphStorage("collection_deadbeef", _client=client)
+
+    await storage.drop()
+
+    client.execute_command.assert_awaited_once_with(
+        "GRAPH.DELETE",
+        "collection_deadbeef",
+    )

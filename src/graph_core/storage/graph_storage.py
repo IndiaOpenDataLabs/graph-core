@@ -25,9 +25,11 @@ from graph_core.models.rel_types import (
 try:
     from falkordb.asyncio import FalkorDB
     from redis.asyncio import BlockingConnectionPool
+    from redis.exceptions import ResponseError
 except ImportError:
     FalkorDB = None  # type: ignore[misc,assignment]
     BlockingConnectionPool = None  # type: ignore[misc,assignment]
+    ResponseError = Exception  # type: ignore[misc,assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,11 @@ def _edge_label_pattern(rel_types: list[str] | None) -> str:
     if len(set(labels)) == 1:
         return f":{labels[0]}"
     return ":" + "|".join(labels)
+
+
+def _is_missing_graph_delete_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "invalid graph operation on empty key" in message
 
 
 class FalkorDBGraphStorage:
@@ -878,14 +885,22 @@ class FalkorDBGraphStorage:
     async def drop(self) -> None:
         graph_name = self._graph_name
         if self._test_client is not None and hasattr(self._test_client, "execute_command"):
-            await self._test_client.execute_command("GRAPH.DELETE", graph_name)
+            try:
+                await self._test_client.execute_command("GRAPH.DELETE", graph_name)
+            except ResponseError as exc:
+                if not _is_missing_graph_delete_error(exc):
+                    raise
             self._graph = None
             return
 
         graph = await self._get_graph()
         client = self._client
         if client is not None and hasattr(client, "execute_command"):
-            await client.execute_command("GRAPH.DELETE", graph_name)
+            try:
+                await client.execute_command("GRAPH.DELETE", graph_name)
+            except ResponseError as exc:
+                if not _is_missing_graph_delete_error(exc):
+                    raise
             self._graph = None
             return
 
