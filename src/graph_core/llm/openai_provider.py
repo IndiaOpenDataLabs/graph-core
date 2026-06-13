@@ -59,7 +59,7 @@ class OpenAILLMProvider(LLMProvider):
                 messages=messages,
                 max_tokens=self._max_output_tokens,
             )
-        return response.choices[0].message.content or ""
+        return self._response_text(response)
 
     async def chat_stream(self, messages: list[dict]) -> AsyncIterator[str]:
         async with llm_call_slot(
@@ -76,6 +76,15 @@ class OpenAILLMProvider(LLMProvider):
                 delta = chunk.choices[0].delta.content
                 if delta:
                     yield delta
+
+    @staticmethod
+    def _response_text(response) -> str:
+        message = response.choices[0].message
+        content = getattr(message, "content", None) or ""
+        if content.strip():
+            return content
+        reasoning_content = getattr(message, "reasoning_content", None) or ""
+        return reasoning_content
 
     async def structured_extract(self, prompt: str, schema: dict) -> dict:
         async def _request(extract_prompt: str, force_json: bool = False):
@@ -105,7 +114,7 @@ class OpenAILLMProvider(LLMProvider):
             except Exception:
                 response = await _request(prompt, force_json=True)
 
-        content = response.choices[0].message.content or ""
+        content = self._response_text(response)
         if not content:
             return {}
         try:
@@ -122,7 +131,7 @@ class OpenAILLMProvider(LLMProvider):
                 max_concurrent_calls=self._max_concurrent_calls,
             ):
                 repair_response = await _request(repair_prompt, force_json=True)
-            repair_content = repair_response.choices[0].message.content or ""
+            repair_content = self._response_text(repair_response)
             if not repair_content:
                 return {}
             return json.loads(repair_content)

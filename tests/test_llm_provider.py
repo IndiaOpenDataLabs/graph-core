@@ -7,18 +7,19 @@ import graph_core.llm.openai_provider as openai_provider
 
 
 class _FakeMessage:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str, reasoning_content: str | None = None) -> None:
         self.content = content
+        self.reasoning_content = reasoning_content
 
 
 class _FakeChoice:
-    def __init__(self, content: str) -> None:
-        self.message = _FakeMessage(content)
+    def __init__(self, content: str, reasoning_content: str | None = None) -> None:
+        self.message = _FakeMessage(content, reasoning_content=reasoning_content)
 
 
 class _FakeResponse:
-    def __init__(self, content: str) -> None:
-        self.choices = [_FakeChoice(content)]
+    def __init__(self, content: str, reasoning_content: str | None = None) -> None:
+        self.choices = [_FakeChoice(content, reasoning_content=reasoning_content)]
 
 
 class _FakeCompletions:
@@ -67,6 +68,29 @@ async def test_chat_sets_default_max_tokens(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_chat_uses_reasoning_content_when_content_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", _FakeAsyncOpenAI)
+    monkeypatch.setattr(openai_provider, "llm_call_slot", _noop_llm_call_slot)
+
+    provider = openai_provider.OpenAILLMProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+    provider._client.chat.completions.create = AsyncMock(
+        return_value=_FakeResponse(
+            "",
+            reasoning_content="fallback answer",
+        )
+    )
+
+    response = await provider.chat([{"role": "user", "content": "hello"}])
+
+    assert response == "fallback answer"
+
+
+@pytest.mark.asyncio
 async def test_structured_extract_sets_default_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +116,31 @@ async def test_structured_extract_sets_default_max_tokens(
     assert result == {"ok": True}
     kwargs = provider._client.chat.completions.create.await_args.kwargs
     assert kwargs["max_tokens"] == 23
+
+
+@pytest.mark.asyncio
+async def test_structured_extract_uses_reasoning_content_when_content_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", _FakeAsyncOpenAI)
+    monkeypatch.setattr(openai_provider, "llm_call_slot", _noop_llm_call_slot)
+    provider = openai_provider.OpenAILLMProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+    provider._client.chat.completions.create = AsyncMock(
+        return_value=_FakeResponse(
+            "",
+            reasoning_content='{"ok": true, "source": "reasoning_content"}',
+        )
+    )
+
+    result = await provider.structured_extract(
+        prompt="extract",
+        schema={"title": "result"},
+    )
+
+    assert result == {"ok": True, "source": "reasoning_content"}
 
 
 @pytest.mark.asyncio

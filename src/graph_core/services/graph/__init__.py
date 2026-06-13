@@ -1524,9 +1524,6 @@ class GraphService:
 
         node_id_map: dict[str, uuid.UUID] = {}
         canonical_name_to_entity_id: dict[str, uuid.UUID] = {}
-        canonical_name_by_entity_id: dict[uuid.UUID, str] = {}
-        node_rows_by_id: dict[str, dict[str, Any]] = {}
-        edge_rows_by_id: dict[str, dict[str, Any]] = {}
         resolver = IncrementalEntityResolver(
             embedding_provider,
             meta_collection.id,
@@ -1534,6 +1531,8 @@ class GraphService:
         )
 
         async with AsyncSessionLocal() as session:
+            # Keep each entity/relationship durable as soon as it is resolved so
+            # an interrupted enhance run preserves completed progress.
             for canonical_name in merged_node_order:
                 node = merged_nodes_by_name[canonical_name]
                 primary_type = str(node.get("primary_type") or "concept").strip() or "concept"
@@ -1561,7 +1560,6 @@ class GraphService:
                     source_chunk_hash=source_chunk_hash,
                 )
                 canonical_name_to_entity_id[canonical_name] = resolved.entity_id
-                canonical_name_by_entity_id[resolved.entity_id] = resolved.canonical_name
                 for alias in sorted(
                     {
                         str(value).strip()
@@ -1575,11 +1573,16 @@ class GraphService:
                         alias,
                         source_chunk_hash,
                     )
-                node_rows_by_id[str(resolved.entity_id)] = {
-                    "id": str(resolved.entity_id),
-                    "name": resolved.canonical_name,
-                    "collection_id": str(meta_collection.id),
-                }
+                await session.commit()
+                await graph_storage.upsert_nodes(
+                    [
+                        {
+                            "id": str(resolved.entity_id),
+                            "name": resolved.canonical_name,
+                            "collection_id": str(meta_collection.id),
+                        }
+                    ]
+                )
 
             for old_node_id, canonical_name in old_node_to_name.items():
                 entity_id = canonical_name_to_entity_id.get(canonical_name)
@@ -1629,22 +1632,21 @@ class GraphService:
                 )
                 if persisted_rel is None:
                     continue
-                edge_rows_by_id[str(rel_result.relationship_id)] = {
-                    "source_id": str(persisted_rel.source_entity_id),
-                    "target_id": str(persisted_rel.target_entity_id),
-                    "id": str(rel_result.relationship_id),
-                    "weight": int(persisted_rel.weight or 1),
-                    "keywords": persisted_rel.keywords or [],
-                    "rel_type": persisted_rel.rel_type,
-                    "collection_id": str(meta_collection.id),
-                }
+                await session.commit()
+                await graph_storage.upsert_edges(
+                    [
+                        {
+                            "source_id": str(persisted_rel.source_entity_id),
+                            "target_id": str(persisted_rel.target_entity_id),
+                            "id": str(rel_result.relationship_id),
+                            "weight": int(persisted_rel.weight or 1),
+                            "keywords": persisted_rel.keywords or [],
+                            "rel_type": persisted_rel.rel_type,
+                            "collection_id": str(meta_collection.id),
+                        }
+                    ]
+                )
 
-            await session.commit()
-
-        if node_rows_by_id:
-            await graph_storage.upsert_nodes(list(node_rows_by_id.values()))
-        if edge_rows_by_id:
-            await graph_storage.upsert_edges(list(edge_rows_by_id.values()))
         if chunks:
             vector_chunks: list[dict[str, Any]] = []
             for chunk in chunks:
