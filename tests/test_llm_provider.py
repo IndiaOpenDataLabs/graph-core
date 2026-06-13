@@ -45,15 +45,9 @@ async def _noop_llm_call_slot(*args, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_chat_sets_default_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_chat_does_not_set_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(openai_provider, "AsyncOpenAI", _FakeAsyncOpenAI)
     monkeypatch.setattr(openai_provider, "llm_call_slot", _noop_llm_call_slot)
-    monkeypatch.setattr(
-        openai_provider.settings,
-        "default_llm_max_output_tokens",
-        17,
-        raising=False,
-    )
 
     provider = openai_provider.OpenAILLMProvider(
         api_key="test-key",
@@ -64,7 +58,7 @@ async def test_chat_sets_default_max_tokens(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert response == '{"ok": true}'
     kwargs = provider._client.chat.completions.create.await_args.kwargs
-    assert kwargs["max_tokens"] == 17
+    assert "max_tokens" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -91,17 +85,11 @@ async def test_chat_uses_reasoning_content_when_content_empty(
 
 
 @pytest.mark.asyncio
-async def test_structured_extract_sets_default_max_tokens(
+async def test_structured_extract_does_not_set_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(openai_provider, "AsyncOpenAI", _FakeAsyncOpenAI)
     monkeypatch.setattr(openai_provider, "llm_call_slot", _noop_llm_call_slot)
-    monkeypatch.setattr(
-        openai_provider.settings,
-        "default_llm_max_output_tokens",
-        23,
-        raising=False,
-    )
 
     provider = openai_provider.OpenAILLMProvider(
         api_key="test-key",
@@ -115,7 +103,7 @@ async def test_structured_extract_sets_default_max_tokens(
 
     assert result == {"ok": True}
     kwargs = provider._client.chat.completions.create.await_args.kwargs
-    assert kwargs["max_tokens"] == 23
+    assert "max_tokens" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -149,12 +137,6 @@ async def test_structured_extract_repairs_invalid_json_with_error_message(
 ) -> None:
     monkeypatch.setattr(openai_provider, "AsyncOpenAI", _FakeAsyncOpenAI)
     monkeypatch.setattr(openai_provider, "llm_call_slot", _noop_llm_call_slot)
-    monkeypatch.setattr(
-        openai_provider.settings,
-        "default_llm_max_output_tokens",
-        23,
-        raising=False,
-    )
 
     provider = openai_provider.OpenAILLMProvider(
         api_key="test-key",

@@ -22,12 +22,11 @@ def _cache_key(
     base_url: str | None,
     profile_id: str | None,
     max_concurrent_calls: int | None,
-    max_output_tokens: int | None,
 ) -> str:
     raw = (
         f"{provider_name}|{model}|"
         f"{hashlib.sha256((api_key or '').encode()).hexdigest()}|"
-        f"{base_url}|{profile_id}|{max_concurrent_calls}|{max_output_tokens}"
+        f"{base_url}|{profile_id}|{max_concurrent_calls}"
     )
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -40,7 +39,6 @@ def get_llm_provider(
     base_url: str | None = None,
     profile_id: str | None = None,
     max_concurrent_calls: int | None = None,
-    max_output_tokens: int | None = None,
 ) -> LLMProvider:
     provider_name = provider_name or settings.default_llm_provider
     model = model or settings.default_llm_model
@@ -59,7 +57,6 @@ def get_llm_provider(
             normalize_provider_base_url(base_url or settings.openai_base_url),
             profile_id,
             max_concurrent_calls,
-            max_output_tokens,
         )
 
         with _cache_lock:
@@ -75,7 +72,6 @@ def get_llm_provider(
                 ),
                 profile_id=profile_id,
                 max_concurrent_calls=max_concurrent_calls,
-                max_output_tokens=max_output_tokens,
             )
             _llm_provider_cache[key] = instance
             return instance
