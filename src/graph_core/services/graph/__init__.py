@@ -2253,22 +2253,18 @@ class GraphService:
                 final_analysis = analysis
                 break
             if meta_collection is None:
-                meta_collection = await self._prepare_meta_collection(
-                    source_collection,
-                    namespace_id,
-                    target_level,
+                raise RuntimeError(
+                    "Enhance produced candidate regions but did not materialize any"
                 )
-                await self._materialize_meta_collection(meta_collection, understanding)
-            else:
-                if embedding_provider is None or graph_storage is None:
-                    raise RuntimeError("Enhance did not initialize materialization state")
-                await self._materialize_meta_edges(
-                    meta_collection,
-                    list(understanding.get("edges") or []),
-                    node_id_map,
-                    embedding_provider=embedding_provider,
-                    graph_storage=graph_storage,
-                )
+            if embedding_provider is None or graph_storage is None:
+                raise RuntimeError("Enhance did not initialize materialization state")
+            await self._materialize_meta_edges(
+                meta_collection,
+                list(understanding.get("edges") or []),
+                node_id_map,
+                embedding_provider=embedding_provider,
+                graph_storage=graph_storage,
+            )
 
             kind_counts: dict[str, int] = {}
             for node in understanding["nodes"]:

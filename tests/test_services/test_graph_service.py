@@ -341,23 +341,41 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
     service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
     service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
     service._get_collection_by_names = AsyncMock(return_value=None)  # type: ignore[method-assign]
-    service.create_collection = AsyncMock(return_value=level_one)  # type: ignore[method-assign]
-    service._materialize_meta_collection = AsyncMock()  # type: ignore[method-assign]
+    service._prepare_meta_collection = AsyncMock(return_value=level_one)  # type: ignore[method-assign]
+    service._resolve_collection_embedding_provider = AsyncMock(return_value=object())  # type: ignore[method-assign]
+    service._graph_storage = lambda collection: object()  # type: ignore[method-assign]
+    service._materialize_region_concept = AsyncMock()  # type: ignore[method-assign]
+    service._materialize_meta_edges = AsyncMock()  # type: ignore[method-assign]
     service._graph_name = lambda collection: f"graph_{collection.name}"  # type: ignore[method-assign]
+
+    async def _fake_build_collection_understanding(*args, **kwargs):
+        on_region_concept = kwargs.get("on_region_concept")
+        if on_region_concept is not None:
+            await on_region_concept(
+                {"region_id": "role_group_1", "source_ids": ["node-1"]},
+                {
+                    "label": "concept-1",
+                    "concept_type": "derived_concept",
+                    "description": "concept description",
+                    "aliases": [],
+                    "importance_reason": "important",
+                    "member_entity_names": [],
+                    "evidence_region_ids": ["role_group_1"],
+                },
+            )
+        return {
+            "nodes": [{"id": "concept-1", "type": "derived_concept"}],
+            "edges": [],
+            "chunks": [],
+            "candidate_region_count": 1,
+        }
 
     with patch(
         "graph_core.services.graph.analyze_collection_graph",
         AsyncMock(return_value={"totals": {}, "role_groups": [{}]}),
     ), patch(
         "graph_core.services.graph.build_collection_understanding",
-        AsyncMock(
-            return_value={
-                "nodes": [{"id": "concept-1", "type": "derived_concept"}],
-                "edges": [],
-                "chunks": [],
-                "candidate_region_count": 1,
-            }
-        ),
+        AsyncMock(side_effect=_fake_build_collection_understanding),
     ):
         result = await service.build_collection_understanding(
             base_collection.id,
@@ -365,7 +383,9 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
             levels=100,
         )
 
-    service.create_collection.assert_awaited_once()
+    service._prepare_meta_collection.assert_awaited_once()
+    service._materialize_region_concept.assert_awaited_once()
+    service._materialize_meta_edges.assert_awaited_once()
     assert len(result["generated_levels"]) == 1
     assert result["generated_levels"][0]["level"] == 1
     assert result["generated_levels"][0]["node_count"] == 1
