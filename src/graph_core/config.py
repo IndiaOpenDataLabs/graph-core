@@ -41,7 +41,7 @@ class Settings(BaseSettings):
 
     default_llm_provider: str = "local_echo"
     default_llm_model: str = "echo-v1"
-    default_llm_max_output_tokens: int = 2048
+    default_llm_max_output_tokens: int = 16328
 
     # Graph RAG settings
     falkordb_graph_name: str = "knowledge_graph"
