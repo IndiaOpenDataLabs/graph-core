@@ -1,12 +1,14 @@
 """GraphService — unit tests."""
 
 import uuid
+from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
 
 from graph_core.database import AsyncSessionLocal
+from graph_core.models.collection import Collection
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job
 from graph_core.models.profile import Profile
@@ -36,6 +38,46 @@ async def test_create_collection(service, test_namespace):
     assert coll.name == "new-collection"
     assert coll.namespace_id == test_namespace.id
     assert coll.strategy == "vector"
+
+
+@pytest.mark.asyncio
+async def test_update_collection_renames_meta_collection(service, test_namespace):
+    base_id = uuid.uuid4()
+    meta_id = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Collection(
+                id=base_id,
+                namespace_id=test_namespace.id,
+                name="base",
+                strategy="vector",
+                embedding_dimensions=256,
+            )
+        )
+        session.add(
+            Collection(
+                id=meta_id,
+                namespace_id=test_namespace.id,
+                name="base__meta",
+                strategy="custom_graph_rag",
+                embedding_dimensions=256,
+            )
+        )
+        await session.commit()
+
+    service._migrate_collection_graph_if_needed = AsyncMock()  # type: ignore[method-assign]
+
+    updated = await service.update_collection(
+        base_id,
+        test_namespace.id,
+        name="renamed",
+    )
+
+    assert updated.name == "renamed"
+    async with AsyncSessionLocal() as session:
+        meta = await session.get(Collection, meta_id)
+    assert meta is not None
+    assert meta.name == "renamed__meta"
 
 
 @pytest.mark.asyncio

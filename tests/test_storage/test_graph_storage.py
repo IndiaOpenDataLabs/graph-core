@@ -48,3 +48,49 @@ async def test_drop_ignores_missing_graph_delete_error():
         "GRAPH.DELETE",
         "collection_deadbeef",
     )
+
+
+@pytest.mark.asyncio
+async def test_exists_checks_graph_key():
+    client = _FakeClient()
+    client.execute_command.return_value = 1
+    storage = FalkorDBGraphStorage("collection_deadbeef", _client=client)
+
+    assert await storage.exists() is True
+
+    client.execute_command.assert_awaited_once_with("EXISTS", "collection_deadbeef")
+
+
+@pytest.mark.asyncio
+async def test_rename_renames_graph_key():
+    client = _FakeClient()
+    storage = FalkorDBGraphStorage("collection_deadbeef", _client=client)
+
+    renamed = await storage.rename("collection_new_name")
+
+    assert renamed is True
+    client.execute_command.assert_awaited_once_with(
+        "RENAME",
+        "collection_deadbeef",
+        "collection_new_name",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_ignores_missing_graph_key():
+    client = _FakeClient()
+    client.execute_command.side_effect = ResponseError("no such key")
+    storage = FalkorDBGraphStorage("collection_deadbeef", _client=client)
+
+    renamed = await storage.rename("collection_new_name")
+
+    assert renamed is False
+
+
+@pytest.mark.asyncio
+async def test_node_count_reads_entity_count():
+    client = _FakeClient()
+    client.graph.query.return_value.result_set = [[7]]
+    storage = FalkorDBGraphStorage("collection_deadbeef", _client=client)
+
+    assert await storage.node_count() == 7

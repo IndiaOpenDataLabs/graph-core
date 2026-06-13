@@ -63,6 +63,11 @@ def _is_missing_graph_delete_error(exc: Exception) -> bool:
     return "invalid graph operation on empty key" in message
 
 
+def _is_missing_graph_rename_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "no such key" in message
+
+
 class FalkorDBGraphStorage:
     """FalkorDB-backed knowledge graph storage.
 
@@ -907,6 +912,45 @@ class FalkorDBGraphStorage:
         # Fallback for simple test doubles that expose only graph.query().
         await graph.query("MATCH (n:Entity) DETACH DELETE n")
         self._graph = None
+
+    async def exists(self) -> bool:
+        client = self._test_client
+        if client is None:
+            await self._get_graph()
+            client = self._client
+        if client is not None and hasattr(client, "execute_command"):
+            result = await client.execute_command("EXISTS", self._graph_name)
+            return bool(result)
+        return False
+
+    async def node_count(self) -> int:
+        graph = await self._get_graph()
+        result = await graph.query("MATCH (n:Entity) RETURN count(n) as count")
+        if result and result.result_set:
+            return int(result.result_set[0][0] or 0)
+        return 0
+
+    async def rename(self, new_graph_name: str) -> bool:
+        if not new_graph_name or new_graph_name == self._graph_name:
+            return False
+
+        client = self._test_client
+        if client is None:
+            await self._get_graph()
+            client = self._client
+        if client is None or not hasattr(client, "execute_command"):
+            raise RuntimeError("FalkorDB client does not support graph rename")
+
+        try:
+            await client.execute_command("RENAME", self._graph_name, new_graph_name)
+        except ResponseError as exc:
+            if _is_missing_graph_rename_error(exc):
+                return False
+            raise
+
+        self._graph_name = new_graph_name
+        self._graph = None
+        return True
 
     async def close(self) -> None:
         pass

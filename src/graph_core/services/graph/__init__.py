@@ -65,6 +65,10 @@ from graph_core.services.graph_rag.extractor import (
 )
 from graph_core.services.sanitizer import TextSanitizer
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
+from graph_core.storage.graph_names import (
+    collection_graph_name,
+    legacy_collection_graph_name,
+)
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.vector_store import VectorStore
 from graph_core.storage.vector_tables import (
@@ -105,11 +109,18 @@ class GraphService:
         return FalkorDBGraphStorage(self._chat_graph_name(chat_id))
 
     @staticmethod
-    def _graph_name(collection_id: uuid.UUID) -> str:
-        return f"collection_{str(collection_id).replace('-', '')}"
+    def _graph_name(collection: Collection) -> str:
+        return collection_graph_name(
+            collection_id=collection.id,
+            collection_name=collection.name,
+        )
 
-    def _graph_storage(self, collection_id: uuid.UUID) -> FalkorDBGraphStorage:
-        return FalkorDBGraphStorage(self._graph_name(collection_id))
+    @staticmethod
+    def _legacy_graph_name(collection_id: uuid.UUID) -> str:
+        return legacy_collection_graph_name(collection_id)
+
+    def _graph_storage(self, collection: Collection) -> FalkorDBGraphStorage:
+        return FalkorDBGraphStorage(self._graph_name(collection))
 
     @staticmethod
     def _base_collection_name(collection_name: str) -> str:
@@ -158,7 +169,88 @@ class GraphService:
                 f"Collection {collection.id} has no embedding dimensions"
             )
         await create_all_tables(collection.id, collection.embedding_dimensions)
-        await self._graph_storage(collection.id).drop()
+        await self._graph_storage(collection).drop()
+
+    async def _migrate_collection_graph_if_needed(
+        self,
+        collection: Collection,
+        *,
+        previous_name: str | None = None,
+    ) -> str:
+        current_graph_name = self._graph_name(collection)
+        candidate_old_names: list[str] = []
+        if previous_name and previous_name != collection.name:
+            candidate_old_names.append(
+                collection_graph_name(
+                    collection_id=collection.id,
+                    collection_name=previous_name,
+                )
+            )
+        legacy_name = self._legacy_graph_name(collection.id)
+        if legacy_name not in candidate_old_names:
+            candidate_old_names.append(legacy_name)
+
+        current_storage = FalkorDBGraphStorage(current_graph_name)
+        current_exists = await current_storage.exists()
+        current_node_count = (
+            await current_storage.node_count() if current_exists else 0
+        )
+
+        for old_graph_name in candidate_old_names:
+            if old_graph_name == current_graph_name:
+                continue
+            old_storage = FalkorDBGraphStorage(old_graph_name)
+            old_exists = await old_storage.exists()
+            if not old_exists:
+                continue
+            if current_exists:
+                old_node_count = await old_storage.node_count()
+                if current_node_count == 0 and old_node_count > 0:
+                    await current_storage.drop()
+                    if await old_storage.rename(current_graph_name):
+                        return current_graph_name
+                elif old_node_count == 0:
+                    await old_storage.drop()
+                continue
+            if await old_storage.rename(current_graph_name):
+                return current_graph_name
+
+        return current_graph_name
+
+    async def _rename_meta_collection_for_base_rename(
+        self,
+        collection: Collection,
+        *,
+        previous_name: str | None,
+    ) -> None:
+        if previous_name is None or previous_name == collection.name:
+            return
+        if self._is_meta_collection_name(previous_name):
+            return
+
+        old_meta_name = self._meta_collection_name(previous_name)
+        new_meta_name = self._meta_collection_name(collection.name)
+        if old_meta_name == new_meta_name:
+            return
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Collection).where(
+                    Collection.namespace_id == collection.namespace_id,
+                    Collection.name == old_meta_name,
+                )
+            )
+            meta_collection = result.scalar_one_or_none()
+            if meta_collection is None:
+                return
+            meta_collection.name = new_meta_name
+            await session.commit()
+            await session.refresh(meta_collection)
+
+        await self._migrate_collection_graph_if_needed(
+            meta_collection,
+            previous_name=old_meta_name,
+        )
 
     async def create_chat_session(
         self,
@@ -980,6 +1072,7 @@ class GraphService:
 
         if dimensions is not None:
             await create_all_tables(collection.id, dimensions)
+        await self._migrate_collection_graph_if_needed(collection)
 
         return collection
 
@@ -997,6 +1090,7 @@ class GraphService:
         clear_llm_profile: bool = False,
         clear_default_query_mode: bool = False,
     ) -> Collection:
+        previous_name: str | None = None
         async with AsyncSessionLocal() as session:
             collection = await session.get(Collection, collection_id)
             if not collection:
@@ -1006,6 +1100,7 @@ class GraphService:
                 raise ValueError("Gleaning passes must be 0 or greater")
 
             if name is not None:
+                previous_name = collection.name
                 collection.name = name
             if strategy is not None:
                 collection.strategy = strategy
@@ -1046,7 +1141,29 @@ class GraphService:
 
             await session.commit()
             await session.refresh(collection)
-            return collection
+        await self._migrate_collection_graph_if_needed(
+            collection,
+            previous_name=previous_name,
+        )
+        await self._rename_meta_collection_for_base_rename(
+            collection,
+            previous_name=previous_name,
+        )
+        return collection
+
+    async def migrate_all_collection_graph_names(self) -> list[dict[str, str]]:
+        collections = await self.list_collections_for_all_namespaces()
+        results: list[dict[str, str]] = []
+        for collection in collections:
+            graph_name = await self._migrate_collection_graph_if_needed(collection)
+            results.append(
+                {
+                    "collection_id": str(collection.id),
+                    "collection_name": collection.name,
+                    "graph_name": graph_name,
+                }
+            )
+        return results
 
     async def delete_collection(self, collection_id: uuid.UUID) -> None:
         collection = await self.get_collection(collection_id)
@@ -1058,7 +1175,9 @@ class GraphService:
             if meta is not None:
                 await self.delete_collection(meta.id)
         await drop_all_tables(collection_id)
-        await self._graph_storage(collection_id).drop()
+        await self._graph_storage(collection).drop()
+        legacy_storage = FalkorDBGraphStorage(self._legacy_graph_name(collection.id))
+        await legacy_storage.drop()
         async with AsyncSessionLocal() as session:
             await session.execute(
                 delete(Collection).where(Collection.id == collection_id)
@@ -1070,6 +1189,11 @@ class GraphService:
             result = await session.execute(
                 select(Collection).where(Collection.namespace_id == namespace_id)
             )
+            return list(result.scalars().all())
+
+    async def list_collections_for_all_namespaces(self) -> list[Collection]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(Collection))
             return list(result.scalars().all())
 
     async def get_collection(self, collection_id: uuid.UUID) -> Collection:
@@ -1286,7 +1410,7 @@ class GraphService:
         embedding_provider = await self._resolve_collection_embedding_provider(
             meta_collection
         )
-        graph_storage = self._graph_storage(meta_collection.id)
+        graph_storage = self._graph_storage(meta_collection)
 
         raw_nodes = understanding.get("nodes", [])
         edges = understanding.get("edges", [])
@@ -1332,7 +1456,11 @@ class GraphService:
         canonical_name_by_entity_id: dict[uuid.UUID, str] = {}
         node_rows_by_id: dict[str, dict[str, Any]] = {}
         edge_rows_by_id: dict[str, dict[str, Any]] = {}
-        resolver = IncrementalEntityResolver(embedding_provider, meta_collection.id)
+        resolver = IncrementalEntityResolver(
+            embedding_provider,
+            meta_collection.id,
+            collection_name=meta_collection.name,
+        )
 
         async with AsyncSessionLocal() as session:
             for canonical_name in merged_node_order:
@@ -1530,7 +1658,7 @@ class GraphService:
         return {
             "analysis": analysis,
             "derived_graph": {
-                "graph_name": self._graph_name(meta_collection.id),
+                "graph_name": self._graph_name(meta_collection),
                 "collection_id": str(meta_collection.id),
                 "collection_name": meta_collection.name,
                 "node_count": len(understanding["nodes"]),

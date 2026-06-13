@@ -32,6 +32,10 @@ from graph_core.models.graph_rag import (
     RelationshipTypeAlias,
 )
 from graph_core.models.rel_types import normalize_rel_type, relationship_embedding_text
+from graph_core.storage.graph_names import (
+    collection_graph_name,
+    legacy_collection_graph_name,
+)
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 
@@ -70,14 +74,21 @@ class IncrementalEntityResolver:
         embedding_provider: EmbeddingProvider,
         collection_id: uuid.UUID,
         domain: str | None = None,
+        collection_name: str | None = None,
     ) -> None:
         self._embedding = embedding_provider
         self._collection_id = collection_id
         self._domain = (domain or "").strip().lower() or None
         self._vstore = GraphRAGVectorStore()
-        self._graph_storage = FalkorDBGraphStorage(
-            f"collection_{str(collection_id).replace('-', '')}"
+        graph_name = (
+            collection_graph_name(
+                collection_id=collection_id,
+                collection_name=collection_name,
+            )
+            if collection_name is not None
+            else legacy_collection_graph_name(collection_id)
         )
+        self._graph_storage = FalkorDBGraphStorage(graph_name)
 
     async def _resolve_rel_type(
         self,

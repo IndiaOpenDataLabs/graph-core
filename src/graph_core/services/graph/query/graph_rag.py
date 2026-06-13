@@ -40,6 +40,7 @@ from graph_core.models.rel_types import (
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
+from graph_core.storage.graph_names import collection_graph_name
 
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
@@ -195,7 +196,7 @@ async def _rank_dimensions(
         return dimensions[:top_k]
 
     # Step 2: Collect rel_types from edges incident to the top entities.
-    graph_storage = get_graph_storage(collection.id)
+    graph_storage = get_graph_storage(collection)
     rel_type_alias_map = await _load_rel_type_alias_map(collection.id)
     rel_type_counts: dict[str, int] = defaultdict(int)
 
@@ -526,10 +527,13 @@ async def _resolve_llm_provider(
         )
 
 
-def get_graph_storage(collection_id: uuid.UUID):
+def get_graph_storage(collection: Collection):
     from graph_core.storage.graph_storage import FalkorDBGraphStorage
 
-    graph_name = f"collection_{str(collection_id).replace('-', '')}"
+    graph_name = collection_graph_name(
+        collection_id=collection.id,
+        collection_name=collection.name,
+    )
     return FalkorDBGraphStorage(graph_name)
 
 
@@ -786,7 +790,7 @@ async def _entity_first_state(
             if eid and sim > seed_rel_scores.get(eid, 0.0):
                 seed_rel_scores[eid] = sim
 
-    graph_storage = get_graph_storage(collection.id)
+    graph_storage = get_graph_storage(collection)
     visited = set(seed_entity_ids)
     traversed_rel_ids: list[str] = []
     discovered_entity_ids = set(seed_entity_ids)
@@ -949,7 +953,7 @@ async def _relationship_seed_state(
     rel_combined_score_cache: dict[str, float] = {}
     discovered_entity_ids: set[str] = set()
     entity_relevance: dict[str, float] = {}
-    graph_storage = get_graph_storage(collection.id)
+    graph_storage = get_graph_storage(collection)
     entity_name_by_id: dict[str, str] = {}
     rel_debug_rows: list[dict[str, Any]] = []
     raw_rel_seed_rows: list[dict[str, Any]] = []
