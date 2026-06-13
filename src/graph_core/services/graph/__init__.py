@@ -1068,6 +1068,293 @@ class GraphService:
                 max_concurrent_calls=profile.max_concurrent_calls,
             )
 
+    async def _prepare_meta_collection(
+        self,
+        source_collection: Collection,
+        namespace_id: uuid.UUID,
+        target_level: int,
+    ) -> Collection:
+        target_name = self._meta_collection_name(
+            source_collection.name,
+            target_level,
+        )
+        meta_collection = await self._get_collection_by_names(
+            namespace_id,
+            self._meta_name_candidates(
+                self._base_collection_name(source_collection.name),
+                target_level,
+            ),
+        )
+        if meta_collection is not None:
+            previous_name = meta_collection.name
+            if previous_name != target_name:
+                async with AsyncSessionLocal() as session:
+                    persisted = await session.get(Collection, meta_collection.id)
+                    if persisted is None:
+                        raise ValueError(f"Collection {meta_collection.id} not found")
+                    persisted.name = target_name
+                    await session.commit()
+                    await session.refresh(persisted)
+                    meta_collection = persisted
+                await self._migrate_collection_graph_if_needed(
+                    meta_collection,
+                    previous_name=previous_name,
+                )
+            await self._reset_collection_contents(meta_collection)
+            return meta_collection
+
+        return await self.create_collection(
+            name=target_name,
+            namespace_id=namespace_id,
+            strategy="custom_graph_rag",
+            embedding_profile_id=source_collection.embedding_profile_id,
+            llm_profile_id=source_collection.llm_profile_id,
+            default_query_mode=source_collection.default_query_mode,
+            gleaning_passes=0,
+        )
+
+    async def _materialize_region_concept(
+        self,
+        meta_collection: Collection,
+        region: dict[str, Any],
+        concept: dict[str, Any],
+        *,
+        embedding_provider,
+        graph_storage,
+        node_id_map: dict[str, uuid.UUID],
+    ) -> None:
+        def slug(text: str) -> str:
+            return "_".join(part for part in text.strip().lower().split() if part)[:96]
+
+        label = str(concept.get("label") or "").strip()
+        if not label:
+            return
+        node_id = f"derived:concept:{slug(label)}"
+        evidence_ids = [
+            str(value)
+            for value in concept.get("evidence_region_ids", [])
+            if str(value).strip()
+        ]
+        source_ids = sorted(
+            {
+                str(value).strip()
+                for value in region.get("source_ids", [])
+                if str(value).strip()
+            }
+        )
+        description = (
+            f"{str(concept.get('description') or '').strip()} "
+            f"Why it matters: {str(concept.get('importance_reason') or '').strip()}"
+        ).strip()
+        concept_aliases = sorted(
+            {
+                str(value).strip()
+                for value in concept.get("aliases", [])
+                if str(value).strip()
+            }
+        )
+        member_names = [
+            str(value).strip()
+            for value in concept.get("member_entity_names", [])
+            if str(value).strip()
+        ]
+        member_ref_ids: dict[str, uuid.UUID] = {}
+        evidence_edge_rows: list[dict[str, Any]] = []
+        source_chunk_hash = hashlib.md5(
+            "::".join(source_ids or [label]).encode("utf-8")
+        ).hexdigest()
+        resolver = IncrementalEntityResolver(
+            embedding_provider,
+            meta_collection.id,
+            collection_name=meta_collection.name,
+        )
+
+        async with AsyncSessionLocal() as session:
+            resolved = await resolver.resolve_entity(
+                session=session,
+                name=label,
+                entity_type=str(concept.get("concept_type") or "concept"),
+                description=description,
+                source_chunk_hash=source_chunk_hash,
+            )
+            node_id_map[node_id] = resolved.entity_id
+            for alias in concept_aliases:
+                await resolver._add_alias(
+                    session,
+                    resolved.entity_id,
+                    alias,
+                    source_chunk_hash,
+                )
+            for name in member_names[:10]:
+                ref_id = await resolver.resolve_entity(
+                    session=session,
+                    name=name,
+                    entity_type="base_entity_ref",
+                    description=f"Reference to base graph entity: {name}.",
+                    source_chunk_hash=source_chunk_hash,
+                )
+                member_ref_ids[name] = ref_id.entity_id
+                rel_result = await resolver.resolve_relationship(
+                    session=session,
+                    source_entity_id=resolved.entity_id,
+                    target_entity_id=ref_id.entity_id,
+                    description=f"Concept {label} is evidenced by entity {name}.",
+                    keywords=[],
+                    weight=1.0,
+                    source_chunk_hash=source_chunk_hash,
+                    rel_type="EVIDENCED_BY",
+                )
+                evidence_edge_rows.append(
+                    {
+                        "source_id": str(resolved.entity_id),
+                        "target_id": str(ref_id.entity_id),
+                        "id": str(rel_result.relationship_id),
+                        "weight": 1,
+                        "keywords": [],
+                        "rel_type": "EVIDENCED_BY",
+                        "collection_id": str(meta_collection.id),
+                    }
+                )
+            await session.commit()
+
+        await graph_storage.upsert_nodes(
+            [
+                {
+                    "id": str(resolved.entity_id),
+                    "name": resolved.canonical_name,
+                    "collection_id": str(meta_collection.id),
+                }
+            ]
+        )
+        for name, ref_entity_id in member_ref_ids.items():
+            await graph_storage.upsert_nodes(
+                [
+                    {
+                        "id": str(ref_entity_id),
+                        "name": name,
+                        "collection_id": str(meta_collection.id),
+                    }
+                ]
+            )
+        if evidence_edge_rows:
+            await graph_storage.upsert_edges(evidence_edge_rows)
+        chunk_content = (
+            description
+            if not concept_aliases
+            else f"{description}\nAliases: {', '.join(concept_aliases)}"
+        )
+        chunk_embedding = await embedding_provider.embed_query(chunk_content)
+        chunk_hash = hashlib.md5("::".join([label, node_id]).encode("utf-8")).hexdigest()
+        await self._graph_rag_vectors.upsert_chunk_embedding(
+            collection_id=meta_collection.id,
+            chunk_hash=chunk_hash,
+            chunk_index=0,
+            content=chunk_content,
+            embedding=chunk_embedding,
+        )
+        await self._vector_store.upsert_chunks(
+            namespace_id=meta_collection.namespace_id,
+            collection_id=meta_collection.id,
+            chunks=[
+                {
+                    "chunk_hash": chunk_hash,
+                    "chunk_index": 0,
+                    "content": chunk_content,
+                    "token_count": len(chunk_content.split()),
+                    "metadata": {
+                        "memory_type": "derived_graph",
+                        "derived_kind": "concept",
+                        "derived_id": node_id,
+                        "object_type": "entity",
+                        "canonical_name": label,
+                        "concept_type": str(concept.get("concept_type") or "concept"),
+                        "aliases": concept_aliases,
+                        "collection_id": str(meta_collection.id),
+                        "evidence_region_ids": evidence_ids,
+                    },
+                    "embedding": chunk_embedding,
+                }
+            ],
+        )
+
+    async def _materialize_meta_edges(
+        self,
+        meta_collection: Collection,
+        edges: list[dict[str, Any]],
+        node_id_map: dict[str, uuid.UUID],
+        *,
+        embedding_provider,
+        graph_storage,
+    ) -> None:
+        resolver = IncrementalEntityResolver(
+            embedding_provider,
+            meta_collection.id,
+            collection_name=meta_collection.name,
+        )
+        async with AsyncSessionLocal() as session:
+            for edge in edges:
+                source_old_id = str(edge.get("source_id") or "").strip()
+                target_old_id = str(edge.get("target_id") or "").strip()
+                source_entity_id = node_id_map.get(source_old_id)
+                target_entity_id = node_id_map.get(target_old_id)
+                if source_entity_id is None or target_entity_id is None:
+                    continue
+                rel_type = str(edge.get("rel_type") or "RELATES_TO").strip().upper()
+                keywords = edge.get("keywords")
+                if not isinstance(keywords, list):
+                    keywords = []
+                try:
+                    weight = float(edge.get("weight") or 1)
+                except (TypeError, ValueError):
+                    weight = 1.0
+                description = str(edge.get("description") or "").strip() or rel_type
+                source_ids = edge.get("source_ids")
+                if not isinstance(source_ids, list):
+                    source_ids = []
+                source_chunk_hash = (
+                    hashlib.md5(
+                        "::".join(
+                            [str(value).strip() for value in source_ids if str(value).strip()]
+                            or [
+                                description,
+                                str(source_entity_id),
+                                str(target_entity_id),
+                                rel_type,
+                            ]
+                        ).encode("utf-8")
+                    ).hexdigest()
+                )
+                rel_result = await resolver.resolve_relationship(
+                    session=session,
+                    source_entity_id=source_entity_id,
+                    target_entity_id=target_entity_id,
+                    description=description,
+                    keywords=keywords,
+                    weight=weight,
+                    source_chunk_hash=source_chunk_hash,
+                    rel_type=rel_type,
+                )
+                persisted_rel = await session.get(
+                    GraphRelationship,
+                    rel_result.relationship_id,
+                )
+                if persisted_rel is None:
+                    continue
+                await session.commit()
+                await graph_storage.upsert_edges(
+                    [
+                        {
+                            "source_id": str(persisted_rel.source_entity_id),
+                            "target_id": str(persisted_rel.target_entity_id),
+                            "id": str(rel_result.relationship_id),
+                            "weight": int(persisted_rel.weight or 1),
+                            "keywords": persisted_rel.keywords or [],
+                            "rel_type": persisted_rel.rel_type,
+                            "collection_id": str(meta_collection.id),
+                        }
+                    ]
+                )
+
     async def create_collection(
         self,
         name: str,
@@ -1923,9 +2210,41 @@ class GraphService:
             llm_provider = await self._resolve_collection_llm_provider(
                 source_collection, None
             )
+            meta_collection: Collection | None = None
+            embedding_provider: Any | None = None
+            graph_storage: FalkorDBGraphStorage | None = None
+            node_id_map: dict[str, uuid.UUID] = {}
+
+            async def on_region_concept(
+                region: dict[str, Any],
+                concept: dict[str, Any],
+            ) -> None:
+                nonlocal meta_collection, embedding_provider, graph_storage
+                if meta_collection is None:
+                    meta_collection = await self._prepare_meta_collection(
+                        source_collection,
+                        namespace_id,
+                        target_level,
+                    )
+                    embedding_provider = await self._resolve_collection_embedding_provider(
+                        meta_collection
+                    )
+                    graph_storage = self._graph_storage(meta_collection)
+                if embedding_provider is None or graph_storage is None:
+                    raise RuntimeError("Enhance meta collection was not initialized")
+                await self._materialize_region_concept(
+                    meta_collection,
+                    region,
+                    concept,
+                    embedding_provider=embedding_provider,
+                    graph_storage=graph_storage,
+                    node_id_map=node_id_map,
+                )
+
             understanding = await build_collection_understanding(
                 analysis,
                 llm_provider=llm_provider,
+                on_region_concept=on_region_concept,
             )
             candidate_region_count = int(
                 understanding.get("candidate_region_count") or 0
@@ -1933,46 +2252,23 @@ class GraphService:
             if candidate_region_count == 0:
                 final_analysis = analysis
                 break
-            target_name = self._meta_collection_name(
-                source_collection.name,
-                target_level,
-            )
-            meta_collection = await self._get_collection_by_names(
-                namespace_id,
-                self._meta_name_candidates(
-                    self._base_collection_name(source_collection.name),
+            if meta_collection is None:
+                meta_collection = await self._prepare_meta_collection(
+                    source_collection,
+                    namespace_id,
                     target_level,
-                ),
-            )
-            if meta_collection is not None:
-                previous_name = meta_collection.name
-                if previous_name != target_name:
-                    async with AsyncSessionLocal() as session:
-                        persisted = await session.get(Collection, meta_collection.id)
-                        if persisted is None:
-                            raise ValueError(
-                                f"Collection {meta_collection.id} not found"
-                            )
-                        persisted.name = target_name
-                        await session.commit()
-                        await session.refresh(persisted)
-                        meta_collection = persisted
-                    await self._migrate_collection_graph_if_needed(
-                        meta_collection,
-                        previous_name=previous_name,
-                    )
-                await self._reset_collection_contents(meta_collection)
-            else:
-                meta_collection = await self.create_collection(
-                    name=target_name,
-                    namespace_id=namespace_id,
-                    strategy="custom_graph_rag",
-                    embedding_profile_id=source_collection.embedding_profile_id,
-                    llm_profile_id=source_collection.llm_profile_id,
-                    default_query_mode=source_collection.default_query_mode,
-                    gleaning_passes=0,
                 )
-            await self._materialize_meta_collection(meta_collection, understanding)
+                await self._materialize_meta_collection(meta_collection, understanding)
+            else:
+                if embedding_provider is None or graph_storage is None:
+                    raise RuntimeError("Enhance did not initialize materialization state")
+                await self._materialize_meta_edges(
+                    meta_collection,
+                    list(understanding.get("edges") or []),
+                    node_id_map,
+                    embedding_provider=embedding_provider,
+                    graph_storage=graph_storage,
+                )
 
             kind_counts: dict[str, int] = {}
             for node in understanding["nodes"]:

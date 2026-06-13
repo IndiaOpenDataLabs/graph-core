@@ -6,10 +6,10 @@ semantic concepts from them via LLM or deterministic fallback.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import math
 import uuid
+from collections.abc import Awaitable, Callable
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import combinations
@@ -527,6 +527,8 @@ async def analyze_collection_graph(
 async def build_collection_understanding(
     analysis: dict[str, Any],
     llm_provider: LLMProvider | None = None,
+    on_region_concept: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
+    | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
     max_deterministic_link_pairs = 64
@@ -680,6 +682,7 @@ async def build_collection_understanding(
         )
 
     induced_concepts = list(fallback_concepts)
+    streamed_regions = False
     if llm_provider and not isinstance(llm_provider, LocalEchoLLMProvider) and candidate_regions:
         concept_schema = {
             "type": "object",
@@ -779,15 +782,20 @@ async def build_collection_understanding(
                     "member_entity_names": region["entity_names"][:8],
                 }
 
-        induced_concepts = list(
-            await asyncio.gather(
-                *(induce_region_concept(region) for region in candidate_regions)
-            )
-        )
+        induced_concepts = []
+        for region in candidate_regions:
+            concept = await induce_region_concept(region)
+            induced_concepts.append(concept)
+            if on_region_concept is not None:
+                await on_region_concept(region, concept)
+        streamed_regions = True
     region_concepts: list[dict[str, Any]] = [
         {"region": region, "concept": concept}
         for region, concept in zip(candidate_regions, induced_concepts, strict=False)
     ]
+    if on_region_concept is not None and not streamed_regions:
+        for region_entry in region_concepts:
+            await on_region_concept(region_entry["region"], region_entry["concept"])
     region_lookup = {region["region_id"]: region for region in candidate_regions}
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}
