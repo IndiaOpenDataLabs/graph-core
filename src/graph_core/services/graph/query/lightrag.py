@@ -24,6 +24,7 @@ from graph_core.storage.vector_tables import table_name
 
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
+_QUERY_MAX_OUTPUT_TOKENS = 4096
 
 
 # ── Credential / provider resolution helpers ──
@@ -86,6 +87,7 @@ async def _resolve_llm_provider(
             base_url=base_url,
             profile_id=str(profile.id),
             max_concurrent_calls=profile.max_concurrent_calls,
+            max_output_tokens=_QUERY_MAX_OUTPUT_TOKENS,
         )
 
 

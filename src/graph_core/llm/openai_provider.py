@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
+from graph_core.config import settings
 from graph_core.llm.interface import LLMProvider
 from graph_core.provider_semaphore import llm_call_slot
 
@@ -36,11 +37,17 @@ class OpenAILLMProvider(LLMProvider):
         base_url: str | None = None,
         profile_id: str | None = None,
         max_concurrent_calls: int | None = None,
+        max_output_tokens: int | None = None,
     ):
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._model = model
         self._profile_id = profile_id
         self._max_concurrent_calls = max_concurrent_calls
+        self._max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else settings.default_llm_max_output_tokens
+        )
 
     async def chat(self, messages: list[dict]) -> str:
         async with llm_call_slot(
@@ -50,6 +57,7 @@ class OpenAILLMProvider(LLMProvider):
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
+                max_tokens=self._max_output_tokens,
             )
         return response.choices[0].message.content or ""
 
@@ -62,6 +70,7 @@ class OpenAILLMProvider(LLMProvider):
                 model=self._model,
                 messages=messages,
                 stream=True,
+                max_tokens=self._max_output_tokens,
             )
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content
@@ -78,6 +87,7 @@ class OpenAILLMProvider(LLMProvider):
                 response = await self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
+                    max_tokens=self._max_output_tokens,
                     response_format={
                         "type": "json_schema",
                         "json_schema": {
@@ -90,6 +100,7 @@ class OpenAILLMProvider(LLMProvider):
                 response = await self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,
+                    max_tokens=self._max_output_tokens,
                     response_format={"type": "json"},
                 )
 

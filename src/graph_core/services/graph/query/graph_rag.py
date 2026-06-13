@@ -51,6 +51,7 @@ from graph_core.storage.meta_collections import (
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
 logger = logging.getLogger(__name__)
+_QUERY_MAX_OUTPUT_TOKENS = 4096
 _ENTITY_RETRIEVAL_INSTRUCTION = (
     "Retrieve ontology entities whose descriptions best explain the user's "
     "state, process, causal mechanism, or source of exhaustion."
@@ -528,6 +529,7 @@ async def _resolve_llm_provider(
             base_url=base_url,
             profile_id=str(profile.id),
             max_concurrent_calls=profile.max_concurrent_calls,
+            max_output_tokens=_QUERY_MAX_OUTPUT_TOKENS,
         )
 
 
