@@ -83,6 +83,16 @@ class _RedisSemaphore:
         except Exception:
             logger.exception("Failed to release provider semaphore %s", key)
 
+
+async def _release_slot(
+    semaphore: _RedisSemaphore,
+    scope: str,
+    token: str | None,
+    limit: int,
+) -> None:
+    """Release a provider semaphore slot even if the caller was cancelled."""
+    await asyncio.shield(semaphore.release(scope, token, limit))
+
 _llm_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:llm")
 _embedding_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:embedding")
 
@@ -102,7 +112,7 @@ async def llm_call_slot(
     try:
         yield
     finally:
-        await _llm_semaphore.release(semaphore_scope, token, limit)
+        await _release_slot(_llm_semaphore, semaphore_scope, token, limit)
 
 
 @asynccontextmanager
@@ -120,4 +130,4 @@ async def embedding_call_slot(
     try:
         yield
     finally:
-        await _embedding_semaphore.release(semaphore_scope, token, limit)
+        await _release_slot(_embedding_semaphore, semaphore_scope, token, limit)
