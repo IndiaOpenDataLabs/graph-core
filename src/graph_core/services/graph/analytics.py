@@ -784,13 +784,18 @@ async def build_collection_understanding(
                 *(induce_region_concept(region) for region in candidate_regions)
             )
         )
+    region_concepts: list[dict[str, Any]] = [
+        {"region": region, "concept": concept}
+        for region, concept in zip(candidate_regions, induced_concepts, strict=False)
+    ]
     region_lookup = {region["region_id"]: region for region in candidate_regions}
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}
     concept_labels_by_id: dict[str, str] = {}
     concept_descriptions_by_id: dict[str, str] = {}
     concept_region_ids_by_id: dict[str, list[str]] = {}
-    for concept in induced_concepts:
+    for region_entry in region_concepts:
+        concept = region_entry["concept"]
         label = str(concept.get("label") or "").strip()
         if not label:
             continue
@@ -1021,5 +1026,6 @@ async def build_collection_understanding(
         "nodes": nodes,
         "edges": edges,
         "chunks": chunks,
+        "regions": region_concepts,
         "candidate_region_count": len(candidate_regions),
     }

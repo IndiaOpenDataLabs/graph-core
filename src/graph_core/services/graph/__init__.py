@@ -1530,6 +1530,223 @@ class GraphService:
             collection_name=meta_collection.name,
         )
 
+        region_entries = list(understanding.get("regions") or [])
+        if region_entries:
+            def slug(text: str) -> str:
+                return "_".join(part for part in text.strip().lower().split() if part)[:96]
+
+            async with AsyncSessionLocal() as session:
+                node_id_map: dict[str, uuid.UUID] = {}
+                for region_entry in region_entries:
+                    region = dict(region_entry.get("region") or {})
+                    concept = dict(region_entry.get("concept") or {})
+                    label = str(concept.get("label") or "").strip()
+                    if not label:
+                        continue
+                    node_id = f"derived:concept:{slug(label)}"
+                    evidence_ids = [
+                        str(value)
+                        for value in concept.get("evidence_region_ids", [])
+                        if str(value).strip()
+                    ]
+                    source_ids = sorted(
+                        {
+                            str(value).strip()
+                            for value in region.get("source_ids", [])
+                            if str(value).strip()
+                        }
+                    )
+                    description = (
+                        f"{str(concept.get('description') or '').strip()} "
+                        f"Why it matters: {str(concept.get('importance_reason') or '').strip()}"
+                    ).strip()
+                    concept_aliases = sorted(
+                        {
+                            str(value).strip()
+                            for value in concept.get("aliases", [])
+                            if str(value).strip()
+                        }
+                    )
+                    member_names = [
+                        str(value).strip()
+                        for value in concept.get("member_entity_names", [])
+                        if str(value).strip()
+                    ]
+                    member_ref_ids: dict[str, uuid.UUID] = {}
+                    evidence_edge_rows: list[dict[str, Any]] = []
+                    source_chunk_hash = hashlib.md5(
+                        "::".join(source_ids or [label]).encode("utf-8")
+                    ).hexdigest()
+                    resolved = await resolver.resolve_entity(
+                        session=session,
+                        name=label,
+                        entity_type=str(concept.get("concept_type") or "concept"),
+                        description=description,
+                        source_chunk_hash=source_chunk_hash,
+                    )
+                    node_id_map[node_id] = resolved.entity_id
+                    for alias in concept_aliases:
+                        await resolver._add_alias(
+                            session,
+                            resolved.entity_id,
+                            alias,
+                            source_chunk_hash,
+                        )
+                    for name in member_names[:10]:
+                        ref_id = await resolver.resolve_entity(
+                            session=session,
+                            name=name,
+                            entity_type="base_entity_ref",
+                            description=f"Reference to base graph entity: {name}.",
+                            source_chunk_hash=source_chunk_hash,
+                        )
+                        member_ref_ids[name] = ref_id.entity_id
+                        rel_result = await resolver.resolve_relationship(
+                            session=session,
+                            source_entity_id=resolved.entity_id,
+                            target_entity_id=ref_id.entity_id,
+                            description=f"Concept {label} is evidenced by entity {name}.",
+                            keywords=[],
+                            weight=1.0,
+                            source_chunk_hash=source_chunk_hash,
+                            rel_type="EVIDENCED_BY",
+                        )
+                        evidence_edge_rows.append(
+                            {
+                                "source_id": str(resolved.entity_id),
+                                "target_id": str(ref_id.entity_id),
+                                "id": str(rel_result.relationship_id),
+                                "weight": 1,
+                                "keywords": [],
+                                "rel_type": "EVIDENCED_BY",
+                                "collection_id": str(meta_collection.id),
+                            }
+                        )
+                    await session.commit()
+                    await graph_storage.upsert_nodes(
+                        [
+                            {
+                                "id": str(resolved.entity_id),
+                                "name": resolved.canonical_name,
+                                "collection_id": str(meta_collection.id),
+                            }
+                        ]
+                    )
+                    for name, ref_entity_id in member_ref_ids.items():
+                        await graph_storage.upsert_nodes(
+                            [
+                                {
+                                    "id": str(ref_entity_id),
+                                    "name": name,
+                                    "collection_id": str(meta_collection.id),
+                                }
+                            ]
+                        )
+                    if evidence_edge_rows:
+                        await graph_storage.upsert_edges(evidence_edge_rows)
+                    chunk_content = (
+                        description
+                        if not concept_aliases
+                        else f"{description}\nAliases: {', '.join(concept_aliases)}"
+                    )
+                    chunk_embedding = await embedding_provider.embed_query(
+                        chunk_content
+                    )
+                    chunk_hash = hashlib.md5(
+                        "::".join([label, node_id]).encode("utf-8")
+                    ).hexdigest()
+                    await self._graph_rag_vectors.upsert_chunk_embedding(
+                        collection_id=meta_collection.id,
+                        chunk_hash=chunk_hash,
+                        chunk_index=0,
+                        content=chunk_content,
+                        embedding=chunk_embedding,
+                    )
+                    await self._vector_store.upsert_chunks(
+                        namespace_id=meta_collection.namespace_id,
+                        collection_id=meta_collection.id,
+                        chunks=[
+                            {
+                                "chunk_hash": chunk_hash,
+                                "chunk_index": 0,
+                                "content": chunk_content,
+                                "token_count": len(chunk_content.split()),
+                                "metadata": {
+                                    "memory_type": "derived_graph",
+                                    "derived_kind": "concept",
+                                    "derived_id": node_id,
+                                    "object_type": "entity",
+                                    "canonical_name": label,
+                                    "concept_type": str(
+                                        concept.get("concept_type") or "concept"
+                                    ),
+                                    "aliases": concept_aliases,
+                                    "collection_id": str(meta_collection.id),
+                                    "evidence_region_ids": evidence_ids,
+                                },
+                                "embedding": chunk_embedding,
+                            }
+                        ],
+                    )
+
+                for edge in understanding.get("edges", []):
+                    source_old_id = str(edge.get("source_id") or "").strip()
+                    target_old_id = str(edge.get("target_id") or "").strip()
+                    source_entity_id = node_id_map.get(source_old_id)
+                    target_entity_id = node_id_map.get(target_old_id)
+                    if source_entity_id is None or target_entity_id is None:
+                        continue
+                    rel_type = str(edge.get("rel_type") or "RELATES_TO").strip().upper()
+                    keywords = edge.get("keywords")
+                    if not isinstance(keywords, list):
+                        keywords = []
+                    try:
+                        weight = float(edge.get("weight") or 1)
+                    except (TypeError, ValueError):
+                        weight = 1.0
+                    description = str(edge.get("description") or "").strip() or rel_type
+                    source_ids = edge.get("source_ids")
+                    if not isinstance(source_ids, list):
+                        source_ids = []
+                    source_chunk_hash = (
+                        hashlib.md5(
+                            "::".join(
+                                [str(value).strip() for value in source_ids if str(value).strip()]
+                                or [
+                                    description,
+                                    str(source_entity_id),
+                                    str(target_entity_id),
+                                    rel_type,
+                                ]
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    )
+                    rel_result = await resolver.resolve_relationship(
+                        session=session,
+                        source_entity_id=source_entity_id,
+                        target_entity_id=target_entity_id,
+                        description=description,
+                        keywords=keywords,
+                        weight=weight,
+                        source_chunk_hash=source_chunk_hash,
+                        rel_type=rel_type,
+                    )
+                    await session.commit()
+                    await graph_storage.upsert_edges(
+                        [
+                            {
+                                "source_id": str(source_entity_id),
+                                "target_id": str(target_entity_id),
+                                "id": str(rel_result.relationship_id),
+                                "weight": int(weight * 10),
+                                "keywords": keywords,
+                                "rel_type": rel_type,
+                                "collection_id": str(meta_collection.id),
+                            }
+                        ]
+                    )
+            return
+
         async with AsyncSessionLocal() as session:
             # Keep each entity/relationship durable as soon as it is resolved so
             # an interrupted enhance run preserves completed progress.
