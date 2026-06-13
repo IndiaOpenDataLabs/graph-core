@@ -2097,6 +2097,16 @@ async def graph_rag_query(
         artifacts.context for _, artifacts in meta_artifacts if artifacts.context
     )
     fallback_text = meta_fallback or base.rel_context or entity_fallback
+    all_meta_entities = [
+        entity
+        for _, artifacts in meta_artifacts
+        for entity in artifacts.entities_used
+    ]
+    all_meta_relationships = [
+        relationship
+        for _, artifacts in meta_artifacts
+        for relationship in artifacts.relationships_used
+    ]
     response = await _answer_from_context(
         question,
         namespace_id,
@@ -2108,14 +2118,12 @@ async def graph_rag_query(
         response=response,
         entities_used=list(
             dict.fromkeys(
-                base.entities_used
-                + (meta.entities_used if meta is not None else [])
+                base.entities_used + all_meta_entities
             )
         ),
         relationships_used=list(
             dict.fromkeys(
-                base.relationships_used
-                + (meta.relationships_used if meta is not None else [])
+                base.relationships_used + all_meta_relationships
             )
         ),
         mode=_MODE_ALIASES.get((mode or "mix").lower(), "mix"),

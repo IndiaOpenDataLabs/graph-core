@@ -15,6 +15,7 @@ from graph_core.models.profile import Profile
 from graph_core.services.graph import (
     ChunkIngestionResult,
     DocumentIngestionResult,
+    GraphService,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     process_single_chunk,
@@ -273,6 +274,101 @@ async def test_collection_embedding_profile_is_used(service, test_namespace):
 async def test_get_job_not_found(service):
     with pytest.raises(ValueError, match="not found"):
         await service.get_job(uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_enhance_stops_when_no_candidate_regions(test_namespace):
+    service = GraphService()
+    base_collection = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_namespace.id,
+        name="base",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
+    service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service._get_collection_by_names = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service.create_collection = AsyncMock()  # type: ignore[method-assign]
+    service._materialize_meta_collection = AsyncMock()  # type: ignore[method-assign]
+
+    with patch(
+        "graph_core.services.graph.analyze_collection_graph",
+        AsyncMock(return_value={"totals": {}, "role_groups": []}),
+    ), patch(
+        "graph_core.services.graph.build_collection_understanding",
+        AsyncMock(
+            return_value={
+                "nodes": [],
+                "edges": [],
+                "chunks": [],
+                "candidate_region_count": 0,
+            }
+        ),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="No candidate regions found for further enhancement",
+        ):
+            await service.build_collection_understanding(
+                base_collection.id,
+                test_namespace.id,
+                levels=100,
+            )
+
+    service.create_collection.assert_not_awaited()
+    service._materialize_meta_collection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enhance_stops_after_single_concept_level(test_namespace):
+    service = GraphService()
+    base_collection = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_namespace.id,
+        name="base",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+        embedding_profile_id=uuid.uuid4(),
+    )
+    level_one = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_namespace.id,
+        name="base__meta__l1",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
+    service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service._get_collection_by_names = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service.create_collection = AsyncMock(return_value=level_one)  # type: ignore[method-assign]
+    service._materialize_meta_collection = AsyncMock()  # type: ignore[method-assign]
+    service._graph_name = lambda collection: f"graph_{collection.name}"  # type: ignore[method-assign]
+
+    with patch(
+        "graph_core.services.graph.analyze_collection_graph",
+        AsyncMock(return_value={"totals": {}, "role_groups": [{}]}),
+    ), patch(
+        "graph_core.services.graph.build_collection_understanding",
+        AsyncMock(
+            return_value={
+                "nodes": [{"id": "concept-1", "type": "derived_concept"}],
+                "edges": [],
+                "chunks": [],
+                "candidate_region_count": 1,
+            }
+        ),
+    ):
+        result = await service.build_collection_understanding(
+            base_collection.id,
+            test_namespace.id,
+            levels=100,
+        )
+
+    service.create_collection.assert_awaited_once()
+    assert len(result["generated_levels"]) == 1
+    assert result["generated_levels"][0]["level"] == 1
+    assert result["generated_levels"][0]["node_count"] == 1
 
 
 @pytest.mark.asyncio

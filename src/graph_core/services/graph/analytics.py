@@ -1013,4 +1013,9 @@ async def build_collection_understanding(
         ) >= max_deterministic_meta_edges:
             break
 
-    return {"nodes": nodes, "edges": edges, "chunks": chunks}
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "chunks": chunks,
+        "candidate_region_count": len(candidate_regions),
+    }

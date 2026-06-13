@@ -1708,6 +1708,12 @@ class GraphService:
                 analysis,
                 llm_provider=llm_provider,
             )
+            candidate_region_count = int(
+                understanding.get("candidate_region_count") or 0
+            )
+            if candidate_region_count == 0:
+                final_analysis = analysis
+                break
             target_name = self._meta_collection_name(
                 source_collection.name,
                 target_level,
@@ -1765,9 +1771,14 @@ class GraphService:
                     "node_type_counts": kind_counts,
                 }
             )
+            if len(understanding["nodes"]) <= 1:
+                final_analysis = analysis
+                break
             source_collection = meta_collection
             final_analysis = analysis
 
+        if not generated_levels:
+            raise ValueError("No candidate regions found for further enhancement")
         if final_analysis is None:
             raise ValueError("Enhance did not generate any levels")
         final_level = generated_levels[-1]
