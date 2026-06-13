@@ -1068,6 +1068,45 @@ class GraphService:
                 max_concurrent_calls=profile.max_concurrent_calls,
             )
 
+    async def _resolve_enhance_region_batch_size(
+        self,
+        collection: Collection,
+    ) -> int:
+        if collection.embedding_profile_id is None:
+            raise ValueError(
+                f"Collection {collection.id} has no embedding profile configured"
+            )
+        if collection.llm_profile_id is None:
+            raise ValueError(
+                f"Collection {collection.id} has no LLM profile configured"
+            )
+        async with AsyncSessionLocal() as session:
+            embedding_profile = await session.get(
+                Profile, collection.embedding_profile_id
+            )
+            if embedding_profile is None:
+                raise ValueError(
+                    f"Embedding profile {collection.embedding_profile_id} not found"
+                )
+            llm_profile = await session.get(Profile, collection.llm_profile_id)
+            if llm_profile is None:
+                raise ValueError(f"LLM profile {collection.llm_profile_id} not found")
+            if embedding_profile.max_concurrent_calls is None:
+                raise ValueError(
+                    f"Embedding profile {embedding_profile.id} has no max_concurrent_calls"
+                )
+            if llm_profile.max_concurrent_calls is None:
+                raise ValueError(
+                    f"LLM profile {llm_profile.id} has no max_concurrent_calls"
+                )
+            return max(
+                1,
+                min(
+                    int(embedding_profile.max_concurrent_calls),
+                    int(llm_profile.max_concurrent_calls),
+                ),
+            )
+
     async def _prepare_meta_collection(
         self,
         source_collection: Collection,
@@ -2210,6 +2249,9 @@ class GraphService:
             llm_provider = await self._resolve_collection_llm_provider(
                 source_collection, None
             )
+            region_batch_size = await self._resolve_enhance_region_batch_size(
+                source_collection
+            )
             meta_collection: Collection | None = None
             embedding_provider: Any | None = None
             graph_storage: FalkorDBGraphStorage | None = None
@@ -2244,6 +2286,7 @@ class GraphService:
             understanding = await build_collection_understanding(
                 analysis,
                 llm_provider=llm_provider,
+                region_batch_size=region_batch_size,
                 on_region_concept=on_region_concept,
             )
             candidate_region_count = int(

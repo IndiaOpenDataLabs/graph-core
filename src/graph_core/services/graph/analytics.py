@@ -6,6 +6,7 @@ semantic concepts from them via LLM or deterministic fallback.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import uuid
@@ -527,6 +528,7 @@ async def analyze_collection_graph(
 async def build_collection_understanding(
     analysis: dict[str, Any],
     llm_provider: LLMProvider | None = None,
+    region_batch_size: int = 1,
     on_region_concept: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
     | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -783,11 +785,16 @@ async def build_collection_understanding(
                 }
 
         induced_concepts = []
-        for region in candidate_regions:
-            concept = await induce_region_concept(region)
-            induced_concepts.append(concept)
-            if on_region_concept is not None:
-                await on_region_concept(region, concept)
+        batch_size = max(1, int(region_batch_size))
+        for batch_start in range(0, len(candidate_regions), batch_size):
+            batch = candidate_regions[batch_start : batch_start + batch_size]
+            concepts = await asyncio.gather(
+                *(induce_region_concept(region) for region in batch)
+            )
+            for region, concept in zip(batch, concepts, strict=False):
+                induced_concepts.append(concept)
+                if on_region_concept is not None:
+                    await on_region_concept(region, concept)
         streamed_regions = True
     region_concepts: list[dict[str, Any]] = [
         {"region": region, "concept": concept}

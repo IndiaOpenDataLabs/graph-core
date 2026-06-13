@@ -277,6 +277,48 @@ async def test_get_job_not_found(service):
 
 
 @pytest.mark.asyncio
+async def test_resolve_enhance_region_batch_size_uses_profile_min(
+    service, test_namespace
+):
+    async with AsyncSessionLocal() as session:
+        embedding_profile = Profile(
+            namespace_id=test_namespace.id,
+            kind="embedding",
+            provider="local_hash",
+            model="hash-256",
+            dimensions=16,
+            distance_metric="cosine",
+            max_concurrent_calls=7,
+        )
+        llm_profile = Profile(
+            namespace_id=test_namespace.id,
+            kind="llm",
+            provider="local_echo",
+            model="echo-v1",
+            max_concurrent_calls=3,
+        )
+        session.add_all([embedding_profile, llm_profile])
+        await session.commit()
+        await session.refresh(embedding_profile)
+        await session.refresh(llm_profile)
+        collection = Collection(
+            id=uuid.uuid4(),
+            namespace_id=test_namespace.id,
+            name="base",
+            strategy="custom_graph_rag",
+            embedding_dimensions=256,
+            embedding_profile_id=embedding_profile.id,
+            llm_profile_id=llm_profile.id,
+        )
+        session.add(collection)
+        await session.commit()
+        await session.refresh(collection)
+
+    batch_size = await service._resolve_enhance_region_batch_size(collection)
+    assert batch_size == 3
+
+
+@pytest.mark.asyncio
 async def test_enhance_stops_when_no_candidate_regions(test_namespace):
     service = GraphService()
     base_collection = Collection(
@@ -288,6 +330,7 @@ async def test_enhance_stops_when_no_candidate_regions(test_namespace):
     )
     service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
     service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_enhance_region_batch_size = AsyncMock(return_value=1)  # type: ignore[method-assign]
     service._get_collection_by_names = AsyncMock(return_value=None)  # type: ignore[method-assign]
     service.create_collection = AsyncMock()  # type: ignore[method-assign]
     service._materialize_meta_collection = AsyncMock()  # type: ignore[method-assign]
@@ -340,6 +383,7 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
     )
     service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
     service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_enhance_region_batch_size = AsyncMock(return_value=1)  # type: ignore[method-assign]
     service._get_collection_by_names = AsyncMock(return_value=None)  # type: ignore[method-assign]
     service._prepare_meta_collection = AsyncMock(return_value=level_one)  # type: ignore[method-assign]
     service._resolve_collection_embedding_provider = AsyncMock(return_value=object())  # type: ignore[method-assign]
