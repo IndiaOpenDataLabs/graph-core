@@ -78,33 +78,51 @@ class OpenAILLMProvider(LLMProvider):
                     yield delta
 
     async def structured_extract(self, prompt: str, schema: dict) -> dict:
-        messages = [{"role": "user", "content": prompt}]
+        async def _request(extract_prompt: str, force_json: bool = False):
+            request_kwargs = {
+                "model": self._model,
+                "messages": [{"role": "user", "content": extract_prompt}],
+                "max_tokens": self._max_output_tokens,
+            }
+            if force_json:
+                request_kwargs["response_format"] = {"type": "json"}
+            else:
+                request_kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.get("title", "schema"),
+                        "schema": schema,
+                    },
+                }
+            return await self._client.chat.completions.create(**request_kwargs)
+
         async with llm_call_slot(
             scope=self._profile_id,
             max_concurrent_calls=self._max_concurrent_calls,
         ):
             try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    max_tokens=self._max_output_tokens,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": schema.get("title", "schema"),
-                            "schema": schema,
-                        },
-                    },
-                )
+                response = await _request(prompt)
             except Exception:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    max_tokens=self._max_output_tokens,
-                    response_format={"type": "json"},
-                )
+                response = await _request(prompt, force_json=True)
 
         content = response.choices[0].message.content or ""
         if not content:
             return {}
-        return json.loads(content)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as error:
+            repair_prompt = (
+                f"{prompt}\n\n"
+                "The previous response was not valid JSON.\n"
+                f"Parse error: {error}.\n"
+                "Return only valid JSON that matches the requested schema."
+            )
+            async with llm_call_slot(
+                scope=self._profile_id,
+                max_concurrent_calls=self._max_concurrent_calls,
+            ):
+                repair_response = await _request(repair_prompt, force_json=True)
+            repair_content = repair_response.choices[0].message.content or ""
+            if not repair_content:
+                return {}
+            return json.loads(repair_content)

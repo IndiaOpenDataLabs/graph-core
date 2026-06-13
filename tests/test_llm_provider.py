@@ -92,3 +92,41 @@ async def test_structured_extract_sets_default_max_tokens(
     assert result == {"ok": True}
     kwargs = provider._client.chat.completions.create.await_args.kwargs
     assert kwargs["max_tokens"] == 23
+
+
+@pytest.mark.asyncio
+async def test_structured_extract_repairs_invalid_json_with_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", _FakeAsyncOpenAI)
+    monkeypatch.setattr(openai_provider, "llm_call_slot", _noop_llm_call_slot)
+    monkeypatch.setattr(
+        openai_provider.settings,
+        "default_llm_max_output_tokens",
+        23,
+        raising=False,
+    )
+
+    provider = openai_provider.OpenAILLMProvider(
+        api_key="test-key",
+        model="test-model",
+    )
+    provider._client.chat.completions.create = AsyncMock(
+        side_effect=[
+            _FakeResponse("{bad json"),
+            _FakeResponse('{"fixed": true}'),
+        ]
+    )
+
+    result = await provider.structured_extract(
+        prompt="extract",
+        schema={"title": "result"},
+    )
+
+    assert result == {"fixed": True}
+    assert provider._client.chat.completions.create.await_count == 2
+    repair_prompt = provider._client.chat.completions.create.await_args_list[1].kwargs[
+        "messages"
+    ][0]["content"]
+    assert "Parse error:" in repair_prompt
+    assert "not valid JSON" in repair_prompt
