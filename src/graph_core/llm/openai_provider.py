@@ -94,7 +94,7 @@ class OpenAILLMProvider(LLMProvider):
                 "max_tokens": self._max_output_tokens,
             }
             if force_json:
-                request_kwargs["response_format"] = {"type": "json"}
+                request_kwargs["response_format"] = {"type": "json_object"}
             else:
                 request_kwargs["response_format"] = {
                     "type": "json_schema",
