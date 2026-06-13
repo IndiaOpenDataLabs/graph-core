@@ -256,18 +256,33 @@ async def delete_collection(collection_id: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def enhance_collection(collection_id: str, ctx: Context) -> str:
+async def enhance_collection(
+    collection_id: str,
+    levels: int = 1,
+    ctx: Context | None = None,
+) -> str:
     """Build or rebuild the derived understanding graph for a collection."""
+    if ctx is None:
+        raise ValueError("Context is required")
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.enhance_collection(collection_id)
+    result = await client.enhance_collection(collection_id, levels=levels)
     type_counts = result.get("node_type_counts", {})
     type_lines = "\n".join(
         f"  {key}: {value}" for key, value in sorted(type_counts.items())
     )
+    generated_levels = result.get("generated_levels", [])
+    level_lines = "\n".join(
+        (
+            f"  l{level['level']}: {level['collection_name']} "
+            f"(nodes={level['node_count']}, edges={level['edge_count']}, chunks={level['chunk_count']})"
+        )
+        for level in generated_levels
+    )
     return (
         f"Enhanced collection:\n"
         f"  collection_id: {result['collection_id']}\n"
+        f"  requested_levels: {result.get('requested_levels', levels)}\n"
         f"  graph_name: {result['graph_name']}\n"
         f"  node_count: {result['node_count']}\n"
         f"  edge_count: {result['edge_count']}\n"
@@ -277,6 +292,7 @@ async def enhance_collection(collection_id: str, ctx: Context) -> str:
         f"  anchor_count: {result.get('anchor_count', 0)}\n"
         f"  bridge_count: {result.get('bridge_count', 0)}\n"
         f"  connector_count: {result.get('connector_count', 0)}\n"
+        f"  generated_levels:\n{level_lines or '  (none)'}\n"
         f"  node_type_counts:\n{type_lines or '  (none)'}"
     )
 

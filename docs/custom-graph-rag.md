@@ -11,16 +11,20 @@ It reflects the code after the move away from community-based derived graphs.
 
 ## Overview
 
-`custom_graph_rag` now works with two normal collections:
+`custom_graph_rag` now works with one base collection plus zero or more
+higher-level meta collections:
 
 1. **Base collection**
    - the canonical extracted graph from source documents
 
-2. **Meta collection**
-   - a sibling collection named:
-     - `<base_name>__meta`
-   - built from the base graph
-   - stores higher-level concepts and concept-to-concept relationships
+2. **Meta collections**
+   - sibling collections named:
+     - `<base_name>__meta__l1`
+     - `<base_name>__meta__l2`
+     - ...
+   - `__meta` is still recognized as a legacy level-1 name
+   - each level is built from the graph at the level immediately below it
+   - each stores higher-level concepts and concept-to-concept relationships
 
 Both are real collections. Both use the same persistence/query machinery:
 
@@ -112,9 +116,11 @@ and uses the base graph as the evidence layer.
 
 The old special `_derived` graph is gone.
 
-The meta layer is now just another collection:
+The meta layer is now one or more normal collections:
 
-- `<base_name>__meta`
+- `<base_name>__meta__l1`
+- `<base_name>__meta__l2`
+- ...
 
 It is materialized using the same models as base:
 
@@ -128,7 +134,7 @@ So meta concepts are first-class graph objects, not special-case Falkor-only nod
 
 ### How it is built
 
-The meta collection is built from the base graph in two stages:
+Each meta collection is built from the graph below it in two stages:
 
 1. **Concept candidate mining**
 2. **Concept materialization + deterministic concept linking**
@@ -276,12 +282,12 @@ Meta entities also carry:
 
 Query now treats base and meta collections the same way operationally.
 
-When querying a base collection:
+When querying a collection:
 
-1. run `custom_graph_rag` on the base collection using the user-selected mode
-2. if `<base_name>__meta` exists:
-   - run the same `custom_graph_rag` logic on the meta collection with the same mode
-3. combine both contexts into the final answer prompt
+1. run `custom_graph_rag` on the selected collection using the user-selected mode
+2. if higher meta levels exist:
+   - run the same `custom_graph_rag` logic on every higher level with the same mode
+3. combine all higher-level contexts into the final answer prompt
 
 So there is no special shallow meta retrieval path anymore.
 

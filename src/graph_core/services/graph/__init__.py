@@ -69,6 +69,14 @@ from graph_core.storage.graph_names import (
     collection_graph_name,
     legacy_collection_graph_name,
 )
+from graph_core.storage.meta_collections import (
+    base_collection_name,
+    is_meta_collection_name,
+    legacy_meta_collection_name,
+    meta_collection_level,
+    meta_collection_name,
+    parse_meta_collection_name,
+)
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.vector_store import VectorStore
 from graph_core.storage.vector_tables import (
@@ -77,7 +85,6 @@ from graph_core.storage.vector_tables import (
 )
 
 _crypto = CredentialCrypto()
-_META_COLLECTION_SUFFIX = "__meta"
 
 
 async def _resolve_credential(
@@ -124,17 +131,22 @@ class GraphService:
 
     @staticmethod
     def _base_collection_name(collection_name: str) -> str:
-        if collection_name.endswith(_META_COLLECTION_SUFFIX):
-            return collection_name[: -len(_META_COLLECTION_SUFFIX)]
-        return collection_name
+        return base_collection_name(collection_name)
 
     @staticmethod
-    def _meta_collection_name(collection_name: str) -> str:
-        return f"{GraphService._base_collection_name(collection_name)}{_META_COLLECTION_SUFFIX}"
+    def _meta_collection_name(
+        collection_name: str,
+        level: int = 1,
+    ) -> str:
+        return meta_collection_name(collection_name, level)
 
     @staticmethod
     def _is_meta_collection_name(collection_name: str) -> bool:
-        return collection_name.endswith(_META_COLLECTION_SUFFIX)
+        return is_meta_collection_name(collection_name)
+
+    @staticmethod
+    def _meta_collection_level(collection_name: str) -> int:
+        return meta_collection_level(collection_name)
 
     async def _get_collection_by_name(
         self,
@@ -149,6 +161,49 @@ class GraphService:
                 )
             )
             return result.scalar_one_or_none()
+
+    async def _get_collection_by_names(
+        self,
+        namespace_id: uuid.UUID,
+        names: list[str],
+    ) -> Collection | None:
+        for name in names:
+            collection = await self._get_collection_by_name(namespace_id, name)
+            if collection is not None:
+                return collection
+        return None
+
+    async def _list_meta_collections_for_root(
+        self,
+        namespace_id: uuid.UUID,
+        root_name: str,
+    ) -> list[Collection]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Collection).where(Collection.namespace_id == namespace_id)
+            )
+            collections = list(result.scalars().all())
+        descendants: dict[int, Collection] = {}
+        for collection in collections:
+            parsed = parse_meta_collection_name(collection.name)
+            if parsed is None:
+                continue
+            parsed_root, level = parsed
+            if parsed_root != root_name:
+                continue
+            existing = descendants.get(level)
+            if existing is None or collection.name == self._meta_collection_name(
+                root_name, level
+            ):
+                descendants[level] = collection
+        return [descendants[level] for level in sorted(descendants)]
+
+    @staticmethod
+    def _meta_name_candidates(root_name: str, level: int) -> list[str]:
+        canonical = meta_collection_name(root_name, level)
+        if level == 1:
+            return [canonical, legacy_meta_collection_name(root_name)]
+        return [canonical]
 
     async def _reset_collection_contents(self, collection: Collection) -> None:
         async with AsyncSessionLocal() as session:
@@ -217,7 +272,7 @@ class GraphService:
 
         return current_graph_name
 
-    async def _rename_meta_collection_for_base_rename(
+    async def _rename_meta_collections_for_root_rename(
         self,
         collection: Collection,
         *,
@@ -227,30 +282,28 @@ class GraphService:
             return
         if self._is_meta_collection_name(previous_name):
             return
-
-        old_meta_name = self._meta_collection_name(previous_name)
-        new_meta_name = self._meta_collection_name(collection.name)
-        if old_meta_name == new_meta_name:
-            return
-
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Collection).where(
-                    Collection.namespace_id == collection.namespace_id,
-                    Collection.name == old_meta_name,
-                )
-            )
-            meta_collection = result.scalar_one_or_none()
-            if meta_collection is None:
-                return
-            meta_collection.name = new_meta_name
-            await session.commit()
-            await session.refresh(meta_collection)
-
-        await self._migrate_collection_graph_if_needed(
-            meta_collection,
-            previous_name=old_meta_name,
+        descendants = await self._list_meta_collections_for_root(
+            collection.namespace_id,
+            previous_name,
         )
+        for meta_collection in descendants:
+            level = self._meta_collection_level(meta_collection.name)
+            old_name = meta_collection.name
+            new_name = self._meta_collection_name(collection.name, level)
+            if old_name == new_name:
+                continue
+            async with AsyncSessionLocal() as session:
+                persisted = await session.get(Collection, meta_collection.id)
+                if persisted is None:
+                    continue
+                persisted.name = new_name
+                await session.commit()
+                await session.refresh(persisted)
+                meta_collection = persisted
+            await self._migrate_collection_graph_if_needed(
+                meta_collection,
+                previous_name=old_name,
+            )
 
     async def create_chat_session(
         self,
@@ -1100,6 +1153,10 @@ class GraphService:
                 raise ValueError("Gleaning passes must be 0 or greater")
 
             if name is not None:
+                if self._is_meta_collection_name(collection.name):
+                    raise ValueError(
+                        "Meta collections cannot be renamed directly; rename the base collection instead"
+                    )
                 previous_name = collection.name
                 collection.name = name
             if strategy is not None:
@@ -1145,7 +1202,7 @@ class GraphService:
             collection,
             previous_name=previous_name,
         )
-        await self._rename_meta_collection_for_base_rename(
+        await self._rename_meta_collections_for_root_rename(
             collection,
             previous_name=previous_name,
         )
@@ -1167,13 +1224,27 @@ class GraphService:
 
     async def delete_collection(self, collection_id: uuid.UUID) -> None:
         collection = await self.get_collection(collection_id)
-        if not self._is_meta_collection_name(collection.name):
-            meta = await self._get_collection_by_name(
-                collection.namespace_id,
-                self._meta_collection_name(collection.name),
+        root_name = self._base_collection_name(collection.name)
+        level = self._meta_collection_level(collection.name)
+        descendants = await self._list_meta_collections_for_root(
+            collection.namespace_id,
+            root_name,
+        )
+        for descendant in reversed(descendants):
+            descendant_level = self._meta_collection_level(descendant.name)
+            if descendant_level <= level:
+                continue
+            await drop_all_tables(descendant.id)
+            await self._graph_storage(descendant).drop()
+            legacy_storage = FalkorDBGraphStorage(
+                self._legacy_graph_name(descendant.id)
             )
-            if meta is not None:
-                await self.delete_collection(meta.id)
+            await legacy_storage.drop()
+            async with AsyncSessionLocal() as session:
+                await session.execute(
+                    delete(Collection).where(Collection.id == descendant.id)
+                )
+                await session.commit()
         await drop_all_tables(collection_id)
         await self._graph_storage(collection).drop()
         legacy_storage = FalkorDBGraphStorage(self._legacy_graph_name(collection.id))
@@ -1617,55 +1688,94 @@ class GraphService:
         self,
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
+        *,
+        levels: int = 1,
     ) -> dict[str, Any]:
-        collection = await self.get_collection(collection_id)
-        self._enforce_namespace(collection, namespace_id)
-        if self._is_meta_collection_name(collection.name):
-            raise ValueError("Enhance should be run on a base collection, not a meta collection")
-        analysis = await analyze_collection_graph(
-            collection_id,
-        )
-        llm_provider = await self._resolve_collection_llm_provider(collection, None)
-        understanding = await build_collection_understanding(
-            analysis,
-            llm_provider=llm_provider,
-        )
+        if levels < 1:
+            raise ValueError("Enhance levels must be 1 or greater")
+        source_collection = await self.get_collection(collection_id)
+        self._enforce_namespace(source_collection, namespace_id)
+        source_level = self._meta_collection_level(source_collection.name)
+        generated_levels: list[dict[str, Any]] = []
+        final_analysis: dict[str, Any] | None = None
 
-        old_meta = await self._get_collection_by_name(
-            namespace_id,
-            self._meta_collection_name(collection.name),
-        )
-        if old_meta is not None:
-            meta_collection = old_meta
-            await self._reset_collection_contents(meta_collection)
-        else:
-            meta_collection = await self.create_collection(
-                name=self._meta_collection_name(collection.name),
-                namespace_id=namespace_id,
-                strategy="custom_graph_rag",
-                embedding_profile_id=collection.embedding_profile_id,
-                llm_profile_id=collection.llm_profile_id,
-                default_query_mode=collection.default_query_mode,
-                gleaning_passes=0,
+        for target_level in range(source_level + 1, source_level + levels + 1):
+            analysis = await analyze_collection_graph(source_collection.id)
+            llm_provider = await self._resolve_collection_llm_provider(
+                source_collection, None
             )
-        await self._materialize_meta_collection(meta_collection, understanding)
+            understanding = await build_collection_understanding(
+                analysis,
+                llm_provider=llm_provider,
+            )
+            target_name = self._meta_collection_name(
+                source_collection.name,
+                target_level,
+            )
+            meta_collection = await self._get_collection_by_names(
+                namespace_id,
+                self._meta_name_candidates(
+                    self._base_collection_name(source_collection.name),
+                    target_level,
+                ),
+            )
+            if meta_collection is not None:
+                previous_name = meta_collection.name
+                if previous_name != target_name:
+                    async with AsyncSessionLocal() as session:
+                        persisted = await session.get(Collection, meta_collection.id)
+                        if persisted is None:
+                            raise ValueError(
+                                f"Collection {meta_collection.id} not found"
+                            )
+                        persisted.name = target_name
+                        await session.commit()
+                        await session.refresh(persisted)
+                        meta_collection = persisted
+                    await self._migrate_collection_graph_if_needed(
+                        meta_collection,
+                        previous_name=previous_name,
+                    )
+                await self._reset_collection_contents(meta_collection)
+            else:
+                meta_collection = await self.create_collection(
+                    name=target_name,
+                    namespace_id=namespace_id,
+                    strategy="custom_graph_rag",
+                    embedding_profile_id=source_collection.embedding_profile_id,
+                    llm_profile_id=source_collection.llm_profile_id,
+                    default_query_mode=source_collection.default_query_mode,
+                    gleaning_passes=0,
+                )
+            await self._materialize_meta_collection(meta_collection, understanding)
 
-        kind_counts: dict[str, int] = {}
-        for node in understanding["nodes"]:
-            node_type = str(node.get("type") or "unknown")
-            kind_counts[node_type] = kind_counts.get(node_type, 0) + 1
+            kind_counts: dict[str, int] = {}
+            for node in understanding["nodes"]:
+                node_type = str(node.get("type") or "unknown")
+                kind_counts[node_type] = kind_counts.get(node_type, 0) + 1
+            generated_levels.append(
+                {
+                    "level": target_level,
+                    "graph_name": self._graph_name(meta_collection),
+                    "collection_id": str(meta_collection.id),
+                    "collection_name": meta_collection.name,
+                    "node_count": len(understanding["nodes"]),
+                    "edge_count": len(understanding["edges"]),
+                    "chunk_count": len(understanding.get("chunks", [])),
+                    "node_type_counts": kind_counts,
+                }
+            )
+            source_collection = meta_collection
+            final_analysis = analysis
 
+        if final_analysis is None:
+            raise ValueError("Enhance did not generate any levels")
+        final_level = generated_levels[-1]
         return {
-            "analysis": analysis,
-            "derived_graph": {
-                "graph_name": self._graph_name(meta_collection),
-                "collection_id": str(meta_collection.id),
-                "collection_name": meta_collection.name,
-                "node_count": len(understanding["nodes"]),
-                "edge_count": len(understanding["edges"]),
-                "chunk_count": len(understanding.get("chunks", [])),
-                "node_type_counts": kind_counts,
-            },
+            "analysis": final_analysis,
+            "requested_levels": levels,
+            "generated_levels": generated_levels,
+            "derived_graph": final_level,
         }
 
     async def update_job_status(

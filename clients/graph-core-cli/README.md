@@ -84,7 +84,7 @@ Keyboard behavior:
 - `/collection create`
 - `/collection edit <collection>`
 - `/collection delete <collection>`
-- `/enhance <collection>`
+- `/enhance <collection> [--levels N]`
 
 The create/edit flows open guided forms with:
 - name
@@ -105,8 +105,10 @@ Supported default query modes:
 - `naive`
 - `mix`
 
-`/enhance <collection>` rebuilds the collection's derived understanding graph
-from the current base graph and persists the updated summaries.
+`/enhance <collection> [--levels N]` rebuilds one or more higher-level meta
+collections. Running it on a base collection builds `__meta__l1`, `__meta__l2`,
+and so on. Running it on an existing meta collection starts from that level and
+builds the next levels above it.
 
 ### Ingestion
 

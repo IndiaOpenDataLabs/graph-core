@@ -242,8 +242,9 @@ The CLI currently stores the most recent returned `job_id` in `_last_job_id`.
 
 ## Enhance Pattern
 
-`/enhance <collection>` is a collection-scoped operation that rebuilds the
-derived understanding graph from the current canonical base graph.
+`/enhance <collection> [--levels N]` is a collection-scoped operation that
+rebuilds one or more higher-level meta collections from the selected
+collection's current canonical graph.
 
 Design intent:
 - the CLI should not know how derived graphs are built

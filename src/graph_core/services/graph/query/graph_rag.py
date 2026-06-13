@@ -41,6 +41,12 @@ from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.graph_names import collection_graph_name
+from graph_core.storage.meta_collections import (
+    base_collection_name,
+    meta_collection_level,
+    meta_collection_name,
+    parse_meta_collection_name,
+)
 
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
@@ -68,8 +74,6 @@ _MODE_ALIASES = {
     "mix": "mix",
 }
 _MAX_QUERY_DIMENSIONS = 25
-_META_COLLECTION_SUFFIX = "__meta"
-
 
 async def _active_dimensions(collection: Collection) -> list[str]:
     """Active graph dimensions for this collection, in priority order.
@@ -1862,9 +1866,10 @@ async def _answer_from_context(
             " find themes, abstractions, or organizing structure, but do"
             " not frame the final answer around those meta concepts or"
             " cite them explicitly unless the same idea is directly"
-            " supported in the base Entities or Relationships By Type"
-            " sections. Prefer answering in terms of the base entities,"
-            " base relationships, and their concrete descriptions."
+            " supported in the Primary Evidence entities or"
+            " Relationships By Type sections. Prefer answering in terms"
+            " of the primary-evidence entities, relationships, and"
+            " their concrete descriptions."
             "\n\nThe Relationships By Type section groups edges by"
             " semantic role. Each edge is listed in the form"
             " 'SRC -[REL_TYPE]-> TGT: description'. REL_TYPE is the"
@@ -1880,17 +1885,28 @@ async def _answer_from_context(
     ])
 
 
-async def _load_meta_collection(collection: Collection) -> Collection | None:
-    if collection.name.endswith(_META_COLLECTION_SUFFIX):
-        return None
+async def _load_meta_collections(collection: Collection) -> list[Collection]:
+    root_name = base_collection_name(collection.name)
+    current_level = meta_collection_level(collection.name)
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Collection).where(
-                Collection.namespace_id == collection.namespace_id,
-                Collection.name == f"{collection.name}{_META_COLLECTION_SUFFIX}",
-            )
+            select(Collection).where(Collection.namespace_id == collection.namespace_id)
         )
-        return result.scalar_one_or_none()
+        collections = list(result.scalars().all())
+    descendants: dict[int, Collection] = {}
+    for candidate in collections:
+        parsed = parse_meta_collection_name(candidate.name)
+        if parsed is None:
+            continue
+        candidate_root, candidate_level = parsed
+        if candidate_root != root_name or candidate_level <= current_level:
+            continue
+        existing = descendants.get(candidate_level)
+        if existing is None or candidate.name == meta_collection_name(
+            root_name, candidate_level
+        ):
+            descendants[candidate_level] = candidate
+    return [descendants[level] for level in sorted(descendants)]
 
 
 def _strip_context_label(context: str) -> str:
@@ -2028,42 +2044,59 @@ async def graph_rag_query(
         mode,
         llm_profile_id,
     )
-    meta = None
-    meta_collection = await _load_meta_collection(collection)
-    if meta_collection is not None:
-        meta = await _build_graph_query_artifacts(
-            question,
-            meta_collection,
-            namespace_id,
-            mode,
-            llm_profile_id,
+    meta_collections = await _load_meta_collections(collection)
+    meta_artifacts: list[tuple[Collection, GraphQueryArtifacts]] = []
+    for meta_collection in meta_collections:
+        meta_artifacts.append(
+            (
+                meta_collection,
+                await _build_graph_query_artifacts(
+                    question,
+                    meta_collection,
+                    namespace_id,
+                    mode,
+                    llm_profile_id,
+                ),
+            )
         )
 
-    if meta is not None:
+    if meta_artifacts:
+        meta_sections = "\n\n".join(
+            (
+                f"Level {meta_collection_level(meta_collection.name)} "
+                f"({meta_collection.name}):\n"
+                f"{_strip_context_label(artifacts.context)}"
+            )
+            for meta_collection, artifacts in meta_artifacts
+        )
         context = (
             "Internal Higher-Level Context:\n"
-            f"{_strip_context_label(meta.context)}\n\n"
-            "Base Evidence:\n"
+            f"{meta_sections}\n\n"
+            "Primary Evidence:\n"
             f"{_strip_context_label(base.context)}"
         )
     else:
         context = base.context
 
+    meta_entity_count = sum(
+        len(artifacts.entities_used) for _, artifacts in meta_artifacts
+    )
+    meta_relationship_count = sum(
+        len(artifacts.relationships_used) for _, artifacts in meta_artifacts
+    )
     logger.info(
-        "graph_rag final context collection=%s meta_collection=%s route=%s entities=%d relationships=%d",
+        "graph_rag final context collection=%s meta_collections=%s route=%s entities=%d relationships=%d",
         collection.name,
-        meta_collection.name if meta_collection is not None else None,
+        [meta_collection.name for meta_collection, _ in meta_artifacts],
         base.route_profile.primary_route,
-        len(base.entities_used) + (len(meta.entities_used) if meta is not None else 0),
-        len(base.relationships_used)
-        + (len(meta.relationships_used) if meta is not None else 0),
+        len(base.entities_used) + meta_entity_count,
+        len(base.relationships_used) + meta_relationship_count,
     )
     entity_fallback = "\n".join(base.entities_used)
-    fallback_text = (
-        meta.context
-        if meta is not None and meta.context
-        else base.rel_context or entity_fallback
+    meta_fallback = "\n\n".join(
+        artifacts.context for _, artifacts in meta_artifacts if artifacts.context
     )
+    fallback_text = meta_fallback or base.rel_context or entity_fallback
     response = await _answer_from_context(
         question,
         namespace_id,

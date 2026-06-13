@@ -794,8 +794,8 @@ class ConsoleScreen(Screen):
             "[--clear-default-query-mode]"
         ): "Update a collection.",
         "/collection delete COLLECTION": "Delete a collection.",
-        "/enhance COLLECTION": (
-            "Build or rebuild the derived understanding graph for a collection."
+        "/enhance COLLECTION [--levels N]": (
+            "Build or rebuild one or more higher-level meta collections."
         ),
         "/ingest chunk COLLECTION \"text\" [--domain general|books|code|personal]": "Ingest a single chunk.",
         "/ingest file COLLECTION /path/to/file.txt [--domain general|books|code|personal]": "Ingest a file asynchronously.",
@@ -854,7 +854,7 @@ class ConsoleScreen(Screen):
             "[--clear-default-query-mode]"
         ): "/collection edit ",
         "/collection delete COLLECTION": "/collection delete <collection>",
-        "/enhance COLLECTION": "/enhance <collection>",
+        "/enhance COLLECTION [--levels N]": "/enhance <collection> [--levels <n>]",
         "/ingest chunk COLLECTION \"text\" [--domain general|books|code|personal]": "/ingest chunk <collection> \"<text>\" [--domain <domain>]",
         (
             "/ingest file COLLECTION /path/to/file.txt [--domain general|books|code|personal]"
@@ -1518,13 +1518,17 @@ class ConsoleScreen(Screen):
         )
 
     async def _command_enhance(self, args: list[str]) -> None:
-        if len(args) != 1:
-            raise ValueError("Usage: /enhance COLLECTION")
-        collection = await self._resolve_collection(args[0])
+        positional, flags = parse_flag_args(args)
+        if len(positional) != 1:
+            raise ValueError("Usage: /enhance COLLECTION [--levels N]")
+        collection = await self._resolve_collection(positional[0])
+        call_args: dict[str, str | int] = {"collection_id": collection["id"]}
+        if isinstance(flags.get("levels"), str) and flags["levels"]:
+            call_args["levels"] = int(str(flags["levels"]))
         self._write(
             await self._call(
                 "enhance_collection",
-                {"collection_id": collection["id"]},
+                call_args,
             )
         )
 

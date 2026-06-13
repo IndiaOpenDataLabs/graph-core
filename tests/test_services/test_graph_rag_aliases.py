@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from graph_core.llm.interface import LLMProvider
+from graph_core.models.collection import Collection
 from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
@@ -742,3 +743,62 @@ async def test_materialize_meta_collection_persists_derived_chunks(
     assert upsert_kwargs["chunks"][0]["chunk_hash"] == "derived-1"
     assert upsert_kwargs["chunks"][0]["metadata"]["memory_type"] == "derived_graph"
     service._graph_rag_vectors.upsert_chunk_embedding.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_load_meta_collections_returns_all_levels(
+    db_session,
+    test_graph_rag_collection,
+):
+    l1 = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_graph_rag_collection.namespace_id,
+        name="graph-rag-collection__meta__l1",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    l2 = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_graph_rag_collection.namespace_id,
+        name="graph-rag-collection__meta__l2",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    db_session.add_all([l1, l2])
+    await db_session.commit()
+
+    collections = await graph_rag._load_meta_collections(test_graph_rag_collection)
+
+    assert [collection.name for collection in collections] == [
+        "graph-rag-collection__meta__l1",
+        "graph-rag-collection__meta__l2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_meta_collections_prefers_leveled_l1_over_legacy(
+    db_session,
+    test_graph_rag_collection,
+):
+    legacy_l1 = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_graph_rag_collection.namespace_id,
+        name="graph-rag-collection__meta",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    leveled_l1 = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_graph_rag_collection.namespace_id,
+        name="graph-rag-collection__meta__l1",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    db_session.add_all([legacy_l1, leveled_l1])
+    await db_session.commit()
+
+    collections = await graph_rag._load_meta_collections(test_graph_rag_collection)
+
+    assert [collection.name for collection in collections] == [
+        "graph-rag-collection__meta__l1",
+    ]

@@ -30,10 +30,24 @@ def _has_pgvector_tables() -> bool:
 
 @pytest.mark.asyncio
 async def test_create_collection(service, test_namespace):
+    async with AsyncSessionLocal() as session:
+        profile = Profile(
+            namespace_id=test_namespace.id,
+            kind="embedding",
+            provider="local_hash",
+            model="hash-256",
+            dimensions=16,
+            distance_metric="cosine",
+        )
+        session.add(profile)
+        await session.commit()
+        await session.refresh(profile)
+
     coll = await service.create_collection(
         name="new-collection",
         namespace_id=test_namespace.id,
         strategy="vector",
+        embedding_profile_id=profile.id,
     )
     assert coll.name == "new-collection"
     assert coll.namespace_id == test_namespace.id
@@ -77,7 +91,30 @@ async def test_update_collection_renames_meta_collection(service, test_namespace
     async with AsyncSessionLocal() as session:
         meta = await session.get(Collection, meta_id)
     assert meta is not None
-    assert meta.name == "renamed__meta"
+    assert meta.name == "renamed__meta__l1"
+
+
+@pytest.mark.asyncio
+async def test_update_collection_rejects_direct_meta_rename(service, test_namespace):
+    meta_id = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Collection(
+                id=meta_id,
+                namespace_id=test_namespace.id,
+                name="base__meta__l1",
+                strategy="custom_graph_rag",
+                embedding_dimensions=256,
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(ValueError, match="cannot be renamed directly"):
+        await service.update_collection(
+            meta_id,
+            test_namespace.id,
+            name="renamed-meta",
+        )
 
 
 @pytest.mark.asyncio

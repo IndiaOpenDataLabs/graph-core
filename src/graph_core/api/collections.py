@@ -3,7 +3,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from graph_core.api.auth import get_namespace_id
@@ -45,6 +45,7 @@ class CollectionResponse(BaseModel):
 class EnhanceCollectionResponse(BaseModel):
     status: str
     collection_id: str
+    requested_levels: int
     graph_name: str
     node_count: int
     edge_count: int
@@ -55,6 +56,7 @@ class EnhanceCollectionResponse(BaseModel):
     bridge_count: int
     connector_count: int
     node_type_counts: dict[str, int]
+    generated_levels: list[dict[str, str | int | dict[str, int]]]
 
 
 router = APIRouter(prefix="/collections", tags=["collections"])
@@ -146,17 +148,20 @@ async def enhance_collection(
     collection_id: uuid.UUID,
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    levels: Annotated[int, Query(ge=1)] = 1,
 ) -> EnhanceCollectionResponse:
     del session
     try:
         result = await service.build_collection_understanding(
             collection_id=collection_id,
             namespace_id=namespace_id,
+            levels=levels,
         )
         derived_graph = result["derived_graph"]
         return EnhanceCollectionResponse(
             status="enhanced",
             collection_id=str(collection_id),
+            requested_levels=int(result.get("requested_levels", levels)),
             graph_name=str(derived_graph["graph_name"]),
             node_count=int(derived_graph["node_count"]),
             edge_count=int(derived_graph["edge_count"]),
@@ -167,6 +172,7 @@ async def enhance_collection(
             bridge_count=len(result["analysis"].get("bridge_nodes", [])),
             connector_count=len(result["analysis"].get("connector_paths", [])),
             node_type_counts=dict(derived_graph.get("node_type_counts", {})),
+            generated_levels=list(result.get("generated_levels", [])),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
