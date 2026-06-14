@@ -1708,7 +1708,7 @@ class ConsoleScreen(Screen):
             if not job_id:
                 raise ValueError("Query failed: job_id was not returned.")
 
-            self._replace_response(
+            self._write(
                 "Query queued.\n"
                 f"  job_id: {job_id}\n"
                 "  status: pending"
@@ -1723,7 +1723,7 @@ class ConsoleScreen(Screen):
                 job = dict(status_payload.get("job") or {})
                 status = str(job.get("status") or "unknown")
                 progress = int(job.get("progress_percent") or 0)
-                self._replace_response(
+                self._write(
                     "Query in progress.\n"
                     f"  job_id: {job_id}\n"
                     f"  status: {status}\n"
@@ -1750,7 +1750,6 @@ class ConsoleScreen(Screen):
                     if query_result.get("chat_id"):
                         lines.append(f"Chat ID: {query_result['chat_id']}")
                     final_text = "\n".join(lines)
-                    self._replace_response(final_text)
                     return final_text
                 if status == "failed":
                     raise ValueError(
