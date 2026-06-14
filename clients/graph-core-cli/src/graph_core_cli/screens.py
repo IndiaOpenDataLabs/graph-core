@@ -1020,6 +1020,7 @@ class ConsoleScreen(Screen):
         self._last_command_text = ""
         self._last_response_text = ""
         self._query_started_at: float | None = None
+        self._query_status_text = ""
         self._query_progress_task: asyncio.Task | None = None
 
     def compose(self):
@@ -1723,12 +1724,8 @@ class ConsoleScreen(Screen):
                 job = dict(status_payload.get("job") or {})
                 status = str(job.get("status") or "unknown")
                 progress = int(job.get("progress_percent") or 0)
-                self._write(
-                    "Query in progress.\n"
-                    f"  job_id: {job_id}\n"
-                    f"  status: {status}\n"
-                    f"  progress: {progress}%"
-                )
+                self._query_status_text = f"query={status} {progress}%"
+                self._refresh_context()
                 if status == "completed":
                     result_result = await client.call_result(
                         "get_job_result",
@@ -1898,6 +1895,8 @@ class ConsoleScreen(Screen):
         if self._query_started_at is not None:
             elapsed = int(asyncio.get_running_loop().time() - self._query_started_at)
             query_suffix = f"  query=running {elapsed}s"
+            if self._query_status_text:
+                query_suffix += f"  {self._query_status_text}"
         try:
             self.query_one("#context", Label).update(
                 f"admin={cfg.get('admin_mcp_url', '')}  user={cfg.get('user_mcp_url', '')}"
@@ -2051,6 +2050,7 @@ class ConsoleScreen(Screen):
     def _start_query_progress(self, collection_name: str) -> None:
         self._stop_query_progress(write_completion=False)
         self._query_started_at = asyncio.get_running_loop().time()
+        self._query_status_text = "query=queued"
         self._write(f"Query running against {collection_name}...")
         self._refresh_context()
         self._query_progress_task = asyncio.create_task(self._query_progress_loop())
@@ -2063,6 +2063,7 @@ class ConsoleScreen(Screen):
             return
         elapsed = asyncio.get_running_loop().time() - self._query_started_at
         self._query_started_at = None
+        self._query_status_text = ""
         self._refresh_context()
         if write_completion:
             self._write(f"Query completed in {elapsed:.1f}s.")
