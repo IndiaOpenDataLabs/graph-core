@@ -36,6 +36,18 @@ async def get_job(job_id: uuid.UUID) -> dict:
         raise HTTPException(status_code=404, detail="Job not found")
 
 
+@router.get("/{job_id}/result")
+async def get_job_result(job_id: uuid.UUID) -> dict:
+    """Get the final result payload for a completed job."""
+    try:
+        return await service.get_job_result(job_id)
+    except ValueError as exc:
+        message = str(exc)
+        if "not completed" in message:
+            raise HTTPException(status_code=409, detail=message)
+        raise HTTPException(status_code=404, detail=message)
+
+
 @router.get("/{job_id}/stream")
 async def stream_job_events(job_id: uuid.UUID):
     """SSE stream of transient job events via Redis pubsub."""

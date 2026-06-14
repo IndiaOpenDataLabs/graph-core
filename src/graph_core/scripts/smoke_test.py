@@ -188,7 +188,7 @@ async def ingest_chunk(client, headers, collection_id: str, text: str) -> dict:
 
 async def query_collection(client, headers, collection_id: str,
                            question: str, mode: str | None = None) -> dict:
-    """Query a collection. Returns response JSON."""
+    """Query a collection. Returns the completed job result payload."""
     body = {"question": question}
     if mode:
         body["mode"] = mode
@@ -197,9 +197,36 @@ async def query_collection(client, headers, collection_id: str,
         json=body,
         headers=headers,
     )
-    if r.status_code != 200:
+    if r.status_code not in (200, 202):
         raise ValueError(f"Query failed: {r.text}")
-    return r.json()
+    data = r.json()
+    job_id = data["job_id"]
+
+    for _ in range(180):
+        job = await client.get(f"/jobs/{job_id}", headers=headers)
+        if job.status_code != 200:
+            raise ValueError(f"Job lookup failed: {job.text}")
+        job_data = job.json()
+        if job_data.get("status") == "completed":
+            result_response = await client.get(
+                f"/jobs/{job_id}/result",
+                headers=headers,
+            )
+            if result_response.status_code != 200:
+                raise ValueError(f"Job result lookup failed: {result_response.text}")
+            result_data = result_response.json()
+            result = result_data.get("result") or {}
+            if not result:
+                raise ValueError(f"Query job {job_id} completed without result payload")
+            result["job_id"] = job_id
+            return result
+        if job_data.get("status") == "failed":
+            raise ValueError(
+                f"Query job {job_id} failed: {job_data.get('error') or 'unknown error'}"
+            )
+        await asyncio.sleep(1)
+
+    raise TimeoutError(f"Query job {job_id} did not complete in time")
 
 
 def check_response(data: dict, keywords: list[str]) -> bool:

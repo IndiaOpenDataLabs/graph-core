@@ -1729,6 +1729,69 @@ class GraphService:
             result.chat_id = str(chat_id)
         return result
 
+    async def enqueue_query_job(
+        self,
+        question: str,
+        collection_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+        mode: str | None = None,
+        llm_profile_id: uuid.UUID | None = None,
+        chat_id: uuid.UUID | None = None,
+    ) -> dict[str, Any]:
+        collection = await self.get_collection(collection_id)
+        self._enforce_namespace(collection, namespace_id)
+        async with AsyncSessionLocal() as session:
+            job = Job(
+                namespace_id=namespace_id,
+                collection_id=collection_id,
+                job_type="query",
+                status="pending",
+                payload={
+                    "question": question,
+                    "mode": mode,
+                    "llm_profile_id": str(llm_profile_id) if llm_profile_id else None,
+                    "chat_id": str(chat_id) if chat_id else None,
+                },
+            )
+            session.add(job)
+            await session.commit()
+            await session.refresh(job)
+            return {
+                "job_id": str(job.id),
+                "type": job.job_type,
+                "status": job.status,
+                "collection_id": str(collection_id),
+                "namespace_id": str(namespace_id),
+            }
+
+    async def enqueue_enhance_job(
+        self,
+        collection_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+        *,
+        levels: int = 1,
+    ) -> dict[str, Any]:
+        collection = await self.get_collection(collection_id)
+        self._enforce_namespace(collection, namespace_id)
+        async with AsyncSessionLocal() as session:
+            job = Job(
+                namespace_id=namespace_id,
+                collection_id=collection_id,
+                job_type="enhance",
+                status="pending",
+                payload={"levels": levels},
+            )
+            session.add(job)
+            await session.commit()
+            await session.refresh(job)
+            return {
+                "job_id": str(job.id),
+                "type": job.job_type,
+                "status": job.status,
+                "collection_id": str(collection_id),
+                "namespace_id": str(namespace_id),
+            }
+
     # ── Jobs ──
 
     async def get_job(self, job_id: uuid.UUID) -> dict[str, Any]:
@@ -1749,7 +1812,142 @@ class GraphService:
                 ),
                 "chunks_total": job.chunks_total,
                 "chunks_completed": job.chunks_completed,
+                "payload": job.payload,
             }
+
+    async def get_job_result(self, job_id: uuid.UUID) -> dict[str, Any]:
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            if job.status != "completed":
+                raise ValueError(f"Job {job_id} is not completed")
+            payload = dict(job.payload or {})
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise ValueError(f"Job {job_id} does not contain a result payload")
+            return {
+                "id": str(job.id),
+                "type": job.job_type,
+                "status": job.status,
+                "result": result,
+                "payload": payload,
+            }
+
+    async def _set_job_payload(self, job_id: uuid.UUID, payload: dict[str, Any]) -> None:
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                return
+            job.payload = payload
+            await session.commit()
+
+    async def run_query_job(self, job_id: uuid.UUID) -> None:
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            if job.job_type != "query":
+                raise ValueError(f"Job {job_id} is not a query job")
+            payload = dict(job.payload or {})
+            collection_id = job.collection_id
+            namespace_id = job.namespace_id
+            if collection_id is None:
+                raise ValueError(f"Job {job_id} is missing collection_id")
+            question = str(payload.get("question") or "").strip()
+            if not question:
+                raise ValueError(f"Job {job_id} is missing question")
+            mode = payload.get("mode")
+            llm_profile_id = (
+                uuid.UUID(payload["llm_profile_id"])
+                if payload.get("llm_profile_id")
+                else None
+            )
+            chat_id = (
+                uuid.UUID(payload["chat_id"]) if payload.get("chat_id") else None
+            )
+
+        await self.update_job_status(job_id, "running")
+        await self.append_job_event(job_id, "started")
+        try:
+            result = await self.query(
+                question,
+                collection_id,
+                namespace_id,
+                mode,
+                llm_profile_id=llm_profile_id,
+                chat_id=chat_id,
+            )
+            await self._set_job_payload(
+                job_id,
+                {
+                    **payload,
+                    "result": {
+                        "response": result.response,
+                        "entities_used": result.entities_used,
+                        "relationships_used": result.relationships_used,
+                        "mode": result.mode,
+                        "chat_id": result.chat_id,
+                    },
+                },
+            )
+            await self.update_job_status(job_id, "completed", progress_percent=100)
+            await self.append_job_event(
+                job_id,
+                "completed",
+                {
+                    "response": result.response,
+                    "entities_used": result.entities_used,
+                    "relationships_used": result.relationships_used,
+                    "mode": result.mode,
+                    "chat_id": result.chat_id,
+                },
+            )
+        except Exception as e:
+            await self.update_job_status(job_id, "failed", error=str(e))
+            await self.append_job_event(job_id, "error", {"error": str(e)})
+            raise
+
+    async def run_enhance_job(self, job_id: uuid.UUID) -> None:
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            if job.job_type != "enhance":
+                raise ValueError(f"Job {job_id} is not an enhance job")
+            payload = dict(job.payload or {})
+            collection_id = job.collection_id
+            namespace_id = job.namespace_id
+            if collection_id is None:
+                raise ValueError(f"Job {job_id} is missing collection_id")
+            levels = int(payload.get("levels") or 1)
+
+        await self.update_job_status(job_id, "running")
+        await self.append_job_event(job_id, "started")
+        try:
+            result = await self.build_collection_understanding(
+                collection_id,
+                namespace_id,
+                levels=levels,
+            )
+            summary = {
+                "requested_levels": result.get("requested_levels", levels),
+                "generated_levels": result.get("generated_levels", []),
+                "derived_graph": result.get("derived_graph", {}),
+            }
+            await self._set_job_payload(
+                job_id,
+                {
+                    **payload,
+                    "result": summary,
+                },
+            )
+            await self.update_job_status(job_id, "completed", progress_percent=100)
+            await self.append_job_event(job_id, "completed", summary)
+        except Exception as e:
+            await self.update_job_status(job_id, "failed", error=str(e))
+            await self.append_job_event(job_id, "error", {"error": str(e)})
+            raise
 
     async def list_jobs(
         self,
@@ -1784,6 +1982,7 @@ class GraphService:
                         job.created_at.isoformat() if job.created_at else None
                     ),
                     "error": job.error,
+                    "payload": job.payload,
                 }
                 for job in jobs
             ]

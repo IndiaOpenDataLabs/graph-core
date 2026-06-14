@@ -1726,18 +1726,68 @@ class ConsoleScreen(Screen):
             ) from None
 
         result = response.json()
-        lines = [result.get("response", "")]
-        if result.get("entities_used"):
-            lines.append(f"\nEntities used: {', '.join(result['entities_used'])}")
-        if result.get("relationships_used"):
-            lines.append(
-                f"Relationships: {', '.join(result['relationships_used'])}"
+        job_id = result["job_id"]
+        self._replace_response(
+            "Query queued.\n"
+            f"  job_id: {job_id}\n"
+            "  status: pending"
+        )
+
+        for _ in range(180):
+            job_response = await client.get(f"{base_url}/jobs/{job_id}")
+            if job_response.status_code != 200:
+                try:
+                    detail = job_response.json()
+                except Exception:
+                    detail = job_response.text
+                raise ValueError(
+                    f"Job lookup failed: GET {job_response.request.url} -> "
+                    f"{job_response.status_code}: {detail}"
+                )
+            job = job_response.json()
+            status = str(job.get("status") or "unknown")
+            progress = int(job.get("progress_percent") or 0)
+            self._replace_response(
+                "Query in progress.\n"
+                f"  job_id: {job_id}\n"
+                f"  status: {status}\n"
+                f"  progress: {progress}%"
             )
-        if result.get("mode"):
-            lines.append(f"Mode: {result['mode']}")
-        if result.get("chat_id"):
-            lines.append(f"Chat ID: {result['chat_id']}")
-        return "\n".join(lines)
+            if job.get("status") == "completed":
+                result_response = await client.get(f"{base_url}/jobs/{job_id}/result")
+                if result_response.status_code != 200:
+                    try:
+                        detail = result_response.json()
+                    except Exception:
+                        detail = result_response.text
+                    raise ValueError(
+                        f"Job result lookup failed: GET {result_response.request.url} -> "
+                        f"{result_response.status_code}: {detail}"
+                    )
+                query_result = result_response.json().get("result") or {}
+                lines = [query_result.get("response", "")]
+                if query_result.get("entities_used"):
+                    lines.append(
+                        f"\nEntities used: {', '.join(query_result['entities_used'])}"
+                    )
+                if query_result.get("relationships_used"):
+                    lines.append(
+                        f"Relationships: {', '.join(query_result['relationships_used'])}"
+                    )
+                if query_result.get("mode"):
+                    lines.append(f"Mode: {query_result['mode']}")
+                if query_result.get("chat_id"):
+                    lines.append(f"Chat ID: {query_result['chat_id']}")
+                final_text = "\n".join(lines)
+                self._replace_response(final_text)
+                return final_text
+            if job.get("status") == "failed":
+                raise ValueError(
+                    f"Query job failed: {job.get('error') or 'unknown error'}"
+                )
+            await asyncio.sleep(1)
+
+        raise ValueError(f"Query job {job_id} did not complete in time.")
 
     async def _list_profiles(self, kind: str) -> list[dict]:
         if kind == "embedding":
@@ -1949,6 +1999,10 @@ class ConsoleScreen(Screen):
             return
         output.clear()
         self.call_after_refresh(output.scroll_end, animate=False)
+
+    def _replace_response(self, text: str) -> None:
+        self._clear_output()
+        self._write(text)
 
     def _copy_response(self) -> None:
         text = self._last_response_text or self._output_buffer

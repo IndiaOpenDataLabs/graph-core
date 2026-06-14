@@ -472,56 +472,29 @@ async def enhance_collection(
     levels: int = 1,
     ctx: Context | None = None,
 ) -> CallToolResult:
-    """Build or rebuild the derived understanding graph for a collection."""
+    """Queue a derived-understanding build for a collection."""
     if ctx is None:
         raise ValueError("Context is required")
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.enhance_collection(collection_id, levels=levels)
-    type_counts = result.get("node_type_counts", {})
-    type_lines = "\n".join(
-        f"  {key}: {value}" for key, value in sorted(type_counts.items())
-    )
-    generated_levels = result.get("generated_levels", [])
-    level_lines = "\n".join(
-        (
-            f"  l{level['level']}: {level['collection_name']} "
-            f"(nodes={level['node_count']}, edges={level['edge_count']}, chunks={level['chunk_count']})"
-        )
-        for level in generated_levels
-    )
     text = (
-        f"Enhanced collection:\n"
+        f"Enhance queued:\n"
+        f"  job_id: {result['job_id']}\n"
         f"  collection_id: {result['collection_id']}\n"
-        f"  requested_levels: {result.get('requested_levels', levels)}\n"
-        f"  graph_name: {result['graph_name']}\n"
-        f"  node_count: {result['node_count']}\n"
-        f"  edge_count: {result['edge_count']}\n"
-        f"  chunk_count: {result['chunk_count']}\n"
-        f"  rel_type_count: {result.get('rel_type_count', 0)}\n"
-        f"  community_count: {result.get('community_count', 0)}\n"
-        f"  anchor_count: {result.get('anchor_count', 0)}\n"
-        f"  bridge_count: {result.get('bridge_count', 0)}\n"
-        f"  connector_count: {result.get('connector_count', 0)}\n"
-        f"  generated_levels:\n{level_lines or '  (none)'}\n"
-        f"  node_type_counts:\n{type_lines or '  (none)'}"
+        f"  namespace_id: {result['namespace_id']}\n"
+        f"  status: {result['status']}\n"
+        f"  type: {result['type']}\n\n"
+        f"Poll with get_job_status('{result['job_id']}')"
     )
     return _result(
         text,
         {
+            "job_id": result["job_id"],
             "collection_id": result["collection_id"],
-            "requested_levels": result.get("requested_levels", levels),
-            "graph_name": result["graph_name"],
-            "node_count": result["node_count"],
-            "edge_count": result["edge_count"],
-            "chunk_count": result["chunk_count"],
-            "rel_type_count": result.get("rel_type_count", 0),
-            "community_count": result.get("community_count", 0),
-            "anchor_count": result.get("anchor_count", 0),
-            "bridge_count": result.get("bridge_count", 0),
-            "connector_count": result.get("connector_count", 0),
-            "generated_levels": generated_levels,
-            "node_type_counts": type_counts,
+            "namespace_id": result["namespace_id"],
+            "status": result["status"],
+            "type": result["type"],
         },
     )
 
@@ -647,23 +620,23 @@ async def query_collection(
         mode=mode,
         chat_id=chat_id,
     )
-    lines = [result["response"]]
-    if result.get("entities_used"):
-        lines.append(f"\nEntities used: {', '.join(result['entities_used'])}")
-    if result.get("relationships_used"):
-        lines.append(f"Relationships: {', '.join(result['relationships_used'])}")
-    if result.get("mode"):
-        lines.append(f"Mode: {result['mode']}")
-    if result.get("chat_id"):
-        lines.append(f"Chat ID: {result['chat_id']}")
+    text = (
+        f"Query queued:\n"
+        f"  job_id: {result['job_id']}\n"
+        f"  collection_id: {result['collection_id']}\n"
+        f"  namespace_id: {result['namespace_id']}\n"
+        f"  status: {result['status']}\n"
+        f"  type: {result['type']}\n\n"
+        f"Poll with get_job_status('{result['job_id']}')"
+    )
     return _result(
-        "\n".join(lines),
+        text,
         {
-            "response": result["response"],
-            "entities_used": result.get("entities_used", []),
-            "relationships_used": result.get("relationships_used", []),
-            "mode": result.get("mode"),
-            "chat_id": result.get("chat_id"),
+            "job_id": result["job_id"],
+            "collection_id": result["collection_id"],
+            "namespace_id": result["namespace_id"],
+            "status": result["status"],
+            "type": result["type"],
         },
     )
 
@@ -751,6 +724,17 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
         lines.append(
             f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
         )
+    payload = job.get("payload") or {}
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, dict):
+        if "response" in result:
+            response = str(result.get("response") or "").strip()
+            if response:
+                lines.append(f"  response: {response[:240]}")
+        if "generated_levels" in result:
+            lines.append(
+                f"  generated_levels: {len(result.get('generated_levels') or [])}"
+            )
     return _result(
         "\n".join(lines),
         {
@@ -762,7 +746,61 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
                 "error": job.get("error"),
                 "chunks_total": job.get("chunks_total"),
                 "chunks_completed": job.get("chunks_completed"),
+                "payload": job.get("payload"),
             }
+        },
+    )
+
+
+@user_tool()
+async def get_job_result(job_id: str, ctx: Context) -> CallToolResult:
+    """Get the final result payload for a completed query or enhance job."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key)
+    result = await client.get_job_result(job_id)
+    payload = result.get("result") or {}
+    if result.get("type") == "query":
+        text = (
+            f"Query result:\n"
+            f"  job_id: {result['id']}\n"
+            f"  status: {result['status']}\n\n"
+            f"{payload.get('response', '')}"
+        )
+        return _result(
+            text,
+            {
+                "job_id": result["id"],
+                "status": result["status"],
+                "type": result["type"],
+                "result": payload,
+            },
+        )
+    if result.get("type") == "enhance":
+        summary = payload
+        generated_levels = summary.get("generated_levels") or []
+        text = (
+            f"Enhance result:\n"
+            f"  job_id: {result['id']}\n"
+            f"  status: {result['status']}\n"
+            f"  requested_levels: {summary.get('requested_levels', 1)}\n"
+            f"  generated_levels: {len(generated_levels)}"
+        )
+        return _result(
+            text,
+            {
+                "job_id": result["id"],
+                "status": result["status"],
+                "type": result["type"],
+                "result": summary,
+            },
+        )
+    return _result(
+        f"Job result:\n  job_id: {result['id']}\n  status: {result['status']}",
+        {
+            "job_id": result["id"],
+            "status": result["status"],
+            "type": result["type"],
+            "result": payload,
         },
     )
 
@@ -801,6 +839,7 @@ async def list_jobs(
                 "progress_percent": job.get("progress_percent", 0),
                 "chunks_total": job.get("chunks_total"),
                 "chunks_completed": job.get("chunks_completed"),
+                "payload": job.get("payload"),
             }
         )
     return _result("\n".join(lines), {"jobs": items})

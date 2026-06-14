@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from graph_core.api.auth import get_namespace_id
 from graph_core.database import AsyncSession, get_session
 from graph_core.services.graph import GraphService
+from graph_core.workers.enhance import run_enhance
 
 
 class CreateCollectionRequest(BaseModel):
@@ -43,20 +44,11 @@ class CollectionResponse(BaseModel):
 
 
 class EnhanceCollectionResponse(BaseModel):
+    job_id: str
+    type: str
     status: str
     collection_id: str
-    requested_levels: int
-    graph_name: str
-    node_count: int
-    edge_count: int
-    chunk_count: int
-    rel_type_count: int
-    community_count: int
-    anchor_count: int
-    bridge_count: int
-    connector_count: int
-    node_type_counts: dict[str, int]
-    generated_levels: list[dict[str, str | int | dict[str, int]]]
+    namespace_id: str
 
 
 router = APIRouter(prefix="/collections", tags=["collections"])
@@ -143,7 +135,7 @@ async def delete_collection(
         raise HTTPException(status_code=403, detail=str(e))
 
 
-@router.post("/{collection_id}/enhance")
+@router.post("/{collection_id}/enhance", status_code=202)
 async def enhance_collection(
     collection_id: uuid.UUID,
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
@@ -152,28 +144,13 @@ async def enhance_collection(
 ) -> EnhanceCollectionResponse:
     del session
     try:
-        result = await service.build_collection_understanding(
+        result = await service.enqueue_enhance_job(
             collection_id=collection_id,
             namespace_id=namespace_id,
             levels=levels,
         )
-        derived_graph = result["derived_graph"]
-        return EnhanceCollectionResponse(
-            status="enhanced",
-            collection_id=str(collection_id),
-            requested_levels=int(result.get("requested_levels", levels)),
-            graph_name=str(derived_graph["graph_name"]),
-            node_count=int(derived_graph["node_count"]),
-            edge_count=int(derived_graph["edge_count"]),
-            chunk_count=int(derived_graph["chunk_count"]),
-            rel_type_count=int(result["analysis"]["totals"].get("rel_types", 0)),
-            community_count=len(result["analysis"].get("communities", [])),
-            anchor_count=len(result["analysis"].get("top_anchors", [])),
-            bridge_count=len(result["analysis"].get("bridge_nodes", [])),
-            connector_count=len(result["analysis"].get("connector_paths", [])),
-            node_type_counts=dict(derived_graph.get("node_type_counts", {})),
-            generated_levels=list(result.get("generated_levels", [])),
-        )
+        run_enhance.send(result["job_id"])
+        return EnhanceCollectionResponse(**result)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:

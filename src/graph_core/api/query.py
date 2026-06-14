@@ -7,8 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from graph_core.api.auth import get_namespace_id
-from graph_core.api.provider_errors import raise_provider_http_error
 from graph_core.services.graph import GraphService
+from graph_core.workers.query import run_query
 
 
 class QueryRequest(BaseModel):
@@ -19,25 +19,29 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    response: str
-    entities_used: list[str]
-    relationships_used: list[str]
-    mode: str | None = None
-    chat_id: str | None = None
+    job_id: str
+    type: str
+    status: str
+    collection_id: str
+    namespace_id: str
 
 
 router = APIRouter(tags=["query"])
 service = GraphService()
 
 
-@router.post("/collections/{collection_id}/query", response_model=QueryResponse)
+@router.post(
+    "/collections/{collection_id}/query",
+    response_model=QueryResponse,
+    status_code=202,
+)
 async def query_collection(
     body: QueryRequest,
     collection_id: uuid.UUID,
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
 ) -> QueryResponse:
     try:
-        result = await service.query(
+        result = await service.enqueue_query_job(
             body.question,
             collection_id,
             namespace_id,
@@ -45,11 +49,9 @@ async def query_collection(
             llm_profile_id=body.llm_profile_id,
             chat_id=body.chat_id,
         )
-        return QueryResponse(**result.__dict__)
+        run_query.send(result["job_id"])
+        return QueryResponse(**result)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise_provider_http_error(e)
-        raise

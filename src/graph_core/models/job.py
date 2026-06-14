@@ -18,7 +18,16 @@ class Job(Base):
     collection_id = Column(UUIDType(as_uuid=True), ForeignKey("collections.id", ondelete="CASCADE"), nullable=True, index=True)
 
     job_type = Column(
-        Enum("ingest_chunk", "ingest_document", "delete_collection", "reindex", name="job_type", create_type=True),
+        Enum(
+            "ingest_chunk",
+            "ingest_document",
+            "delete_collection",
+            "reindex",
+            "query",
+            "enhance",
+            name="job_type",
+            create_type=True,
+        ),
         nullable=False,
     )
     status = Column(
