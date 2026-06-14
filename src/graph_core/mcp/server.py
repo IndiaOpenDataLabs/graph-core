@@ -206,9 +206,7 @@ async def create_namespace(name: str, ctx: Context) -> CallToolResult:
     text = (
         f"Created namespace:\n"
         f"  id: {result['id']}\n"
-        f"  name: {result['name']}\n"
-        f"  api_key: {result['api_key']}\n\n"
-        f"Save the api_key — it won't be shown again."
+        f"  name: {result['name']}"
     )
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
@@ -216,7 +214,6 @@ async def create_namespace(name: str, ctx: Context) -> CallToolResult:
             "namespace": {
                 "id": result["id"],
                 "name": result["name"],
-                "api_key": result["api_key"],
             }
         },
     )
@@ -238,14 +235,12 @@ async def list_namespaces(ctx: Context) -> CallToolResult:
     lines = ["Namespaces:"]
     items: list[dict[str, str]] = []
     for ns in namespaces:
-        prefix = ns.get("api_key_prefix", "") or ""
-        text_line = f"  - {ns['id']} | {ns['name']} {prefix}"
+        text_line = f"  - {ns['id']} | {ns['name']}"
         lines.append(text_line)
         items.append(
             {
                 "id": ns["id"],
                 "name": ns["name"],
-                "api_key_prefix": prefix,
             }
         )
     text = "\n".join(lines)
@@ -262,29 +257,6 @@ async def get_current_namespace(ctx: Context) -> str:
     client = await get_client(api_key)
     ns = await client.get_namespace_me()
     return f"Namespace: {ns['id']} | {ns['name']}"
-
-
-@admin_tool()
-async def rotate_namespace_key(
-    namespace_id: str,
-    ctx: Context,
-) -> CallToolResult:
-    """Rotate a namespace's API key. Requires admin JWT.
-
-    Args:
-        namespace_id: The UUID of the namespace.
-    """
-    api_key = _extract_api_key(ctx)
-    client = await get_client(api_key, admin=True)
-    result = await client.rotate_namespace_key(namespace_id)
-    text = f"New api_key: {result['api_key']}\nSave it — it won't be shown again."
-    return CallToolResult(
-        content=[TextContent(type="text", text=text)],
-        structuredContent={
-            "namespace_id": namespace_id,
-            "api_key": result["api_key"],
-        },
-    )
 
 
 # -- Collection tools -------------------------------------------------------

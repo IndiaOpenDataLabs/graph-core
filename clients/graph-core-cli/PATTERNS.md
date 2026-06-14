@@ -334,5 +334,5 @@ uv run python -m compileall src
 - Changing MCP response text without updating CLI parsers
 - Passing host file paths to Docker instead of reading files locally in the CLI
 - Using one global provider semaphore for all profiles
-- Confusing namespace key state in config with verified backend namespace state
+- Confusing saved namespace session state with verified backend namespace context
 - Adding background MCP workers on mount/resume that make shutdown brittle

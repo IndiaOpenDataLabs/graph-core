@@ -193,7 +193,7 @@ uv run graph-core-admin-jwt --subject my-mcp-client
 | `create_namespace`     | Create a new namespace (admin)     |
 | `list_namespaces`      | List all namespaces (admin)        |
 | `get_current_namespace`| Get current namespace info         |
-| `rotate_namespace_key` | Rotate a namespace API key (admin) |
+| `issue_user_token`     | Mint a namespace-scoped user JWT (admin) |
 | `create_embedding_profile` | Create an embedding profile     |
 | `create_llm_profile`   | Create an LLM profile              |
 | `list_embedding_profiles` | List embedding profiles         |
@@ -218,7 +218,7 @@ from graph_core.client import GraphCoreClient
 
 async with GraphCoreClient(
     base_url="http://localhost:8001",
-    api_key="ns_key_...",
+    api_key="<user-or-admin-token>",
 ) as client:
     collections = await client.list_collections()
     result = await client.query_collection(collection_id, "What is dharma?")

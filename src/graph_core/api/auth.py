@@ -1,6 +1,6 @@
 """Auth dependency — resolves namespace context from request headers.
 
-Handles namespace API keys, legacy X-Namespace-ID, and JWT bearer tokens.
+Handles admin and user JWT bearer tokens plus legacy X-Namespace-ID.
 """
 
 from __future__ import annotations
@@ -15,10 +15,8 @@ from fastapi import Header, HTTPException, Request
 from jwt import InvalidTokenError
 
 from graph_core.database import AsyncSessionLocal, current_namespace_id
-from graph_core.models.namespace import Namespace
 from graph_core.config import settings
 from graph_core.models.namespace import Namespace
-from graph_core.services import auth_service
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +102,6 @@ def resolve_bearer_identity(authorization: str | None) -> BearerIdentity:
 
     token = parts[1]
 
-    if token.startswith("ns_key_"):
-        return BearerIdentity(kind="user")
-
     claims = _decode_jwt(token)
     scopes = _scope_values(claims)
     token_type = str(claims.get("token_type") or claims.get("kind") or claims.get("role") or "").lower()
@@ -131,9 +126,8 @@ async def get_auth_context(
     """Resolve auth context from request headers.
 
     Priority:
-    1. Authorization: Bearer <ns_key_...>          → namespace-scoped
-    2. Authorization: Bearer <JWT with scopes>     → admin or namespace-scoped
-    3. X-Namespace-ID: <uuid>                      → legacy (deprecated)
+    1. Authorization: Bearer <JWT with scopes>     → admin or namespace-scoped
+    2. X-Namespace-ID: <uuid>                      → legacy (deprecated)
     """
     del request
 
@@ -148,20 +142,6 @@ async def get_auth_context(
                 token_kind="admin",
                 claims=identity.claims,
             )
-
-        token = authorization.split(" ", 1)[1]
-        if token.startswith("ns_key_"):
-            async with AsyncSessionLocal() as session:
-                ns = await auth_service.verify_namespace_api_key(session, token)
-            if ns:
-                current_namespace_id.set(ns.id)
-                return AuthContext(
-                    namespace_id=ns.id,
-                    is_admin=False,
-                    token_kind="user",
-                    namespace=ns,
-                )
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
 
         namespace_id = identity.namespace_id
         if namespace_id is None:
@@ -184,7 +164,7 @@ async def get_auth_context(
 
     # 2. Legacy X-Namespace-ID header (deprecated, self-hosted only)
     if x_namespace_id:
-        logger.warning("X-Namespace-ID header is deprecated; use Authorization: Bearer <ns_key>")
+        logger.warning("X-Namespace-ID header is deprecated; use Authorization: Bearer <JWT>")
         try:
             ns_id = uuid.UUID(x_namespace_id)
             current_namespace_id.set(ns_id)

@@ -1,4 +1,4 @@
-"""FastAPI router — namespace management and key rotation."""
+"""FastAPI router — namespace management and user-token minting."""
 
 from __future__ import annotations
 
@@ -19,18 +19,12 @@ class CreateNamespaceRequest(BaseModel):
 class CreateNamespaceResponse(BaseModel):
     id: str
     name: str
-    api_key: str
 
 
 class NamespaceResponse(BaseModel):
     id: str
     name: str
-    api_key_prefix: str | None
     created_at: str | None
-
-
-class RotateKeyResponse(BaseModel):
-    api_key: str
 
 
 class IssueUserTokenRequest(BaseModel):
@@ -60,14 +54,13 @@ async def create_namespace(
     if not auth.is_admin:
         raise HTTPException(status_code=403, detail="Admin JWT required to create namespaces")
 
-    result = await auth_service.create_namespace_with_key(
+    result = await auth_service.create_namespace(
         session,
         name=body.name,
     )
     return CreateNamespaceResponse(
-        id=str(result.namespace.id),
-        name=result.namespace.name,
-        api_key=result.api_key,
+        id=str(result.id),
+        name=result.name,
     )
 
 
@@ -85,7 +78,6 @@ async def list_namespaces(
         NamespaceResponse(
             id=str(ns.id),
             name=ns.name,
-            api_key_prefix=ns.api_key_prefix,
             created_at=ns.created_at.isoformat() if ns.created_at else None,
         )
         for ns in namespaces
@@ -96,33 +88,15 @@ async def list_namespaces(
 async def get_current_namespace(
     auth: Annotated[AuthContext, Depends(get_auth_context)],
 ) -> NamespaceResponse:
-    """Get the current namespace. Works with namespace API key."""
+    """Get the current namespace. Works with a user JWT."""
     if not auth.namespace:
-        raise HTTPException(status_code=400, detail="Not authenticated with a namespace key")
+        raise HTTPException(status_code=400, detail="Not authenticated with a user token")
 
     return NamespaceResponse(
         id=str(auth.namespace.id),
         name=auth.namespace.name,
-        api_key_prefix=auth.namespace.api_key_prefix,
         created_at=auth.namespace.created_at.isoformat() if auth.namespace.created_at else None,
     )
-
-
-@router.post("/{namespace_id}/rotate-key", response_model=RotateKeyResponse)
-async def rotate_namespace_key(
-    namespace_id: str,
-    auth: Annotated[AuthContext, Depends(get_auth_context)],
-    session: Annotated[AsyncSession, Depends(get_session)],
-) -> RotateKeyResponse:
-    """Rotate a namespace's API key. Requires admin JWT."""
-    if not auth.is_admin:
-        raise HTTPException(status_code=403, detail="Admin JWT required to rotate keys")
-
-    result = await auth_service.rotate_namespace_key(session, namespace_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"Namespace {namespace_id} not found")
-
-    return RotateKeyResponse(api_key=result.api_key)
 
 
 @router.post("/{namespace_id}/issue-user-token", response_model=IssueUserTokenResponse)
@@ -149,10 +123,10 @@ async def issue_user_token(
         raise HTTPException(status_code=404, detail=f"Namespace {namespace_id} not found")
 
     return IssueUserTokenResponse(
-        namespace_id=str(result.namespace.id),
-        namespace_name=result.namespace.name,
+        namespace_id=str(result[0].id),
+        namespace_name=result[0].name,
         token_type="user",
         scope="graph-core:user",
-        token=result.token,
-        expires_at=result.expires_at.isoformat(),
+        token=result[1],
+        expires_at=result[2].isoformat(),
     )

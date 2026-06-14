@@ -16,10 +16,6 @@ class Namespace(Base):
     name = Column(String(128), unique=True, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    # Auth: self-hosted namespace API key
-    api_key_hash = Column(String(128), nullable=True)
-    api_key_prefix = Column(String(16), nullable=True)
-
     # Auth: multi-tenant ownership tracking
     owner_app_id = Column(UUIDType(as_uuid=True), ForeignKey("registered_apps.id", ondelete="SET NULL"), nullable=True)
     owner_user_sub = Column(String(256), nullable=True)

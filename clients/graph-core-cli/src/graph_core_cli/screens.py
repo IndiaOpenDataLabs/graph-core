@@ -182,10 +182,6 @@ class SetupScreen(Screen):
             status.update("Admin JWT is required.")
             return
 
-        if admin_jwt.startswith("ns_key_"):
-            status.update("This setup expects an admin JWT, not a namespace token.")
-            return
-
         self.app.config = {
             "api_base_url": os.getenv("GRAPH_CORE_URL", "http://localhost:8001"),
             "admin_mcp_url": os.getenv(
@@ -769,7 +765,6 @@ class ConsoleScreen(Screen):
         "/namespace list": "List namespaces with the admin JWT.",
         "/namespace create NAME": "Create namespace and stay in admin mode.",
         "/namespace current": "Show current namespace details.",
-        "/namespace rotate-key ID_OR_NAME": "Rotate a namespace key.",
         "/connect NAMESPACE_ID": "Mint a namespace user token and switch to user mode.",
     }
     USER_COMMAND_HELP = {
@@ -833,7 +828,6 @@ class ConsoleScreen(Screen):
         "/namespace list": "/namespace list",
         "/namespace create NAME": "/namespace create ",
         "/namespace current": "/namespace current",
-        "/namespace rotate-key ID_OR_NAME": "/namespace rotate-key ",
         "/connect NAMESPACE_ID": "/connect ",
     }
     USER_COMMAND_INSERT_TEXT = {
@@ -1240,7 +1234,7 @@ class ConsoleScreen(Screen):
 
     async def _command_namespace(self, args: list[str]) -> None:
         if not args:
-            raise ValueError("Usage: /namespace list|create|current|rotate-key ...")
+            raise ValueError("Usage: /namespace list|create|current ...")
         action = args[0]
         if action == "list":
             self._write(await self._call("list_namespaces", admin=True))
@@ -1265,29 +1259,7 @@ class ConsoleScreen(Screen):
                 return
             self._write("Namespace: (not selected)")
             return
-        if action == "rotate-key" and len(args) >= 2:
-            target = " ".join(args[1:])
-            namespaces = parse_namespaces(
-                await self._call("list_namespaces", admin=True)
-            )
-            namespace = self._resolve_entity(
-                target,
-                namespaces,
-                id_key="id",
-                text_keys=["name"],
-            )
-            text = await self._call(
-                "rotate_namespace_key",
-                {"namespace_id": namespace["id"]},
-                admin=True,
-            )
-            cfg = dict(self.app.config)
-            cfg["namespace_id"] = namespace["id"]
-            cfg["namespace_name"] = namespace["name"]
-            self.app.config = cfg
-            self._write(text)
-            return
-        raise ValueError("Usage: /namespace list|create|current|rotate-key ...")
+        raise ValueError("Usage: /namespace list|create|current ...")
 
     async def _command_connect(self, args: list[str]) -> None:
         if len(args) != 1:

@@ -63,7 +63,6 @@ Keyboard behavior:
 - `/namespace list`
 - `/namespace create <name>`
 - `/namespace current`
-- `/namespace rotate-key <id-or-name>`
 
 ### Profiles
 

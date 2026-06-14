@@ -8,7 +8,7 @@ import httpx
 class GraphCoreClient:
     """Async HTTP client for the Graph Core REST API.
 
-    Supports namespace-key and JWT authentication.
+    Supports admin and user JWT authentication.
     """
 
     def __init__(
@@ -71,11 +71,6 @@ class GraphCoreClient:
 
     async def get_namespace_me(self) -> dict[str, Any]:
         return await self._request("GET", "/platform/namespaces/me")
-
-    async def rotate_namespace_key(self, namespace_id: str) -> dict[str, Any]:
-        return await self._request(
-            "POST", f"/platform/namespaces/{namespace_id}/rotate-key"
-        )
 
     # -- Collections --------------------------------------------------------
 

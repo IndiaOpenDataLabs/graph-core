@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def create_namespace_via_api(client, admin_jwt: str) -> tuple[uuid.UUID, str]:
-    """Create a namespace via API. Returns (ns_id, api_key)."""
+    """Create a namespace via API. Returns the namespace ID and name."""
     ns_name = f"smoke-test-{uuid.uuid4().hex[:8]}"
     r = await client.post(
         "/platform/namespaces/",
@@ -95,7 +95,19 @@ async def create_namespace_via_api(client, admin_jwt: str) -> tuple[uuid.UUID, s
     if r.status_code != 200:
         raise ValueError(f"Namespace creation failed: {r.text}")
     data = r.json()
-    return uuid.UUID(data["id"]), data["api_key"]
+    return uuid.UUID(data["id"]), data["name"]
+
+
+async def issue_user_token_via_api(client, admin_jwt: str, namespace_id: uuid.UUID) -> str:
+    """Mint a namespace-scoped user JWT via API."""
+    r = await client.post(
+        f"/platform/namespaces/{namespace_id}/issue-user-token",
+        json={"subject": "graph-core-smoke-test", "expires_in_days": 365},
+        headers={"Authorization": f"Bearer {admin_jwt}"},
+    )
+    if r.status_code != 200:
+        raise ValueError(f"User token issuance failed: {r.text}")
+    return r.json()["token"]
 
 
 async def create_namespace_direct_db() -> uuid.UUID:
@@ -246,7 +258,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         # ── 2. Create namespace ──────────────────────────────────────
         print(f"\n{BOLD}2. Create namespace{RESET}")
         ns_id = None
-        ns_key = None
+        user_token = None
         use_legacy_auth = not args.admin_jwt
 
         if use_legacy_auth:
@@ -260,14 +272,15 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
             headers = {"X-Namespace-ID": str(ns_id)}
             _info("Using legacy X-Namespace-ID auth — pass --admin-jwt for API-based namespace creation")
         else:
-            # New: API-based creation + namespace API key
+            # New: API-based creation + user JWT
             try:
-                ns_id, ns_key = await create_namespace_via_api(client, args.admin_jwt)
-                record(True, f"Namespace created: {ns_id} (key: {ns_key[:15]}...)")
+                ns_id, ns_name = await create_namespace_via_api(client, args.admin_jwt)
+                user_token = await issue_user_token_via_api(client, args.admin_jwt, ns_id)
+                record(True, f"Namespace created: {ns_id} ({ns_name})")
             except Exception as e:
                 record(False, f"Failed to create namespace: {e}")
                 return False
-            headers = {"Authorization": f"Bearer {ns_key}"}
+            headers = {"Authorization": f"Bearer {user_token}"}
 
         # ── 3. Register credential (OpenAI only) ─────────────────────
         cred_id = None
