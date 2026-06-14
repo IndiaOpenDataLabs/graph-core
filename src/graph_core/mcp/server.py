@@ -149,6 +149,22 @@ class TokenScopedMCPApp:
         await self._app(scope, receive, send)
 
 
+class MCPPathAliasApp:
+    """Rewrite `/mcp` and `/mcp/` to the MCP app root."""
+
+    def __init__(self, app) -> None:
+        self._app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if path in {"", "/", "/mcp", "/mcp/"}:
+            aliased_scope = dict(scope)
+            aliased_scope["path"] = "/"
+            await self._app(aliased_scope, receive, send)
+            return
+        await _send_http_error(send, 404, "Not Found")
+
+
 _admin_server_app = TokenScopedMCPApp(
     app=admin_mcp.streamable_http_app(),
     required_kind="admin",
@@ -784,12 +800,18 @@ async def get_capabilities(ctx: Context) -> str:
 
 def admin_mcp_server_app() -> Starlette:
     """Create a standalone Starlette app for the admin MCP server."""
-    return Starlette(routes=[Mount("/", app=_admin_server_app)], lifespan=_admin_lifespan)
+    return Starlette(
+        routes=[Mount("/", app=MCPPathAliasApp(_admin_server_app))],
+        lifespan=_admin_lifespan,
+    )
 
 
 def user_mcp_server_app() -> Starlette:
     """Create a standalone Starlette app for the user MCP server."""
-    return Starlette(routes=[Mount("/", app=_user_server_app)], lifespan=_user_lifespan)
+    return Starlette(
+        routes=[Mount("/", app=MCPPathAliasApp(_user_server_app))],
+        lifespan=_user_lifespan,
+    )
 
 
 def admin_main() -> None:
