@@ -190,7 +190,7 @@ uv run graph-core-admin-jwt --subject my-mcp-client
 
 | Tool                   | Description                        |
 |------------------------|------------------------------------|
-| `create_namespace`     | Create a new namespace (admin)     |
+| `create_namespace`     | Create a new namespace and mint a user JWT (admin) |
 | `list_namespaces`      | List all namespaces (admin)        |
 | `get_current_namespace`| Get current namespace info         |
 | `issue_user_token`     | Mint a namespace-scoped user JWT (admin) |

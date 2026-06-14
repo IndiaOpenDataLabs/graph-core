@@ -66,6 +66,22 @@ class GraphCoreClient:
     async def create_namespace(self, name: str) -> dict[str, Any]:
         return await self._request("POST", "/platform/namespaces/", json={"name": name})
 
+    async def issue_user_token(
+        self,
+        namespace_id: str,
+        *,
+        subject: str | None = None,
+        expires_in_days: int = 365,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"expires_in_days": expires_in_days}
+        if subject is not None:
+            body["subject"] = subject
+        return await self._request(
+            "POST",
+            f"/platform/namespaces/{namespace_id}/issue-user-token",
+            json=body,
+        )
+
     async def list_namespaces(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/platform/namespaces/")
 

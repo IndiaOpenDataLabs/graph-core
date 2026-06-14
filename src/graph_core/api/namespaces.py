@@ -19,6 +19,10 @@ class CreateNamespaceRequest(BaseModel):
 class CreateNamespaceResponse(BaseModel):
     id: str
     name: str
+    token_type: str
+    scope: str
+    token: str
+    expires_at: str
 
 
 class NamespaceResponse(BaseModel):
@@ -58,9 +62,21 @@ async def create_namespace(
         session,
         name=body.name,
     )
+    token_result = await auth_service.issue_namespace_user_token(
+        session,
+        str(result.id),
+        subject="graph-core-cli",
+        expires_in_days=365,
+    )
+    if token_result is None:
+        raise HTTPException(status_code=500, detail="Failed to mint namespace token")
     return CreateNamespaceResponse(
         id=str(result.id),
         name=result.name,
+        token_type="user",
+        scope="graph-core:user",
+        token=token_result[1],
+        expires_at=token_result[2].isoformat(),
     )
 
 

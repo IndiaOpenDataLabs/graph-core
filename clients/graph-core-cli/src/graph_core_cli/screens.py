@@ -72,6 +72,11 @@ def extract_name(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def extract_token(text: str) -> str:
+    match = re.search(r"token:\s*([^\s\n]+)", text)
+    return match.group(1) if match else ""
+
+
 def extract_job_id(text: str) -> str:
     match = re.search(r"job_id:\s*([^\s\n]+)", text)
     return match.group(1) if match else ""
@@ -763,7 +768,7 @@ class ConsoleScreen(Screen):
         "/config show": "Show saved admin/user MCP URLs and UI mode.",
         "/config set-admin-url URL": "Update admin MCP URL.",
         "/namespace list": "List namespaces with the admin JWT.",
-        "/namespace create NAME": "Create namespace and stay in admin mode.",
+        "/namespace create NAME": "Create namespace and switch into it.",
         "/namespace current": "Show current namespace details.",
         "/connect NAMESPACE_ID": "Mint a namespace user token and switch to user mode.",
     }
@@ -1244,10 +1249,14 @@ class ConsoleScreen(Screen):
             text = await self._call("create_namespace", {"name": name}, admin=True)
             namespace_id = extract_id(text)
             namespace_name = extract_name(text) or name
+            token = extract_token(text)
             cfg = dict(self.app.config)
             cfg["namespace_id"] = namespace_id
             cfg["namespace_name"] = namespace_name
+            cfg["namespace_token"] = token
+            cfg["ui_mode"] = "user"
             self.app.config = cfg
+            self._namespace_verified = True
             self._write(text)
             return
         if action == "current":

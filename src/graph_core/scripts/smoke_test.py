@@ -84,8 +84,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def create_namespace_via_api(client, admin_jwt: str) -> tuple[uuid.UUID, str]:
-    """Create a namespace via API. Returns the namespace ID and name."""
+async def create_namespace_via_api(client, admin_jwt: str) -> tuple[uuid.UUID, str, str]:
+    """Create a namespace via API. Returns the namespace ID, name, and token."""
     ns_name = f"smoke-test-{uuid.uuid4().hex[:8]}"
     r = await client.post(
         "/platform/namespaces/",
@@ -95,19 +95,7 @@ async def create_namespace_via_api(client, admin_jwt: str) -> tuple[uuid.UUID, s
     if r.status_code != 200:
         raise ValueError(f"Namespace creation failed: {r.text}")
     data = r.json()
-    return uuid.UUID(data["id"]), data["name"]
-
-
-async def issue_user_token_via_api(client, admin_jwt: str, namespace_id: uuid.UUID) -> str:
-    """Mint a namespace-scoped user JWT via API."""
-    r = await client.post(
-        f"/platform/namespaces/{namespace_id}/issue-user-token",
-        json={"subject": "graph-core-smoke-test", "expires_in_days": 365},
-        headers={"Authorization": f"Bearer {admin_jwt}"},
-    )
-    if r.status_code != 200:
-        raise ValueError(f"User token issuance failed: {r.text}")
-    return r.json()["token"]
+    return uuid.UUID(data["id"]), data["name"], data["token"]
 
 
 async def create_namespace_direct_db() -> uuid.UUID:
@@ -274,8 +262,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         else:
             # New: API-based creation + user JWT
             try:
-                ns_id, ns_name = await create_namespace_via_api(client, args.admin_jwt)
-                user_token = await issue_user_token_via_api(client, args.admin_jwt, ns_id)
+                ns_id, ns_name, user_token = await create_namespace_via_api(client, args.admin_jwt)
                 record(True, f"Namespace created: {ns_id} ({ns_name})")
             except Exception as e:
                 record(False, f"Failed to create namespace: {e}")

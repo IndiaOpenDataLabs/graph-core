@@ -61,7 +61,7 @@ Keyboard behavior:
 ### Namespaces
 
 - `/namespace list`
-- `/namespace create <name>`
+- `/namespace create <name>` - creates the namespace, mints a user JWT, and switches into it
 - `/namespace current`
 
 ### Profiles

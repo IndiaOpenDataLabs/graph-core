@@ -206,7 +206,11 @@ async def create_namespace(name: str, ctx: Context) -> CallToolResult:
     text = (
         f"Created namespace:\n"
         f"  id: {result['id']}\n"
-        f"  name: {result['name']}"
+        f"  name: {result['name']}\n"
+        f"  token_type: {result['token_type']}\n"
+        f"  scope: {result['scope']}\n"
+        f"  token: {result['token']}\n"
+        f"  expires_at: {result['expires_at']}"
     )
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
@@ -214,6 +218,10 @@ async def create_namespace(name: str, ctx: Context) -> CallToolResult:
             "namespace": {
                 "id": result["id"],
                 "name": result["name"],
+                "token_type": result["token_type"],
+                "scope": result["scope"],
+                "token": result["token"],
+                "expires_at": result["expires_at"],
             }
         },
     )
@@ -257,6 +265,43 @@ async def get_current_namespace(ctx: Context) -> str:
     client = await get_client(api_key)
     ns = await client.get_namespace_me()
     return f"Namespace: {ns['id']} | {ns['name']}"
+
+
+@admin_tool()
+async def issue_user_token(
+    namespace_id: str,
+    ctx: Context,
+    subject: str | None = None,
+    expires_in_days: int = 365,
+) -> CallToolResult:
+    """Issue a long-lived user JWT for an existing namespace. Requires admin JWT."""
+    api_key = _extract_api_key(ctx)
+    client = await get_client(api_key, admin=True)
+    result = await client.issue_user_token(
+        namespace_id,
+        subject=subject,
+        expires_in_days=expires_in_days,
+    )
+    text = (
+        f"Issued user token:\n"
+        f"  namespace_id: {result['namespace_id']}\n"
+        f"  namespace_name: {result['namespace_name']}\n"
+        f"  token_type: {result['token_type']}\n"
+        f"  scope: {result['scope']}\n"
+        f"  token: {result['token']}\n"
+        f"  expires_at: {result['expires_at']}"
+    )
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={
+            "namespace_id": result["namespace_id"],
+            "namespace_name": result["namespace_name"],
+            "token_type": result["token_type"],
+            "scope": result["scope"],
+            "token": result["token"],
+            "expires_at": result["expires_at"],
+        },
+    )
 
 
 # -- Collection tools -------------------------------------------------------
