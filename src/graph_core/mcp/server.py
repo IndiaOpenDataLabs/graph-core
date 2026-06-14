@@ -4,6 +4,7 @@ The admin and user surfaces run as separate MCP servers on different ports.
 """
 
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 
@@ -127,6 +128,29 @@ async def _send_http_error(send, status_code: int, detail: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+async def _send_jsonrpc_error(send, status_code: int, code: int, message: str) -> None:
+    payload = {
+        "jsonrpc": "2.0",
+        "error": {
+            "code": code,
+            "message": message,
+        },
+        "id": None,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
 class TokenScopedMCPApp:
     """Wrap a FastMCP app and require a specific bearer-token kind."""
 
@@ -150,7 +174,12 @@ class TokenScopedMCPApp:
                     detail=f"{self._required_kind.title()} token required",
                 )
         except HTTPException as exc:
-            await _send_http_error(send, exc.status_code, str(exc.detail))
+            await _send_jsonrpc_error(
+                send,
+                exc.status_code,
+                code=-32001 if exc.status_code == 401 else -32003,
+                message=str(exc.detail),
+            )
             return
 
         await self._app(scope, receive, send)
