@@ -25,7 +25,7 @@ class GraphCoreTUI(App):
         self._config = {
             "mcp_url": persisted.get("mcp_url", "http://localhost:8001/mcp/"),
             "api_key": persisted.get("api_key", ""),
-            "admin_api_key": persisted.get("admin_api_key", ""),
+            "admin_jwt": persisted.get("admin_jwt", ""),
             "namespace_api_key": persisted.get("namespace_api_key", ""),
             "active_api_key_kind": persisted.get("active_api_key_kind", "admin"),
             "is_admin": bool(persisted.get("is_admin", False)),
@@ -51,7 +51,7 @@ class GraphCoreTUI(App):
             self._config = {
                 "mcp_url": "",
                 "api_key": "",
-                "admin_api_key": "",
+                "admin_jwt": "",
                 "namespace_api_key": "",
                 "active_api_key_kind": "admin",
                 "is_admin": False,
@@ -72,13 +72,17 @@ class GraphCoreTUI(App):
         kind = self.config.get("active_api_key_kind", "admin")
         if kind == "namespace":
             return self.config.get("namespace_api_key", "")
-        return self.config.get("admin_api_key", "") or self.config.get("api_key", "")
+        return self.config.get("admin_jwt", "") or self.config.get("api_key", "")
+
+    @property
+    def admin_jwt(self) -> str:
+        return self.config.get("admin_jwt", "") or (
+            self.config.get("api_key", "") if self.config.get("is_admin", False) else ""
+        )
 
     @property
     def admin_api_key(self) -> str:
-        return self.config.get("admin_api_key", "") or (
-            self.config.get("api_key", "") if self.config.get("is_admin", False) else ""
-        )
+        return self.admin_jwt
 
     @property
     def namespace_api_key(self) -> str:

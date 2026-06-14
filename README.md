@@ -165,6 +165,12 @@ Generate an admin token:
 uv run graph-core-admin-jwt
 ```
 
+By default it lasts 1 year. For a shorter token:
+
+```bash
+uv run graph-core-admin-jwt --expires-in-minutes 60
+```
+
 Or, if you want to use a custom subject:
 
 ```bash

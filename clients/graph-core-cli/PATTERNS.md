@@ -61,7 +61,7 @@ The console is intentionally closer to `opencode` than to a traditional form-hea
 - Current keys:
   - `mcp_url`
   - `api_key`
-  - `admin_api_key`
+  - `admin_jwt`
   - `namespace_api_key`
   - `active_api_key_kind`
   - `is_admin`

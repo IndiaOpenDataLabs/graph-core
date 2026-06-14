@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from graph_core.api import chats, collections, ingest, jobs, namespaces, platform, query
 from graph_core.database import current_namespace_id
-from graph_core.mcp.server import mcp_server_app
+from graph_core.mcp.server import admin_mcp, user_mcp, mcp_server_app
 
 
 @asynccontextmanager
@@ -17,7 +17,8 @@ async def lifespan(app: FastAPI):
     import graph_core.workers  # noqa: F401
 
     del app
-    yield
+    async with admin_mcp.session_manager.run(), user_mcp.session_manager.run():
+        yield
 
 
 app = FastAPI(

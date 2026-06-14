@@ -22,8 +22,8 @@ On first launch, the CLI asks for:
 - `API Key`
 
 Use:
-- the platform admin key for namespace management
-- a namespace key for namespace-scoped operations
+- an admin JWT for namespace management
+- a namespace token for namespace-scoped operations
 
 Config is stored in `~/.config/graph-core/config.json`.
 
@@ -50,7 +50,7 @@ Keyboard behavior:
 - `/status`
 - `/config show`
 - `/config set-url <url>`
-- `/auth set-key <key> [--kind admin|namespace|auto]`
+- `/auth set-key <token> [--kind admin|namespace|auto]`
 - `/auth use admin`
 - `/auth use namespace`
 

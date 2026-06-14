@@ -46,10 +46,16 @@ def parse_args() -> argparse.Namespace:
         help="JWT subject claim",
     )
     parser.add_argument(
+        "--expires-in-days",
+        type=int,
+        default=365,
+        help="Token lifetime in days (default: 365)",
+    )
+    parser.add_argument(
         "--expires-in-minutes",
         type=int,
-        default=60,
-        help="Token lifetime in minutes",
+        default=None,
+        help="Override token lifetime in minutes",
     )
     return parser.parse_args()
 
@@ -59,12 +65,18 @@ def build_token(args: argparse.Namespace) -> str:
         raise SystemExit("JWT secret is required. Set JWT_SECRET or pass --secret.")
 
     now = datetime.now(timezone.utc)
+    expires = (
+        timedelta(minutes=args.expires_in_minutes)
+        if args.expires_in_minutes is not None
+        else timedelta(days=args.expires_in_days)
+    )
+
     payload: dict[str, object] = {
         "sub": args.subject,
         "token_type": "admin",
         "scope": ADMIN_SCOPE,
         "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=args.expires_in_minutes)).timestamp()),
+        "exp": int((now + expires).timestamp()),
     }
     if args.issuer:
         payload["iss"] = args.issuer

@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult, TextContent
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
@@ -178,7 +179,7 @@ async def _gateway_lifespan(app: Starlette):
 
 
 @admin_tool()
-async def create_namespace(name: str, ctx: Context) -> str:
+async def create_namespace(name: str, ctx: Context) -> CallToolResult:
     """Create a new namespace. Requires admin JWT.
 
     Args:
@@ -187,28 +188,56 @@ async def create_namespace(name: str, ctx: Context) -> str:
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key, admin=True)
     result = await client.create_namespace(name)
-    return (
+    text = (
         f"Created namespace:\n"
         f"  id: {result['id']}\n"
         f"  name: {result['name']}\n"
         f"  api_key: {result['api_key']}\n\n"
         f"Save the api_key — it won't be shown again."
     )
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={
+            "namespace": {
+                "id": result["id"],
+                "name": result["name"],
+                "api_key": result["api_key"],
+            }
+        },
+    )
 
 
 @admin_tool()
-async def list_namespaces(ctx: Context) -> str:
+async def list_namespaces(ctx: Context) -> CallToolResult:
     """List all namespaces. Requires admin JWT."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key, admin=True)
     namespaces = await client.list_namespaces()
     if not namespaces:
-        return "No namespaces found."
+        text = "No namespaces found."
+        return CallToolResult(
+            content=[TextContent(type="text", text=text)],
+            structuredContent={"namespaces": []},
+        )
+
     lines = ["Namespaces:"]
+    items: list[dict[str, str]] = []
     for ns in namespaces:
         prefix = ns.get("api_key_prefix", "") or ""
-        lines.append(f"  - {ns['id']} | {ns['name']} {prefix}")
-    return "\n".join(lines)
+        text_line = f"  - {ns['id']} | {ns['name']} {prefix}"
+        lines.append(text_line)
+        items.append(
+            {
+                "id": ns["id"],
+                "name": ns["name"],
+                "api_key_prefix": prefix,
+            }
+        )
+    text = "\n".join(lines)
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={"namespaces": items},
+    )
 
 
 @user_tool()
@@ -221,7 +250,10 @@ async def get_current_namespace(ctx: Context) -> str:
 
 
 @admin_tool()
-async def rotate_namespace_key(namespace_id: str, ctx: Context) -> str:
+async def rotate_namespace_key(
+    namespace_id: str,
+    ctx: Context,
+) -> CallToolResult:
     """Rotate a namespace's API key. Requires admin JWT.
 
     Args:
@@ -230,7 +262,14 @@ async def rotate_namespace_key(namespace_id: str, ctx: Context) -> str:
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key, admin=True)
     result = await client.rotate_namespace_key(namespace_id)
-    return f"New api_key: {result['api_key']}\nSave it — it won't be shown again."
+    text = f"New api_key: {result['api_key']}\nSave it — it won't be shown again."
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={
+            "namespace_id": namespace_id,
+            "api_key": result["api_key"],
+        },
+    )
 
 
 # -- Collection tools -------------------------------------------------------
@@ -746,6 +785,11 @@ async def get_capabilities(ctx: Context) -> str:
 
 def mcp_server_app() -> object:
     """Create the token-scoped MCP ASGI app for mounting in FastAPI."""
+    return _gateway_app
+
+
+def standalone_mcp_server_app() -> Starlette:
+    """Create a standalone Starlette app for direct MCP serving."""
     return Starlette(routes=[Mount("/", app=_gateway_app)], lifespan=_gateway_lifespan)
 
 
@@ -753,4 +797,4 @@ def main() -> None:
     """CLI entry point for the MCP server."""
     import uvicorn
 
-    uvicorn.run(mcp_server_app(), host="127.0.0.1", port=8000)
+    uvicorn.run(standalone_mcp_server_app(), host="127.0.0.1", port=8000)

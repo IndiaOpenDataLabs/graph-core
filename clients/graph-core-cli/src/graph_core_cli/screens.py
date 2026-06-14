@@ -121,7 +121,7 @@ def parse_flag_args(tokens: list[str]) -> tuple[list[str], dict[str, str | bool]
 
 
 class SetupScreen(Screen):
-    """First-run setup for MCP URL and API key."""
+    """First-run setup for MCP URL and token."""
 
     CSS = """
     SetupScreen {
@@ -158,14 +158,14 @@ class SetupScreen(Screen):
 
     def compose(self):
         mcp_url = os.getenv("MCP_URL", "http://localhost:8001/mcp/")
-        api_key = os.getenv("PLATFORM_ADMIN_KEY", "") or os.getenv(
+        api_key = os.getenv("GRAPH_CORE_ADMIN_JWT", "") or os.getenv(
             "GRAPH_CORE_API_KEY",
             "",
         )
         yield Container(
             Label("Graph Core CLI Setup", id="setup-title"),
             Label(
-                "Enter your MCP URL and API key. After this, use slash commands.",
+                "Enter your MCP URL and token. After this, use slash commands.",
                 id="setup-hint",
             ),
             Label("MCP URL"),
@@ -174,10 +174,10 @@ class SetupScreen(Screen):
                 placeholder="http://localhost:8001/mcp/",
                 id="mcp-url",
             ),
-            Label("API Key"),
+            Label("Token"),
             Input(
                 value=api_key,
-                placeholder="Admin key or namespace key",
+                placeholder="Admin JWT or namespace token",
                 password=True,
                 id="api-key",
             ),
@@ -195,7 +195,7 @@ class SetupScreen(Screen):
         status = self.query_one("#setup-status", Label)
 
         if not api_key:
-            status.update("API key is required.")
+            status.update("Token is required.")
             return
 
         if not mcp_url:
@@ -205,7 +205,7 @@ class SetupScreen(Screen):
         self.app.config = {
             "mcp_url": mcp_url,
             "api_key": api_key,
-            "admin_api_key": "" if is_namespace_key else api_key,
+            "admin_jwt": "" if is_namespace_key else api_key,
             "namespace_api_key": api_key if is_namespace_key else "",
             "active_api_key_kind": "namespace" if is_namespace_key else "admin",
             "is_admin": not is_namespace_key,
@@ -763,14 +763,14 @@ class ConsoleScreen(Screen):
         "/clear": "Clear console output.",
         "/quit": "Exit the CLI.",
         "/exit": "Exit the CLI.",
-        "/config show": "Show saved MCP URL and key mode.",
+        "/config show": "Show saved MCP URL and token mode.",
         "/config set-url URL": "Update MCP URL.",
-        "/auth set-key KEY [--kind admin|namespace|auto]": "Save and switch API key.",
-        "/auth use admin|namespace": "Switch active saved key.",
-        "/namespace list": "List namespaces with the admin key.",
-        "/namespace create NAME": "Create namespace and switch to its namespace key.",
-        "/namespace current": "Show current namespace for active namespace key.",
-        "/namespace rotate-key ID_OR_NAME": "Rotate namespace key and switch to it.",
+        "/auth set-key TOKEN [--kind admin|namespace|auto]": "Save and switch token.",
+        "/auth use admin|namespace": "Switch active saved token.",
+        "/namespace list": "List namespaces with the admin JWT.",
+        "/namespace create NAME": "Create namespace and switch to its namespace token.",
+        "/namespace current": "Show current namespace for active namespace token.",
+        "/namespace rotate-key ID_OR_NAME": "Rotate namespace token and switch to it.",
         "/profile list [embedding|llm]": "List profiles.",
         (
             "/profile create embedding|llm --provider P --model M --secret S "
@@ -825,7 +825,7 @@ class ConsoleScreen(Screen):
         "/exit": "/exit",
         "/config show": "/config show",
         "/config set-url URL": "/config set-url ",
-        "/auth set-key KEY [--kind admin|namespace|auto]": "/auth set-key ",
+        "/auth set-key TOKEN [--kind admin|namespace|auto]": "/auth set-key ",
         "/auth use admin|namespace": "/auth use ",
         "/namespace list": "/namespace list",
         "/namespace create NAME": "/namespace create ",
@@ -1151,11 +1151,11 @@ class ConsoleScreen(Screen):
             namespace = (
                 cfg.get("namespace_name")
                 if self._namespace_verified
-                else "(unverified namespace key)"
+                else "(unverified namespace token)"
             ) or "(not selected)"
         lines = [
             f"MCP URL: {cfg.get('mcp_url', '')}",
-            f"Active key: {cfg.get('active_api_key_kind', 'admin')}",
+            f"Active token: {cfg.get('active_api_key_kind', 'admin')}",
             f"Namespace: {namespace}",
         ]
         if (
@@ -1180,11 +1180,11 @@ class ConsoleScreen(Screen):
 
     async def _command_auth(self, args: list[str]) -> None:
         if not args:
-            raise ValueError("Usage: /auth set-key KEY [--kind ...] | /auth use ...")
+            raise ValueError("Usage: /auth set-key TOKEN [--kind ...] | /auth use ...")
         if args[0] == "set-key":
             if len(args) < 2:
                 raise ValueError(
-                    "Usage: /auth set-key KEY [--kind admin|namespace|auto]"
+                    "Usage: /auth set-key TOKEN [--kind admin|namespace|auto]"
                 )
             positional, flags = parse_flag_args(args[1:])
             key = positional[0]
@@ -1195,19 +1195,19 @@ class ConsoleScreen(Screen):
             target = args[1]
             cfg = dict(self.app.config)
             if target == "admin":
-                if not self.app.admin_api_key:
-                    raise ValueError("No saved admin key.")
+                if not self.app.admin_jwt:
+                    raise ValueError("No saved admin JWT.")
                 cfg["active_api_key_kind"] = "admin"
             elif target == "namespace":
                 if not self.app.namespace_api_key:
-                    raise ValueError("No saved namespace key.")
+                    raise ValueError("No saved namespace token.")
                 cfg["active_api_key_kind"] = "namespace"
             else:
                 raise ValueError("Usage: /auth use admin|namespace")
             self.app.config = cfg
-            self._write(f"Switched active key to {target}.")
+            self._write(f"Switched active token to {target}.")
             return
-        raise ValueError("Usage: /auth set-key KEY [--kind ...] | /auth use ...")
+        raise ValueError("Usage: /auth set-key TOKEN [--kind ...] | /auth use ...")
 
     async def _command_namespace(self, args: list[str]) -> None:
         if not args:
@@ -1611,10 +1611,10 @@ class ConsoleScreen(Screen):
         *,
         admin: bool = False,
     ) -> str:
-        api_key = self.app.admin_api_key if admin else self.app.active_api_key
-        if not api_key:
-            raise ValueError("No API key available for this command.")
-        client = self.app.mcp_client_for_key(api_key)
+        token = self.app.admin_jwt if admin else self.app.active_api_key
+        if not token:
+            raise ValueError("No token available for this command.")
+        client = self.app.mcp_client_for_key(token)
         await client.connect()
         result = ""
         try:
@@ -1626,7 +1626,7 @@ class ConsoleScreen(Screen):
     async def _query_via_rest(self, arguments: dict[str, str]) -> str:
         api_key = self.app.active_api_key
         if not api_key:
-            raise ValueError("No API key available for this command.")
+            raise ValueError("No token available for this command.")
 
         base_url = self.app.config.get("mcp_url", "http://localhost:8001/mcp/")
         if base_url.endswith("/mcp/"):
@@ -1734,7 +1734,7 @@ class ConsoleScreen(Screen):
             raise ValueError("Kind must be admin, namespace, or auto.")
         cfg = dict(self.app.config)
         if effective_kind == "admin":
-            cfg["admin_api_key"] = key
+            cfg["admin_jwt"] = key
             cfg["namespace_id"] = ""
             cfg["namespace_name"] = ""
             self._namespace_verified = False
@@ -1743,7 +1743,7 @@ class ConsoleScreen(Screen):
             self._namespace_verified = False
         cfg["active_api_key_kind"] = effective_kind
         self.app.config = cfg
-        self._write(f"Saved {effective_kind} key and switched to it.")
+        self._write(f"Saved {effective_kind} token and switched to it.")
 
     def _resolve_entity(
         self,
@@ -1845,7 +1845,7 @@ class ConsoleScreen(Screen):
             namespace = (
                 cfg.get("namespace_name")
                 if self._namespace_verified
-                else "(unverified namespace key)"
+                else "(unverified namespace token)"
             ) or "(not selected)"
         else:
             namespace = "(admin context)"
@@ -1855,7 +1855,7 @@ class ConsoleScreen(Screen):
             query_suffix = f"  query=running {elapsed}s"
         try:
             self.query_one("#context", Label).update(
-                f"mcp={cfg.get('mcp_url', '')}  key={key_kind}  namespace={namespace}"
+                f"mcp={cfg.get('mcp_url', '')}  token={key_kind}  namespace={namespace}"
                 f"{query_suffix}"
             )
         except NoMatches:
