@@ -6,7 +6,9 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".config" / "graph-core"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-DEFAULT_MCP_URL = "http://localhost:8001/mcp/"
+DEFAULT_API_BASE_URL = "http://localhost:8001"
+DEFAULT_ADMIN_MCP_URL = "http://localhost:8002/mcp/"
+DEFAULT_USER_MCP_URL = "http://localhost:8003/mcp/"
 
 
 def config_exists() -> bool:
@@ -17,12 +19,13 @@ def config_exists() -> bool:
 def load_config() -> dict:
     """Load persisted config from disk."""
     defaults = {
-        "mcp_url": DEFAULT_MCP_URL,
-        "api_key": "",
+        "api_base_url": DEFAULT_API_BASE_URL,
+        "mcp_url": DEFAULT_ADMIN_MCP_URL,
+        "admin_mcp_url": DEFAULT_ADMIN_MCP_URL,
+        "user_mcp_url": DEFAULT_USER_MCP_URL,
         "admin_jwt": "",
-        "namespace_api_key": "",
-        "active_api_key_kind": "admin",
-        "is_admin": False,
+        "namespace_token": "",
+        "active_token_kind": "admin",
         "namespace_id": "",
         "namespace_name": "",
     }
@@ -31,26 +34,7 @@ def load_config() -> dict:
     try:
         with open(CONFIG_FILE) as f:
             data = json.load(f)
-        merged = {**defaults, **data}
-        legacy_api_key = str(merged.get("api_key", "") or "")
-        legacy_is_admin = bool(merged.get("is_admin", False))
-        legacy_admin_jwt = str(merged.get("admin_api_key", "") or "")
-        if legacy_admin_jwt and not merged.get("admin_jwt"):
-            merged["admin_jwt"] = legacy_admin_jwt
-        if legacy_api_key:
-            if legacy_is_admin:
-                merged["admin_jwt"] = merged.get("admin_jwt") or legacy_api_key
-                merged["active_api_key_kind"] = (
-                    merged.get("active_api_key_kind") or "admin"
-                )
-            else:
-                merged["namespace_api_key"] = (
-                    merged.get("namespace_api_key") or legacy_api_key
-                )
-                merged["active_api_key_kind"] = (
-                    merged.get("active_api_key_kind") or "namespace"
-                )
-        return merged
+        return {**defaults, **data}
     except (json.JSONDecodeError, OSError):
         return defaults
 
@@ -58,18 +42,15 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     """Persist config dict to disk."""
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    active_kind = cfg.get("active_api_key_kind", "admin")
-    admin_jwt = cfg.get("admin_jwt", "")
-    namespace_api_key = cfg.get("namespace_api_key", "")
-    active_api_key = namespace_api_key if active_kind == "namespace" else admin_jwt
     with open(CONFIG_FILE, "w") as f:
         json.dump({
-            "mcp_url": cfg.get("mcp_url", DEFAULT_MCP_URL),
-            "api_key": active_api_key,
-            "admin_jwt": admin_jwt,
-            "namespace_api_key": namespace_api_key,
-            "active_api_key_kind": active_kind,
-            "is_admin": active_kind == "admin",
+            "api_base_url": cfg.get("api_base_url", DEFAULT_API_BASE_URL),
+            "mcp_url": cfg.get("mcp_url", cfg.get("admin_mcp_url", DEFAULT_ADMIN_MCP_URL)),
+            "admin_mcp_url": cfg.get("admin_mcp_url", DEFAULT_ADMIN_MCP_URL),
+            "user_mcp_url": cfg.get("user_mcp_url", DEFAULT_USER_MCP_URL),
+            "admin_jwt": cfg.get("admin_jwt", ""),
+            "namespace_token": cfg.get("namespace_token", ""),
+            "active_token_kind": cfg.get("active_token_kind", "admin"),
             "namespace_id": cfg.get("namespace_id", ""),
             "namespace_name": cfg.get("namespace_name", ""),
         }, f, indent=2)

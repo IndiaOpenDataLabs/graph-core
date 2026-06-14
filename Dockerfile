@@ -14,7 +14,7 @@ RUN uv sync --frozen --no-dev --compile-bytecode --all-extras
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-EXPOSE 8001
+EXPOSE 8001 8002 8003
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uvicorn", "graph_core.main:app", "--host", "0.0.0.0", "--port", "8001"]

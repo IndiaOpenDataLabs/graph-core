@@ -119,7 +119,12 @@ uv sync
 uv run python -m graph_core_cli
 ```
 
-The TUI talks to the MCP server exposed by the Docker stack at `http://localhost:8001/mcp/`. On first launch, it prompts for your MCP URL and API key. Configuration is persisted to `~/.config/graph-core/config.json`. Once connected, use key bindings to navigate:
+The TUI talks to the split MCP servers exposed by the Docker stack:
+
+- admin MCP: `http://localhost:8002/mcp/`
+- user MCP: `http://localhost:8003/mcp/`
+
+On first launch, it prompts for the admin MCP URL and admin JWT. Configuration is persisted to `~/.config/graph-core/config.json`. Once connected, use key bindings to navigate:
 
 | Key     | Screen        | Description                          |
 |---------|---------------|--------------------------------------|
@@ -142,14 +147,20 @@ Claude Code, and any MCP client.
 make docker-up
 ```
 
-The MCP server is part of the full Docker stack and is exposed over streamable HTTP at `http://localhost:8001/mcp/`. The same app process also serves the REST API on `http://localhost:8001/`. You do not need to run a separate `make server` target.
+The MCP surface is split across two streamable HTTP servers:
+
+- admin MCP at `http://localhost:8002/mcp/`
+- user MCP at `http://localhost:8003/mcp/`
+
+The REST API remains at `http://localhost:8001/`. You do not need to run a separate `make server` target.
 
 Configure via environment variables:
 
 | Env Var                  | Description                          |
 |--------------------------|--------------------------------------|
 | `GRAPH_CORE_URL`         | Platform base URL (default: localhost:8001) |
-| `GRAPH_CORE_API_KEY`     | Namespace API key                    |
+| `GRAPH_CORE_ADMIN_MCP_URL` | Admin MCP URL (default: localhost:8002/mcp/) |
+| `GRAPH_CORE_USER_MCP_URL` | User MCP URL (default: localhost:8003/mcp/) |
 | `GRAPH_CORE_ADMIN_JWT`   | Admin JWT for namespace management   |
 
 JWT bearer tokens are also supported for external MCP/API clients:
@@ -208,7 +219,7 @@ The `GraphCoreClient` class provides a typed async client for all REST endpoints
 from graph_core.client import GraphCoreClient
 
 async with GraphCoreClient(
-    base_url="http://localhost:8000",
+    base_url="http://localhost:8001",
     api_key="ns_key_...",
 ) as client:
     collections = await client.list_collections()
@@ -217,12 +228,13 @@ async with GraphCoreClient(
 
 ## Platform Setup
 
-All control-plane endpoints are namespace-scoped through `X-Namespace-ID`.
+All control-plane endpoints are namespace-scoped. Use bearer JWTs or namespace
+tokens for new clients.
 
 ### 1. Register a credential
 
 ```bash
-curl -X POST http://localhost:8000/platform/credentials \
+curl -X POST http://localhost:8001/platform/credentials \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -247,7 +259,7 @@ Response:
 For local draft work with no external API calls:
 
 ```bash
-curl -X POST http://localhost:8000/platform/profiles \
+curl -X POST http://localhost:8001/platform/profiles \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -263,7 +275,7 @@ curl -X POST http://localhost:8000/platform/profiles \
 For real OpenAI embeddings:
 
 ```bash
-curl -X POST http://localhost:8000/platform/profiles \
+curl -X POST http://localhost:8001/platform/profiles \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -282,7 +294,7 @@ curl -X POST http://localhost:8000/platform/profiles \
 Offline draft mode:
 
 ```bash
-curl -X POST http://localhost:8000/platform/profiles \
+curl -X POST http://localhost:8001/platform/profiles \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -296,7 +308,7 @@ curl -X POST http://localhost:8000/platform/profiles \
 OpenAI-backed answering:
 
 ```bash
-curl -X POST http://localhost:8000/platform/profiles \
+curl -X POST http://localhost:8001/platform/profiles \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -311,7 +323,7 @@ curl -X POST http://localhost:8000/platform/profiles \
 ### 4. Create a vector collection bound to the embedding profile
 
 ```bash
-curl -X POST http://localhost:8000/collections/ \
+curl -X POST http://localhost:8001/collections/ \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -327,7 +339,7 @@ curl -X POST http://localhost:8000/collections/ \
 Synchronous chunk ingest:
 
 ```bash
-curl -X POST http://localhost:8000/collections/<collection-uuid>/ingest/chunk \
+curl -X POST http://localhost:8001/collections/<collection-uuid>/ingest/chunk \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -338,7 +350,7 @@ curl -X POST http://localhost:8000/collections/<collection-uuid>/ingest/chunk \
 Async document ingest:
 
 ```bash
-curl -X POST http://localhost:8000/collections/<collection-uuid>/ingest/doc \
+curl -X POST http://localhost:8001/collections/<collection-uuid>/ingest/doc \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -351,7 +363,7 @@ curl -X POST http://localhost:8000/collections/<collection-uuid>/ingest/doc \
 With the collection default LLM path:
 
 ```bash
-curl -X POST http://localhost:8000/collections/<collection-uuid>/query \
+curl -X POST http://localhost:8001/collections/<collection-uuid>/query \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{
@@ -362,7 +374,7 @@ curl -X POST http://localhost:8000/collections/<collection-uuid>/query \
 With an explicit LLM profile:
 
 ```bash
-curl -X POST http://localhost:8000/collections/<collection-uuid>/query \
+curl -X POST http://localhost:8001/collections/<collection-uuid>/query \
   -H "Content-Type: application/json" \
   -H "X-Namespace-ID: <namespace-uuid>" \
   -d '{

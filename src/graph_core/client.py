@@ -1,6 +1,5 @@
 """Async HTTP client for the Graph Core REST API."""
 
-import os
 from typing import Any
 
 import httpx
@@ -18,14 +17,10 @@ class GraphCoreClient:
         api_key: str | None = None,
         is_admin: bool = False,
     ) -> None:
-        self.base_url = (
-            base_url or os.getenv("GRAPH_CORE_URL") or "http://localhost:8001"
-        ).rstrip("/")
-        key = api_key or os.getenv("GRAPH_CORE_API_KEY")
+        self.base_url = (base_url or "http://localhost:8001").rstrip("/")
+        key = api_key
         if not key:
-            raise ValueError(
-                "api_key is required (set GRAPH_CORE_API_KEY env var)"
-            )
+            raise ValueError("api_key is required")
         self._key = key
         self._is_admin = is_admin
         self._client = httpx.AsyncClient(

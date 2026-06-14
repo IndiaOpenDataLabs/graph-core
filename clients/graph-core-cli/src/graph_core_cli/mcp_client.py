@@ -1,6 +1,6 @@
 """MCP client with auth support.
 
-Passes the API key through MCP protocol metadata on every tool call,
+Passes the bearer token through MCP protocol metadata on every tool call,
 so the MCP server can extract it reliably regardless of transport.
 """
 
@@ -13,11 +13,11 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 class AuthenticatedMCPClient:
-    """MCP client that passes API key via protocol metadata."""
+    """MCP client that passes the bearer token via protocol metadata."""
 
-    def __init__(self, mcp_url: str, api_key: str) -> None:
+    def __init__(self, mcp_url: str, token: str) -> None:
         self.mcp_url = mcp_url if mcp_url.endswith("/") else mcp_url + "/"
-        self._api_key = api_key
+        self._token = token
         self._session: ClientSession | None = None
         self._transport_ctx = None
         self._http_client: httpx.AsyncClient | None = None
@@ -25,7 +25,7 @@ class AuthenticatedMCPClient:
     async def connect(self) -> None:
         self._http_client = httpx.AsyncClient(
             headers={
-                "Authorization": f"Bearer {self._api_key}",
+                "Authorization": f"Bearer {self._token}",
             },
             follow_redirects=True,
             timeout=1800.0,
@@ -45,7 +45,7 @@ class AuthenticatedMCPClient:
         else:
             raise RuntimeError(
                 f"Unexpected stream count: {len(streams)}. "
-                f"Check MCP library version compatibility."
+                f"Check MCP library version."
             )
         self._session = ClientSession(read_stream, write_stream)
         await self._session.__aenter__()
@@ -77,7 +77,7 @@ class AuthenticatedMCPClient:
         result = await self._session.call_tool(
             tool_name,
             arguments=arguments or {},
-            meta={"api_key": self._api_key},
+            meta={"api_key": self._token},
         )
         parts: list[str] = []
         for block in result.content:

@@ -50,7 +50,7 @@ The console is intentionally closer to `opencode` than to a traditional form-hea
 ## Startup Flow
 
 1. `GraphCoreTUI.on_mount()` loads persisted config from `~/.config/graph-core/config.json`
-2. If an active API key exists, it pushes `ConsoleScreen`
+2. If an active token exists, it pushes `ConsoleScreen`
 3. If not, it pushes `SetupScreen`
 4. Config writes go through `self.app.config = ...`, which auto-saves
 
@@ -59,12 +59,13 @@ The console is intentionally closer to `opencode` than to a traditional form-hea
 - Module: `config.py`
 - File: `~/.config/graph-core/config.json`
 - Current keys:
+  - `api_base_url`
   - `mcp_url`
-  - `api_key`
+  - `admin_mcp_url`
+  - `user_mcp_url`
   - `admin_jwt`
-  - `namespace_api_key`
-  - `active_api_key_kind`
-  - `is_admin`
+  - `namespace_token`
+  - `active_token_kind`
   - `namespace_id`
   - `namespace_name`
 
@@ -90,7 +91,10 @@ The client sends `Authorization: Bearer <key>` on every MCP HTTP request via
 Use this pattern for all direct MCP calls:
 
 ```python
-client = self.app.mcp_client_for_key(self.app.active_api_key)
+client = self.app.mcp_client_for_token(
+    self.app.active_token,
+    kind=self.app.active_token_kind,
+)
 await client.connect()
 try:
     text = await client.call("tool_name", args)

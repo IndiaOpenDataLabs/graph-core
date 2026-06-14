@@ -1,6 +1,6 @@
 # Graph Core CLI
 
-Terminal client for Graph Core, built with [Textual](https://textual.textualize.io/). The CLI talks only to the MCP server exposed by the Docker stack.
+Terminal client for Graph Core, built with [Textual](https://textual.textualize.io/). The CLI talks only to the MCP servers exposed by the Docker stack.
 
 ## Quick Start
 
@@ -12,18 +12,18 @@ uv sync
 uv run python -m graph_core_cli
 ```
 
-The default MCP endpoint is `http://localhost:8001/mcp/`.
+The default admin MCP endpoint is `http://localhost:8002/mcp/`.
+The default user MCP endpoint is `http://localhost:8003/mcp/`.
 
 ## First Run
 
 On first launch, the CLI asks for:
 
-- `MCP URL`
-- `API Key`
+- `Admin MCP URL`
+- `Admin JWT`
 
-Use:
-- an admin JWT for namespace management
-- a namespace token for namespace-scoped operations
+Use an admin JWT for namespace management. Namespace tokens are created and
+rotated from inside the CLI after setup.
 
 Config is stored in `~/.config/graph-core/config.json`.
 
@@ -190,8 +190,8 @@ Autocomplete is intentionally lightweight today:
 ## Architecture
 
 ```text
-graph-core-cli  ->  MCP (streamable HTTP)  ->  FastMCP server  ->  FastAPI backend
-   (Textual)          (mcp SDK)                (port 8001)         (port 8000)
+graph-core-cli  ->  MCP (streamable HTTP)  ->  FastMCP servers  ->  FastAPI backend
+   (Textual)          (mcp SDK)             (ports 8002/8003)      (port 8001)
 ```
 
 The CLI does not call the FastAPI API directly. All operations go through MCP tools.

@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from graph_core.api import chats, collections, ingest, jobs, namespaces, platform, query
 from graph_core.database import current_namespace_id
-from graph_core.mcp.server import admin_mcp, user_mcp, mcp_server_app
+from graph_core.mcp.server import admin_mcp, user_mcp
 
 
 @asynccontextmanager
@@ -36,8 +36,7 @@ async def set_namespace_context(request: Request, call_next):
     The contextvar is read by NamespacedAsyncSession.begin() to set the
     Postgres app.current_namespace_id session variable for RLS policies.
 
-    DEPRECATED: New clients should use Authorization: Bearer <ns_key> header.
-    This middleware remains for backward compatibility.
+    New clients should use Authorization: Bearer <ns_key> header.
     """
     ns_header = request.headers.get("x-namespace-id")
     if ns_header:
@@ -67,6 +66,3 @@ app.include_router(query.router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "0.1.0"}
-
-
-app.mount("/mcp", mcp_server_app())

@@ -1,9 +1,6 @@
 """MCP server for Graph Core — exposes platform operations as tools.
 
-Auth flow:
-1. Client sends Authorization: Bearer <key> on every MCP HTTP request
-2. Server extracts the key from ctx.request_context.request.headers
-3. Server passes the key to GraphCoreClient which forwards it to FastAPI
+The admin and user surfaces run as separate MCP servers on different ports.
 """
 
 import asyncio
@@ -31,7 +28,6 @@ def _extract_api_key(ctx: Context) -> str:
     1. MCP protocol meta ({"api_key": "..."}) — most reliable
     2. Authorization: Bearer <key> header
     3. X-API-Key header
-    4. Environment variables (fallback for testing)
     """
     # 1. MCP protocol metadata (passed through call_tool meta param)
     try:
@@ -54,12 +50,8 @@ def _extract_api_key(ctx: Context) -> str:
     except AttributeError:
         pass
 
-    # 3. Fallback for non-HTTP transports or testing
-    env_key = os.getenv("GRAPH_CORE_API_KEY")
-    if env_key:
-        return env_key
     raise GraphCoreAPIError(
-        "No API key found in request metadata or headers."
+        "No bearer token found in request metadata or headers."
     )
 
 
@@ -128,50 +120,57 @@ async def _send_http_error(send, status_code: int, detail: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-class ScopedMCPGateway:
-    """Route MCP HTTP requests to the admin or user tool surface.
+class TokenScopedMCPApp:
+    """Wrap a FastMCP app and require a specific bearer-token kind."""
 
-    Tool discovery stays scoped because each request is forwarded to a separate
-    FastMCP app based on the bearer token scopes.
-    """
-
-    def __init__(self, admin_app, user_app) -> None:
-        self._admin_app = admin_app
-        self._user_app = user_app
+    def __init__(self, *, app, required_kind: str) -> None:
+        self._app = app
+        self._required_kind = required_kind
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
-            await self._user_app(scope, receive, send)
+            await self._app(scope, receive, send)
             return
 
         authorization = _header_lookup(scope, b"authorization")
-        x_namespace_id = _header_lookup(scope, b"x-namespace-id")
-
         try:
-            if authorization:
-                identity = resolve_bearer_identity(authorization)
-                app = self._admin_app if identity.kind == "admin" else self._user_app
-            elif x_namespace_id:
-                app = self._user_app
-            else:
+            if not authorization:
                 raise HTTPException(status_code=401, detail="Authorization header required")
+            identity = resolve_bearer_identity(authorization)
+            if identity.kind != self._required_kind:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"{self._required_kind.title()} token required",
+                )
         except HTTPException as exc:
             await _send_http_error(send, exc.status_code, str(exc.detail))
             return
 
-        await app(scope, receive, send)
+        await self._app(scope, receive, send)
 
 
-_gateway_app = ScopedMCPGateway(
-    admin_app=admin_mcp.streamable_http_app(),
-    user_app=user_mcp.streamable_http_app(),
+_admin_server_app = TokenScopedMCPApp(
+    app=admin_mcp.streamable_http_app(),
+    required_kind="admin",
+)
+
+_user_server_app = TokenScopedMCPApp(
+    app=user_mcp.streamable_http_app(),
+    required_kind="user",
 )
 
 
 @asynccontextmanager
-async def _gateway_lifespan(app: Starlette):
+async def _admin_lifespan(app: Starlette):
     del app
-    async with admin_mcp.session_manager.run(), user_mcp.session_manager.run():
+    async with admin_mcp.session_manager.run():
+        yield
+
+
+@asynccontextmanager
+async def _user_lifespan(app: Starlette):
+    del app
+    async with user_mcp.session_manager.run():
         yield
 
 
@@ -783,18 +782,27 @@ async def get_capabilities(ctx: Context) -> str:
     return "\n".join(lines)
 
 
-def mcp_server_app() -> object:
-    """Create the token-scoped MCP ASGI app for mounting in FastAPI."""
-    return _gateway_app
+def admin_mcp_server_app() -> Starlette:
+    """Create a standalone Starlette app for the admin MCP server."""
+    return Starlette(routes=[Mount("/", app=_admin_server_app)], lifespan=_admin_lifespan)
 
 
-def standalone_mcp_server_app() -> Starlette:
-    """Create a standalone Starlette app for direct MCP serving."""
-    return Starlette(routes=[Mount("/", app=_gateway_app)], lifespan=_gateway_lifespan)
+def user_mcp_server_app() -> Starlette:
+    """Create a standalone Starlette app for the user MCP server."""
+    return Starlette(routes=[Mount("/", app=_user_server_app)], lifespan=_user_lifespan)
 
 
-def main() -> None:
-    """CLI entry point for the MCP server."""
+def admin_main() -> None:
+    """CLI entry point for the admin MCP server."""
     import uvicorn
 
-    uvicorn.run(standalone_mcp_server_app(), host="127.0.0.1", port=8000)
+    port = int(os.getenv("GRAPH_CORE_ADMIN_MCP_PORT", "8002"))
+    uvicorn.run(admin_mcp_server_app(), host="0.0.0.0", port=port)
+
+
+def user_main() -> None:
+    """CLI entry point for the user MCP server."""
+    import uvicorn
+
+    port = int(os.getenv("GRAPH_CORE_USER_MCP_PORT", "8003"))
+    uvicorn.run(user_mcp_server_app(), host="0.0.0.0", port=port)

@@ -71,7 +71,8 @@ strict = true
 python_version = "3.11"
 
 [project.scripts]
-graph-core-mcp = "graph_core.mcp.server:main"
+graph-core-admin-mcp = "graph_core.mcp.server:admin_main"
+graph-core-user-mcp = "graph_core.mcp.server:user_main"
 graph-core-admin-jwt = "graph_core.scripts.generate_admin_jwt:main"
 
 [build-system]
