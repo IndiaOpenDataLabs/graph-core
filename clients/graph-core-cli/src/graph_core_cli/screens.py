@@ -10,7 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import httpx
 from rich.panel import Panel
 from rich.text import Text
 from textual import events, on
@@ -1274,40 +1273,24 @@ class ConsoleScreen(Screen):
         if len(args) != 1:
             raise ValueError("Usage: /connect NAMESPACE_ID")
         namespace_id = args[0]
-        cfg = self.app.config
         if not self.app.admin_jwt:
             raise ValueError("No saved admin JWT.")
-        base_url = cfg.get("api_base_url", "http://localhost:8001").rstrip("/")
-        async with httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {self.app.admin_jwt}"},
-            follow_redirects=True,
-            timeout=120.0,
-        ) as client:
-            response = await client.post(
-                f"{base_url}/platform/namespaces/{namespace_id}/issue-user-token",
-                json={
-                    "expires_in_days": 365,
-                    "subject": "graph-core-cli",
-                },
-            )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-            raise ValueError(
-                f"Connect failed: POST {response.request.url} -> "
-                f"{response.status_code}: {detail}"
-            ) from None
-
-        payload = response.json()
+        result = await self._call_result(
+            "issue_user_token",
+            {
+                "namespace_id": namespace_id,
+                "expires_in_days": 365,
+                "subject": "graph-core-cli",
+            },
+            admin=True,
+        )
+        payload = dict(result.structuredContent or {})
         namespace_name = str(payload.get("namespace_name", "") or "")
         token = str(payload.get("token", "") or "")
         if not token:
             raise ValueError("Connect failed: user token was not returned.")
 
+        text = self._tool_text(result)
         cfg = dict(self.app.config)
         cfg["namespace_id"] = str(payload.get("namespace_id", namespace_id))
         cfg["namespace_name"] = namespace_name
@@ -1315,11 +1298,14 @@ class ConsoleScreen(Screen):
         cfg["ui_mode"] = "user"
         self.app.config = cfg
         self._namespace_verified = True
-        self._write(
-            f"Connected to {namespace_name or namespace_id}.\n"
-            f"Namespace ID: {cfg['namespace_id']}\n"
-            f"Token expires at: {payload.get('expires_at', 'unknown')}"
-        )
+        if text:
+            self._write(text)
+        else:
+            self._write(
+                f"Connected to {namespace_name or namespace_id}.\n"
+                f"Namespace ID: {cfg['namespace_id']}\n"
+                f"Token expires at: {payload.get('expires_at', 'unknown')}"
+            )
 
     async def _command_disconnect(self, args: list[str]) -> None:
         if args:
@@ -1635,7 +1621,7 @@ class ConsoleScreen(Screen):
             call_args["chat_id"] = str(flags["chat_id"])
         self._start_query_progress(collection["name"])
         try:
-            result = await self._query_via_rest(call_args)
+            result = await self._query_via_mcp(call_args)
         finally:
             self._stop_query_progress()
         self._write(result)
@@ -1689,103 +1675,92 @@ class ConsoleScreen(Screen):
             await client.disconnect()
         return result
 
-    async def _query_via_rest(self, arguments: dict[str, str]) -> str:
+    async def _call_result(
+        self,
+        tool_name: str,
+        arguments: dict | None = None,
+        *,
+        admin: bool = False,
+    ):
+        token = self.app.admin_jwt if admin else self.app.namespace_token
+        if not token:
+            raise ValueError("No token available for this command.")
+        client = self.app.mcp_client_for_token(
+            token,
+            kind="admin" if admin else "user",
+        )
+        await client.connect()
+        try:
+            return await client.call_result(tool_name, arguments or {})
+        finally:
+            await client.disconnect()
+
+    async def _query_via_mcp(self, arguments: dict[str, str]) -> str:
         token = self.app.namespace_token
         if not token:
             raise ValueError("No token available for this command.")
-
-        base_url = self.app.config.get("api_base_url", "http://localhost:8001").rstrip("/")
-
-        collection_id = arguments["collection_id"]
-        body: dict[str, str] = {"question": arguments["question"]}
-        if "mode" in arguments:
-            body["mode"] = arguments["mode"]
-        if "chat_id" in arguments:
-            body["chat_id"] = arguments["chat_id"]
-
-        async with httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {token}"},
-            follow_redirects=True,
-            timeout=1800.0,
-        ) as client:
-            response = await client.post(
-                f"{base_url}/collections/{collection_id}/query",
-                json=body,
-            )
-
+        client = self.app.mcp_client_for_token(token, kind="user")
+        await client.connect()
         try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-            raise ValueError(
-                f"Query failed: POST {response.request.url} -> "
-                f"{response.status_code}: {detail}"
-            ) from None
+            result = await client.call_result("query_collection", arguments)
+            payload = dict(result.structuredContent or {})
+            job_id = str(payload.get("job_id", "") or "")
+            if not job_id:
+                job_id = extract_job_id(self._tool_text(result))
+            if not job_id:
+                raise ValueError("Query failed: job_id was not returned.")
 
-        result = response.json()
-        job_id = result["job_id"]
-        self._replace_response(
-            "Query queued.\n"
-            f"  job_id: {job_id}\n"
-            "  status: pending"
-        )
-
-        for _ in range(180):
-            job_response = await client.get(f"{base_url}/jobs/{job_id}")
-            if job_response.status_code != 200:
-                try:
-                    detail = job_response.json()
-                except Exception:
-                    detail = job_response.text
-                raise ValueError(
-                    f"Job lookup failed: GET {job_response.request.url} -> "
-                    f"{job_response.status_code}: {detail}"
-                )
-            job = job_response.json()
-            status = str(job.get("status") or "unknown")
-            progress = int(job.get("progress_percent") or 0)
             self._replace_response(
-                "Query in progress.\n"
+                "Query queued.\n"
                 f"  job_id: {job_id}\n"
-                f"  status: {status}\n"
-                f"  progress: {progress}%"
+                "  status: pending"
             )
-            if job.get("status") == "completed":
-                result_response = await client.get(f"{base_url}/jobs/{job_id}/result")
-                if result_response.status_code != 200:
-                    try:
-                        detail = result_response.json()
-                    except Exception:
-                        detail = result_response.text
-                    raise ValueError(
-                        f"Job result lookup failed: GET {result_response.request.url} -> "
-                        f"{result_response.status_code}: {detail}"
-                    )
-                query_result = result_response.json().get("result") or {}
-                lines = [query_result.get("response", "")]
-                if query_result.get("entities_used"):
-                    lines.append(
-                        f"\nEntities used: {', '.join(query_result['entities_used'])}"
-                    )
-                if query_result.get("relationships_used"):
-                    lines.append(
-                        f"Relationships: {', '.join(query_result['relationships_used'])}"
-                    )
-                if query_result.get("mode"):
-                    lines.append(f"Mode: {query_result['mode']}")
-                if query_result.get("chat_id"):
-                    lines.append(f"Chat ID: {query_result['chat_id']}")
-                final_text = "\n".join(lines)
-                self._replace_response(final_text)
-                return final_text
-            if job.get("status") == "failed":
-                raise ValueError(
-                    f"Query job failed: {job.get('error') or 'unknown error'}"
+
+            for _ in range(180):
+                status_result = await client.call_result(
+                    "get_job_status",
+                    {"job_id": job_id},
                 )
-            await asyncio.sleep(1)
+                status_payload = dict(status_result.structuredContent or {})
+                job = dict(status_payload.get("job") or {})
+                status = str(job.get("status") or "unknown")
+                progress = int(job.get("progress_percent") or 0)
+                self._replace_response(
+                    "Query in progress.\n"
+                    f"  job_id: {job_id}\n"
+                    f"  status: {status}\n"
+                    f"  progress: {progress}%"
+                )
+                if status == "completed":
+                    result_result = await client.call_result(
+                        "get_job_result",
+                        {"job_id": job_id},
+                    )
+                    result_payload = dict(result_result.structuredContent or {})
+                    query_result = dict(result_payload.get("result") or {})
+                    lines = [str(query_result.get("response", "") or "")]
+                    if query_result.get("entities_used"):
+                        lines.append(
+                            f"\nEntities used: {', '.join(query_result['entities_used'])}"
+                        )
+                    if query_result.get("relationships_used"):
+                        lines.append(
+                            f"Relationships: {', '.join(query_result['relationships_used'])}"
+                        )
+                    if query_result.get("mode"):
+                        lines.append(f"Mode: {query_result['mode']}")
+                    if query_result.get("chat_id"):
+                        lines.append(f"Chat ID: {query_result['chat_id']}")
+                    final_text = "\n".join(lines)
+                    self._replace_response(final_text)
+                    return final_text
+                if status == "failed":
+                    raise ValueError(
+                        f"Query job failed: {job.get('error') or 'unknown error'}"
+                    )
+                await asyncio.sleep(1)
+        finally:
+            await client.disconnect()
 
         raise ValueError(f"Query job {job_id} did not complete in time.")
 
@@ -2003,6 +1978,13 @@ class ConsoleScreen(Screen):
     def _replace_response(self, text: str) -> None:
         self._clear_output()
         self._write(text)
+
+    def _tool_text(self, result) -> str:
+        parts: list[str] = []
+        for block in getattr(result, "content", []) or []:
+            if getattr(block, "type", "") == "text" and hasattr(block, "text"):
+                parts.append(block.text)
+        return "\n".join(parts) if parts else ""
 
     def _copy_response(self) -> None:
         text = self._last_response_text or self._output_buffer

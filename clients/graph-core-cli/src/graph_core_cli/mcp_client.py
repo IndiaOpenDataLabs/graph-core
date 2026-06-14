@@ -72,14 +72,21 @@ class AuthenticatedMCPClient:
             self._http_client = None
 
     async def call(self, tool_name: str, arguments: dict | None = None) -> str:
-        if self._session is None:
-            raise RuntimeError("Not connected; call connect() first")
-        result = await self._session.call_tool(
-            tool_name,
-            arguments=arguments or {},
-        )
+        result = await self.call_result(tool_name, arguments=arguments)
         parts: list[str] = []
         for block in result.content:
             if isinstance(block, types.TextContent):
                 parts.append(block.text)
         return "\n".join(parts) if parts else ""
+
+    async def call_result(
+        self,
+        tool_name: str,
+        arguments: dict | None = None,
+    ) -> types.CallToolResult:
+        if self._session is None:
+            raise RuntimeError("Not connected; call connect() first")
+        return await self._session.call_tool(
+            tool_name,
+            arguments=arguments or {},
+        )
