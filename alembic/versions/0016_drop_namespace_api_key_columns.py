@@ -1,6 +1,6 @@
 """drop namespace api key columns
 
-Revision ID: 0016_drop_namespace_api_key_columns
+Revision ID: 0016_drop_ns_api_keys
 Revises: d7088ddd7fea
 Create Date: 2026-06-14
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = "0016_drop_namespace_api_key_columns"
+revision = "0016_drop_ns_api_keys"
 down_revision = "d7088ddd7fea"
 branch_labels = None
 depends_on = None
