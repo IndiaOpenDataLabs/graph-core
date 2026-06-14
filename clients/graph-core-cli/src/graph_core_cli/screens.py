@@ -72,11 +72,6 @@ def extract_name(text: str) -> str:
     return match.group(1) if match else ""
 
 
-def extract_token(text: str) -> str:
-    match = re.search(r"api_key:\s*([^\s\n]+)", text)
-    return match.group(1) if match else ""
-
-
 def extract_job_id(text: str) -> str:
     match = re.search(r"job_id:\s*([^\s\n]+)", text)
     return match.group(1) if match else ""
@@ -121,7 +116,7 @@ def parse_flag_args(tokens: list[str]) -> tuple[list[str], dict[str, str | bool]
 
 
 class SetupScreen(Screen):
-    """First-run setup for admin MCP URL and admin JWT."""
+    """First-run setup for the admin JWT."""
 
     CSS = """
     SetupScreen {
@@ -157,22 +152,12 @@ class SetupScreen(Screen):
     """
 
     def compose(self):
-        mcp_url = os.getenv(
-            "GRAPH_CORE_ADMIN_MCP_URL",
-            "http://localhost:8002/mcp/",
-        )
         admin_jwt = os.getenv("GRAPH_CORE_ADMIN_JWT", "")
         yield Container(
             Label("Graph Core CLI Setup", id="setup-title"),
             Label(
-                "Enter your admin MCP URL and admin JWT. After this, use slash commands.",
+                "Enter your admin JWT. After this, use slash commands.",
                 id="setup-hint",
-            ),
-            Label("Admin MCP URL"),
-            Input(
-                value=mcp_url,
-                placeholder="http://localhost:8002/mcp/",
-                id="mcp-url",
             ),
             Label("Admin JWT"),
             Input(
@@ -190,7 +175,6 @@ class SetupScreen(Screen):
 
     @on(Input.Submitted)
     def save_config_and_continue(self) -> None:
-        mcp_url = self.query_one("#mcp-url", Input).value.strip()
         admin_jwt = self.query_one("#admin-jwt", Input).value.strip()
         status = self.query_one("#setup-status", Label)
 
@@ -198,24 +182,23 @@ class SetupScreen(Screen):
             status.update("Admin JWT is required.")
             return
 
-        if not mcp_url:
-            mcp_url = "http://localhost:8002/mcp/"
-
         if admin_jwt.startswith("ns_key_"):
             status.update("This setup expects an admin JWT, not a namespace token.")
             return
 
         self.app.config = {
             "api_base_url": os.getenv("GRAPH_CORE_URL", "http://localhost:8001"),
-            "mcp_url": mcp_url,
-            "admin_mcp_url": mcp_url,
+            "admin_mcp_url": os.getenv(
+                "GRAPH_CORE_ADMIN_MCP_URL",
+                "http://localhost:8002/mcp/",
+            ),
             "user_mcp_url": os.getenv(
                 "GRAPH_CORE_USER_MCP_URL",
                 "http://localhost:8003/mcp/",
             ),
             "admin_jwt": admin_jwt,
             "namespace_token": "",
-            "active_token_kind": "admin",
+            "ui_mode": "admin",
             "namespace_id": "",
             "namespace_name": "",
         }
@@ -451,7 +434,7 @@ class ProfileCreateScreen(Screen):
 
         client = self.app.mcp_client_for_token(
             self.app.namespace_token,
-            kind="namespace",
+            kind="user",
         )
         await client.connect()
         try:
@@ -599,7 +582,7 @@ class CollectionFormScreen(Screen):
     async def _load_profiles(self) -> None:
         client = self.app.mcp_client_for_token(
             self.app.namespace_token,
-            kind="namespace",
+            kind="user",
         )
         await client.connect()
         try:
@@ -665,7 +648,7 @@ class CollectionFormScreen(Screen):
 
         client = self.app.mcp_client_for_token(
             self.app.namespace_token,
-            kind="namespace",
+            kind="user",
         )
         await client.connect()
         try:
@@ -773,20 +756,23 @@ class ConsoleScreen(Screen):
     }
     """
 
-    COMMAND_HELP = {
+    UTILITY_COMMAND_HELP = {
         "/help": "Show command help.",
-        "/status": "Show current auth and namespace context.",
+        "/status": "Show current admin or user context.",
         "/clear": "Clear console output.",
         "/quit": "Exit the CLI.",
         "/exit": "Exit the CLI.",
-        "/config show": "Show saved admin/user MCP URLs and token mode.",
-        "/config set-url URL": "Update admin MCP URL.",
-        "/auth set-key TOKEN [--kind admin|namespace|auto]": "Save and switch token.",
-        "/auth use admin|namespace": "Switch active saved token.",
+    }
+    ADMIN_COMMAND_HELP = {
+        "/config show": "Show saved admin/user MCP URLs and UI mode.",
+        "/config set-admin-url URL": "Update admin MCP URL.",
         "/namespace list": "List namespaces with the admin JWT.",
-        "/namespace create NAME": "Create namespace and switch to its namespace token.",
-        "/namespace current": "Show current namespace for active namespace token.",
-        "/namespace rotate-key ID_OR_NAME": "Rotate namespace token and switch to it.",
+        "/namespace create NAME": "Create namespace and stay in admin mode.",
+        "/namespace current": "Show current namespace details.",
+        "/namespace rotate-key ID_OR_NAME": "Rotate a namespace key.",
+        "/connect NAMESPACE_ID": "Mint a namespace user token and switch to user mode.",
+    }
+    USER_COMMAND_HELP = {
         "/profile list [embedding|llm]": "List profiles.",
         (
             "/profile create embedding|llm --provider P --model M --secret S "
@@ -832,21 +818,25 @@ class ConsoleScreen(Screen):
         "/jobs list [--limit N] [--collection COLLECTION]": "List recent jobs.",
         "/jobs show JOB_ID": "Show job status.",
         "/jobs watch JOB_ID": "Poll a job until it finishes.",
+        "/disconnect": "Return to admin mode and keep the saved namespace token.",
     }
-    COMMAND_INSERT_TEXT = {
+    UTILITY_COMMAND_INSERT_TEXT = {
         "/help": "/help ",
         "/status": "/status",
         "/clear": "/clear",
         "/quit": "/quit",
         "/exit": "/exit",
+    }
+    ADMIN_COMMAND_INSERT_TEXT = {
         "/config show": "/config show",
-        "/config set-url URL": "/config set-url ",
-        "/auth set-key TOKEN [--kind admin|namespace|auto]": "/auth set-key ",
-        "/auth use admin|namespace": "/auth use ",
+        "/config set-admin-url URL": "/config set-admin-url ",
         "/namespace list": "/namespace list",
         "/namespace create NAME": "/namespace create ",
         "/namespace current": "/namespace current",
         "/namespace rotate-key ID_OR_NAME": "/namespace rotate-key ",
+        "/connect NAMESPACE_ID": "/connect ",
+    }
+    USER_COMMAND_INSERT_TEXT = {
         "/profile list [embedding|llm]": "/profile list ",
         (
             "/profile create embedding|llm --provider P --model M --secret S "
@@ -887,6 +877,7 @@ class ConsoleScreen(Screen):
         "/jobs list [--limit N] [--collection COLLECTION]": "/jobs list",
         "/jobs show JOB_ID": "/jobs show <job_id>",
         "/jobs watch JOB_ID": "/jobs watch <job_id>",
+        "/disconnect": "/disconnect",
     }
     STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
     QUERY_MODES = [
@@ -974,6 +965,50 @@ class ConsoleScreen(Screen):
         "eslint.config.*",
         "tailwind.config.*",
     )
+
+    def _command_help(self) -> dict[str, str]:
+        if self.app.ui_mode == "user":
+            return {**self.UTILITY_COMMAND_HELP, **self.USER_COMMAND_HELP}
+        return {**self.UTILITY_COMMAND_HELP, **self.ADMIN_COMMAND_HELP}
+
+    def _command_insert_text(self) -> dict[str, str]:
+        if self.app.ui_mode == "user":
+            return {
+                **self.UTILITY_COMMAND_INSERT_TEXT,
+                **self.USER_COMMAND_INSERT_TEXT,
+            }
+        return {
+            **self.UTILITY_COMMAND_INSERT_TEXT,
+            **self.ADMIN_COMMAND_INSERT_TEXT,
+        }
+
+    def _allowed_top_level_commands(self) -> set[str]:
+        if self.app.ui_mode == "user":
+            return {
+                "/help",
+                "/status",
+                "/clear",
+                "/quit",
+                "/exit",
+                "/profile",
+                "/collection",
+                "/enhance",
+                "/chat",
+                "/ingest",
+                "/query",
+                "/jobs",
+                "/disconnect",
+            }
+        return {
+            "/help",
+            "/status",
+            "/clear",
+            "/quit",
+            "/exit",
+            "/config",
+            "/namespace",
+            "/connect",
+        }
 
     def __init__(self) -> None:
         super().__init__()
@@ -1108,6 +1143,11 @@ class ConsoleScreen(Screen):
 
             parts = shlex.split(raw)
             command = parts[0]
+            if command not in self._allowed_top_level_commands():
+                self._write_error(
+                    f"Command unavailable in {self.app.ui_mode} mode: {command}"
+                )
+                return
             if command == "/help":
                 self._show_help(parts[1:] if len(parts) > 1 else [])
                 return
@@ -1123,8 +1163,11 @@ class ConsoleScreen(Screen):
             if command == "/config":
                 await self._command_config(parts[1:])
                 return
-            if command == "/auth":
-                await self._command_auth(parts[1:])
+            if command == "/connect":
+                await self._command_connect(parts[1:])
+                return
+            if command == "/disconnect":
+                await self._command_disconnect(parts[1:])
                 return
             if command == "/namespace":
                 await self._command_namespace(parts[1:])
@@ -1160,24 +1203,23 @@ class ConsoleScreen(Screen):
             self._refresh_context()
 
     async def _command_status(self) -> None:
-        await self._hydrate_namespace_context()
         cfg = self.app.config
         namespace = "(admin context)"
-        if cfg.get("active_token_kind") == "namespace":
+        if self.app.ui_mode == "user":
             namespace = (
                 cfg.get("namespace_name")
                 if self._namespace_verified
-                else "(unverified namespace token)"
+                else "(saved namespace token)"
             ) or "(not selected)"
         lines = [
-            f"Admin MCP URL: {cfg.get('mcp_url', '')}",
+            f"Mode: {self.app.ui_mode}",
+            f"Admin MCP URL: {cfg.get('admin_mcp_url', '')}",
             f"User MCP URL: {cfg.get('user_mcp_url', '')}",
             f"API Base URL: {cfg.get('api_base_url', '')}",
-            f"Active token: {cfg.get('active_token_kind', 'admin')}",
             f"Namespace: {namespace}",
         ]
         if (
-            cfg.get("active_token_kind") == "namespace"
+            self.app.ui_mode == "user"
             and self._namespace_verified
             and cfg.get("namespace_id")
         ):
@@ -1188,45 +1230,13 @@ class ConsoleScreen(Screen):
         if not args or args[0] == "show":
             await self._command_status()
             return
-        if args[0] == "set-url" and len(args) >= 2:
+        if args[0] == "set-admin-url" and len(args) >= 2:
             cfg = dict(self.app.config)
-            cfg["mcp_url"] = args[1]
             cfg["admin_mcp_url"] = args[1]
             self.app.config = cfg
             self._write(f"Updated admin MCP URL to {args[1]}")
             return
-        raise ValueError("Usage: /config show | /config set-url URL")
-
-    async def _command_auth(self, args: list[str]) -> None:
-        if not args:
-            raise ValueError("Usage: /auth set-key TOKEN [--kind ...] | /auth use ...")
-        if args[0] == "set-key":
-            if len(args) < 2:
-                raise ValueError(
-                    "Usage: /auth set-key TOKEN [--kind admin|namespace|auto]"
-                )
-            positional, flags = parse_flag_args(args[1:])
-            key = positional[0]
-            kind = str(flags.get("kind", "auto"))
-            await self._set_token(key, kind)
-            return
-        if args[0] == "use" and len(args) >= 2:
-            target = args[1]
-            cfg = dict(self.app.config)
-            if target == "admin":
-                if not self.app.admin_jwt:
-                    raise ValueError("No saved admin JWT.")
-                cfg["active_token_kind"] = "admin"
-            elif target == "namespace":
-                if not self.app.namespace_token:
-                    raise ValueError("No saved namespace token.")
-                cfg["active_token_kind"] = "namespace"
-            else:
-                raise ValueError("Usage: /auth use admin|namespace")
-            self.app.config = cfg
-            self._write(f"Switched active token to {target}.")
-            return
-        raise ValueError("Usage: /auth set-key TOKEN [--kind ...] | /auth use ...")
+        raise ValueError("Usage: /config show | /config set-admin-url URL")
 
     async def _command_namespace(self, args: list[str]) -> None:
         if not args:
@@ -1240,24 +1250,20 @@ class ConsoleScreen(Screen):
             text = await self._call("create_namespace", {"name": name}, admin=True)
             namespace_id = extract_id(text)
             namespace_name = extract_name(text) or name
-            token = extract_token(text)
             cfg = dict(self.app.config)
             cfg["namespace_id"] = namespace_id
             cfg["namespace_name"] = namespace_name
-            cfg["namespace_token"] = token
-            cfg["active_token_kind"] = "namespace"
             self.app.config = cfg
             self._write(text)
             return
         if action == "current":
-            text = await self._call("get_current_namespace")
-            match = re.search(r"Namespace:\s*([^\s]+)\s*\|\s*(.+)$", text)
-            if match:
-                cfg = dict(self.app.config)
-                cfg["namespace_id"] = match.group(1).strip()
-                cfg["namespace_name"] = match.group(2).strip()
-                self.app.config = cfg
-            self._write(text)
+            cfg = self.app.config
+            namespace_id = cfg.get("namespace_id", "")
+            namespace_name = cfg.get("namespace_name", "")
+            if namespace_id and namespace_name:
+                self._write(f"Namespace: {namespace_id} | {namespace_name}")
+                return
+            self._write("Namespace: (not selected)")
             return
         if action == "rotate-key" and len(args) >= 2:
             target = " ".join(args[1:])
@@ -1275,16 +1281,73 @@ class ConsoleScreen(Screen):
                 {"namespace_id": namespace["id"]},
                 admin=True,
             )
-            token = extract_token(text)
             cfg = dict(self.app.config)
             cfg["namespace_id"] = namespace["id"]
             cfg["namespace_name"] = namespace["name"]
-            cfg["namespace_token"] = token
-            cfg["active_token_kind"] = "namespace"
             self.app.config = cfg
-            self._write(f"Switched to namespace {namespace['name']}.\n{text}")
+            self._write(text)
             return
         raise ValueError("Usage: /namespace list|create|current|rotate-key ...")
+
+    async def _command_connect(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise ValueError("Usage: /connect NAMESPACE_ID")
+        namespace_id = args[0]
+        cfg = self.app.config
+        if not self.app.admin_jwt:
+            raise ValueError("No saved admin JWT.")
+        base_url = cfg.get("api_base_url", "http://localhost:8001").rstrip("/")
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {self.app.admin_jwt}"},
+            follow_redirects=True,
+            timeout=120.0,
+        ) as client:
+            response = await client.post(
+                f"{base_url}/platform/namespaces/{namespace_id}/issue-user-token",
+                json={
+                    "expires_in_days": 365,
+                    "subject": "graph-core-cli",
+                },
+            )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
+            raise ValueError(
+                f"Connect failed: POST {response.request.url} -> "
+                f"{response.status_code}: {detail}"
+            ) from None
+
+        payload = response.json()
+        namespace_name = str(payload.get("namespace_name", "") or "")
+        token = str(payload.get("token", "") or "")
+        if not token:
+            raise ValueError("Connect failed: user token was not returned.")
+
+        cfg = dict(self.app.config)
+        cfg["namespace_id"] = str(payload.get("namespace_id", namespace_id))
+        cfg["namespace_name"] = namespace_name
+        cfg["namespace_token"] = token
+        cfg["ui_mode"] = "user"
+        self.app.config = cfg
+        self._namespace_verified = True
+        self._write(
+            f"Connected to {namespace_name or namespace_id}.\n"
+            f"Namespace ID: {cfg['namespace_id']}\n"
+            f"Token expires at: {payload.get('expires_at', 'unknown')}"
+        )
+
+    async def _command_disconnect(self, args: list[str]) -> None:
+        if args:
+            raise ValueError("Usage: /disconnect")
+        cfg = dict(self.app.config)
+        cfg["ui_mode"] = "admin"
+        self.app.config = cfg
+        self._namespace_verified = False
+        self._write("Returned to admin mode.")
 
     async def _command_profile(self, args: list[str]) -> None:
         if not args:
@@ -1635,7 +1698,7 @@ class ConsoleScreen(Screen):
             raise ValueError("No token available for this command.")
         client = self.app.mcp_client_for_token(
             token,
-            kind="admin" if admin else "namespace",
+            kind="admin" if admin else "user",
         )
         await client.connect()
         result = ""
@@ -1703,35 +1766,15 @@ class ConsoleScreen(Screen):
 
     async def _hydrate_namespace_context(self) -> None:
         cfg = dict(self.app.config)
-        if cfg.get("active_token_kind") != "namespace":
+        if self.app.ui_mode != "user":
             self._namespace_verified = False
-            if cfg.get("namespace_id") or cfg.get("namespace_name"):
-                cfg["namespace_id"] = ""
-                cfg["namespace_name"] = ""
-                self.app.config = cfg
             self._refresh_context()
             return
 
-        try:
-            text = await self._call("get_current_namespace")
-        except Exception:
-            self._namespace_verified = False
-            if cfg.get("namespace_id") or cfg.get("namespace_name"):
-                cfg["namespace_id"] = ""
-                cfg["namespace_name"] = ""
-                self.app.config = cfg
-                self._write_error(
-                    "Saved namespace context is stale; cleared local namespace state."
-                )
-            self._refresh_context()
-            return
-
-        match = re.search(r"Namespace:\s*([^\s]+)\s*\|\s*(.+)$", text)
-        if match:
+        if cfg.get("namespace_id") and cfg.get("namespace_name"):
             self._namespace_verified = True
-            cfg["namespace_id"] = match.group(1).strip()
-            cfg["namespace_name"] = match.group(2).strip()
-            self.app.config = cfg
+        else:
+            self._namespace_verified = False
         self._refresh_context()
 
     async def _resolve_collection(self, target: str) -> dict:
@@ -1742,25 +1785,6 @@ class ConsoleScreen(Screen):
             id_key="id",
             text_keys=["name"],
         )
-
-    async def _set_token(self, token: str, kind: str) -> None:
-        effective_kind = kind
-        if effective_kind == "auto":
-            effective_kind = "namespace" if token.startswith("ns_key_") else "admin"
-        if effective_kind not in {"admin", "namespace"}:
-            raise ValueError("Kind must be admin, namespace, or auto.")
-        cfg = dict(self.app.config)
-        if effective_kind == "admin":
-            cfg["admin_jwt"] = token
-            cfg["namespace_id"] = ""
-            cfg["namespace_name"] = ""
-            self._namespace_verified = False
-        else:
-            cfg["namespace_token"] = token
-            self._namespace_verified = False
-        cfg["active_token_kind"] = effective_kind
-        self.app.config = cfg
-        self._write(f"Saved {effective_kind} token and switched to it.")
 
     def _resolve_entity(
         self,
@@ -1806,15 +1830,16 @@ class ConsoleScreen(Screen):
         raise ValueError(f"Could not uniquely resolve '{target}'.")
 
     def _show_help(self, args: list[str]) -> None:
+        command_help = self._command_help()
         if not args:
             lines = [
                 f"{command}\n  {text}"
-                for command, text in self.COMMAND_HELP.items()
+                for command, text in command_help.items()
             ]
             self._write("\n".join(lines))
             return
         key = "/" + " ".join(args)
-        for command, text in self.COMMAND_HELP.items():
+        for command, text in command_help.items():
             if command.startswith(key):
                 self._write(f"{command}\n  {text}")
                 return
@@ -1857,12 +1882,12 @@ class ConsoleScreen(Screen):
 
     def _refresh_context(self) -> None:
         cfg = self.app.config
-        key_kind = cfg.get("active_token_kind", "admin")
-        if key_kind == "namespace":
+        key_kind = self.app.ui_mode
+        if key_kind == "user":
             namespace = (
                 cfg.get("namespace_name")
                 if self._namespace_verified
-                else "(unverified namespace token)"
+                else "(saved namespace token)"
             ) or "(not selected)"
         else:
             namespace = "(admin context)"
@@ -1872,8 +1897,8 @@ class ConsoleScreen(Screen):
             query_suffix = f"  query=running {elapsed}s"
         try:
             self.query_one("#context", Label).update(
-                f"admin={cfg.get('mcp_url', '')}  user={cfg.get('user_mcp_url', '')}"
-                f"  token={key_kind}  namespace={namespace}"
+                f"admin={cfg.get('admin_mcp_url', '')}  user={cfg.get('user_mcp_url', '')}"
+                f"  mode={key_kind}  namespace={namespace}"
                 f"{query_suffix}"
             )
         except NoMatches:
@@ -2107,7 +2132,7 @@ class ConsoleScreen(Screen):
             prefix = value
             suggestions = [
                 (command, description)
-                for command, description in self.COMMAND_HELP.items()
+                for command, description in self._command_help().items()
                 if command.startswith(prefix)
             ]
         elif "--strategy " in value:
@@ -2180,7 +2205,7 @@ class ConsoleScreen(Screen):
         input_widget = self.query_one("#command", Input)
         current = input_widget.value
         if current.startswith("/") and " " not in current:
-            inserted = self.COMMAND_INSERT_TEXT.get(value, value)
+            inserted = self._command_insert_text().get(value, value)
             self._set_command_input(inserted)
             return
 

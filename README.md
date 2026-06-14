@@ -124,19 +124,15 @@ The TUI talks to the split MCP servers exposed by the Docker stack:
 - admin MCP: `http://localhost:8002/mcp/`
 - user MCP: `http://localhost:8003/mcp/`
 
-On first launch, it prompts for the admin MCP URL and admin JWT. Configuration is persisted to `~/.config/graph-core/config.json`. Once connected, use key bindings to navigate:
+On first launch, it prompts for the admin JWT and starts in the admin area.
+From there:
 
-| Key     | Screen        | Description                          |
-|---------|---------------|--------------------------------------|
-| `h`     | Home          | Dashboard overview                   |
-| `n`     | Namespaces    | List/create namespaces (admin JWT)   |
-| `p`     | Profiles      | Create/list embedding and LLM profiles |
-| `l`     | Collections   | List/create collections              |
-| `Shift+Q` | Query       | Query a collection with NL           |
-| `i`     | Ingest        | Ingest text or files into a collection |
-| `j`     | Jobs          | Track async ingestion jobs           |
-| `c`     | Config        | Reconfigure connection               |
-| `q`     | Quit          | Exit                                 |
+- `/namespace list` shows namespaces
+- `/connect <namespace_id>` mints a long-lived namespace user JWT and switches
+  into the user area
+- `/disconnect` returns to the admin area
+
+The CLI persists its local state in `~/.config/graph-core/config.json`.
 
 ### MCP Server
 
@@ -169,6 +165,8 @@ JWT bearer tokens are also supported for external MCP/API clients:
 - `graph-core:user` scope exposes namespace-scoped tools only
 - user tokens must include a `namespace_id` claim
 - set `JWT_SECRET` to enable JWT verification
+- admin JWTs can mint namespace user JWTs through
+  `POST /platform/namespaces/{namespace_id}/issue-user-token`
 
 Generate an admin token:
 

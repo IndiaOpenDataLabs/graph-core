@@ -25,9 +25,11 @@ graph-core/
 
 This is no longer a multi-screen CRUD TUI.
 
-The current client is a keyboard-first slash-command console:
-- `SetupScreen` handles first-run MCP URL and API key setup
-- `ConsoleScreen` is the main surface
+The current client is a keyboard-first slash-command console with two areas:
+- `SetupScreen` handles first-run admin JWT setup
+- `ConsoleScreen` starts in admin mode
+- `/connect <namespace_id>` mints a namespace user JWT and switches to user mode
+- `/disconnect` returns to admin mode
 - guided modal flows are used only for structured operations such as:
   - profile creation
   - collection creation/edit
@@ -60,24 +62,23 @@ The console is intentionally closer to `opencode` than to a traditional form-hea
 - File: `~/.config/graph-core/config.json`
 - Current keys:
   - `api_base_url`
-  - `mcp_url`
   - `admin_mcp_url`
   - `user_mcp_url`
   - `admin_jwt`
   - `namespace_token`
-  - `active_token_kind`
+  - `ui_mode`
   - `namespace_id`
   - `namespace_name`
 
 Important behavior:
-- admin and namespace keys are persisted separately
-- namespace context shown in the UI is local client state until refreshed/verified
-- admin mode clears displayed namespace context
+- admin JWT and namespace JWT are persisted separately
+- the app always starts in admin mode, even if a namespace JWT is saved
+- namespace context shown in the UI is local client state until `/connect` succeeds
 
 ## Auth Flow
 
 ```text
-CLI  →  Authorization: Bearer <key>  →  MCP Server  →  GraphCoreClient  →  FastAPI
+CLI  →  Authorization: Bearer <token>  →  MCP Server  →  GraphCoreClient  →  FastAPI
 ```
 
 The client sends `Authorization: Bearer <key>` on every MCP HTTP request via
@@ -93,7 +94,7 @@ Use this pattern for all direct MCP calls:
 ```python
 client = self.app.mcp_client_for_token(
     self.app.active_token,
-    kind=self.app.active_token_kind,
+    kind=self.app.ui_mode,
 )
 await client.connect()
 try:
@@ -112,7 +113,7 @@ Rules:
 `ConsoleScreen` in `screens.py` is the primary app surface.
 
 Main widgets:
-- `#context` shows MCP URL, active key kind, and namespace context
+- `#context` shows MCP URLs, active mode, and namespace context
 - `#output` is a read-only `TextArea`
 - `#command` is the prompt input
 - `#suggestions` renders autocomplete results
@@ -149,18 +150,20 @@ All slash commands are dispatched from `ConsoleScreen._execute_command()`.
 Current top-level commands:
 - `/help`
 - `/status`
-- `/copy`
 - `/clear`
 - `/quit`
 - `/config ...`
-- `/auth ...`
-- `/namespace ...`
-- `/profile ...`
-- `/collection ...`
-- `/enhance ...`
-- `/ingest ...`
-- `/query ...`
-- `/jobs ...`
+- `/connect`
+- `/disconnect`
+- admin mode only:
+  - `/namespace ...`
+- user mode only:
+  - `/profile ...`
+  - `/collection ...`
+  - `/enhance ...`
+  - `/ingest ...`
+  - `/query ...`
+  - `/jobs ...`
 
 Guideline:
 - keep command dispatch centralized
@@ -203,7 +206,6 @@ Important helpers in `screens.py`:
 - `parse_jobs(text)`
 - `extract_id(text)`
 - `extract_name(text)`
-- `extract_api_key(text)`
 - `extract_job_id(text)`
 
 If you change MCP response formatting in the backend, update these parsers immediately.

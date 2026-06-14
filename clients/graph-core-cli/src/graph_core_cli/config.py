@@ -20,12 +20,11 @@ def load_config() -> dict:
     """Load persisted config from disk."""
     defaults = {
         "api_base_url": DEFAULT_API_BASE_URL,
-        "mcp_url": DEFAULT_ADMIN_MCP_URL,
         "admin_mcp_url": DEFAULT_ADMIN_MCP_URL,
         "user_mcp_url": DEFAULT_USER_MCP_URL,
         "admin_jwt": "",
         "namespace_token": "",
-        "active_token_kind": "admin",
+        "ui_mode": "admin",
         "namespace_id": "",
         "namespace_name": "",
     }
@@ -45,12 +44,11 @@ def save_config(cfg: dict) -> None:
     with open(CONFIG_FILE, "w") as f:
         json.dump({
             "api_base_url": cfg.get("api_base_url", DEFAULT_API_BASE_URL),
-            "mcp_url": cfg.get("mcp_url", cfg.get("admin_mcp_url", DEFAULT_ADMIN_MCP_URL)),
             "admin_mcp_url": cfg.get("admin_mcp_url", DEFAULT_ADMIN_MCP_URL),
             "user_mcp_url": cfg.get("user_mcp_url", DEFAULT_USER_MCP_URL),
             "admin_jwt": cfg.get("admin_jwt", ""),
             "namespace_token": cfg.get("namespace_token", ""),
-            "active_token_kind": cfg.get("active_token_kind", "admin"),
+            "ui_mode": cfg.get("ui_mode", "admin"),
             "namespace_id": cfg.get("namespace_id", ""),
             "namespace_name": cfg.get("namespace_name", ""),
         }, f, indent=2)

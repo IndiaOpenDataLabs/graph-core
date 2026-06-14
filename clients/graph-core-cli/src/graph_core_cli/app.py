@@ -22,23 +22,25 @@ class GraphCoreTUI(App):
         from graph_core_cli.screens import ConsoleScreen, SetupScreen
 
         persisted = load_config()
+        persisted_mode = persisted.get("ui_mode", "admin")
         self._config = {
             "api_base_url": persisted.get("api_base_url", "http://localhost:8001"),
-            "mcp_url": persisted.get("admin_mcp_url", "http://localhost:8002/mcp/"),
             "admin_mcp_url": persisted.get("admin_mcp_url", "http://localhost:8002/mcp/"),
             "user_mcp_url": persisted.get("user_mcp_url", "http://localhost:8003/mcp/"),
             "admin_jwt": persisted.get("admin_jwt", ""),
             "namespace_token": persisted.get("namespace_token", ""),
-            "active_token_kind": persisted.get("active_token_kind", "admin"),
+            "ui_mode": persisted_mode,
             "namespace_id": persisted.get("namespace_id", ""),
             "namespace_name": persisted.get("namespace_name", ""),
         }
-        if self._config.get("active_token_kind") == "admin":
-            self._config["namespace_id"] = ""
-            self._config["namespace_name"] = ""
         save_config(self._config)
 
-        if self.active_token:
+        if self.ui_mode == "user" and self.namespace_token:
+            self.push_screen(ConsoleScreen())
+        elif self.admin_jwt:
+            if self.ui_mode != "admin":
+                self._config["ui_mode"] = "admin"
+                save_config(self._config)
             self.push_screen(ConsoleScreen())
         else:
             self.push_screen(SetupScreen())
@@ -51,12 +53,11 @@ class GraphCoreTUI(App):
         if not hasattr(self, "_config"):
             self._config = {
                 "api_base_url": "",
-                "mcp_url": "",
                 "admin_mcp_url": "",
                 "user_mcp_url": "",
                 "admin_jwt": "",
                 "namespace_token": "",
-                "active_token_kind": "admin",
+                "ui_mode": "admin",
                 "namespace_id": "",
                 "namespace_name": "",
             }
@@ -71,19 +72,18 @@ class GraphCoreTUI(App):
     def mcp_client(self) -> AuthenticatedMCPClient:
         return self.mcp_client_for_token(
             self.active_token,
-            kind=self.active_token_kind,
+            kind=self.ui_mode,
         )
 
     @property
     def active_token(self) -> str:
-        kind = self.active_token_kind
-        if kind == "namespace":
+        if self.ui_mode == "user":
             return self.config.get("namespace_token", "")
         return self.config.get("admin_jwt", "")
 
     @property
-    def active_token_kind(self) -> str:
-        return self.config.get("active_token_kind", "admin")
+    def ui_mode(self) -> str:
+        return self.config.get("ui_mode", "admin")
 
     @property
     def admin_jwt(self) -> str:
@@ -103,11 +103,11 @@ class GraphCoreTUI(App):
         *,
         kind: str | None = None,
     ) -> AuthenticatedMCPClient:
-        kind = kind or self.active_token_kind
-        if kind == "namespace":
+        kind = kind or self.ui_mode
+        if kind == "user":
             mcp_url = self.config.get("user_mcp_url", "http://localhost:8003/mcp/")
         else:
-            mcp_url = self.config.get("admin_mcp_url", self.config.get("mcp_url", "http://localhost:8002/mcp/"))
+            mcp_url = self.config.get("admin_mcp_url", "http://localhost:8002/mcp/")
         return AuthenticatedMCPClient(mcp_url, token)
 
 

@@ -77,7 +77,6 @@ class AuthenticatedMCPClient:
         result = await self._session.call_tool(
             tool_name,
             arguments=arguments or {},
-            meta={"api_key": self._token},
         )
         parts: list[str] = []
         for block in result.content:

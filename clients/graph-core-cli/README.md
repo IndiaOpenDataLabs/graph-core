@@ -19,11 +19,16 @@ The default user MCP endpoint is `http://localhost:8003/mcp/`.
 
 On first launch, the CLI asks for:
 
-- `Admin MCP URL`
 - `Admin JWT`
 
-Use an admin JWT for namespace management. Namespace tokens are created and
-rotated from inside the CLI after setup.
+The CLI always starts in the admin area. From there:
+
+- `/namespace list` shows namespaces
+- `/connect <namespace_id>` mints a long-lived namespace user JWT and switches
+  the CLI into the user area
+- `/disconnect` returns to the admin area
+
+The namespace user token is stored locally in `~/.config/graph-core/config.json`.
 
 Config is stored in `~/.config/graph-core/config.json`.
 
@@ -49,10 +54,9 @@ Keyboard behavior:
 - `/help`
 - `/status`
 - `/config show`
-- `/config set-url <url>`
-- `/auth set-key <token> [--kind admin|namespace|auto]`
-- `/auth use admin`
-- `/auth use namespace`
+- `/config set-admin-url <url>`
+- `/connect <namespace_id>`
+- `/disconnect`
 
 ### Namespaces
 
