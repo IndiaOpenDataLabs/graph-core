@@ -187,7 +187,6 @@ class SetupScreen(Screen):
             return
 
         self.app.config = {
-            "api_base_url": os.getenv("GRAPH_CORE_URL", "http://localhost:8001"),
             "admin_mcp_url": os.getenv(
                 "GRAPH_CORE_ADMIN_MCP_URL",
                 "http://localhost:8002/mcp/",
@@ -1213,7 +1212,6 @@ class ConsoleScreen(Screen):
             f"Mode: {self.app.ui_mode}",
             f"Admin MCP URL: {cfg.get('admin_mcp_url', '')}",
             f"User MCP URL: {cfg.get('user_mcp_url', '')}",
-            f"API Base URL: {cfg.get('api_base_url', '')}",
             f"Namespace: {namespace}",
         ]
         if (

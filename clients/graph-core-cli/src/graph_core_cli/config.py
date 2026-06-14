@@ -19,7 +19,6 @@ def config_exists() -> bool:
 def load_config() -> dict:
     """Load persisted config from disk."""
     defaults = {
-        "api_base_url": DEFAULT_API_BASE_URL,
         "admin_mcp_url": DEFAULT_ADMIN_MCP_URL,
         "user_mcp_url": DEFAULT_USER_MCP_URL,
         "admin_jwt": "",
@@ -43,7 +42,6 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump({
-            "api_base_url": cfg.get("api_base_url", DEFAULT_API_BASE_URL),
             "admin_mcp_url": cfg.get("admin_mcp_url", DEFAULT_ADMIN_MCP_URL),
             "user_mcp_url": cfg.get("user_mcp_url", DEFAULT_USER_MCP_URL),
             "admin_jwt": cfg.get("admin_jwt", ""),

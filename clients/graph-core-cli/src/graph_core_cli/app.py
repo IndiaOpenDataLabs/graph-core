@@ -24,7 +24,6 @@ class GraphCoreTUI(App):
         persisted = load_config()
         persisted_mode = persisted.get("ui_mode", "admin")
         self._config = {
-            "api_base_url": persisted.get("api_base_url", "http://localhost:8001"),
             "admin_mcp_url": persisted.get("admin_mcp_url", "http://localhost:8002/mcp/"),
             "user_mcp_url": persisted.get("user_mcp_url", "http://localhost:8003/mcp/"),
             "admin_jwt": persisted.get("admin_jwt", ""),
@@ -52,7 +51,6 @@ class GraphCoreTUI(App):
     def config(self) -> dict:
         if not hasattr(self, "_config"):
             self._config = {
-                "api_base_url": "",
                 "admin_mcp_url": "",
                 "user_mcp_url": "",
                 "admin_jwt": "",
