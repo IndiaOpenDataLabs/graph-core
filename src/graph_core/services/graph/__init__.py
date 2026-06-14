@@ -1740,6 +1740,8 @@ class GraphService:
     ) -> dict[str, Any]:
         collection = await self.get_collection(collection_id)
         self._enforce_namespace(collection, namespace_id)
+        if chat_id is not None:
+            await self._get_chat_session(chat_id, collection_id, namespace_id)
         async with AsyncSessionLocal() as session:
             job = Job(
                 namespace_id=namespace_id,
@@ -1903,6 +1905,10 @@ class GraphService:
                     "chat_id": result.chat_id,
                 },
             )
+        except ValueError as e:
+            await self.update_job_status(job_id, "failed", error=str(e))
+            await self.append_job_event(job_id, "error", {"error": str(e)})
+            return
         except Exception as e:
             await self.update_job_status(job_id, "failed", error=str(e))
             await self.append_job_event(job_id, "error", {"error": str(e)})

@@ -417,14 +417,19 @@ async def list_collections(ctx: Context) -> CallToolResult:
             structuredContent={"collections": []},
         )
     lines = ["Collections:"]
-    items: list[dict[str, str]] = []
+    items: list[dict[str, str | None]] = []
     for col in collections:
-        lines.append(f"  - {col['id']} | {col['name']} ({col['strategy']})")
+        llm_profile_id = col.get("llm_profile_id")
+        llm_suffix = f" | llm={llm_profile_id}" if llm_profile_id else ""
+        lines.append(
+            f"  - {col['id']} | {col['name']} ({col['strategy']}){llm_suffix}"
+        )
         items.append(
             {
                 "id": col["id"],
                 "name": col["name"],
                 "strategy": col["strategy"],
+                "llm_profile_id": llm_profile_id,
             }
         )
     text = "\n".join(lines)

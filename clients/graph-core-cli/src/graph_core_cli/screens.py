@@ -32,11 +32,18 @@ def parse_namespaces(text: str) -> list[dict]:
 
 def parse_collections(text: str) -> list[dict]:
     items = []
-    for match in re.finditer(r"^  - ([^|]+)\| (.+?) \((.+?)\)$", text, re.MULTILINE):
+    for match in re.finditer(
+        r"^  - ([^|]+)\| (.+?) \((.+?)\)(?: \| llm=(.+))?$",
+        text,
+        re.MULTILINE,
+    ):
         items.append({
             "id": match.group(1).strip(),
             "name": match.group(2).strip(),
             "strategy": match.group(3).strip(),
+            "llm_profile_id": (
+                match.group(4).strip() if match.group(4) and match.group(4).strip() else ""
+            ),
         })
     return items
 
@@ -1733,20 +1740,22 @@ class ConsoleScreen(Screen):
                     )
                     result_payload = dict(result_result.structuredContent or {})
                     query_result = dict(result_payload.get("result") or {})
-                    lines = [str(query_result.get("response", "") or "")]
-                    if query_result.get("entities_used"):
-                        lines.append(
-                            f"\nEntities used: {', '.join(query_result['entities_used'])}"
-                        )
-                    if query_result.get("relationships_used"):
-                        lines.append(
-                            f"Relationships: {', '.join(query_result['relationships_used'])}"
-                        )
-                    if query_result.get("mode"):
-                        lines.append(f"Mode: {query_result['mode']}")
-                    if query_result.get("chat_id"):
-                        lines.append(f"Chat ID: {query_result['chat_id']}")
-                    final_text = "\n".join(lines)
+                    final_text = str(query_result.get("response", "") or "").strip()
+                    if not final_text:
+                        lines = ["No answer returned."]
+                        if query_result.get("entities_used"):
+                            lines.append(
+                                f"Entities used: {', '.join(query_result['entities_used'])}"
+                            )
+                        if query_result.get("relationships_used"):
+                            lines.append(
+                                f"Relationships: {', '.join(query_result['relationships_used'])}"
+                            )
+                        if query_result.get("mode"):
+                            lines.append(f"Mode: {query_result['mode']}")
+                        if query_result.get("chat_id"):
+                            lines.append(f"Chat ID: {query_result['chat_id']}")
+                        final_text = "\n".join(lines)
                     return final_text
                 if status == "failed":
                     raise ValueError(
