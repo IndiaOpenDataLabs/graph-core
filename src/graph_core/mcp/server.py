@@ -259,12 +259,21 @@ async def list_namespaces(ctx: Context) -> CallToolResult:
 
 
 @user_tool()
-async def get_current_namespace(ctx: Context) -> str:
+async def get_current_namespace(ctx: Context) -> CallToolResult:
     """Get info about the current authenticated namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     ns = await client.get_namespace_me()
-    return f"Namespace: {ns['id']} | {ns['name']}"
+    text = f"Namespace: {ns['id']} | {ns['name']}"
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={
+            "namespace": {
+                "id": ns["id"],
+                "name": ns["name"],
+            }
+        },
+    )
 
 
 @admin_tool()
@@ -349,17 +358,32 @@ async def create_collection(
 
 
 @user_tool()
-async def list_collections(ctx: Context) -> str:
+async def list_collections(ctx: Context) -> CallToolResult:
     """List all collections in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     collections = await client.list_collections()
     if not collections:
-        return "No collections found."
+        return CallToolResult(
+            content=[TextContent(type="text", text="No collections found.")],
+            structuredContent={"collections": []},
+        )
     lines = ["Collections:"]
+    items: list[dict[str, str]] = []
     for col in collections:
         lines.append(f"  - {col['id']} | {col['name']} ({col['strategy']})")
-    return "\n".join(lines)
+        items.append(
+            {
+                "id": col["id"],
+                "name": col["name"],
+                "strategy": col["strategy"],
+            }
+        )
+    text = "\n".join(lines)
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={"collections": items},
+    )
 
 
 @user_tool()
