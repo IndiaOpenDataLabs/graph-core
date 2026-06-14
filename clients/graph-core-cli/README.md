@@ -12,8 +12,8 @@ uv sync
 uv run python -m graph_core_cli
 ```
 
-The default admin MCP endpoint is `http://localhost:8002/mcp/`.
-The default user MCP endpoint is `http://localhost:8003/mcp/`.
+The default admin MCP endpoint is `http://localhost:18102/mcp/`.
+The default user MCP endpoint is `http://localhost:18103/mcp/`.
 
 ## First Run
 
@@ -194,7 +194,7 @@ Autocomplete is intentionally lightweight today:
 
 ```text
 graph-core-cli  ->  MCP (streamable HTTP)  ->  FastMCP servers  ->  FastAPI backend
-   (Textual)          (mcp SDK)             (ports 8002/8003)      (port 8001)
+   (Textual)          (mcp SDK)           (ports 18102/18103)     (port 8001)
 ```
 
 The CLI does not call the FastAPI API directly. All operations go through MCP tools.

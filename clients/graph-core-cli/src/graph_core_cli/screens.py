@@ -189,11 +189,11 @@ class SetupScreen(Screen):
         self.app.config = {
             "admin_mcp_url": os.getenv(
                 "GRAPH_CORE_ADMIN_MCP_URL",
-                "http://localhost:8002/mcp/",
+                "http://localhost:18102/mcp/",
             ),
             "user_mcp_url": os.getenv(
                 "GRAPH_CORE_USER_MCP_URL",
-                "http://localhost:8003/mcp/",
+                "http://localhost:18103/mcp/",
             ),
             "admin_jwt": admin_jwt,
             "namespace_token": "",

@@ -33,10 +33,10 @@ services:
       FALKORDB_URL: falkordb://falkordb:6379
       REDIS_SEMAPHORE_URL: redis://redis:6379/0
       GRAPH_CORE_URL: http://app:8001
-      GRAPH_CORE_ADMIN_MCP_PORT: 8002
+      GRAPH_CORE_ADMIN_MCP_PORT: 18102
     command: ["graph-core-admin-mcp"]
     ports:
-      - "8002:8002"
+      - "18102:18102"
     depends_on:
       app:
         condition: service_started
@@ -54,10 +54,10 @@ services:
       FALKORDB_URL: falkordb://falkordb:6379
       REDIS_SEMAPHORE_URL: redis://redis:6379/0
       GRAPH_CORE_URL: http://app:8001
-      GRAPH_CORE_USER_MCP_PORT: 8003
+      GRAPH_CORE_USER_MCP_PORT: 18103
     command: ["graph-core-user-mcp"]
     ports:
-      - "8003:8003"
+      - "18103:18103"
     depends_on:
       app:
         condition: service_started

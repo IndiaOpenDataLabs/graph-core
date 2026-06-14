@@ -7,8 +7,8 @@ CONFIG_DIR = Path.home() / ".config" / "graph-core"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_API_BASE_URL = "http://localhost:8001"
-DEFAULT_ADMIN_MCP_URL = "http://localhost:8002/mcp/"
-DEFAULT_USER_MCP_URL = "http://localhost:8003/mcp/"
+DEFAULT_ADMIN_MCP_URL = "http://localhost:18102/mcp/"
+DEFAULT_USER_MCP_URL = "http://localhost:18103/mcp/"
 
 
 def config_exists() -> bool:

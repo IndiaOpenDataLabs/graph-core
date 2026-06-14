@@ -24,8 +24,8 @@ class GraphCoreTUI(App):
         persisted = load_config()
         persisted_mode = persisted.get("ui_mode", "admin")
         self._config = {
-            "admin_mcp_url": persisted.get("admin_mcp_url", "http://localhost:8002/mcp/"),
-            "user_mcp_url": persisted.get("user_mcp_url", "http://localhost:8003/mcp/"),
+            "admin_mcp_url": persisted.get("admin_mcp_url", "http://localhost:18102/mcp/"),
+            "user_mcp_url": persisted.get("user_mcp_url", "http://localhost:18103/mcp/"),
             "admin_jwt": persisted.get("admin_jwt", ""),
             "namespace_token": persisted.get("namespace_token", ""),
             "ui_mode": persisted_mode,
@@ -103,9 +103,9 @@ class GraphCoreTUI(App):
     ) -> AuthenticatedMCPClient:
         kind = kind or self.ui_mode
         if kind == "user":
-            mcp_url = self.config.get("user_mcp_url", "http://localhost:8003/mcp/")
+            mcp_url = self.config.get("user_mcp_url", "http://localhost:18103/mcp/")
         else:
-            mcp_url = self.config.get("admin_mcp_url", "http://localhost:8002/mcp/")
+            mcp_url = self.config.get("admin_mcp_url", "http://localhost:18102/mcp/")
         return AuthenticatedMCPClient(mcp_url, token)
 
 

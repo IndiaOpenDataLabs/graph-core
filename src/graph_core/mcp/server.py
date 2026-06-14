@@ -1077,7 +1077,7 @@ def admin_main() -> None:
     """CLI entry point for the admin MCP server."""
     import uvicorn
 
-    port = int(os.getenv("GRAPH_CORE_ADMIN_MCP_PORT", "8002"))
+    port = int(os.getenv("GRAPH_CORE_ADMIN_MCP_PORT", "18102"))
     uvicorn.run(admin_mcp_server_app(), host="0.0.0.0", port=port)
 
 
@@ -1085,5 +1085,5 @@ def user_main() -> None:
     """CLI entry point for the user MCP server."""
     import uvicorn
 
-    port = int(os.getenv("GRAPH_CORE_USER_MCP_PORT", "8003"))
+    port = int(os.getenv("GRAPH_CORE_USER_MCP_PORT", "18103"))
     uvicorn.run(user_mcp_server_app(), host="0.0.0.0", port=port)

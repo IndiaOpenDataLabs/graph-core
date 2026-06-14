@@ -121,8 +121,8 @@ uv run python -m graph_core_cli
 
 The TUI talks to the split MCP servers exposed by the Docker stack:
 
-- admin MCP: `http://localhost:8002/mcp/`
-- user MCP: `http://localhost:8003/mcp/`
+- admin MCP: `http://localhost:18102/mcp/`
+- user MCP: `http://localhost:18103/mcp/`
 
 On first launch, it prompts for the admin JWT and starts in the admin area.
 From there:
@@ -145,8 +145,8 @@ make docker-up
 
 The MCP surface is split across two streamable HTTP servers:
 
-- admin MCP at `http://localhost:8002/mcp/`
-- user MCP at `http://localhost:8003/mcp/`
+- admin MCP at `http://localhost:18102/mcp/`
+- user MCP at `http://localhost:18103/mcp/`
 
 The REST API remains at `http://localhost:8001/`. You do not need to run a separate `make server` target.
 
@@ -155,8 +155,8 @@ Configure via environment variables:
 | Env Var                  | Description                          |
 |--------------------------|--------------------------------------|
 | `GRAPH_CORE_URL`         | Platform base URL (default: localhost:8001) |
-| `GRAPH_CORE_ADMIN_MCP_URL` | Admin MCP URL (default: localhost:8002/mcp/) |
-| `GRAPH_CORE_USER_MCP_URL` | User MCP URL (default: localhost:8003/mcp/) |
+| `GRAPH_CORE_ADMIN_MCP_URL` | Admin MCP URL (default: localhost:18102/mcp/) |
+| `GRAPH_CORE_USER_MCP_URL` | User MCP URL (default: localhost:18103/mcp/) |
 | `GRAPH_CORE_ADMIN_JWT`   | Admin JWT for namespace management   |
 
 JWT bearer tokens are also supported for external MCP/API clients:
