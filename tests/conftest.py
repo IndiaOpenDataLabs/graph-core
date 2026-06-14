@@ -12,7 +12,7 @@ import graph_core.config
 
 graph_core.config.settings.database_url = "sqlite+aiosqlite:///:memory:"
 graph_core.config.settings.credential_encryption_key = "test-key"
-graph_core.config.settings.platform_admin_key = "test-admin-key"
+graph_core.config.settings.jwt_secret = "test-jwt-secret-32-bytes-minimum!!"
 
 # Now import — engine will be created with SQLite
 from graph_core.database import AsyncSessionLocal, Base, engine

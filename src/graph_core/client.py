@@ -9,7 +9,7 @@ import httpx
 class GraphCoreClient:
     """Async HTTP client for the Graph Core REST API.
 
-    Supports both admin-key and namespace-key authentication.
+    Supports namespace-key and JWT authentication.
     """
 
     def __init__(
@@ -21,11 +21,7 @@ class GraphCoreClient:
         self.base_url = (
             base_url or os.getenv("GRAPH_CORE_URL") or "http://localhost:8001"
         ).rstrip("/")
-        key = api_key or (
-            os.getenv("PLATFORM_ADMIN_KEY")
-            if is_admin
-            else os.getenv("GRAPH_CORE_API_KEY")
-        )
+        key = api_key or os.getenv("GRAPH_CORE_API_KEY")
         if not key:
             raise ValueError(
                 "api_key is required (set GRAPH_CORE_API_KEY env var)"

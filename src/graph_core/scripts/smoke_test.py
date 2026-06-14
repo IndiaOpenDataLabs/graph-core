@@ -73,7 +73,7 @@ def _info(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Graph Core smoke test")
-    p.add_argument("--admin-key", default=os.environ.get("PLATFORM_ADMIN_KEY", ""), help="Platform admin key for namespace creation")
+    p.add_argument("--admin-jwt", default=os.environ.get("GRAPH_CORE_ADMIN_JWT", ""), help="Admin JWT for namespace creation")
     p.add_argument("--llm-key", help="OpenAI (or compatible) API key for LLM")
     p.add_argument("--llm-url", help="Custom LLM base URL (e.g. https://api.openai.com/v1)")
     p.add_argument("--llm-model", default="gpt-4o", help="LLM model name (default: gpt-4o)")
@@ -84,13 +84,13 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def create_namespace_via_api(client, admin_key: str) -> tuple[uuid.UUID, str]:
+async def create_namespace_via_api(client, admin_jwt: str) -> tuple[uuid.UUID, str]:
     """Create a namespace via API. Returns (ns_id, api_key)."""
     ns_name = f"smoke-test-{uuid.uuid4().hex[:8]}"
     r = await client.post(
         "/platform/namespaces/",
         json={"name": ns_name},
-        headers={"Authorization": f"Bearer {admin_key}"},
+        headers={"Authorization": f"Bearer {admin_jwt}"},
     )
     if r.status_code != 200:
         raise ValueError(f"Namespace creation failed: {r.text}")
@@ -247,7 +247,7 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
         print(f"\n{BOLD}2. Create namespace{RESET}")
         ns_id = None
         ns_key = None
-        use_legacy_auth = not args.admin_key
+        use_legacy_auth = not args.admin_jwt
 
         if use_legacy_auth:
             # Legacy: raw DB creation + X-Namespace-ID header
@@ -258,11 +258,11 @@ async def run_smoke_test(args: argparse.Namespace) -> bool:
                 record(False, f"Failed to create namespace: {e}")
                 return False
             headers = {"X-Namespace-ID": str(ns_id)}
-            _info("Using legacy X-Namespace-ID auth — pass --admin-key for new auth flow")
+            _info("Using legacy X-Namespace-ID auth — pass --admin-jwt for API-based namespace creation")
         else:
             # New: API-based creation + namespace API key
             try:
-                ns_id, ns_key = await create_namespace_via_api(client, args.admin_key)
+                ns_id, ns_key = await create_namespace_via_api(client, args.admin_jwt)
                 record(True, f"Namespace created: {ns_id} (key: {ns_key[:15]}...)")
             except Exception as e:
                 record(False, f"Failed to create namespace: {e}")
@@ -437,11 +437,11 @@ def main():
             sys.exit(1)
 
     # Check if asyncpg is available (only needed for legacy auth)
-    if not args.admin_key:
+    if not args.admin_jwt:
         try:
             import asyncpg  # noqa: F401
         except ImportError:
-            print(f"{RED}asyncpg is not installed. Run: uv sync --all-groups or pass --admin-key{RESET}")
+            print(f"{RED}asyncpg is not installed. Run: uv sync --all-groups or pass --admin-jwt{RESET}")
             sys.exit(1)
 
     has_api = bool(args.llm_key and args.embed_key)

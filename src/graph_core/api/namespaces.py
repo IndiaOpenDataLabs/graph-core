@@ -40,7 +40,7 @@ async def create_namespace(
     auth: Annotated[AuthContext, Depends(get_auth_context)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> CreateNamespaceResponse:
-    """Create a new namespace. Requires admin key."""
+    """Create a new namespace. Requires admin JWT."""
     if not auth.is_admin:
         raise HTTPException(status_code=403, detail="Admin key required to create namespaces")
 
@@ -60,7 +60,7 @@ async def list_namespaces(
     auth: Annotated[AuthContext, Depends(get_auth_context)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> list[NamespaceResponse]:
-    """List all namespaces. Requires admin key."""
+    """List all namespaces. Requires admin JWT."""
     if not auth.is_admin:
         raise HTTPException(status_code=403, detail="Admin key required to list namespaces")
 
@@ -98,7 +98,7 @@ async def rotate_namespace_key(
     auth: Annotated[AuthContext, Depends(get_auth_context)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> RotateKeyResponse:
-    """Rotate a namespace's API key. Requires admin key."""
+    """Rotate a namespace's API key. Requires admin JWT."""
     if not auth.is_admin:
         raise HTTPException(status_code=403, detail="Admin key required to rotate keys")
 

@@ -10,8 +10,12 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
+from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
+from graph_core.api.auth import resolve_bearer_identity
 from graph_core.client import GraphCoreAPIError, GraphCoreClient
 
 
@@ -50,7 +54,7 @@ def _extract_api_key(ctx: Context) -> str:
         pass
 
     # 3. Fallback for non-HTTP transports or testing
-    env_key = os.getenv("PLATFORM_ADMIN_KEY") or os.getenv("GRAPH_CORE_API_KEY")
+    env_key = os.getenv("GRAPH_CORE_API_KEY")
     if env_key:
         return env_key
     raise GraphCoreAPIError(
@@ -83,20 +87,99 @@ async def server_lifespan(server: FastMCP):
         _client_cache.clear()
 
 
-mcp = FastMCP(
-    name="graph-core",
-    instructions="MCP server for the Graph Core knowledge platform",
+admin_mcp = FastMCP(
+    name="graph-core-admin",
+    instructions="MCP admin tools for namespace management",
     lifespan=server_lifespan,
     streamable_http_path="/",
 )
+
+user_mcp = FastMCP(
+    name="graph-core-user",
+    instructions="MCP user tools scoped to a namespace",
+    lifespan=server_lifespan,
+    streamable_http_path="/",
+)
+
+admin_tool = admin_mcp.tool
+user_tool = user_mcp.tool
+
+
+def _header_lookup(scope: dict, name: bytes) -> str:
+    for key, value in scope.get("headers", []):
+        if key.lower() == name:
+            return value.decode("latin-1")
+    return ""
+
+
+async def _send_http_error(send, status_code: int, detail: str) -> None:
+    body = detail.encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+class ScopedMCPGateway:
+    """Route MCP HTTP requests to the admin or user tool surface.
+
+    Tool discovery stays scoped because each request is forwarded to a separate
+    FastMCP app based on the bearer token scopes.
+    """
+
+    def __init__(self, admin_app, user_app) -> None:
+        self._admin_app = admin_app
+        self._user_app = user_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._user_app(scope, receive, send)
+            return
+
+        authorization = _header_lookup(scope, b"authorization")
+        x_namespace_id = _header_lookup(scope, b"x-namespace-id")
+
+        try:
+            if authorization:
+                identity = resolve_bearer_identity(authorization)
+                app = self._admin_app if identity.kind == "admin" else self._user_app
+            elif x_namespace_id:
+                app = self._user_app
+            else:
+                raise HTTPException(status_code=401, detail="Authorization header required")
+        except HTTPException as exc:
+            await _send_http_error(send, exc.status_code, str(exc.detail))
+            return
+
+        await app(scope, receive, send)
+
+
+_gateway_app = ScopedMCPGateway(
+    admin_app=admin_mcp.streamable_http_app(),
+    user_app=user_mcp.streamable_http_app(),
+)
+
+
+@asynccontextmanager
+async def _gateway_lifespan(app: Starlette):
+    del app
+    async with admin_mcp.session_manager.run(), user_mcp.session_manager.run():
+        yield
 
 
 # -- Namespace tools --------------------------------------------------------
 
 
-@mcp.tool()
+@admin_tool()
 async def create_namespace(name: str, ctx: Context) -> str:
-    """Create a new namespace. Requires admin key.
+    """Create a new namespace. Requires admin JWT.
 
     Args:
         name: Human-readable namespace name (must be unique).
@@ -113,9 +196,9 @@ async def create_namespace(name: str, ctx: Context) -> str:
     )
 
 
-@mcp.tool()
+@admin_tool()
 async def list_namespaces(ctx: Context) -> str:
-    """List all namespaces. Requires admin key."""
+    """List all namespaces. Requires admin JWT."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key, admin=True)
     namespaces = await client.list_namespaces()
@@ -128,7 +211,7 @@ async def list_namespaces(ctx: Context) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@user_tool()
 async def get_current_namespace(ctx: Context) -> str:
     """Get info about the current authenticated namespace."""
     api_key = _extract_api_key(ctx)
@@ -137,9 +220,9 @@ async def get_current_namespace(ctx: Context) -> str:
     return f"Namespace: {ns['id']} | {ns['name']}"
 
 
-@mcp.tool()
+@admin_tool()
 async def rotate_namespace_key(namespace_id: str, ctx: Context) -> str:
-    """Rotate a namespace's API key. Requires admin key.
+    """Rotate a namespace's API key. Requires admin JWT.
 
     Args:
         namespace_id: The UUID of the namespace.
@@ -153,7 +236,7 @@ async def rotate_namespace_key(namespace_id: str, ctx: Context) -> str:
 # -- Collection tools -------------------------------------------------------
 
 
-@mcp.tool()
+@user_tool()
 async def create_collection(
     name: str,
     strategy: str,
@@ -194,7 +277,7 @@ async def create_collection(
     )
 
 
-@mcp.tool()
+@user_tool()
 async def list_collections(ctx: Context) -> str:
     """List all collections in the current namespace."""
     api_key = _extract_api_key(ctx)
@@ -208,7 +291,7 @@ async def list_collections(ctx: Context) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@user_tool()
 async def update_collection(
     collection_id: str,
     ctx: Context,
@@ -246,7 +329,7 @@ async def update_collection(
     )
 
 
-@mcp.tool()
+@user_tool()
 async def delete_collection(collection_id: str, ctx: Context) -> str:
     """Delete a collection in the current namespace."""
     api_key = _extract_api_key(ctx)
@@ -255,7 +338,7 @@ async def delete_collection(collection_id: str, ctx: Context) -> str:
     return f"Deleted collection {result.get('id', collection_id)}"
 
 
-@mcp.tool()
+@user_tool()
 async def enhance_collection(
     collection_id: str,
     levels: int = 1,
@@ -300,7 +383,7 @@ async def enhance_collection(
 # -- Ingestion tools --------------------------------------------------------
 
 
-@mcp.tool()
+@user_tool()
 async def ingest_chunk(
     collection_id: str,
     text: str,
@@ -326,7 +409,7 @@ async def ingest_chunk(
     )
 
 
-@mcp.tool()
+@user_tool()
 async def ingest_document(
     collection_id: str,
     text: str,
@@ -352,7 +435,7 @@ async def ingest_document(
     )
 
 
-@mcp.tool()
+@user_tool()
 async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> str:
     """Read a local file and ingest its contents into a collection.
 
@@ -381,7 +464,7 @@ async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> str:
 # -- Query tools ------------------------------------------------------------
 
 
-@mcp.tool()
+@user_tool()
 async def query_collection(
     collection_id: str,
     question: str,
@@ -417,7 +500,7 @@ async def query_collection(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@user_tool()
 async def create_chat_session(
     collection_id: str,
     ctx: Context,
@@ -436,7 +519,7 @@ async def create_chat_session(
     )
 
 
-@mcp.tool()
+@user_tool()
 async def list_chat_sessions(
     collection_id: str,
     ctx: Context,
@@ -460,7 +543,7 @@ async def list_chat_sessions(
 # -- Job tools --------------------------------------------------------------
 
 
-@mcp.tool()
+@user_tool()
 async def get_job_status(job_id: str, ctx: Context) -> str:
     """Check the status of an async ingestion job.
 
@@ -485,7 +568,7 @@ async def get_job_status(job_id: str, ctx: Context) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@user_tool()
 async def list_jobs(
     limit: int = 20,
     collection_id: str | None = None,
@@ -516,7 +599,7 @@ async def list_jobs(
 # -- Platform tools ---------------------------------------------------------
 
 
-@mcp.tool()
+@user_tool()
 async def create_embedding_profile(
     provider: str,
     model: str,
@@ -569,7 +652,7 @@ async def create_embedding_profile(
     )
 
 
-@mcp.tool()
+@user_tool()
 async def create_llm_profile(
     provider: str,
     model: str,
@@ -631,7 +714,7 @@ def _format_profile_list(title: str, profiles: list[dict]) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@user_tool()
 async def list_embedding_profiles(ctx: Context) -> str:
     """List embedding profiles in the current namespace."""
     api_key = _extract_api_key(ctx)
@@ -640,7 +723,7 @@ async def list_embedding_profiles(ctx: Context) -> str:
     return _format_profile_list("Embedding Profiles", profiles)
 
 
-@mcp.tool()
+@user_tool()
 async def list_llm_profiles(ctx: Context) -> str:
     """List LLM profiles in the current namespace."""
     api_key = _extract_api_key(ctx)
@@ -649,7 +732,7 @@ async def list_llm_profiles(ctx: Context) -> str:
     return _format_profile_list("LLM Profiles", profiles)
 
 
-@mcp.tool()
+@user_tool()
 async def get_capabilities(ctx: Context) -> str:
     """Get available capabilities: embedding profiles, LLM profiles, strategies."""
     api_key = _extract_api_key(ctx)
@@ -662,13 +745,12 @@ async def get_capabilities(ctx: Context) -> str:
 
 
 def mcp_server_app() -> object:
-    """Create the StreamableHTTP ASGI app for mounting in FastAPI."""
-    return mcp.streamable_http_app()
+    """Create the token-scoped MCP ASGI app for mounting in FastAPI."""
+    return Starlette(routes=[Mount("/", app=_gateway_app)], lifespan=_gateway_lifespan)
 
 
 def main() -> None:
     """CLI entry point for the MCP server."""
-    import sys
+    import uvicorn
 
-    transport = sys.argv[1] if len(sys.argv) > 1 else "streamable-http"
-    mcp.run(transport=transport)
+    uvicorn.run(mcp_server_app(), host="127.0.0.1", port=8000)

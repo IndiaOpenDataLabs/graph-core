@@ -24,10 +24,12 @@ class Settings(BaseSettings):
     # Deployment mode: "self_hosted" (default) or "multi_tenant"
     platform_mode: str = "self_hosted"
 
-    # Admin key for platform management (create namespaces, register apps)
-    # Supports dual-key rotation via platform_admin_key_secondary
-    platform_admin_key: str = ""
-    platform_admin_key_secondary: str = ""
+    # JWT support for external MCP / API clients.
+    # The token should carry either a `token_type` claim or a scope value of
+    # `graph-core:admin` / `graph-core:user`.
+    jwt_secret: str = ""
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
 
     # Defaults for new collections
     default_embedding_provider: str = "local_hash"

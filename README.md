@@ -124,7 +124,7 @@ The TUI talks to the MCP server exposed by the Docker stack at `http://localhost
 | Key     | Screen        | Description                          |
 |---------|---------------|--------------------------------------|
 | `h`     | Home          | Dashboard overview                   |
-| `n`     | Namespaces    | List/create namespaces (admin key)   |
+| `n`     | Namespaces    | List/create namespaces (admin JWT)   |
 | `p`     | Profiles      | Create/list embedding and LLM profiles |
 | `l`     | Collections   | List/create collections              |
 | `Shift+Q` | Query       | Query a collection with NL           |
@@ -149,8 +149,27 @@ Configure via environment variables:
 | Env Var                  | Description                          |
 |--------------------------|--------------------------------------|
 | `GRAPH_CORE_URL`         | Platform base URL (default: localhost:8001) |
-| `GRAPH_CORE_API_KEY`     | Namespace API key or admin key       |
-| `GRAPH_CORE_ADMIN_KEY`   | Admin key for namespace management   |
+| `GRAPH_CORE_API_KEY`     | Namespace API key                    |
+| `GRAPH_CORE_ADMIN_JWT`   | Admin JWT for namespace management   |
+
+JWT bearer tokens are also supported for external MCP/API clients:
+
+- `graph-core:admin` scope exposes namespace-management tools only
+- `graph-core:user` scope exposes namespace-scoped tools only
+- user tokens must include a `namespace_id` claim
+- set `JWT_SECRET` to enable JWT verification
+
+Generate an admin token:
+
+```bash
+uv run graph-core-admin-jwt
+```
+
+Or, if you want to use a custom subject:
+
+```bash
+uv run graph-core-admin-jwt --subject my-mcp-client
+```
 
 **Available tools:**
 

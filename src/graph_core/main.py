@@ -9,15 +9,15 @@ from fastapi.responses import JSONResponse
 
 from graph_core.api import chats, collections, ingest, jobs, namespaces, platform, query
 from graph_core.database import current_namespace_id
-from graph_core.mcp.server import mcp as mcp_server
+from graph_core.mcp.server import mcp_server_app
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import graph_core.workers  # noqa: F401
 
-    async with mcp_server.session_manager.run():
-        yield
+    del app
+    yield
 
 
 app = FastAPI(
@@ -68,4 +68,4 @@ async def health():
     return {"status": "ok", "version": "0.1.0"}
 
 
-app.mount("/mcp", mcp_server.streamable_http_app())
+app.mount("/mcp", mcp_server_app())

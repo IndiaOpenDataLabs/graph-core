@@ -1,14 +1,12 @@
-"""Authentication service — admin key, namespace key, and secret hashing."""
+"""Authentication service — namespace key and secret hashing."""
 
 import secrets
 from dataclasses import dataclass
 
 import bcrypt
-from hmac import compare_digest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from graph_core.config import settings
 from graph_core.models.namespace import Namespace
 
 
@@ -28,18 +26,6 @@ def generate_api_key() -> tuple[str, str]:
     raw = secrets.token_hex(16)
     full_key = f"ns_key_{raw}"
     return full_key, _hash_secret(full_key)
-
-
-def is_admin_key(key: str) -> bool:
-    """Check if a key matches the primary or secondary admin key.
-
-    Admin keys are plain-text env vars — constant-time comparison, no hashing.
-    """
-    if key and settings.platform_admin_key and compare_digest(key, settings.platform_admin_key):
-        return True
-    if key and settings.platform_admin_key_secondary and compare_digest(key, settings.platform_admin_key_secondary):
-        return True
-    return False
 
 
 async def verify_namespace_api_key(

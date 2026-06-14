@@ -72,6 +72,7 @@ python_version = "3.11"
 
 [project.scripts]
 graph-core-mcp = "graph_core.mcp.server:main"
+graph-core-admin-jwt = "graph_core.scripts.generate_admin_jwt:main"
 
 [build-system]
 requires = ["hatchling"]
