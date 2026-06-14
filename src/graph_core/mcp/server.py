@@ -105,6 +105,13 @@ def _header_lookup(scope: dict, name: bytes) -> str:
     return ""
 
 
+def _result(text: str, structured: dict) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent=structured,
+    )
+
+
 async def _send_http_error(send, status_code: int, detail: str) -> None:
     body = detail.encode("utf-8")
     await send(
@@ -325,7 +332,7 @@ async def create_collection(
     llm_profile_id: str | None = None,
     default_query_mode: str | None = None,
     gleaning_passes: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create a new collection in the current namespace.
 
     Args:
@@ -346,14 +353,26 @@ async def create_collection(
         default_query_mode=default_query_mode,
         gleaning_passes=gleaning_passes,
     )
-    return (
-        f"Created collection:\n"
-        f"  id: {result['id']}\n"
-        f"  name: {result['name']}\n"
-        f"  strategy: {result['strategy']}\n"
-        f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
-        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
-        f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
+    return _result(
+        (
+            f"Created collection:\n"
+            f"  id: {result['id']}\n"
+            f"  name: {result['name']}\n"
+            f"  strategy: {result['strategy']}\n"
+            f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
+            f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
+            f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
+        ),
+        {
+            "collection": {
+                "id": result["id"],
+                "name": result["name"],
+                "strategy": result["strategy"],
+                "embedding_profile_id": result.get("embedding_profile_id"),
+                "llm_profile_id": result.get("llm_profile_id"),
+                "gleaning_passes": result.get("gleaning_passes", 1),
+            }
+        },
     )
 
 
@@ -398,7 +417,7 @@ async def update_collection(
     gleaning_passes: int | None = None,
     clear_llm_profile: bool = False,
     clear_default_query_mode: bool = False,
-) -> str:
+) -> CallToolResult:
     """Update a collection in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
@@ -413,7 +432,7 @@ async def update_collection(
         clear_llm_profile=clear_llm_profile,
         clear_default_query_mode=clear_default_query_mode,
     )
-    return (
+    text = (
         f"Updated collection:\n"
         f"  id: {result['id']}\n"
         f"  name: {result['name']}\n"
@@ -422,15 +441,29 @@ async def update_collection(
         f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
         f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
     )
+    return _result(
+        text,
+        {
+            "collection": {
+                "id": result["id"],
+                "name": result["name"],
+                "strategy": result["strategy"],
+                "embedding_profile_id": result.get("embedding_profile_id"),
+                "llm_profile_id": result.get("llm_profile_id"),
+                "gleaning_passes": result.get("gleaning_passes", 1),
+            }
+        },
+    )
 
 
 @user_tool()
-async def delete_collection(collection_id: str, ctx: Context) -> str:
+async def delete_collection(collection_id: str, ctx: Context) -> CallToolResult:
     """Delete a collection in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.delete_collection(collection_id)
-    return f"Deleted collection {result.get('id', collection_id)}"
+    deleted_id = result.get("id", collection_id)
+    return _result(f"Deleted collection {deleted_id}", {"collection_id": deleted_id})
 
 
 @user_tool()
@@ -438,7 +471,7 @@ async def enhance_collection(
     collection_id: str,
     levels: int = 1,
     ctx: Context | None = None,
-) -> str:
+) -> CallToolResult:
     """Build or rebuild the derived understanding graph for a collection."""
     if ctx is None:
         raise ValueError("Context is required")
@@ -457,7 +490,7 @@ async def enhance_collection(
         )
         for level in generated_levels
     )
-    return (
+    text = (
         f"Enhanced collection:\n"
         f"  collection_id: {result['collection_id']}\n"
         f"  requested_levels: {result.get('requested_levels', levels)}\n"
@@ -473,6 +506,24 @@ async def enhance_collection(
         f"  generated_levels:\n{level_lines or '  (none)'}\n"
         f"  node_type_counts:\n{type_lines or '  (none)'}"
     )
+    return _result(
+        text,
+        {
+            "collection_id": result["collection_id"],
+            "requested_levels": result.get("requested_levels", levels),
+            "graph_name": result["graph_name"],
+            "node_count": result["node_count"],
+            "edge_count": result["edge_count"],
+            "chunk_count": result["chunk_count"],
+            "rel_type_count": result.get("rel_type_count", 0),
+            "community_count": result.get("community_count", 0),
+            "anchor_count": result.get("anchor_count", 0),
+            "bridge_count": result.get("bridge_count", 0),
+            "connector_count": result.get("connector_count", 0),
+            "generated_levels": generated_levels,
+            "node_type_counts": type_counts,
+        },
+    )
 
 
 # -- Ingestion tools --------------------------------------------------------
@@ -484,7 +535,7 @@ async def ingest_chunk(
     text: str,
     ctx: Context,
     domain: str | None = None,
-) -> str:
+) -> CallToolResult:
     """Ingest a text chunk directly into a collection.
 
     For large documents, use ingest_document instead (it runs async with a job).
@@ -496,11 +547,18 @@ async def ingest_chunk(
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.ingest_chunk(collection_id, text, domain=domain)
-    return (
-        f"Ingested chunk:\n"
-        f"  hash: {result.get('chunk_hash', 'N/A')}\n"
-        f"  entities: {result.get('entity_count', 0)}\n"
-        f"  relationships: {result.get('relationship_count', 0)}"
+    return _result(
+        (
+            f"Ingested chunk:\n"
+            f"  hash: {result.get('chunk_hash', 'N/A')}\n"
+            f"  entities: {result.get('entity_count', 0)}\n"
+            f"  relationships: {result.get('relationship_count', 0)}"
+        ),
+        {
+            "chunk_hash": result.get("chunk_hash"),
+            "entity_count": result.get("entity_count", 0),
+            "relationship_count": result.get("relationship_count", 0),
+        },
     )
 
 
@@ -510,7 +568,7 @@ async def ingest_document(
     text: str,
     ctx: Context,
     domain: str | None = None,
-) -> str:
+) -> CallToolResult:
     """Ingest a full document into a collection (async, returns job_id).
 
     For large documents, the platform will chunk and process in the background.
@@ -522,16 +580,19 @@ async def ingest_document(
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.ingest_document(collection_id, text, domain=domain)
-    return (
-        f"Document ingestion started:\n"
-        f"  job_id: {result['job_id']}\n"
-        f"  status: {result['status']}\n\n"
-        f"Track with get_job_status('{result['job_id']}')"
+    return _result(
+        (
+            f"Document ingestion started:\n"
+            f"  job_id: {result['job_id']}\n"
+            f"  status: {result['status']}\n\n"
+            f"Track with get_job_status('{result['job_id']}')"
+        ),
+        {"job_id": result["job_id"], "status": result["status"]},
     )
 
 
 @user_tool()
-async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> str:
+async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> CallToolResult:
     """Read a local file and ingest its contents into a collection.
 
     Args:
@@ -548,11 +609,14 @@ async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> str:
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.ingest_document(collection_id, content)
-    return (
-        f"Document ingestion started:\n"
-        f"  job_id: {result['job_id']}\n"
-        f"  status: {result['status']}\n\n"
-        f"Track with get_job_status('{result['job_id']}')"
+    return _result(
+        (
+            f"Document ingestion started:\n"
+            f"  job_id: {result['job_id']}\n"
+            f"  status: {result['status']}\n\n"
+            f"Track with get_job_status('{result['job_id']}')"
+        ),
+        {"job_id": result["job_id"], "status": result["status"]},
     )
 
 
@@ -566,7 +630,7 @@ async def query_collection(
     ctx: Context,
     mode: str | None = None,
     chat_id: str | None = None,
-) -> str:
+) -> CallToolResult:
     """Query a collection with a natural language question.
 
     Args:
@@ -592,7 +656,16 @@ async def query_collection(
         lines.append(f"Mode: {result['mode']}")
     if result.get("chat_id"):
         lines.append(f"Chat ID: {result['chat_id']}")
-    return "\n".join(lines)
+    return _result(
+        "\n".join(lines),
+        {
+            "response": result["response"],
+            "entities_used": result.get("entities_used", []),
+            "relationships_used": result.get("relationships_used", []),
+            "mode": result.get("mode"),
+            "chat_id": result.get("chat_id"),
+        },
+    )
 
 
 @user_tool()
@@ -600,17 +673,27 @@ async def create_chat_session(
     collection_id: str,
     ctx: Context,
     title: str | None = None,
-) -> str:
+) -> CallToolResult:
     """Create a chat session for follow-up query context."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     result = await client.create_chat_session(collection_id, title=title)
-    return (
-        f"Created chat session:\n"
-        f"  id: {result['id']}\n"
-        f"  collection_id: {result['collection_id']}\n"
-        f"  title: {result.get('title') or '-'}\n"
-        f"  turn_count: {result.get('turn_count', 0)}"
+    return _result(
+        (
+            f"Created chat session:\n"
+            f"  id: {result['id']}\n"
+            f"  collection_id: {result['collection_id']}\n"
+            f"  title: {result.get('title') or '-'}\n"
+            f"  turn_count: {result.get('turn_count', 0)}"
+        ),
+        {
+            "chat_session": {
+                "id": result["id"],
+                "collection_id": result["collection_id"],
+                "title": result.get("title"),
+                "turn_count": result.get("turn_count", 0),
+            }
+        },
     )
 
 
@@ -619,27 +702,35 @@ async def list_chat_sessions(
     collection_id: str,
     ctx: Context,
     limit: int = 20,
-) -> str:
+) -> CallToolResult:
     """List chat sessions for a collection."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     rows = await client.list_chat_sessions(collection_id, limit=limit)
     if not rows:
-        return "No chat sessions found."
+        return _result("No chat sessions found.", {"chat_sessions": []})
     lines = ["Chat sessions:"]
+    items: list[dict[str, object]] = []
     for row in rows:
         lines.append(
             f"  - {row['id']} | turns={row.get('turn_count', 0)}"
             f" | title={row.get('title') or '-'}"
         )
-    return "\n".join(lines)
+        items.append(
+            {
+                "id": row["id"],
+                "turn_count": row.get("turn_count", 0),
+                "title": row.get("title"),
+            }
+        )
+    return _result("\n".join(lines), {"chat_sessions": items})
 
 
 # -- Job tools --------------------------------------------------------------
 
 
 @user_tool()
-async def get_job_status(job_id: str, ctx: Context) -> str:
+async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
     """Check the status of an async ingestion job.
 
     Args:
@@ -660,7 +751,20 @@ async def get_job_status(job_id: str, ctx: Context) -> str:
         lines.append(
             f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
         )
-    return "\n".join(lines)
+    return _result(
+        "\n".join(lines),
+        {
+            "job": {
+                "id": job.get("id", job_id),
+                "type": job.get("type", job.get("job_type")),
+                "status": job.get("status", "unknown"),
+                "progress_percent": job.get("progress_percent", 0),
+                "error": job.get("error"),
+                "chunks_total": job.get("chunks_total"),
+                "chunks_completed": job.get("chunks_completed"),
+            }
+        },
+    )
 
 
 @user_tool()
@@ -668,14 +772,15 @@ async def list_jobs(
     limit: int = 20,
     collection_id: str | None = None,
     ctx: Context = None,
-) -> str:
+) -> CallToolResult:
     """List recent jobs in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     jobs = await client.list_jobs(limit=limit, collection_id=collection_id)
     if not jobs:
-        return "No jobs found."
+        return _result("No jobs found.", {"jobs": []})
     lines = ["Jobs:"]
+    items: list[dict[str, object]] = []
     for job in jobs:
         chunks = ""
         if job.get("chunks_total"):
@@ -688,7 +793,17 @@ async def list_jobs(
             f"{job.get('status', 'unknown')} | "
             f"{job.get('progress_percent', 0)}%{chunks}"
         )
-    return "\n".join(lines)
+        items.append(
+            {
+                "id": job["id"],
+                "type": job.get("type"),
+                "status": job.get("status"),
+                "progress_percent": job.get("progress_percent", 0),
+                "chunks_total": job.get("chunks_total"),
+                "chunks_completed": job.get("chunks_completed"),
+            }
+        )
+    return _result("\n".join(lines), {"jobs": items})
 
 
 # -- Platform tools ---------------------------------------------------------
@@ -736,14 +851,26 @@ async def create_embedding_profile(
         distance_metric=distance_metric,
         max_concurrent_calls=max_concurrent_calls,
     )
-    return (
-        f"Created embedding profile:\n"
-        f"  profile_id: {profile['profile_id']}\n"
-        f"  label: {profile.get('label') or '-'}\n"
-        f"  provider: {profile['provider']}\n"
-        f"  model: {profile['model']}\n"
-        f"  dimensions: {profile.get('dimensions') or '-'}\n"
-        f"  max_concurrent_calls: {profile.get('max_concurrent_calls') or '-'}"
+    return _result(
+        (
+            f"Created embedding profile:\n"
+            f"  profile_id: {profile['profile_id']}\n"
+            f"  label: {profile.get('label') or '-'}\n"
+            f"  provider: {profile['provider']}\n"
+            f"  model: {profile['model']}\n"
+            f"  dimensions: {profile.get('dimensions') or '-'}\n"
+            f"  max_concurrent_calls: {profile.get('max_concurrent_calls') or '-'}"
+        ),
+        {
+            "profile": {
+                "profile_id": profile["profile_id"],
+                "label": profile.get("label"),
+                "provider": profile["provider"],
+                "model": profile["model"],
+                "dimensions": profile.get("dimensions"),
+                "max_concurrent_calls": profile.get("max_concurrent_calls"),
+            }
+        },
     )
 
 
@@ -756,7 +883,7 @@ async def create_llm_profile(
     label: str | None = None,
     base_url: str | None = None,
     max_concurrent_calls: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create an LLM profile in the current namespace.
 
     Args:
@@ -783,20 +910,32 @@ async def create_llm_profile(
         base_url=base_url,
         max_concurrent_calls=max_concurrent_calls,
     )
-    return (
-        f"Created llm profile:\n"
-        f"  profile_id: {profile['profile_id']}\n"
-        f"  label: {profile.get('label') or '-'}\n"
-        f"  provider: {profile['provider']}\n"
-        f"  model: {profile['model']}\n"
-        f"  max_concurrent_calls: {profile.get('max_concurrent_calls') or '-'}"
+    return _result(
+        (
+            f"Created llm profile:\n"
+            f"  profile_id: {profile['profile_id']}\n"
+            f"  label: {profile.get('label') or '-'}\n"
+            f"  provider: {profile['provider']}\n"
+            f"  model: {profile['model']}\n"
+            f"  max_concurrent_calls: {profile.get('max_concurrent_calls') or '-'}"
+        ),
+        {
+            "profile": {
+                "profile_id": profile["profile_id"],
+                "label": profile.get("label"),
+                "provider": profile["provider"],
+                "model": profile["model"],
+                "max_concurrent_calls": profile.get("max_concurrent_calls"),
+            }
+        },
     )
 
 
-def _format_profile_list(title: str, profiles: list[dict]) -> str:
+def _format_profile_list(title: str, profiles: list[dict]) -> tuple[str, list[dict[str, object]]]:
     if not profiles:
-        return f"No {title.lower()} found."
+        return f"No {title.lower()} found.", []
     lines = [f"{title}:"]
+    items: list[dict[str, object]] = []
     for profile in profiles:
         label = profile.get("label") or "-"
         model = profile.get("model") or "-"
@@ -806,29 +945,40 @@ def _format_profile_list(title: str, profiles: list[dict]) -> str:
             f"  - {profile['profile_id']} | {label} | {provider} | {model} | "
             f"max_concurrent_calls={limit if limit is not None else '-'}"
         )
-    return "\n".join(lines)
+        items.append(
+            {
+                "profile_id": profile["profile_id"],
+                "label": profile.get("label"),
+                "provider": profile.get("provider"),
+                "model": profile.get("model"),
+                "max_concurrent_calls": profile.get("max_concurrent_calls"),
+            }
+        )
+    return "\n".join(lines), items
 
 
 @user_tool()
-async def list_embedding_profiles(ctx: Context) -> str:
+async def list_embedding_profiles(ctx: Context) -> CallToolResult:
     """List embedding profiles in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     profiles = await client.list_embedding_profiles()
-    return _format_profile_list("Embedding Profiles", profiles)
+    text, items = _format_profile_list("Embedding Profiles", profiles)
+    return _result(text, {"profiles": items})
 
 
 @user_tool()
-async def list_llm_profiles(ctx: Context) -> str:
+async def list_llm_profiles(ctx: Context) -> CallToolResult:
     """List LLM profiles in the current namespace."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
     profiles = await client.list_llm_profiles()
-    return _format_profile_list("LLM Profiles", profiles)
+    text, items = _format_profile_list("LLM Profiles", profiles)
+    return _result(text, {"profiles": items})
 
 
 @user_tool()
-async def get_capabilities(ctx: Context) -> str:
+async def get_capabilities(ctx: Context) -> CallToolResult:
     """Get available capabilities: embedding profiles, LLM profiles, strategies."""
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
@@ -836,7 +986,7 @@ async def get_capabilities(ctx: Context) -> str:
     lines = ["Platform Capabilities:"]
     for key, value in caps.items():
         lines.append(f"  {key}: {value}")
-    return "\n".join(lines)
+    return _result("\n".join(lines), {"capabilities": caps})
 
 
 def admin_mcp_server_app() -> Starlette:
