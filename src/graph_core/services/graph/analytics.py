@@ -784,15 +784,44 @@ async def build_collection_understanding(
                     "member_entity_names": region["entity_names"][:8],
                 }
 
-        induced_concepts = []
+        induced_concepts: list[dict[str, Any] | None] = [None] * len(candidate_regions)
         batch_size = max(1, int(region_batch_size))
-        for batch_start in range(0, len(candidate_regions), batch_size):
-            batch = candidate_regions[batch_start : batch_start + batch_size]
-            concepts = await asyncio.gather(
-                *(induce_region_concept(region) for region in batch)
+
+        async def induce_region_concept_at(
+            index: int,
+            region: dict[str, Any],
+        ) -> tuple[int, dict[str, Any]]:
+            concept = await induce_region_concept(region)
+            return index, concept
+
+        pending: set[asyncio.Task[tuple[int, dict[str, Any]]]] = set()
+        next_index = 0
+        while next_index < len(candidate_regions) and len(pending) < batch_size:
+            region = candidate_regions[next_index]
+            pending.add(
+                asyncio.create_task(
+                    induce_region_concept_at(next_index, region)
+                )
             )
-            for region, concept in zip(batch, concepts, strict=False):
-                induced_concepts.append(concept)
+            next_index += 1
+
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                index, concept = task.result()
+                region = candidate_regions[index]
+                induced_concepts[index] = concept
+                while next_index < len(candidate_regions) and len(pending) < batch_size:
+                    next_region = candidate_regions[next_index]
+                    pending.add(
+                        asyncio.create_task(
+                            induce_region_concept_at(next_index, next_region)
+                        )
+                    )
+                    next_index += 1
                 if on_region_concept is not None:
                     await on_region_concept(region, concept)
         streamed_regions = True
