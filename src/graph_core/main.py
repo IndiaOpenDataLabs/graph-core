@@ -1,5 +1,6 @@
-"""Graph Core — FastAPI application entry point."""
+"""Graph Core - FastAPI application entry point."""
 
+import logging
 import uuid
 from contextlib import asynccontextmanager
 
@@ -8,8 +9,24 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from graph_core.api import chats, collections, ingest, jobs, namespaces, platform, query
-from graph_core.database import current_namespace_id
+from graph_core.database import AsyncSessionLocal, current_namespace_id
 from graph_core.mcp.server import admin_mcp, user_mcp
+from graph_core.migrations.falkordb_acl import (
+    load_namespace_acl_payloads,
+    replay_namespace_acl_payloads,
+)
+
+logger = logging.getLogger(__name__)
+
+
+async def _replay_namespace_falkordb_acls() -> None:
+    async with AsyncSessionLocal() as session:
+        payloads = await session.run_sync(load_namespace_acl_payloads)
+    if not payloads:
+        logger.info("No namespace FalkorDB ACLs to replay on startup")
+        return
+    await replay_namespace_acl_payloads(payloads)
+    logger.info("Replayed %d namespace FalkorDB ACLs on startup", len(payloads))
 
 
 @asynccontextmanager
@@ -18,6 +35,7 @@ async def lifespan(app: FastAPI):
 
     del app
     async with admin_mcp.session_manager.run(), user_mcp.session_manager.run():
+        await _replay_namespace_falkordb_acls()
         yield
 
 
