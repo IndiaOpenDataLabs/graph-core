@@ -111,6 +111,7 @@ async def test_provision_namespace_falkordb_credential_sets_acl_user(
             "+GRAPH.LIST",
             "+GRAPH.QUERY",
             "+GRAPH.EXPLAIN",
+            "+GRAPH.MEMORY",
             "+GRAPH.RO_QUERY",
             f"~tenant:{ns.id}:*",
             f"%R~tenant:{ns.id}:*",
