@@ -57,7 +57,6 @@ async def _provision_namespace_falkordb_acl(
             f"%R~{_namespace_falkordb_graph_pattern(namespace_id)}",
             f"%W~{_namespace_falkordb_graph_pattern(namespace_id)}",
         )
-        await client.execute_command("ACL", "SAVE")
     finally:
         await client.aclose()
 
