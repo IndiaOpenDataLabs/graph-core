@@ -20,7 +20,20 @@ class _FakeRedis:
 
 
 @pytest.mark.asyncio
-async def test_provision_namespace_falkordb_credential_persists_metadata(db_session):
+async def test_provision_namespace_falkordb_credential_persists_metadata(
+    db_session, monkeypatch
+):
+    fake_redis = _FakeRedis()
+
+    def _fake_from_url(url: str, decode_responses: bool = False, **kwargs):  # noqa: ARG001
+        assert url == "redis://localhost:6379"
+        return fake_redis
+
+    monkeypatch.setattr(
+        "redis.asyncio.client.Redis.from_url",
+        _fake_from_url,
+    )
+
     ns = Namespace(name="ns-a")
     db_session.add(ns)
     await db_session.commit()
@@ -100,14 +113,30 @@ async def test_provision_namespace_falkordb_credential_sets_acl_user(
             f"~tenant:{ns.id}:*",
             f"%R~tenant:{ns.id}:*",
             f"%W~tenant:{ns.id}:*",
-        )
+        ),
+        (
+            "ACL",
+            "SAVE",
+        ),
     ]
 
 
 @pytest.mark.asyncio
 async def test_ensure_namespace_falkordb_credential_backfills_missing_state(
     db_session,
+    monkeypatch,
 ):
+    fake_redis = _FakeRedis()
+
+    def _fake_from_url(url: str, decode_responses: bool = False, **kwargs):  # noqa: ARG001
+        assert url == "redis://localhost:6379"
+        return fake_redis
+
+    monkeypatch.setattr(
+        "redis.asyncio.client.Redis.from_url",
+        _fake_from_url,
+    )
+
     ns = Namespace(name="ns-backfill")
     db_session.add(ns)
     await db_session.commit()

@@ -107,7 +107,7 @@ services:
       - "6379:6379"
       - "3001:3000"
     environment:
-      REDIS_ARGS: "--appendonly yes"
+      REDIS_ARGS: "--appendonly yes --aclfile /var/lib/falkordb/data/users.acl"
     volumes:
       - falkordb_data:/var/lib/falkordb/data
     healthcheck:
