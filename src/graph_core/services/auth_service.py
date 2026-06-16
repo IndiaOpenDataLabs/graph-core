@@ -18,6 +18,61 @@ from graph_core.services.crypto import CredentialCrypto
 _crypto = CredentialCrypto()
 
 
+def _namespace_falkordb_graph_pattern(namespace_id: str) -> str:
+    return f"tenant:{namespace_id}:*"
+
+
+async def _provision_namespace_falkordb_acl(
+    *,
+    namespace_id: str,
+    username: str,
+    secret: str,
+    base_url: str | None = None,
+) -> None:
+    from redis.asyncio import Redis
+
+    redis_url = (base_url or settings.falkordb_url or "").strip()
+    if not redis_url:
+        raise RuntimeError("FalkorDB URL is not configured")
+    if redis_url.startswith("falkordb://"):
+        redis_url = "redis://" + redis_url[len("falkordb://") :]
+
+    client = Redis.from_url(redis_url, decode_responses=True)
+    try:
+        await client.execute_command(
+            "ACL",
+            "SETUSER",
+            username,
+            "reset",
+            "on",
+            f">{secret}",
+            "+AUTH",
+            "+PING",
+            "+GRAPH.LIST",
+            "+GRAPH.QUERY",
+            "+GRAPH.RO_QUERY",
+            f"~{_namespace_falkordb_graph_pattern(namespace_id)}",
+            f"%R~{_namespace_falkordb_graph_pattern(namespace_id)}",
+            f"%W~{_namespace_falkordb_graph_pattern(namespace_id)}",
+        )
+    finally:
+        await client.aclose()
+
+
+def _namespace_falkordb_metadata(
+    ns: Namespace,
+    credential: Credential,
+    username: str,
+    base_url: str | None,
+) -> dict[str, str | None]:
+    return {
+        "credential_id": str(credential.id),
+        "username": username,
+        "base_url": base_url or credential.base_url,
+        "graph_pattern": _namespace_falkordb_graph_pattern(str(ns.id)),
+    }
+
+
 def _jwt_payload(
     namespace_id: str, *, subject: str | None, expires_in_days: int
 ) -> dict[str, object]:
@@ -113,18 +168,28 @@ async def provision_namespace_falkordb_credential(
     session.add(credential)
     await session.flush()
 
-    metadata = dict(ns.metadata_json or {})
-    metadata["falkordb"] = {
-        "credential_id": str(credential.id),
-        "username": falkor_username,
-        "base_url": base_url,
-        "graph_pattern": f"tenant:{ns.id}:*",
-    }
-    ns.metadata_json = metadata
-    await session.commit()
-    await session.refresh(ns)
-    await session.refresh(credential)
-    return ns, credential, falkor_secret
+    try:
+        await _provision_namespace_falkordb_acl(
+            namespace_id=str(ns.id),
+            username=falkor_username,
+            secret=falkor_secret,
+            base_url=base_url,
+        )
+        metadata = dict(ns.metadata_json or {})
+        metadata["falkordb"] = _namespace_falkordb_metadata(
+            ns,
+            credential,
+            falkor_username,
+            base_url,
+        )
+        ns.metadata_json = metadata
+        await session.commit()
+        await session.refresh(ns)
+        await session.refresh(credential)
+        return ns, credential, falkor_secret
+    except Exception:
+        await session.rollback()
+        raise
 
 
 async def ensure_namespace_falkordb_credential(
@@ -168,19 +233,33 @@ async def ensure_namespace_falkordb_credential(
         existing_credential = result.scalars().first()
 
     if existing_credential is not None:
-        metadata["falkordb"] = {
-            "credential_id": str(existing_credential.id),
-            "username": (
-                username or existing_credential.label or f"ns_{ns.id.hex}"
-            ).strip(),
-            "base_url": base_url or existing_credential.base_url,
-            "graph_pattern": f"tenant:{ns.id}:*",
-        }
-        ns.metadata_json = metadata
-        await session.commit()
-        await session.refresh(ns)
-        await session.refresh(existing_credential)
-        return ns, existing_credential, None
+        falkor_username = (
+            username or existing_credential.label or f"ns_{ns.id.hex}"
+        ).strip()
+        if not falkor_username:
+            raise ValueError("username must not be empty")
+        secret = _crypto.decrypt(existing_credential.encrypted_secret)
+        try:
+            await _provision_namespace_falkordb_acl(
+                namespace_id=str(ns.id),
+                username=falkor_username,
+                secret=secret,
+                base_url=base_url or existing_credential.base_url,
+            )
+            metadata["falkordb"] = _namespace_falkordb_metadata(
+                ns,
+                existing_credential,
+                falkor_username,
+                base_url or existing_credential.base_url,
+            )
+            ns.metadata_json = metadata
+            await session.commit()
+            await session.refresh(ns)
+            await session.refresh(existing_credential)
+            return ns, existing_credential, None
+        except Exception:
+            await session.rollback()
+            raise
 
     return await provision_namespace_falkordb_credential(
         session,
