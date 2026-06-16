@@ -48,6 +48,7 @@ async def _provision_namespace_falkordb_acl(
             f">{secret}",
             "+AUTH",
             "+INFO",
+            "+EXISTS",
             "+PING",
             "+GRAPH.LIST",
             "+GRAPH.QUERY",
