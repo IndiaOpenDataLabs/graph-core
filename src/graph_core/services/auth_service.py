@@ -53,6 +53,7 @@ async def _provision_namespace_falkordb_acl(
             "+PING",
             "+GRAPH.LIST",
             "+GRAPH.QUERY",
+            "+GRAPH.EXPLAIN",
             "+GRAPH.RO_QUERY",
             f"~{_namespace_falkordb_graph_pattern(namespace_id)}",
             f"%R~{_namespace_falkordb_graph_pattern(namespace_id)}",
