@@ -120,6 +120,7 @@ async def test_namespace_connection_resolution_uses_namespace_credentials(
         return {
             "host": "tenant-db.example.com",
             "port": 6380,
+            "db": 7,
             "username": "tenant_ns",
             "password": "secret",
         }
@@ -143,5 +144,6 @@ async def test_namespace_connection_resolution_uses_namespace_credentials(
     assert storage._client is not None
     assert storage._client.connection_pool.kwargs["host"] == "tenant-db.example.com"
     assert storage._client.connection_pool.kwargs["port"] == 6380
+    assert storage._client.connection_pool.kwargs["db"] == 7
     assert storage._client.connection_pool.kwargs["username"] == "tenant_ns"
     assert storage._client.connection_pool.kwargs["password"] == "secret"

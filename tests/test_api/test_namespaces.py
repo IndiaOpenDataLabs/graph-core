@@ -35,6 +35,7 @@ async def test_create_namespace_auto_provisions_falkordb_credential(db_session):
     assert resp.status_code == 200
     data = resp.json()
     assert data["name"] == "tenant-alpha"
+    assert data["falkordb_db"] == 0
     assert data["scope"] == "graph-core:user"
     assert data["credential_id"]
     assert data["falkordb_username"]

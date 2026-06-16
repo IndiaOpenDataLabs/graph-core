@@ -19,6 +19,7 @@ class CreateNamespaceRequest(BaseModel):
 class CreateNamespaceResponse(BaseModel):
     id: str
     name: str
+    falkordb_db: int
     token_type: str
     scope: str
     token: str
@@ -87,6 +88,7 @@ async def create_namespace(
     return CreateNamespaceResponse(
         id=str(result.id),
         name=result.name,
+        falkordb_db=int(credential_ns.falkordb_db or 0),
         token_type="user",
         scope="graph-core:user",
         token=token_result[1],

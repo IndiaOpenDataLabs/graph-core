@@ -64,6 +64,7 @@ async def test_provision_namespace_falkordb_credential_persists_metadata(
     assert stored_ns is not None
     assert stored_ns.metadata_json["falkordb"]["credential_id"] == str(credential.id)
     assert stored_ns.metadata_json["falkordb"]["username"] == "tenant_ns_a"
+    assert stored_ns.metadata_json["falkordb"]["db"] == stored_ns.falkordb_db
     assert stored_ns.metadata_json["falkordb"]["graph_pattern"] == f"tenant:{ns.id}:*"
 
 
@@ -157,4 +158,5 @@ async def test_ensure_namespace_falkordb_credential_backfills_missing_state(
     stored_ns = await db_session.get(Namespace, ns.id)
     assert stored_ns is not None
     assert stored_ns.metadata_json["falkordb"]["credential_id"] == str(credential.id)
+    assert stored_ns.metadata_json["falkordb"]["db"] == stored_ns.falkordb_db
     assert stored_ns.metadata_json["falkordb"]["graph_pattern"] == f"tenant:{ns.id}:*"

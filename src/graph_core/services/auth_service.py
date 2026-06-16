@@ -22,6 +22,38 @@ def _namespace_falkordb_graph_pattern(namespace_id: str) -> str:
     return f"tenant:{namespace_id}:*"
 
 
+def _sync_namespace_falkordb_metadata(ns: Namespace) -> None:
+    metadata = dict(ns.metadata_json or {})
+    falkordb_meta = dict(metadata.get("falkordb") or {})
+    if ns.falkordb_db is not None:
+        falkordb_meta["db"] = ns.falkordb_db
+    metadata["falkordb"] = falkordb_meta
+    ns.metadata_json = metadata
+
+
+async def _allocate_namespace_falkordb_db(session: AsyncSession) -> int:
+    result = await session.execute(
+        select(Namespace.falkordb_db)
+        .where(Namespace.falkordb_db.is_not(None))
+        .order_by(Namespace.falkordb_db.asc())
+    )
+    used = {int(value) for value in result.scalars().all() if value is not None}
+    db = 0
+    while db in used:
+        db += 1
+    return db
+
+
+async def _ensure_namespace_falkordb_db(
+    session: AsyncSession,
+    ns: Namespace,
+) -> int:
+    if ns.falkordb_db is None:
+        ns.falkordb_db = await _allocate_namespace_falkordb_db(session)
+    _sync_namespace_falkordb_metadata(ns)
+    return ns.falkordb_db
+
+
 async def _provision_namespace_falkordb_acl(
     *,
     namespace_id: str,
@@ -69,11 +101,12 @@ def _namespace_falkordb_metadata(
     credential: Credential,
     username: str,
     base_url: str | None,
-) -> dict[str, str | None]:
+) -> dict[str, str | int | None]:
     return {
         "credential_id": str(credential.id),
         "username": username,
         "base_url": base_url or credential.base_url,
+        "db": ns.falkordb_db,
         "graph_pattern": _namespace_falkordb_graph_pattern(str(ns.id)),
     }
 
@@ -157,6 +190,7 @@ async def provision_namespace_falkordb_credential(
     ns = await session.get(Namespace, UUID(namespace_id))
     if ns is None:
         raise ValueError(f"Namespace {namespace_id} not found")
+    await _ensure_namespace_falkordb_db(session, ns)
 
     falkor_username = (username or f"ns_{ns.id.hex}").strip()
     if not falkor_username:
@@ -216,6 +250,7 @@ async def ensure_namespace_falkordb_credential(
     if ns is None:
         raise ValueError(f"Namespace {namespace_id} not found")
 
+    await _ensure_namespace_falkordb_db(session, ns)
     metadata = dict(ns.metadata_json or {})
     falkordb_meta = metadata.get("falkordb")
     existing_credential: Credential | None = None
@@ -245,6 +280,7 @@ async def ensure_namespace_falkordb_credential(
             raise ValueError("username must not be empty")
         secret = _crypto.decrypt(existing_credential.encrypted_secret)
         try:
+            await _ensure_namespace_falkordb_db(session, ns)
             await _provision_namespace_falkordb_acl(
                 namespace_id=str(ns.id),
                 username=falkor_username,
@@ -326,10 +362,18 @@ async def resolve_namespace_falkordb_connection(
     username = ""
     if isinstance(falkordb_meta, dict):
         username = str(falkordb_meta.get("username") or "").strip()
+        db_value = falkordb_meta.get("db")
+        if db_value is not None:
+            try:
+                connection_kwargs["db"] = int(db_value)
+            except (TypeError, ValueError):
+                pass
     if not username:
         username = str(credential.label or "").strip()
     if username:
         connection_kwargs["username"] = username
+    if "db" not in connection_kwargs and ns.falkordb_db is not None:
+        connection_kwargs["db"] = int(ns.falkordb_db)
     secret = _crypto.decrypt(credential.encrypted_secret)
     if secret:
         connection_kwargs["password"] = secret

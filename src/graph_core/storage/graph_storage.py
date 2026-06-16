@@ -116,6 +116,11 @@ class FalkorDBGraphStorage:
             connection_kwargs["username"] = parsed.username
         if parsed.password:
             connection_kwargs["password"] = parsed.password
+        if parsed.path and parsed.path != "/":
+            try:
+                connection_kwargs["db"] = int(parsed.path.lstrip("/"))
+            except ValueError:
+                pass
         if parsed.scheme == "rediss":
             connection_kwargs["ssl"] = True
         return connection_kwargs
