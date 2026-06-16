@@ -15,7 +15,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,8 +36,8 @@ from graph_core.storage.graph_names import (
     collection_graph_name,
     legacy_collection_graph_name,
 )
-from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
+from graph_core.storage.graph_storage import FalkorDBGraphStorage
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ class IncrementalEntityResolver:
         embedding_provider: EmbeddingProvider,
         collection_id: uuid.UUID,
         domain: str | None = None,
+        namespace_id: uuid.UUID | None = None,
         collection_name: str | None = None,
     ) -> None:
         self._embedding = embedding_provider
@@ -82,13 +83,17 @@ class IncrementalEntityResolver:
         self._vstore = GraphRAGVectorStore()
         graph_name = (
             collection_graph_name(
+                namespace_id=namespace_id,
                 collection_id=collection_id,
                 collection_name=collection_name,
             )
             if collection_name is not None
             else legacy_collection_graph_name(collection_id)
         )
-        self._graph_storage = FalkorDBGraphStorage(graph_name)
+        self._graph_storage = FalkorDBGraphStorage(
+            graph_name,
+            namespace_id=namespace_id,
+        )
 
     async def _resolve_rel_type(
         self,
@@ -371,7 +376,7 @@ class IncrementalEntityResolver:
         # Normalize rel_type using alias table
         rel_type_resolution = await self._resolve_rel_type(session, rel_type)
         rel_type = rel_type_resolution.canonical_type
-        
+
         # Check for existing relationship (bidirectional, scoped to rel_type).
         # Two rels between the same pair with different rel_types are
         # distinct edges (multi-dimensional graph) and must not merge.

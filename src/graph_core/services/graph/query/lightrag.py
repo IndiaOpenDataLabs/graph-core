@@ -16,8 +16,8 @@ from graph_core.models.credential import Credential
 from graph_core.models.profile import Profile
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
-from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.graph_names import collection_graph_name
+from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.vector_tables import table_name
 
 # ── Module-level singleton dependencies ──
@@ -97,10 +97,14 @@ def get_graph_storage(collection: Collection):
     from graph_core.storage.graph_storage import FalkorDBGraphStorage
 
     graph_name = collection_graph_name(
+        namespace_id=collection.namespace_id,
         collection_id=collection.id,
         collection_name=collection.name,
     )
-    return FalkorDBGraphStorage(graph_name)
+    return FalkorDBGraphStorage(
+        graph_name,
+        namespace_id=collection.namespace_id,
+    )
 
 
 # ── Query functions ──

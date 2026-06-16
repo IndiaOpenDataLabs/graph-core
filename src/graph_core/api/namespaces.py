@@ -23,6 +23,10 @@ class CreateNamespaceResponse(BaseModel):
     scope: str
     token: str
     expires_at: str
+    credential_id: str
+    falkordb_username: str
+    falkordb_secret: str
+    falkordb_graph_pattern: str
 
 
 class NamespaceResponse(BaseModel):
@@ -56,11 +60,21 @@ async def create_namespace(
 ) -> CreateNamespaceResponse:
     """Create a new namespace. Requires admin JWT."""
     if not auth.is_admin:
-        raise HTTPException(status_code=403, detail="Admin JWT required to create namespaces")
+        raise HTTPException(
+            status_code=403, detail="Admin JWT required to create namespaces"
+        )
 
     result = await auth_service.create_namespace(
         session,
         name=body.name,
+    )
+    (
+        credential_ns,
+        credential,
+        secret,
+    ) = await auth_service.provision_namespace_falkordb_credential(
+        session,
+        str(result.id),
     )
     token_result = await auth_service.issue_namespace_user_token(
         session,
@@ -77,6 +91,10 @@ async def create_namespace(
         scope="graph-core:user",
         token=token_result[1],
         expires_at=token_result[2].isoformat(),
+        credential_id=str(credential.id),
+        falkordb_username=credential.label or "",
+        falkordb_secret=secret,
+        falkordb_graph_pattern=f"tenant:{credential_ns.id}:*",
     )
 
 
@@ -87,7 +105,9 @@ async def list_namespaces(
 ) -> list[NamespaceResponse]:
     """List all namespaces. Requires admin JWT."""
     if not auth.is_admin:
-        raise HTTPException(status_code=403, detail="Admin JWT required to list namespaces")
+        raise HTTPException(
+            status_code=403, detail="Admin JWT required to list namespaces"
+        )
 
     namespaces = await auth_service.list_namespaces(session)
     return [
@@ -106,12 +126,16 @@ async def get_current_namespace(
 ) -> NamespaceResponse:
     """Get the current namespace. Works with a user JWT."""
     if not auth.namespace:
-        raise HTTPException(status_code=400, detail="Not authenticated with a user token")
+        raise HTTPException(
+            status_code=400, detail="Not authenticated with a user token"
+        )
 
     return NamespaceResponse(
         id=str(auth.namespace.id),
         name=auth.namespace.name,
-        created_at=auth.namespace.created_at.isoformat() if auth.namespace.created_at else None,
+        created_at=auth.namespace.created_at.isoformat()
+        if auth.namespace.created_at
+        else None,
     )
 
 
@@ -124,7 +148,9 @@ async def issue_user_token(
 ) -> IssueUserTokenResponse:
     """Issue a long-lived namespace-scoped user JWT. Requires admin JWT."""
     if not auth.is_admin:
-        raise HTTPException(status_code=403, detail="Admin JWT required to issue user tokens")
+        raise HTTPException(
+            status_code=403, detail="Admin JWT required to issue user tokens"
+        )
 
     if body.expires_in_days <= 0:
         raise HTTPException(status_code=400, detail="expires_in_days must be positive")
@@ -136,7 +162,9 @@ async def issue_user_token(
         expires_in_days=body.expires_in_days,
     )
     if result is None:
-        raise HTTPException(status_code=404, detail=f"Namespace {namespace_id} not found")
+        raise HTTPException(
+            status_code=404, detail=f"Namespace {namespace_id} not found"
+        )
 
     return IssueUserTokenResponse(
         namespace_id=str(result[0].id),

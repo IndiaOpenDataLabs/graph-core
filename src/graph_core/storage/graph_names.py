@@ -17,12 +17,20 @@ def _slugify_collection_name(name: str) -> str:
 
 def collection_graph_name(
     *,
+    namespace_id: uuid.UUID | None = None,
     collection_id: uuid.UUID,
     collection_name: str,
 ) -> str:
-    """Return a readable, unique FalkorDB graph name for a collection."""
+    """Return a readable, unique FalkorDB graph name for a collection.
+
+    When ``namespace_id`` is provided, the graph name is namespaced so the
+    graph key can be isolated with FalkorDB ACL rules.
+    """
     slug = _slugify_collection_name(collection_name)
-    return f"collection_{slug}_{collection_id.hex[:8]}"
+    graph_name = f"collection_{slug}_{collection_id.hex[:8]}"
+    if namespace_id is None:
+        return graph_name
+    return f"tenant:{namespace_id}:collection:{graph_name}"
 
 
 def legacy_collection_graph_name(collection_id: uuid.UUID) -> str:

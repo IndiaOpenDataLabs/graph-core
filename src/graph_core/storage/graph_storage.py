@@ -13,13 +13,19 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Optional
+import uuid
+from collections.abc import Awaitable, Callable
+from inspect import isawaitable
+from typing import Any
+from urllib.parse import urlparse
 
 from graph_core.config import settings
+from graph_core.database import AsyncSessionLocal
 from graph_core.models.rel_types import (
     DEFAULT_REL_TYPE,
     normalize_rel_type,
 )
+from graph_core.services import auth_service
 
 # FalkorDB is optional — only import when available
 try:
@@ -74,47 +80,92 @@ class FalkorDBGraphStorage:
     Uses the async falkordb Python client with connection pooling.
     """
 
-    _connection_pool: Optional[BlockingConnectionPool] = None
+    _connection_pools: dict[tuple[tuple[str, Any], ...], BlockingConnectionPool] = {}
 
-    def __init__(self, namespace: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        namespace: str,
+        *,
+        namespace_id: uuid.UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
         self._graph_name = namespace or settings.falkordb_graph_name
-        self._host = "localhost"
-        self._port = 6379
-        self._client: Optional[Any] = None
-        self._graph: Optional[Any] = None
-        # Parse URL if provided
-        if settings.falkordb_url:
-            url = settings.falkordb_url
-            if url.startswith("falkordb://"):
-                url = "redis://" + url[len("falkordb://"):]
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            self._host = parsed.hostname or "localhost"
-            self._port = parsed.port or 6379
-        self._test_client: Optional[Any] = kwargs.get("_client")
+        self._namespace_id = namespace_id
+        self._client: Any | None = None
+        self._graph: Any | None = None
+        self._connection_kwargs: dict[str, Any] = dict(
+            kwargs.get("_connection_kwargs") or {}
+        )
+        self._connection_resolver: (
+            Callable[[], Awaitable[dict[str, Any]] | dict[str, Any]] | None
+        ) = kwargs.get("_connection_resolver")
+        self._test_client: Any | None = kwargs.get("_client")
 
     @classmethod
-    def _get_connection_pool(cls) -> BlockingConnectionPool:
-        if cls._connection_pool is None:
-            url = settings.falkordb_url
-            host = "localhost"
-            port = 6379
-            if url:
-                if url.startswith("falkordb://"):
-                    url = "redis://" + url[len("falkordb://"):]
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                host = parsed.hostname or "localhost"
-                port = parsed.port or 6379
+    def _parse_url(cls, url: str) -> dict[str, Any]:
+        normalized = url.strip()
+        if normalized.startswith("falkordb://"):
+            normalized = "redis://" + normalized[len("falkordb://") :]
+        parsed = urlparse(normalized)
+        connection_kwargs: dict[str, Any] = {}
+        if parsed.hostname:
+            connection_kwargs["host"] = parsed.hostname
+        if parsed.port:
+            connection_kwargs["port"] = parsed.port
+        if parsed.username:
+            connection_kwargs["username"] = parsed.username
+        if parsed.password:
+            connection_kwargs["password"] = parsed.password
+        if parsed.scheme == "rediss":
+            connection_kwargs["ssl"] = True
+        return connection_kwargs
 
-            cls._connection_pool = BlockingConnectionPool(
-                max_connections=16,
-                timeout=None,
-                decode_responses=True,
-                host=host,
-                port=port,
-            )
-        return cls._connection_pool
+    async def _resolve_connection_kwargs(self) -> dict[str, Any]:
+        if self._connection_kwargs:
+            return dict(self._connection_kwargs)
+
+        resolved: dict[str, Any] = {}
+        if self._connection_resolver is not None:
+            payload = self._connection_resolver()
+            if isawaitable(payload):
+                payload = await payload
+            if isinstance(payload, dict):
+                resolved.update(payload)
+        elif self._namespace_id is not None:
+            async with AsyncSessionLocal() as session:
+                payload = await auth_service.resolve_namespace_falkordb_connection(
+                    session,
+                    str(self._namespace_id),
+                )
+            if payload:
+                resolved.update(payload)
+
+        if not resolved and settings.falkordb_url:
+            resolved.update(self._parse_url(settings.falkordb_url))
+        return resolved
+
+    @classmethod
+    def _get_connection_pool(
+        cls, connection_kwargs: dict[str, Any]
+    ) -> BlockingConnectionPool:
+        pool_kwargs = {
+            key: value
+            for key, value in connection_kwargs.items()
+            if key in {"host", "port", "username", "password", "db", "ssl"}
+            and value is not None
+        }
+        key = tuple(sorted(pool_kwargs.items()))
+        pool = cls._connection_pools.get(key)
+        if pool is not None:
+            return pool
+        pool = BlockingConnectionPool(
+            max_connections=16,
+            timeout=None,
+            decode_responses=True,
+            **pool_kwargs,
+        )
+        cls._connection_pools[key] = pool
+        return pool
 
     async def _get_graph(self):
         if FalkorDB is None:
@@ -127,7 +178,8 @@ class FalkorDBGraphStorage:
             self._graph = self._test_client.select_graph(self._graph_name)
             return self._graph
 
-        pool = self._get_connection_pool()
+        connection_kwargs = await self._resolve_connection_kwargs()
+        pool = self._get_connection_pool(connection_kwargs)
         if self._client is None:
             self._client = FalkorDB(connection_pool=pool)
         self._graph = self._client.select_graph(self._graph_name)
@@ -144,7 +196,7 @@ class FalkorDBGraphStorage:
             return count > 0
         return False
 
-    async def get_node(self, node_id: str) -> Optional[dict[str, Any]]:
+    async def get_node(self, node_id: str) -> dict[str, Any] | None:
         graph = await self._get_graph()
         result = await graph.query(
             "MATCH (n:Entity {id: $id}) RETURN n",
@@ -526,7 +578,9 @@ class FalkorDBGraphStorage:
             return count > 0
         return False
 
-    async def get_lightrag_node(self, node_name: str, collection_id: str) -> Optional[dict[str, Any]]:
+    async def get_lightrag_node(
+        self, node_name: str, collection_id: str
+    ) -> dict[str, Any] | None:
         """Get LightRAG entity node properties by name."""
         graph = await self._get_graph()
         result = await graph.query(
@@ -602,14 +656,20 @@ class FalkorDBGraphStorage:
                 "rel_type": rel_type,
                 "description": properties.get("description", ""),
                 "weight": properties.get("weight", 1),
-                "keywords": json.dumps(keywords) if isinstance(keywords, list) else (keywords or "[]"),
-                "source_ids": json.dumps(source_ids) if isinstance(source_ids, list) else (source_ids or "[]"),
+                "keywords": json.dumps(keywords)
+                if isinstance(keywords, list)
+                else (keywords or "[]"),
+                "source_ids": json.dumps(source_ids)
+                if isinstance(source_ids, list)
+                else (source_ids or "[]"),
             },
         )
 
         existing = await self.get_lightrag_edge(source_name, target_name, collection_id)
         if existing is None:
-            existing = await self.get_lightrag_edge(target_name, source_name, collection_id)
+            existing = await self.get_lightrag_edge(
+                target_name, source_name, collection_id
+            )
         if existing:
             existing_kws = existing.get("keywords") or []
             if isinstance(existing_kws, str):
@@ -663,7 +723,9 @@ class FalkorDBGraphStorage:
                 "MATCH (n:Entity {id: $node_name, collection_id: $cid})-[r]-(m:Entity)"
                 " RETURN n.id as source, m.id as target"
             )
-        result = await graph.query(cypher, {"node_name": node_name, "cid": collection_id})
+        result = await graph.query(
+            cypher, {"node_name": node_name, "cid": collection_id}
+        )
         edges: list[tuple[str, str]] = []
         if result and result.result_set:
             for row in result.result_set:
@@ -678,7 +740,7 @@ class FalkorDBGraphStorage:
         target_name: str,
         collection_id: str,
         rel_types: list[str] | None = None,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Get LightRAG edge properties between two named nodes."""
         graph = await self._get_graph()
         label_pat = _edge_label_pattern(rel_types)
@@ -784,7 +846,7 @@ class FalkorDBGraphStorage:
         source_id: str,
         target_id: str,
         rel_types: list[str] | None = None,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Get edge properties between two entity IDs.
 
         When ``rel_types`` is provided, restricts the match to those
@@ -884,12 +946,16 @@ class FalkorDBGraphStorage:
             {"collection_id": str(collection_id)},
         )
         count = int(result.nodes_deleted) if result.nodes_deleted else 0
-        logger.info("FalkorDB deleted %d nodes for collection_id=%s", count, collection_id)
+        logger.info(
+            "FalkorDB deleted %d nodes for collection_id=%s", count, collection_id
+        )
         return count
 
     async def drop(self) -> None:
         graph_name = self._graph_name
-        if self._test_client is not None and hasattr(self._test_client, "execute_command"):
+        if self._test_client is not None and hasattr(
+            self._test_client, "execute_command"
+        ):
             try:
                 await self._test_client.execute_command("GRAPH.DELETE", graph_name)
             except ResponseError as exc:

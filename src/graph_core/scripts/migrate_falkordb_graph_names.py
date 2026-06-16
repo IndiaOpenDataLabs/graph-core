@@ -1,23 +1,12 @@
-"""Rename FalkorDB graphs to the collection-name-based naming scheme."""
+"""Rename FalkorDB graphs and backfill namespace credentials."""
 
 from __future__ import annotations
 
-import asyncio
-
-from graph_core.services.graph import GraphService
-
-
-async def _main() -> None:
-    service = GraphService()
-    results = await service.migrate_all_collection_graph_names()
-    for row in results:
-        print(
-            f"{row['collection_id']} {row['collection_name']} -> {row['graph_name']}"
-        )
-
 
 def main() -> None:
-    asyncio.run(_main())
+    from graph_core.scripts.migrate_namespace_falkordb_graph_names import main as _main
+
+    _main()
 
 
 if __name__ == "__main__":

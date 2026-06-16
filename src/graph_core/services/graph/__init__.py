@@ -64,11 +64,12 @@ from graph_core.services.graph_rag.extractor import (
     LLMGraphExtractor,
 )
 from graph_core.services.sanitizer import TextSanitizer
-from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.graph_names import (
     collection_graph_name,
     legacy_collection_graph_name,
 )
+from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
+from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.meta_collections import (
     base_collection_name,
     is_meta_collection_name,
@@ -77,7 +78,6 @@ from graph_core.storage.meta_collections import (
     meta_collection_name,
     parse_meta_collection_name,
 )
-from graph_core.storage.graph_storage import FalkorDBGraphStorage
 from graph_core.storage.vector_store import VectorStore
 from graph_core.storage.vector_tables import (
     create_all_tables,
@@ -118,6 +118,7 @@ class GraphService:
     @staticmethod
     def _graph_name(collection: Collection) -> str:
         return collection_graph_name(
+            namespace_id=collection.namespace_id,
             collection_id=collection.id,
             collection_name=collection.name,
         )
@@ -127,7 +128,10 @@ class GraphService:
         return legacy_collection_graph_name(collection_id)
 
     def _graph_storage(self, collection: Collection) -> FalkorDBGraphStorage:
-        return FalkorDBGraphStorage(self._graph_name(collection))
+        return FalkorDBGraphStorage(
+            self._graph_name(collection),
+            namespace_id=collection.namespace_id,
+        )
 
     @staticmethod
     def _base_collection_name(collection_name: str) -> str:
@@ -1205,6 +1209,7 @@ class GraphService:
         resolver = IncrementalEntityResolver(
             embedding_provider,
             meta_collection.id,
+            namespace_id=meta_collection.namespace_id,
             collection_name=meta_collection.name,
         )
 
@@ -1328,6 +1333,7 @@ class GraphService:
         resolver = IncrementalEntityResolver(
             embedding_provider,
             meta_collection.id,
+            namespace_id=meta_collection.namespace_id,
             collection_name=meta_collection.name,
         )
         async with AsyncSessionLocal() as session:
@@ -2058,6 +2064,7 @@ class GraphService:
         resolver = IncrementalEntityResolver(
             embedding_provider,
             meta_collection.id,
+            namespace_id=meta_collection.namespace_id,
             collection_name=meta_collection.name,
         )
 

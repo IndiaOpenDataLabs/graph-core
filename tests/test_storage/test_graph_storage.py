@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 from redis.exceptions import ResponseError
 
+from graph_core.storage import graph_storage as graph_storage_module
 from graph_core.storage.graph_storage import FalkorDBGraphStorage
 
 
@@ -15,6 +16,20 @@ class _FakeClient:
     def __init__(self) -> None:
         self.graph = _FakeGraph()
         self.execute_command = AsyncMock()
+
+    def select_graph(self, _graph_name: str):
+        return self.graph
+
+
+class _FakePool:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _FakeFalkorDB:
+    def __init__(self, connection_pool=None):
+        self.connection_pool = connection_pool
+        self.graph = _FakeGraph()
 
     def select_graph(self, _graph_name: str):
         return self.graph
@@ -94,3 +109,39 @@ async def test_node_count_reads_entity_count():
     storage = FalkorDBGraphStorage("collection_deadbeef", _client=client)
 
     assert await storage.node_count() == 7
+
+
+@pytest.mark.asyncio
+async def test_namespace_connection_resolution_uses_namespace_credentials(
+    monkeypatch,
+):
+    async def _resolver(session, namespace_id):
+        assert namespace_id == "ns-123"
+        return {
+            "host": "tenant-db.example.com",
+            "port": 6380,
+            "username": "tenant_ns",
+            "password": "secret",
+        }
+
+    monkeypatch.setattr(graph_storage_module, "FalkorDB", _FakeFalkorDB)
+    monkeypatch.setattr(graph_storage_module, "BlockingConnectionPool", _FakePool)
+    monkeypatch.setattr(
+        graph_storage_module.auth_service,
+        "resolve_namespace_falkordb_connection",
+        _resolver,
+    )
+
+    storage = FalkorDBGraphStorage(
+        "tenant:ns-123:collection:collection_demo_abcd1234",
+        namespace_id=None,
+        _connection_resolver=lambda: _resolver(None, "ns-123"),
+    )
+
+    graph = await storage._get_graph()
+    assert graph is not None
+    assert storage._client is not None
+    assert storage._client.connection_pool.kwargs["host"] == "tenant-db.example.com"
+    assert storage._client.connection_pool.kwargs["port"] == 6380
+    assert storage._client.connection_pool.kwargs["username"] == "tenant_ns"
+    assert storage._client.connection_pool.kwargs["password"] == "secret"
