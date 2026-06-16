@@ -700,13 +700,22 @@ class ConsoleScreen(Screen):
     ConsoleScreen {
         layout: grid;
         grid-size: 1;
-        grid-rows: auto auto 1fr auto;
+        grid-rows: auto auto auto 1fr auto;
     }
 
     #title {
         padding: 1;
         background: $boost;
         color: $accent;
+        text-style: bold;
+    }
+
+    #namespace-banner {
+        margin: 0 1;
+        padding: 0 1;
+        height: auto;
+        background: $accent;
+        color: $background;
         text-style: bold;
     }
 
@@ -1035,6 +1044,7 @@ class ConsoleScreen(Screen):
             "Graph Core CLI  |  Slash commands only  |  q=Quit",
             id="title",
         )
+        yield Label("", id="namespace-banner")
         yield Label("", id="context")
         yield Container(
             Container(
@@ -1061,6 +1071,11 @@ class ConsoleScreen(Screen):
     def on_mount(self) -> None:
         self._refresh_context()
         self._write("Use /help to see available commands.")
+        self.run_worker(
+            self._hydrate_namespace_context(),
+            exclusive=True,
+            group="context",
+        )
         self.call_after_refresh(self._focus_command)
         self._file_cache = self._collect_files()
 
@@ -1303,7 +1318,7 @@ class ConsoleScreen(Screen):
         cfg["namespace_token"] = token
         cfg["ui_mode"] = "user"
         self.app.config = cfg
-        self._namespace_verified = True
+        await self._hydrate_namespace_context()
         if text:
             self._write(text)
         else:
@@ -1780,10 +1795,22 @@ class ConsoleScreen(Screen):
             self._refresh_context()
             return
 
-        if cfg.get("namespace_id") and cfg.get("namespace_name"):
-            self._namespace_verified = True
-        else:
-            self._namespace_verified = False
+        try:
+            result = await self._call_result("get_current_namespace", admin=False)
+            payload = dict(result.structuredContent or {})
+            namespace = dict(payload.get("namespace") or {})
+            namespace_id = str(namespace.get("id", "") or "")
+            namespace_name = str(namespace.get("name", "") or "")
+            if namespace_id:
+                cfg["namespace_id"] = namespace_id
+            if namespace_name:
+                cfg["namespace_name"] = namespace_name
+            self.app.config = cfg
+            self._namespace_verified = bool(namespace_id and namespace_name)
+        except Exception:
+            self._namespace_verified = bool(
+                cfg.get("namespace_id") and cfg.get("namespace_name")
+            )
         self._refresh_context()
 
     async def _resolve_collection(self, target: str) -> dict:
@@ -1893,13 +1920,15 @@ class ConsoleScreen(Screen):
         cfg = self.app.config
         key_kind = self.app.ui_mode
         if key_kind == "user":
-            namespace = (
+            namespace_name = (
                 cfg.get("namespace_name")
                 if self._namespace_verified
                 else "(saved namespace token)"
             ) or "(not selected)"
+            namespace_banner = f"Connected to namespace: {namespace_name}"
         else:
-            namespace = "(admin context)"
+            namespace_name = "(admin context)"
+            namespace_banner = "Admin mode"
         query_suffix = ""
         if self._query_started_at is not None:
             elapsed = int(asyncio.get_running_loop().time() - self._query_started_at)
@@ -1907,9 +1936,10 @@ class ConsoleScreen(Screen):
             if self._query_status_text:
                 query_suffix += f"  {self._query_status_text}"
         try:
+            self.query_one("#namespace-banner", Label).update(namespace_banner)
             self.query_one("#context", Label).update(
                 f"admin={cfg.get('admin_mcp_url', '')}  user={cfg.get('user_mcp_url', '')}"
-                f"  mode={key_kind}  namespace={namespace}"
+                f"  mode={key_kind}  namespace={namespace_name}"
                 f"{query_suffix}"
             )
         except NoMatches:

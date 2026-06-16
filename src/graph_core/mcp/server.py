@@ -893,7 +893,7 @@ async def create_embedding_profile(
     dimensions: int | None = None,
     distance_metric: str | None = None,
     max_concurrent_calls: int | None = None,
-) -> str:
+) -> CallToolResult:
     """Create an embedding profile in the current namespace.
 
     Args:
