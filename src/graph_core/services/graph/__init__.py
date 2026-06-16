@@ -217,16 +217,12 @@ class GraphService:
                 )
             )
             await session.execute(
-                delete(GraphEntity).where(
-                    GraphEntity.collection_id == collection.id
-                )
+                delete(GraphEntity).where(GraphEntity.collection_id == collection.id)
             )
             await session.commit()
         await drop_all_tables(collection.id)
         if collection.embedding_dimensions is None:
-            raise ValueError(
-                f"Collection {collection.id} has no embedding dimensions"
-            )
+            raise ValueError(f"Collection {collection.id} has no embedding dimensions")
         await create_all_tables(collection.id, collection.embedding_dimensions)
         await self._graph_storage(collection).drop()
 
@@ -249,11 +245,12 @@ class GraphService:
         if legacy_name not in candidate_old_names:
             candidate_old_names.append(legacy_name)
 
-        current_storage = FalkorDBGraphStorage(current_graph_name)
-        current_exists = await current_storage.exists()
-        current_node_count = (
-            await current_storage.node_count() if current_exists else 0
+        current_storage = FalkorDBGraphStorage(
+            current_graph_name,
+            namespace_id=collection.namespace_id,
         )
+        current_exists = await current_storage.exists()
+        current_node_count = await current_storage.node_count() if current_exists else 0
 
         for old_graph_name in candidate_old_names:
             if old_graph_name == current_graph_name:
@@ -432,13 +429,17 @@ class GraphService:
     ) -> list[ChatMessage]:
         async with AsyncSessionLocal() as session:
             messages = (
-                await session.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.chat_id == chat_id)
-                    .order_by(ChatMessage.message_index.desc())
-                    .limit(limit)
+                (
+                    await session.execute(
+                        select(ChatMessage)
+                        .where(ChatMessage.chat_id == chat_id)
+                        .order_by(ChatMessage.message_index.desc())
+                        .limit(limit)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         return list(reversed(messages))
 
     async def _load_chat_message_rows(
@@ -450,13 +451,19 @@ class GraphService:
             return []
         async with AsyncSessionLocal() as session:
             rows = (
-                await session.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.chat_id == chat_id)
-                    .where(ChatMessage.id.in_([uuid.UUID(mid) for mid in message_ids]))
-                    .order_by(ChatMessage.message_index)
+                (
+                    await session.execute(
+                        select(ChatMessage)
+                        .where(ChatMessage.chat_id == chat_id)
+                        .where(
+                            ChatMessage.id.in_([uuid.UUID(mid) for mid in message_ids])
+                        )
+                        .order_by(ChatMessage.message_index)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         return rows
 
     @staticmethod
@@ -1288,7 +1295,9 @@ class GraphService:
             else f"{description}\nAliases: {', '.join(concept_aliases)}"
         )
         chunk_embedding = await embedding_provider.embed_query(chunk_content)
-        chunk_hash = hashlib.md5("::".join([label, node_id]).encode("utf-8")).hexdigest()
+        chunk_hash = hashlib.md5(
+            "::".join([label, node_id]).encode("utf-8")
+        ).hexdigest()
         await self._graph_rag_vectors.upsert_chunk_embedding(
             collection_id=meta_collection.id,
             chunk_hash=chunk_hash,
@@ -1356,19 +1365,21 @@ class GraphService:
                 source_ids = edge.get("source_ids")
                 if not isinstance(source_ids, list):
                     source_ids = []
-                source_chunk_hash = (
-                    hashlib.md5(
-                        "::".join(
-                            [str(value).strip() for value in source_ids if str(value).strip()]
-                            or [
-                                description,
-                                str(source_entity_id),
-                                str(target_entity_id),
-                                rel_type,
-                            ]
-                        ).encode("utf-8")
-                    ).hexdigest()
-                )
+                source_chunk_hash = hashlib.md5(
+                    "::".join(
+                        [
+                            str(value).strip()
+                            for value in source_ids
+                            if str(value).strip()
+                        ]
+                        or [
+                            description,
+                            str(source_entity_id),
+                            str(target_entity_id),
+                            rel_type,
+                        ]
+                    ).encode("utf-8")
+                ).hexdigest()
                 rel_result = await resolver.resolve_relationship(
                     session=session,
                     source_entity_id=source_entity_id,
@@ -1648,9 +1659,7 @@ class GraphService:
         """Main pipeline — delegates to ingestion submodule."""
         await ingest_document_pipeline(job_id)
 
-    async def process_single_chunk(
-        self, job_id: str, chunk_index: int
-    ) -> None:
+    async def process_single_chunk(self, job_id: str, chunk_index: int) -> None:
         """Process a single chunk — called by run_chunk worker."""
         await process_single_chunk(job_id, chunk_index)
 
@@ -1842,7 +1851,9 @@ class GraphService:
                 "payload": payload,
             }
 
-    async def _set_job_payload(self, job_id: uuid.UUID, payload: dict[str, Any]) -> None:
+    async def _set_job_payload(
+        self, job_id: uuid.UUID, payload: dict[str, Any]
+    ) -> None:
         async with AsyncSessionLocal() as session:
             job = await session.get(Job, job_id)
             if not job:
@@ -1871,9 +1882,7 @@ class GraphService:
                 if payload.get("llm_profile_id")
                 else None
             )
-            chat_id = (
-                uuid.UUID(payload["chat_id"]) if payload.get("chat_id") else None
-            )
+            chat_id = uuid.UUID(payload["chat_id"]) if payload.get("chat_id") else None
 
         await self.update_job_status(job_id, "running")
         await self.append_job_event(job_id, "started")
@@ -2040,7 +2049,8 @@ class GraphService:
                     "canonical_name": canonical_name,
                     "primary_type": str(
                         node.get("primary_type") or node.get("type") or "concept"
-                    ).strip() or "concept",
+                    ).strip()
+                    or "concept",
                     "descriptions": [],
                     "aliases": set(),
                     "source_ids": set(),
@@ -2070,8 +2080,11 @@ class GraphService:
 
         region_entries = list(understanding.get("regions") or [])
         if region_entries:
+
             def slug(text: str) -> str:
-                return "_".join(part for part in text.strip().lower().split() if part)[:96]
+                return "_".join(part for part in text.strip().lower().split() if part)[
+                    :96
+                ]
 
             async with AsyncSessionLocal() as session:
                 node_id_map: dict[str, uuid.UUID] = {}
@@ -2246,19 +2259,21 @@ class GraphService:
                     source_ids = edge.get("source_ids")
                     if not isinstance(source_ids, list):
                         source_ids = []
-                    source_chunk_hash = (
-                        hashlib.md5(
-                            "::".join(
-                                [str(value).strip() for value in source_ids if str(value).strip()]
-                                or [
-                                    description,
-                                    str(source_entity_id),
-                                    str(target_entity_id),
-                                    rel_type,
-                                ]
-                            ).encode("utf-8")
-                        ).hexdigest()
-                    )
+                    source_chunk_hash = hashlib.md5(
+                        "::".join(
+                            [
+                                str(value).strip()
+                                for value in source_ids
+                                if str(value).strip()
+                            ]
+                            or [
+                                description,
+                                str(source_entity_id),
+                                str(target_entity_id),
+                                rel_type,
+                            ]
+                        ).encode("utf-8")
+                    ).hexdigest()
                     rel_result = await resolver.resolve_relationship(
                         session=session,
                         source_entity_id=source_entity_id,
@@ -2290,13 +2305,17 @@ class GraphService:
             # an interrupted enhance run preserves completed progress.
             for canonical_name in merged_node_order:
                 node = merged_nodes_by_name[canonical_name]
-                primary_type = str(node.get("primary_type") or "concept").strip() or "concept"
+                primary_type = (
+                    str(node.get("primary_type") or "concept").strip() or "concept"
+                )
                 descriptions = [
                     str(value).strip()
                     for value in node.get("descriptions", [])
                     if str(value).strip()
                 ]
-                description = max(descriptions, key=len) if descriptions else canonical_name
+                description = (
+                    max(descriptions, key=len) if descriptions else canonical_name
+                )
                 source_ids = sorted(
                     {
                         str(value).strip()
@@ -2304,9 +2323,9 @@ class GraphService:
                         if str(value).strip()
                     }
                 )
-                source_chunk_hash = (
-                    hashlib.md5("::".join(source_ids or [canonical_name]).encode("utf-8")).hexdigest()
-                )
+                source_chunk_hash = hashlib.md5(
+                    "::".join(source_ids or [canonical_name]).encode("utf-8")
+                ).hexdigest()
                 resolved = await resolver.resolve_entity(
                     session=session,
                     name=canonical_name,
@@ -2363,14 +2382,21 @@ class GraphService:
                 source_ids = edge.get("source_ids")
                 if not isinstance(source_ids, list):
                     source_ids = []
-                source_chunk_hash = (
-                    hashlib.md5(
-                        "::".join(
-                            [str(value).strip() for value in source_ids if str(value).strip()]
-                            or [description, str(source_entity_id), str(target_entity_id), rel_type]
-                        ).encode("utf-8")
-                    ).hexdigest()
-                )
+                source_chunk_hash = hashlib.md5(
+                    "::".join(
+                        [
+                            str(value).strip()
+                            for value in source_ids
+                            if str(value).strip()
+                        ]
+                        or [
+                            description,
+                            str(source_entity_id),
+                            str(target_entity_id),
+                            rel_type,
+                        ]
+                    ).encode("utf-8")
+                ).hexdigest()
                 rel_result = await resolver.resolve_relationship(
                     session=session,
                     source_entity_id=source_entity_id,
@@ -2480,8 +2506,10 @@ class GraphService:
                         namespace_id,
                         target_level,
                     )
-                    embedding_provider = await self._resolve_collection_embedding_provider(
-                        meta_collection
+                    embedding_provider = (
+                        await self._resolve_collection_embedding_provider(
+                            meta_collection
+                        )
                     )
                     graph_storage = self._graph_storage(meta_collection)
                 if embedding_provider is None or graph_storage is None:
@@ -2593,6 +2621,7 @@ class GraphService:
                 f"Collection {collection.id} does not belong to namespace "
                 f"{namespace_id}"
             )
+
 
 __all__ = [
     "GraphService",
