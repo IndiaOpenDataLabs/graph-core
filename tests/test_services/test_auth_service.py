@@ -106,6 +106,7 @@ async def test_provision_namespace_falkordb_credential_sets_acl_user(
             "+AUTH",
             "+INFO",
             "+EXISTS",
+            "+MODULE|LIST",
             "+PING",
             "+GRAPH.LIST",
             "+GRAPH.QUERY",
