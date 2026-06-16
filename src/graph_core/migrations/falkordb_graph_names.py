@@ -49,10 +49,7 @@ async def replay_collection_graph_names(
 ) -> None:
     """Replay the collection graph rename pass."""
     for current_graph_name, namespace_id, old_graph_names in payloads:
-        current_storage = FalkorDBGraphStorage(
-            current_graph_name,
-            namespace_id=namespace_id,
-        )
+        current_storage = FalkorDBGraphStorage(current_graph_name)
         current_exists = await current_storage.exists()
         current_node_count = await current_storage.node_count() if current_exists else 0
 
