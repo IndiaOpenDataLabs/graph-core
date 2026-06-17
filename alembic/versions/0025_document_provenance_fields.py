@@ -61,12 +61,14 @@ def upgrade() -> None:
         "relationship_descriptions", "document_path", "VARCHAR(1024)"
     )
 
-    _add_column_if_missing("vector_chunks", "document_id", "UUID")
-    _add_column_if_missing("vector_chunks", "document_path", "VARCHAR(1024)")
-
     collection_ids = bind.execute(sa.text("SELECT id FROM collections")).scalars().all()
     for collection_id in collection_ids:
-        for kind in ("chunk_embeddings", "entity_embeddings", "relationship_embeddings"):
+        for kind in (
+            "vector_chunks",
+            "chunk_embeddings",
+            "entity_embeddings",
+            "relationship_embeddings",
+        ):
             tbl = table_name(collection_id, kind)
             _add_column_if_missing(tbl, "document_id", "UUID")
             _add_column_if_missing(tbl, "document_path", "VARCHAR(1024)")
@@ -103,11 +105,13 @@ def downgrade() -> None:
     op.drop_index("ix_ingestion_chunks_document_id", table_name="ingestion_chunks")
     op.drop_index("ix_jobs_document_id", table_name="jobs")
 
-    op.drop_column("vector_chunks", "document_path")
-    op.drop_column("vector_chunks", "document_id")
-
     for collection_id in bind.execute(sa.text("SELECT id FROM collections")).scalars().all():
-        for kind in ("chunk_embeddings", "entity_embeddings", "relationship_embeddings"):
+        for kind in (
+            "vector_chunks",
+            "chunk_embeddings",
+            "entity_embeddings",
+            "relationship_embeddings",
+        ):
             tbl = table_name(collection_id, kind)
             op.execute(sa.text(f"ALTER TABLE {tbl} DROP COLUMN IF EXISTS document_path"))
             op.execute(sa.text(f"ALTER TABLE {tbl} DROP COLUMN IF EXISTS document_id"))
