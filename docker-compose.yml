@@ -112,7 +112,7 @@ services:
       - falkordb_data:/var/lib/falkordb/data
       - ./scripts/falkordb/users.acl:/var/lib/falkordb/data/users.acl
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      test: ["CMD-SHELL", "redis-cli -p 6382 ping | grep PONG"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -121,9 +121,11 @@ services:
     build: .
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     network_mode: service:falkordb
     environment:
-      DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
+      DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@host.docker.internal:5432/graphcore
       FALKORDB_PROXY_PORT: 6379
       FALKORDB_PROXY_UPSTREAM_URL: falkordb://localhost:6382
     command: ["graph-core-falkordb-proxy"]
