@@ -148,4 +148,48 @@ async def test_proxy_returns_clean_error_for_upstream_failures(monkeypatch):
             "MATCH (n) RETURN n",
         ]
     )
-    assert "No permissions to access a key" in str(error_reply)
+    assert error_reply == []
+
+
+@pytest.mark.asyncio
+async def test_proxy_uses_safe_fallbacks_for_permission_errors(monkeypatch):
+    fake_upstream = _FakeRedis()
+    fake_upstream.execute_command.side_effect = [
+        ResponseError("No permissions to access a key"),
+        ResponseError("No permissions to access a key"),
+        ResponseError("No permissions to access a key"),
+    ]
+
+    monkeypatch.setattr(
+        "graph_core.proxy.falkordb_proxy.Redis.from_url",
+        lambda *args, **kwargs: fake_upstream,
+    )
+
+    proxy = FalkorDBTenantProxy(upstream_default_url="redis://localhost:6379")
+    session = _ProxySession(proxy=proxy, reader=None, writer=None)  # type: ignore[arg-type]
+    session._proxy._resolve_namespace_auth = AsyncMock(
+        return_value=NamespaceAuth(
+            namespace_id="abc",
+            namespace_name="tenant-abc",
+            username="tenant_user",
+            password="tenant-secret",
+            graph_prefix="tenant:abc:",
+            upstream_url="redis://localhost:6379",
+            db=1,
+        )
+    )
+
+    auth_reply = await session.handle_command(["AUTH", "tenant_user", "tenant-secret"])
+    assert isinstance(auth_reply, SimpleString)
+
+    graph_list = await session.handle_command(["GRAPH.LIST"])
+    assert graph_list == []
+
+    graph_query = await session.handle_command(
+        [
+            "GRAPH.QUERY",
+            "tenant:abc:collection:one",
+            "MATCH (n) RETURN n",
+        ]
+    )
+    assert graph_query == []

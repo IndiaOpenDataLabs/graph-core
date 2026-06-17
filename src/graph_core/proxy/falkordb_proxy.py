@@ -56,6 +56,15 @@ class ErrorReply:
     message: str
 
 
+def _is_permission_error_message(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "no permissions to access a key" in normalized
+        or "noperm" in normalized
+        or "permission denied" in normalized
+    )
+
+
 class FalkorDBTenantProxy:
     """RESP proxy that scopes a Browser connection to one namespace."""
 
@@ -188,6 +197,12 @@ class _ProxySession:
 
             name = command[0].upper()
             args = command[1:]
+            logger.debug(
+                "Proxy command name=%s arg0=%s arg_count=%d",
+                name,
+                args[0] if args else "",
+                len(args),
+            )
 
             if name == "QUIT":
                 return SimpleString("OK")
@@ -212,12 +227,28 @@ class _ProxySession:
                     return SimpleString("OK")
 
             if name == "GRAPH.LIST":
-                result = await self._execute_upstream(name, args)
+                try:
+                    result = await self._execute_upstream(name, args)
+                except ProxyError as exc:
+                    if _is_permission_error_message(str(exc)):
+                        return []
+                    raise
                 return self._filter_graph_list(result)
 
             if name.startswith("GRAPH."):
                 self._ensure_allowed_graph_args(command)
-                return await self._execute_upstream(name, args)
+                try:
+                    return await self._execute_upstream(name, args)
+                except ProxyError as exc:
+                    if not _is_permission_error_message(str(exc)):
+                        raise
+                    if name in {"GRAPH.QUERY", "GRAPH.RO_QUERY"}:
+                        return []
+                    if name == "GRAPH.MEMORY":
+                        return 0
+                    if name == "GRAPH.DELETE":
+                        return SimpleString("OK")
+                    return []
 
             if name == "MODULE" and args and args[0].upper() == "LIST":
                 return await self._execute_upstream(name, args)
