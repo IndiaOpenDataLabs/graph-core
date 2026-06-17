@@ -28,3 +28,11 @@ def document_id_for_path(collection_id: uuid.UUID, document_path: str) -> uuid.U
     if not normalized:
         raise ValueError("document_path is required to derive a document_id")
     return uuid.uuid5(document_namespace_id(collection_id), normalized)
+
+
+def document_id_for_chunk(collection_id: uuid.UUID, chunk_hash: str) -> uuid.UUID:
+    """Derive a stable document UUID for a standalone chunk."""
+    normalized = str(chunk_hash or "").strip().lower()
+    if not normalized:
+        raise ValueError("chunk_hash is required to derive a chunk-scoped document_id")
+    return uuid.uuid5(document_namespace_id(collection_id), f"chunk:{normalized}")

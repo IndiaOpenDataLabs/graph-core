@@ -23,6 +23,10 @@ from graph_core.models.graph_rag import GraphEntity, GraphRelationship
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
+from graph_core.services.document_identity import (
+    document_id_for_path,
+    normalize_document_path,
+)
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
@@ -1625,16 +1629,26 @@ class GraphService:
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
         domain: str | None = None,
+        document_path: str | None = None,
     ) -> ChunkIngestionResult:
         if not text.strip():
             raise ValueError("Cannot ingest an empty chunk")
         collection = await self.get_collection(collection_id)
+        normalized_document_path = (
+            normalize_document_path(document_path) if document_path else None
+        )
         return await ingest_collection_chunk(
             text=text,
             collection=collection,
             namespace_id=namespace_id,
             chunk_index=0,
             domain=domain,
+            document_id=(
+                document_id_for_path(collection_id, normalized_document_path)
+                if normalized_document_path
+                else None
+            ),
+            document_path=normalized_document_path,
         )
 
     async def enqueue_document_ingestion(

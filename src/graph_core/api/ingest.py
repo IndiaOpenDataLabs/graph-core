@@ -15,6 +15,7 @@ from graph_core.workers.ingestion import run_ingestion
 class IngestChunkRequest(BaseModel):
     text: str
     domain: str | None = None
+    document_path: str | None = None
 
 
 class IngestChunkResponse(BaseModel):
@@ -53,6 +54,7 @@ async def ingest_chunk(
             collection_id,
             namespace_id,
             domain=body.domain,
+            document_path=body.document_path,
         )
         return IngestChunkResponse(**result.__dict__)
     except PermissionError as e:

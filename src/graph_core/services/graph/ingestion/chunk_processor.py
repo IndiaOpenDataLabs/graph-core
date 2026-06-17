@@ -26,6 +26,8 @@ from graph_core.models.graph_rag import (
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.profile import Profile
 from graph_core.services.document_identity import normalize_document_path
+from graph_core.services.document_identity import document_id_for_chunk
+from graph_core.services.document_identity import document_id_for_path
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.entity_name_cache import EntityNameCache
 from graph_core.services.graph_rag.entity_resolver import (
@@ -168,6 +170,17 @@ async def ingest_collection_chunk(
     _enforce_namespace(collection, namespace_id)
     sanitized_text, report = _sanitizer.sanitize(text, str(namespace_id))
     chunk_hash = _sanitizer.chunk_hash(sanitized_text)
+    normalized_document_path = (
+        normalize_document_path(document_path) if document_path else None
+    )
+    effective_document_id = document_id
+    if effective_document_id is None:
+        if normalized_document_path:
+            effective_document_id = document_id_for_path(
+                collection.id, normalized_document_path
+            )
+        else:
+            effective_document_id = document_id_for_chunk(collection.id, chunk_hash)
 
     if collection.strategy == "vector":
         result = await _ingest_vector_chunk(
@@ -176,8 +189,8 @@ async def ingest_collection_chunk(
             chunk_hash,
             report,
             chunk_index=chunk_index,
-            document_id=document_id,
-            document_path=document_path,
+            document_id=effective_document_id,
+            document_path=normalized_document_path,
         )
     elif collection.strategy == "light_rag":
         result = await _ingest_lightrag_chunk(
@@ -186,8 +199,8 @@ async def ingest_collection_chunk(
             chunk_hash,
             report,
             domain=domain,
-            document_id=document_id,
-            document_path=document_path,
+            document_id=effective_document_id,
+            document_path=normalized_document_path,
         )
     else:
         result = await _ingest_graph_chunk(
@@ -196,8 +209,8 @@ async def ingest_collection_chunk(
             chunk_hash,
             report,
             domain=domain,
-            document_id=document_id,
-            document_path=document_path,
+            document_id=effective_document_id,
+            document_path=normalized_document_path,
         )
 
     await _write_ledger(
@@ -205,8 +218,8 @@ async def ingest_collection_chunk(
         chunk_hash,
         report,
         result,
-        document_id=document_id,
-        document_path=document_path,
+        document_id=effective_document_id,
+        document_path=normalized_document_path,
     )
     return result
 

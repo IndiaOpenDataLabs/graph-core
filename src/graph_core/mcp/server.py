@@ -542,6 +542,7 @@ async def ingest_chunk(
     text: str,
     ctx: Context,
     domain: str | None = None,
+    document_path: str | None = None,
 ) -> CallToolResult:
     """Ingest a text chunk directly into a collection.
 
@@ -553,7 +554,12 @@ async def ingest_chunk(
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.ingest_chunk(collection_id, text, domain=domain)
+    result = await client.ingest_chunk(
+        collection_id,
+        text,
+        domain=domain,
+        document_path=document_path,
+    )
     return _result(
         (
             f"Ingested chunk:\n"

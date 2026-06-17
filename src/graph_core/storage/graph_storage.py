@@ -821,7 +821,7 @@ class FalkorDBGraphStorage:
         document_filter = ""
         params: dict[str, Any] = {"node_id": node_id}
         if document_ids:
-            document_filter = "coalesce(r.document_id, '') IN $document_ids"
+            document_filter = "toString(coalesce(r.document_id, '')) IN $document_ids"
             params["document_ids"] = [str(document_id) for document_id in document_ids]
         if label_pat:
             cypher = (
@@ -858,7 +858,7 @@ class FalkorDBGraphStorage:
         document_filter = ""
         params: dict[str, Any] = {"node_id": node_id}
         if document_ids:
-            document_filter = "coalesce(r.document_id, '') IN $document_ids"
+            document_filter = "toString(coalesce(r.document_id, '')) IN $document_ids"
             params["document_ids"] = [str(document_id) for document_id in document_ids]
         if label_pat:
             cypher = (
@@ -900,7 +900,7 @@ class FalkorDBGraphStorage:
         document_filter = ""
         params: dict[str, Any] = {"source_id": source_id, "target_id": target_id}
         if document_ids:
-            document_filter = "coalesce(r.document_id, '') IN $document_ids"
+            document_filter = "toString(coalesce(r.document_id, '')) IN $document_ids"
             params["document_ids"] = [str(document_id) for document_id in document_ids]
         if label_pat:
             cypher = (
