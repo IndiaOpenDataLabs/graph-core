@@ -19,10 +19,14 @@ def load_namespace_acl_payloads(
     session: Session,
 ) -> list[tuple[str, str, str, str | None]]:
     """Load namespace ACL replay payloads from the sync Alembic session."""
-    result = session.execute(select(Namespace).order_by(Namespace.created_at.asc()))
     payloads: list[tuple[str, str, str, str | None]] = []
-    for namespace in result.scalars().all():
-        metadata = namespace.metadata_json or {}
+    namespace_rows = session.execute(
+        select(Namespace.id, Namespace.metadata_json, Namespace.created_at).order_by(
+            Namespace.created_at.asc()
+        )
+    )
+    for namespace_id, metadata_json in namespace_rows.all():
+        metadata = metadata_json or {}
         falkordb_meta = metadata.get("falkordb")
         credential: Credential | None = None
         if isinstance(falkordb_meta, dict):
@@ -34,7 +38,7 @@ def load_namespace_acl_payloads(
                 session.execute(
                     select(Credential)
                     .where(
-                        Credential.namespace_id == namespace.id,
+                        Credential.namespace_id == namespace_id,
                         Credential.provider == "falkordb",
                     )
                     .order_by(Credential.created_at.desc())
@@ -50,13 +54,13 @@ def load_namespace_acl_payloads(
         else:
             username = ""
         if not username:
-            username = str(credential.label or f"ns_{namespace.id.hex}").strip()
+            username = str(credential.label or f"ns_{namespace_id.hex}").strip()
         if not username:
             continue
 
         payloads.append(
             (
-                str(namespace.id),
+                str(namespace_id),
                 username,
                 _crypto.decrypt(credential.encrypted_secret),
                 credential.base_url,
