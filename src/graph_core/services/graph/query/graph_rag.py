@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import distinct, func, or_, select
+from sqlalchemy import distinct, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -21,7 +21,6 @@ from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
-from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.graph_rag import (
     EntityAlias,
     EntityDescription,
@@ -410,6 +409,14 @@ class GraphQueryArtifacts:
 class DocumentRoutingDecision:
     use_all_documents: bool
     document_ids: list[uuid.UUID]
+    
+
+@dataclass
+class DocumentRoutingCandidate:
+    document_id: str
+    document_path: str
+    best_score: float
+    matched_entities: list[str]
 
 
 def _format_retrieval_query(instruction: str, query: str) -> str:
@@ -596,44 +603,50 @@ def _maybe_uuid_string(value: str) -> str | None:
         return None
 
 
-async def _load_document_candidates(
+async def _load_document_candidates_from_query_entities(
+    question: str,
     collection: Collection,
+    embedding_provider: EmbeddingProvider,
     *,
     limit: int = 20,
-) -> list[dict[str, Any]]:
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(
-                IngestionRecord.document_id,
-                IngestionRecord.document_path,
-                func.count().label("chunk_count"),
-                func.max(IngestionRecord.ingested_at).label("last_ingested_at"),
-            )
-            .where(
-                IngestionRecord.collection_id == collection.id,
-                IngestionRecord.document_id.isnot(None),
-            )
-            .group_by(
-                IngestionRecord.document_id,
-                IngestionRecord.document_path,
-            )
-            .order_by(func.max(IngestionRecord.ingested_at).desc())
-            .limit(limit)
-        )
+) -> list[DocumentRoutingCandidate]:
+    query_embedding = await _embed_entity_query(embedding_provider, question)
+    entity_hits = await _graph_rag_vectors.search_entity_embeddings(
+        collection_id=collection.id,
+        query_embedding=query_embedding,
+        top_k=50,
+    )
 
-    candidates: list[dict[str, Any]] = []
-    for document_id, document_path, chunk_count, _last_ingested_at in result.all():
-        document_id_str = str(document_id) if document_id else ""
-        if not document_id_str:
+    candidate_map: dict[str, DocumentRoutingCandidate] = {}
+    for hit in entity_hits:
+        document_id = str(hit.metadata.get("document_id") or "").strip()
+        if not document_id:
             continue
-        candidates.append(
-            {
-                "document_id": document_id_str,
-                "document_path": document_path or "",
-                "chunk_count": int(chunk_count or 0),
-            }
-        )
-    return candidates
+        document_path = str(hit.metadata.get("document_path") or "").strip()
+        entity_name = str(hit.metadata.get("name") or "").strip()
+        score = 1.0 - float(hit.distance)
+        candidate = candidate_map.get(document_id)
+        if candidate is None:
+            candidate_map[document_id] = DocumentRoutingCandidate(
+                document_id=document_id,
+                document_path=document_path,
+                best_score=score,
+                matched_entities=[entity_name] if entity_name else [],
+            )
+            continue
+        if score > candidate.best_score:
+            candidate.best_score = score
+        if not candidate.document_path and document_path:
+            candidate.document_path = document_path
+        if entity_name and entity_name not in candidate.matched_entities:
+            candidate.matched_entities.append(entity_name)
+
+    candidates = sorted(
+        candidate_map.values(),
+        key=lambda candidate: candidate.best_score,
+        reverse=True,
+    )
+    return candidates[:limit]
 
 
 async def _resolve_document_routing(
@@ -642,7 +655,12 @@ async def _resolve_document_routing(
     namespace_id: uuid.UUID,
     llm_profile_id: uuid.UUID | None,
 ) -> DocumentRoutingDecision:
-    candidates = await _load_document_candidates(collection)
+    embedding_provider = await _resolve_embedding_provider(collection)
+    candidates = await _load_document_candidates_from_query_entities(
+        question,
+        collection,
+        embedding_provider,
+    )
     if not candidates:
         return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
 
@@ -655,9 +673,11 @@ async def _resolve_document_routing(
 
     candidate_lines = []
     for index, candidate in enumerate(candidates[:20], start=1):
-        label = candidate["document_path"] or candidate["document_id"]
+        label = candidate.document_path or candidate.document_id
+        entity_summary = ", ".join(candidate.matched_entities[:5]) or "none"
         candidate_lines.append(
-            f"{index}. {label} | document_id={candidate['document_id']} | chunks={candidate['chunk_count']}"
+            f"{index}. {label} | document_id={candidate.document_id} | "
+            f"entities={entity_summary} | score={candidate.best_score:.3f}"
         )
 
     schema = {
@@ -694,7 +714,7 @@ async def _resolve_document_routing(
     route = str(result.get("route") or "all").strip().lower()
     selected_ids: list[uuid.UUID] = []
     if route == "documents":
-        allowed_ids = {candidate["document_id"] for candidate in candidates}
+        allowed_ids = {candidate.document_id for candidate in candidates}
         for value in result.get("document_ids", []):
             value_str = _maybe_uuid_string(str(value))
             if value_str and value_str in allowed_ids:
