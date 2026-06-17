@@ -26,6 +26,7 @@ class IngestChunkResponse(BaseModel):
 class IngestDocRequest(BaseModel):
     text: str
     domain: str | None = None
+    document_path: str | None = None
 
 
 class IngestDocResponse(BaseModel):
@@ -78,6 +79,7 @@ async def ingest_document(
             collection_id,
             namespace_id,
             domain=body.domain,
+            document_path=body.document_path,
         )
         run_ingestion.send(str(result.job_id))
         return IngestDocResponse(job_id=str(result.job_id), status=result.status)

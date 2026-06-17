@@ -231,6 +231,8 @@ class IncrementalEntityResolver:
         entity_type: str,
         description: str,
         source_chunk_hash: str,
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> EntityResolutionResult:
         normalized_name = self._normalize_entity_name(name)
         # Step 1: Exact alias lookup
@@ -251,6 +253,8 @@ class IncrementalEntityResolver:
                 await self._add_description_and_update_centroid(
                     session, entity_result.id, entity_result, description,
                     source_chunk_hash, context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
                 )
                 await self._add_or_increment_type(session, entity_result.id, entity_type)
                 return EntityResolutionResult(
@@ -271,6 +275,8 @@ class IncrementalEntityResolver:
             context_embedding = await self._embedding.embed_query(search_text)
             await self._add_description_and_update_centroid(
                 session, existing.id, existing, description, source_chunk_hash, context_embedding,
+                document_id=document_id,
+                document_path=document_path,
             )
             await self._add_or_increment_type(session, existing.id, entity_type)
             return EntityResolutionResult(
@@ -294,9 +300,18 @@ class IncrementalEntityResolver:
             )
             if entity_match:
                 logger.debug("Embedding match: %s -> %s", normalized_name, entity_match.canonical_name)
-                await self._add_alias(session, entity_match.id, normalized_name, source_chunk_hash)
+                await self._add_alias(
+                    session,
+                    entity_match.id,
+                    normalized_name,
+                    source_chunk_hash,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
                 await self._add_description_and_update_centroid(
                     session, entity_match.id, entity_match, description, source_chunk_hash, query_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
                 )
                 await self._add_or_increment_type(session, entity_match.id, entity_type)
                 return EntityResolutionResult(
@@ -326,7 +341,9 @@ class IncrementalEntityResolver:
                 entity_id = row[0]
                 entity = await session.get(GraphEntity, entity_id)
                 await self._add_alias(
-                    session, entity_id, normalized_name, source_chunk_hash
+                    session, entity_id, normalized_name, source_chunk_hash,
+                    document_id=document_id,
+                    document_path=document_path,
                 )
                 await self._add_description_and_update_centroid(
                     session,
@@ -335,6 +352,8 @@ class IncrementalEntityResolver:
                     description,
                     source_chunk_hash,
                     query_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
                 )
                 await self._add_or_increment_type(session, entity_id, entity_type)
                 logger.info("New entity created: %s (type=%s)", normalized_name, entity_type)
@@ -354,6 +373,8 @@ class IncrementalEntityResolver:
                 logger.debug("Concurrent entity creation, using existing: %s", normalized_name)
                 await self._add_description_and_update_centroid(
                     session, existing.id, existing, description, source_chunk_hash, query_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
                 )
                 await self._add_or_increment_type(session, existing.id, entity_type)
                 return EntityResolutionResult(
@@ -372,6 +393,8 @@ class IncrementalEntityResolver:
         weight: float,
         source_chunk_hash: str,
         rel_type: str = "RELATES_TO",
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> RelationshipResolutionResult:
         # Normalize rel_type using alias table
         rel_type_resolution = await self._resolve_rel_type(session, rel_type)
@@ -406,6 +429,8 @@ class IncrementalEntityResolver:
                 session, existing.id, description, keywords, source_chunk_hash,
                 source_name=src_name, target_name=tgt_name,
                 rel_type=rel_type,
+                document_id=document_id,
+                document_path=document_path,
             )
             new_kw = list(set(existing.keywords or []) | set(keywords))
             max_weight = settings.graph_rag_max_relationship_weight
@@ -449,6 +474,8 @@ class IncrementalEntityResolver:
             keywords=keywords,
             weight=1,
             source_chunk_hashes=[source_chunk_hash],
+            document_id=document_id,
+            document_path=document_path,
         )
         session.add(desc)
         await session.commit()
@@ -469,6 +496,8 @@ class IncrementalEntityResolver:
             target_name=tgt_name,
             description=description,
             embedding=embedding,
+            document_id=document_id,
+            document_path=document_path,
         )
 
         return RelationshipResolutionResult(is_new=True, relationship_id=new_rel_id)
@@ -533,6 +562,8 @@ class IncrementalEntityResolver:
         description: str,
         source_chunk_hash: str,
         context_embedding: list[float],
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> None:
         if not description:
             return
@@ -584,6 +615,8 @@ class IncrementalEntityResolver:
             description=description,
             weight=1,
             source_chunk_hashes=[source_chunk_hash],
+            document_id=document_id,
+            document_path=document_path,
         )
         desc_id = desc.id
         session.add(desc)
@@ -610,6 +643,8 @@ class IncrementalEntityResolver:
             description=description,
             description_id=desc_id,
             embedding=embedding,
+            document_id=document_id,
+            document_path=document_path,
             session=session,
         )
 
@@ -639,6 +674,8 @@ class IncrementalEntityResolver:
         source_name: str = "",
         target_name: str = "",
         rel_type: str = "RELATES_TO",
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> None:
         embed_text = relationship_embedding_text(
             source_name,
@@ -689,6 +726,8 @@ class IncrementalEntityResolver:
             keywords=keywords,
             weight=1,
             source_chunk_hashes=[source_chunk_hash],
+            document_id=document_id,
+            document_path=document_path,
         )
         session.add(desc)
 
@@ -699,6 +738,8 @@ class IncrementalEntityResolver:
             target_name=target_name,
             description=description,
             embedding=embedding,
+            document_id=document_id,
+            document_path=document_path,
         )
 
     async def _resolve_or_create_relationship_type(
@@ -898,6 +939,8 @@ class IncrementalEntityResolver:
         entity_id: uuid.UUID,
         alias_name: str,
         source_chunk_hash: str,
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> None:
         stmt = (
             pg_insert(EntityAlias)
@@ -907,6 +950,8 @@ class IncrementalEntityResolver:
                 alias_name=alias_name,
                 entity_id=entity_id,
                 source_chunk_hash=source_chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
             )
             .on_conflict_do_nothing()
         )

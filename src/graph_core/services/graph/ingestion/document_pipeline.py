@@ -17,6 +17,10 @@ from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.profile import Profile
+from graph_core.services.document_identity import (
+    document_id_for_path,
+    normalize_document_path,
+)
 from graph_core.services.chunking import DocumentChunker
 from graph_core.services.graph.ingestion.chunk_processor import ingest_collection_chunk
 
@@ -82,6 +86,7 @@ async def enqueue_document_ingestion_job(
     collection_id: uuid.UUID,
     namespace_id: uuid.UUID,
     domain: str | None = None,
+    document_path: str | None = None,
 ) -> DocumentIngestionResult:
     """Create a pending ingest_document Job and return its result wrapper."""
     if not text.strip():
@@ -96,12 +101,28 @@ async def enqueue_document_ingestion_job(
                 f"{namespace_id}"
             )
 
+        normalized_document_path = (
+            normalize_document_path(document_path) if document_path else None
+        )
+        document_id = (
+            document_id_for_path(collection_id, normalized_document_path)
+            if normalized_document_path
+            else None
+        )
+
         job = Job(
             namespace_id=namespace_id,
             collection_id=collection_id,
+            document_id=document_id,
+            document_path=normalized_document_path,
             job_type="ingest_document",
             status="pending",
-            payload={"text": text, "domain": domain},
+            payload={
+                "text": text,
+                "domain": domain,
+                "document_id": str(document_id) if document_id else None,
+                "document_path": normalized_document_path,
+            },
         )
         session.add(job)
         await session.commit()
@@ -128,6 +149,20 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
 
         text = str(job.payload["text"])
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
+        document_path = (
+            normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
+            if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))
+            else None
+        )
+        document_id = (
+            uuid.UUID(str(job.document_id))
+            if getattr(job, "document_id", None)
+            else (
+                uuid.UUID(str(job.payload["document_id"]))
+                if isinstance(job.payload, dict) and job.payload.get("document_id")
+                else (document_id_for_path(collection.id, document_path) if document_path else None)
+            )
+        )
 
     chunks = _chunker.chunk_text(text, domain=domain)
     total_chunks = max(len(chunks), 1)
@@ -138,7 +173,13 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
 
     # For custom_graph_rag and light_rag: fan-out chunks to parallel workers
     if collection.strategy in ("custom_graph_rag", "light_rag"):
-        await fan_out_chunks(job_id, collection.id, chunks)
+        await fan_out_chunks(
+            job_id,
+            collection.id,
+            chunks,
+            document_id=document_id,
+            document_path=document_path,
+        )
     else:
         # Vector strategy: sequential processing
         for index, chunk in enumerate(chunks, start=1):
@@ -148,6 +189,8 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
                 namespace_id=collection.namespace_id,
                 chunk_index=index - 1,
                 domain=domain,
+                document_id=document_id,
+                document_path=document_path,
             )
             progress = int(index * 100 / total_chunks)
             await _update_job_status(job_id, "running", progress_percent=progress)
@@ -162,7 +205,11 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
 
 
 async def fan_out_chunks(
-    job_id: uuid.UUID, collection_id: uuid.UUID, chunks: list[str]
+    job_id: uuid.UUID,
+    collection_id: uuid.UUID,
+    chunks: list[str],
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> None:
     """Create chunk records. Worker is responsible for enqueuing."""
     async with AsyncSessionLocal() as session:
@@ -171,6 +218,8 @@ async def fan_out_chunks(
                 job_id=job_id,
                 chunk_index=index,
                 text=chunk_text,
+                document_id=document_id,
+                document_path=document_path,
                 status="pending",
             )
             session.add(chunk)
@@ -303,13 +352,30 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
         job = await session.get(Job, job_uuid)
         collection = await session.get(Collection, job.collection_id)
         text = chunk.text
+        domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
+        document_path = (
+            normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
+            if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))
+            else None
+        )
+        document_id = (
+            uuid.UUID(str(job.document_id))
+            if getattr(job, "document_id", None)
+            else (
+                uuid.UUID(str(job.payload["document_id"]))
+                if isinstance(job.payload, dict) and job.payload.get("document_id")
+                else (document_id_for_path(collection.id, document_path) if document_path else None)
+            )
+        )
 
     result = await ingest_collection_chunk(
         text=text,
         collection=collection,
         namespace_id=collection.namespace_id,
         chunk_index=chunk_index,
-        domain=job.payload.get("domain") if isinstance(job.payload, dict) else None,
+        domain=domain,
+        document_id=document_id,
+        document_path=document_path,
     )
 
     await update_chunk_status(job_uuid, chunk_index, "completed")

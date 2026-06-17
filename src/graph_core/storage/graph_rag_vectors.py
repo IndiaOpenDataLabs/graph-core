@@ -55,6 +55,8 @@ class GraphRAGVectorStore:
         description: str,
         description_id: uuid.UUID,
         embedding: list[float],
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
         session: AsyncSession | None = None,
     ) -> None:
         tbl = table_name(collection_id, "entity_embeddings")
@@ -72,12 +74,14 @@ class GraphRAGVectorStore:
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
-                    f"(entity_id, collection_id, name, description, description_id, embedding) "
-                    f"VALUES (:eid, :cid, :name, :desc, :did, (:emb){cast})"
+                    f"(entity_id, collection_id, document_id, document_path, name, description, description_id, embedding) "
+                    f"VALUES (:eid, :cid, :document_id, :document_path, :name, :desc, :did, (:emb){cast})"
                 ),
                 {
                     "eid": _uuid_for_sql(entity_id),
                     "cid": _uuid_for_sql(collection_id),
+                    "document_id": _uuid_for_sql(document_id) if document_id else None,
+                    "document_path": document_path,
                     "name": name,
                     "desc": description,
                     "did": _uuid_for_sql(description_id),
@@ -119,6 +123,7 @@ class GraphRAGVectorStore:
                 text(
                     f"""
                     SELECT id::text, entity_id::text, description_id::text, name, description,
+                           document_id::text, document_path,
                            1 - (embedding <=> (:qemb){cast}) as score,
                            embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
@@ -132,12 +137,14 @@ class GraphRAGVectorStore:
             return [
                 VectorSearchHit(
                     id=row[0],
-                    distance=float(row[6]),
+                    distance=float(row[8]),
                     content=row[4],
                     metadata={
                         "entity_id": row[1],
                         "description_id": row[2],
                         "name": row[3],
+                        "document_id": row[5],
+                        "document_path": row[6],
                         "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
@@ -154,6 +161,8 @@ class GraphRAGVectorStore:
         target_name: str,
         description: str,
         embedding: list[float],
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> None:
         tbl = table_name(collection_id, "relationship_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -166,12 +175,14 @@ class GraphRAGVectorStore:
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
-                    f"(relationship_id, collection_id, source_name, target_name, description, embedding) "
-                    f"VALUES (:rid, :cid, :sn, :tn, :desc, (:emb){cast})"
+                    f"(relationship_id, collection_id, document_id, document_path, source_name, target_name, description, embedding) "
+                    f"VALUES (:rid, :cid, :document_id, :document_path, :sn, :tn, :desc, (:emb){cast})"
                 ),
                 {
                     "rid": _uuid_for_sql(relationship_id),
                     "cid": _uuid_for_sql(collection_id),
+                    "document_id": _uuid_for_sql(document_id) if document_id else None,
+                    "document_path": document_path,
                     "sn": source_name,
                     "tn": target_name,
                     "desc": description,
@@ -209,6 +220,7 @@ class GraphRAGVectorStore:
                 text(
                     f"""
                     SELECT id::text, relationship_id::text, source_name, target_name, description,
+                           document_id::text, document_path,
                            1 - (embedding <=> (:qemb){cast}) as score,
                            embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
@@ -222,12 +234,14 @@ class GraphRAGVectorStore:
             return [
                 VectorSearchHit(
                     id=row[0],
-                    distance=float(row[6]),
+                    distance=float(row[8]),
                     content=row[4],
                     metadata={
                         "relationship_id": row[1],
                         "source_name": row[2],
                         "target_name": row[3],
+                        "document_id": row[5],
+                        "document_path": row[6],
                         "collection_id": _uuid_for_sql(collection_id),
                     },
                 )
@@ -379,6 +393,8 @@ class GraphRAGVectorStore:
         chunk_index: int,
         content: str,
         embedding: list[float],
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
     ) -> None:
         tbl = table_name(collection_id, "chunk_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -401,11 +417,13 @@ class GraphRAGVectorStore:
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
-                    f"(collection_id, chunk_hash, chunk_index, content, embedding) "
-                    f"VALUES (:cid, :ch, :ci, :content, (:emb){cast})"
+                    f"(collection_id, document_id, document_path, chunk_hash, chunk_index, content, embedding) "
+                    f"VALUES (:cid, :document_id, :document_path, :ch, :ci, :content, (:emb){cast})"
                 ),
                 {
                     "cid": _uuid_for_sql(collection_id),
+                    "document_id": _uuid_for_sql(document_id) if document_id else None,
+                    "document_path": document_path,
                     "ch": chunk_hash,
                     "ci": chunk_index,
                     "content": content,
@@ -432,6 +450,7 @@ class GraphRAGVectorStore:
                 text(
                     f"""
                     SELECT id::text, chunk_hash, chunk_index, content,
+                           document_id::text, document_path,
                            1 - (embedding <=> (:qemb){cast}) as score,
                            embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
@@ -449,11 +468,13 @@ class GraphRAGVectorStore:
             return [
                 VectorSearchHit(
                     id=row[0],
-                    distance=float(row[5]),
+                    distance=float(row[7]),
                     content=row[3],
                     metadata={
                         "chunk_hash": row[1],
                         "chunk_index": row[2],
+                        "document_id": row[4],
+                        "document_path": row[5],
                         "collection_id": _uuid_for_sql(collection_id),
                     },
                 )

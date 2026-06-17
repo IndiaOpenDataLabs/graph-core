@@ -278,13 +278,17 @@ class FalkorDBGraphStorage:
                 "id": n["id"],
                 "name": n.get("name", ""),
                 "collection_id": str(n.get("collection_id", "")),
+                "document_id": str(n.get("document_id")) if n.get("document_id") else None,
+                "document_path": n.get("document_path") or None,
             }
             for n in nodes
         ]
         await graph.query(
             "UNWIND $nodes AS node"
             " MERGE (n:Entity {id: node.id})"
-            " SET n.name = node.name, n.collection_id = node.collection_id",
+            " SET n.name = node.name, n.collection_id = node.collection_id,"
+            "     n.document_id = node.document_id,"
+            "     n.document_path = node.document_path",
             {"nodes": payload},
         )
 
@@ -310,6 +314,8 @@ class FalkorDBGraphStorage:
                         else (e.get("keywords") or "[]")
                     ),
                     "collection_id": str(e.get("collection_id", "")),
+                    "document_id": str(e.get("document_id")) if e.get("document_id") else None,
+                    "document_path": e.get("document_path") or None,
                     "rel_type": rt,
                 }
             )
@@ -324,6 +330,8 @@ class FalkorDBGraphStorage:
                 "     r.weight = edge.weight,"
                 "     r.keywords = edge.keywords,"
                 "     r.collection_id = edge.collection_id,"
+                "     r.document_id = edge.document_id,"
+                "     r.document_path = edge.document_path,"
                 "     r.rel_type = edge.rel_type",
                 {"edges": payload},
             )
@@ -431,6 +439,8 @@ class FalkorDBGraphStorage:
             "name",
             "canonical_name",
             "collection_id",
+            "document_id",
+            "document_path",
             "type",
             "primary_type",
             "object_type",
@@ -473,6 +483,8 @@ class FalkorDBGraphStorage:
             "weight",
             "keywords",
             "collection_id",
+            "document_id",
+            "document_path",
             "object_type",
             "description",
             "aliases",
@@ -613,6 +625,8 @@ class FalkorDBGraphStorage:
             "id": node_name,
             "name": node_name,
             "collection_id": collection_id,
+            "document_id": properties.get("document_id") or None,
+            "document_path": properties.get("document_path") or None,
             "type": properties.get("type", "UNKNOWN"),
             "description": properties.get("description", ""),
         }
@@ -622,7 +636,8 @@ class FalkorDBGraphStorage:
 
         await graph.query(
             "MERGE (n:Entity {id: $id, collection_id: $collection_id})"
-            " SET n.name = $name, n.type = $type, n.description = $description"
+            " SET n.name = $name, n.type = $type, n.description = $description,"
+            "     n.document_id = $document_id, n.document_path = $document_path"
             " SET n.source_ids = $source_ids",
             props,
         )
@@ -652,6 +667,8 @@ class FalkorDBGraphStorage:
             " r.keywords = $keywords,"
             " r.source_ids = $source_ids,"
             " r.collection_id = $collection_id,"
+            " r.document_id = $document_id,"
+            " r.document_path = $document_path,"
             " r.rel_type = $rel_type",
             {
                 "source_name": source_name,
@@ -661,6 +678,8 @@ class FalkorDBGraphStorage:
                 "rel_type": rel_type,
                 "description": properties.get("description", ""),
                 "weight": properties.get("weight", 1),
+                "document_id": properties.get("document_id") or None,
+                "document_path": properties.get("document_path") or None,
                 "keywords": json.dumps(keywords)
                 if isinstance(keywords, list)
                 else (keywords or "[]"),

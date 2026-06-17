@@ -81,6 +81,7 @@ class EntityDescription(Base):
     weight = Column(Integer, default=1)
     source_chunk_hashes = Column(JSON, nullable=True)
     document_id = Column(UUIDType(as_uuid=True), nullable=True)
+    document_path = Column(String(1024), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     entity = relationship("GraphEntity", back_populates="descriptions")
@@ -108,6 +109,7 @@ class EntityAlias(Base):
     alias_name = Column(String(256), nullable=False, index=True)
     source_chunk_hash = Column(String(64), nullable=True)
     document_id = Column(UUIDType(as_uuid=True), nullable=True)
+    document_path = Column(String(1024), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     entity = relationship("GraphEntity", back_populates="aliases")
@@ -310,6 +312,7 @@ class RelationshipDescription(Base):
     weight = Column(Integer, default=1)
     source_chunk_hashes = Column(JSON, nullable=True)
     document_id = Column(UUIDType(as_uuid=True), nullable=True)
+    document_path = Column(String(1024), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     relationship = relationship("GraphRelationship", back_populates="descriptions")
@@ -330,6 +333,7 @@ class RawChunkExtraction(Base):
         index=True,
     )
     document_id = Column(UUIDType(as_uuid=True), nullable=True)
+    document_path = Column(String(1024), nullable=True)
     entities_json = Column(JSON, nullable=True)
     relationships_json = Column(JSON, nullable=True)
     extraction_model = Column(String(128), nullable=True)

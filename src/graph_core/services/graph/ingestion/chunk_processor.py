@@ -25,6 +25,7 @@ from graph_core.models.graph_rag import (
 )
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.profile import Profile
+from graph_core.services.document_identity import normalize_document_path
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.entity_name_cache import EntityNameCache
 from graph_core.services.graph_rag.entity_resolver import (
@@ -160,6 +161,8 @@ async def ingest_collection_chunk(
     namespace_id: uuid.UUID,
     chunk_index: int,
     domain: str | None = None,
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> ChunkIngestionResult:
     """Route a sanitized text chunk to the appropriate strategy handler."""
     _enforce_namespace(collection, namespace_id)
@@ -168,18 +171,43 @@ async def ingest_collection_chunk(
 
     if collection.strategy == "vector":
         result = await _ingest_vector_chunk(
-            sanitized_text, collection, chunk_hash, report, chunk_index=chunk_index,
+            sanitized_text,
+            collection,
+            chunk_hash,
+            report,
+            chunk_index=chunk_index,
+            document_id=document_id,
+            document_path=document_path,
         )
     elif collection.strategy == "light_rag":
         result = await _ingest_lightrag_chunk(
-            sanitized_text, collection, chunk_hash, report, domain=domain,
+            sanitized_text,
+            collection,
+            chunk_hash,
+            report,
+            domain=domain,
+            document_id=document_id,
+            document_path=document_path,
         )
     else:
         result = await _ingest_graph_chunk(
-            sanitized_text, collection, chunk_hash, report, domain=domain,
+            sanitized_text,
+            collection,
+            chunk_hash,
+            report,
+            domain=domain,
+            document_id=document_id,
+            document_path=document_path,
         )
 
-    await _write_ledger(collection, chunk_hash, report, result)
+    await _write_ledger(
+        collection,
+        chunk_hash,
+        report,
+        result,
+        document_id=document_id,
+        document_path=document_path,
+    )
     return result
 
 
@@ -192,6 +220,8 @@ async def _ingest_vector_chunk(
     chunk_hash: str,
     report,
     chunk_index: int,
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> ChunkIngestionResult:
     """Ingest a chunk using pure vector embedding strategy."""
     embedding_provider = await _resolve_embedding_provider(collection)
@@ -209,6 +239,8 @@ async def _ingest_vector_chunk(
                 "metadata": {
                     "strategy": collection.strategy,
                     "default_query_mode": collection.default_query_mode,
+                    "document_id": str(document_id) if document_id else None,
+                    "document_path": document_path,
                 },
                 "embedding": embedding,
             }
@@ -225,6 +257,8 @@ async def _ingest_graph_chunk(
     chunk_hash: str,
     report,
     domain: str | None = None,
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> ChunkIngestionResult:
     """Full Graph RAG pipeline: extract → resolve → store."""
     embedding_provider = await _resolve_embedding_provider(collection)
@@ -249,6 +283,8 @@ async def _ingest_graph_chunk(
             collection_id=collection.id,
             extraction=extraction,
             domain=domain,
+            document_id=document_id,
+            document_path=document_path,
         )
 
     chunk_embedding = await embedding_provider.embed_query(text)
@@ -258,6 +294,8 @@ async def _ingest_graph_chunk(
         chunk_index=0,
         content=text,
         embedding=chunk_embedding,
+        document_id=document_id,
+        document_path=document_path,
     )
 
     if not extraction.entities and not extraction.relationships:
@@ -291,6 +329,8 @@ async def _ingest_graph_chunk(
                 entity_type=entity.entity_type,
                 description=entity.description,
                 source_chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
             )
             resolved_entity_ids[entity.name] = result.entity_id
             resolved_entity_ids[entity.name.strip().title()] = result.entity_id
@@ -348,6 +388,8 @@ async def _ingest_graph_chunk(
                         entity_type="",
                         description="",
                         source_chunk_hash=chunk_hash,
+                        document_id=document_id,
+                        document_path=document_path,
                     )
                     await session.commit()
                     await name_cache.set_many(
@@ -374,6 +416,8 @@ async def _ingest_graph_chunk(
                 weight=rel.weight,
                 source_chunk_hash=chunk_hash,
                 rel_type=rel.rel_type,
+                document_id=document_id,
+                document_path=document_path,
             )
             persisted_rel = await session.get(
                 GraphRelationship,
@@ -391,11 +435,15 @@ async def _ingest_graph_chunk(
                 "id": str(source_id),
                 "name": source_name,
                 "collection_id": str(collection.id),
+                "document_id": str(document_id) if document_id else None,
+                "document_path": document_path,
             })
             nodes_to_upsert.append({
                 "id": str(target_id),
                 "name": target_name,
                 "collection_id": str(collection.id),
+                "document_id": str(document_id) if document_id else None,
+                "document_path": document_path,
             })
             edges_to_upsert.append({
                 "source_id": str(source_id),
@@ -411,6 +459,8 @@ async def _ingest_graph_chunk(
                     persisted_rel.rel_type if persisted_rel else rel.rel_type
                 ),
                 "collection_id": str(collection.id),
+                "document_id": str(document_id) if document_id else None,
+                "document_path": document_path,
             })
 
     unique_nodes = {n["id"]: n for n in nodes_to_upsert}.values()
@@ -434,6 +484,8 @@ async def _ingest_lightrag_chunk(
     chunk_hash: str,
     report,
     domain: str | None = None,
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> ChunkIngestionResult:
     """LightRAG ingestion: extract → store in FalkorDB + pgvector.
 
@@ -463,6 +515,8 @@ async def _ingest_lightrag_chunk(
             collection_id=collection.id,
             extraction=extraction,
             domain=domain,
+            document_id=document_id,
+            document_path=document_path,
         )
 
     chunk_embedding = await embedding_provider.embed_query(text)
@@ -472,6 +526,8 @@ async def _ingest_lightrag_chunk(
         chunk_index=0,
         content=text,
         embedding=chunk_embedding,
+        document_id=document_id,
+        document_path=document_path,
     )
 
     if not extraction.entities and not extraction.relationships:
@@ -497,6 +553,8 @@ async def _ingest_lightrag_chunk(
                     "type": entity.entity_type,
                     "description": entity.description,
                     "source_ids": [chunk_hash],
+                    "document_id": str(document_id) if document_id else None,
+                    "document_path": document_path,
                 },
             )
         else:
@@ -520,6 +578,8 @@ async def _ingest_lightrag_chunk(
                         "type": entity.entity_type,
                         "description": merged_desc,
                         "source_ids": source_ids[:300],
+                        "document_id": str(document_id) if document_id else None,
+                        "document_path": document_path,
                     },
                 )
 
@@ -552,6 +612,8 @@ async def _ingest_lightrag_chunk(
             description=entity.description,
             description_id=desc_id,
             embedding=desc_embedding,
+            document_id=document_id,
+            document_path=document_path,
         )
 
     for rel in extraction.relationships:
@@ -592,6 +654,8 @@ async def _ingest_lightrag_chunk(
             target_name=target_name,
             description=rel.description,
             embedding=rel_embedding,
+            document_id=document_id,
+            document_path=document_path,
         )
 
         await graph_storage.upsert_lightrag_edge(
@@ -604,6 +668,8 @@ async def _ingest_lightrag_chunk(
                 "keywords": rel.keywords,
                 "weight": int(rel.weight * 10),
                 "source_ids": [chunk_hash],
+                "document_id": str(document_id) if document_id else None,
+                "document_path": document_path,
             },
         )
 
@@ -622,12 +688,16 @@ async def _save_raw_extraction(
     collection_id: uuid.UUID,
     extraction: ExtractionResult,
     domain: str | None = None,
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> None:
     """Persist raw LLM extraction to the database for deduplication."""
     async with AsyncSessionLocal() as session:
         record = RawChunkExtraction(
             chunk_content_hash=chunk_hash,
             collection_id=collection_id,
+            document_id=document_id,
+            document_path=normalize_document_path(document_path) if document_path else None,
             entities_json=[
                 {
                     "name": e.name,
@@ -708,12 +778,16 @@ async def _write_ledger(
     chunk_hash: str,
     report,
     result: ChunkIngestionResult,
+    document_id: uuid.UUID | None = None,
+    document_path: str | None = None,
 ) -> None:
     """Append an ingestion record to the audit ledger."""
     async with AsyncSessionLocal() as session:
         record = IngestionRecord(
             collection_id=collection.id,
             chunk_hash=chunk_hash,
+            document_id=document_id,
+            document_path=normalize_document_path(document_path) if document_path else None,
             strategy=collection.strategy,
             entity_count=result.entity_count,
             relationship_count=result.relationship_count,

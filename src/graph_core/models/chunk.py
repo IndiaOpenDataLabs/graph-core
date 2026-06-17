@@ -9,6 +9,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Integer,
+    String,
     Text,
     func,
 )
@@ -30,6 +31,8 @@ class IngestionChunk(Base):
     )
     chunk_index = Column(Integer, nullable=False)
     text = Column(Text, nullable=False)
+    document_id = Column(UUIDType(as_uuid=True), nullable=True, index=True)
+    document_path = Column(String(1024), nullable=True)
     status = Column(
         Enum("pending", "processing", "completed", "failed", name="chunk_status", create_type=True),
         nullable=False,

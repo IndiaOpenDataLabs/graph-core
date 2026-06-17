@@ -16,6 +16,8 @@ class Job(Base):
     id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
     namespace_id = Column(UUIDType(as_uuid=True), ForeignKey("namespaces.id", ondelete="CASCADE"), nullable=False, index=True)
     collection_id = Column(UUIDType(as_uuid=True), ForeignKey("collections.id", ondelete="CASCADE"), nullable=True, index=True)
+    document_id = Column(UUIDType(as_uuid=True), nullable=True, index=True)
+    document_path = Column(String(1024), nullable=True)
 
     job_type = Column(
         Enum(

@@ -1643,6 +1643,7 @@ class GraphService:
         collection_id: uuid.UUID,
         namespace_id: uuid.UUID,
         domain: str | None = None,
+        document_path: str | None = None,
     ) -> DocumentIngestionResult:
         if not text.strip():
             raise ValueError("Cannot ingest an empty document")
@@ -1653,6 +1654,7 @@ class GraphService:
             collection_id=collection_id,
             namespace_id=namespace_id,
             domain=domain,
+            document_path=document_path,
         )
 
     async def ingest_document_pipeline(self, job_id: uuid.UUID):
@@ -1820,6 +1822,8 @@ class GraphService:
                 "id": str(job.id),
                 "type": job.job_type,
                 "status": job.status,
+                "document_id": str(job.document_id) if getattr(job, "document_id", None) else None,
+                "document_path": getattr(job, "document_path", None),
                 "progress_percent": job.progress_percent,
                 "error": job.error,
                 "created_at": job.created_at.isoformat() if job.created_at else None,
@@ -1993,6 +1997,8 @@ class GraphService:
                     "id": str(job.id),
                     "type": job.job_type,
                     "status": job.status,
+                    "document_id": str(job.document_id) if getattr(job, "document_id", None) else None,
+                    "document_path": getattr(job, "document_path", None),
                     "progress_percent": job.progress_percent,
                     "chunks_total": job.chunks_total,
                     "chunks_completed": job.chunks_completed,

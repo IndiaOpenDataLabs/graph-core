@@ -204,11 +204,17 @@ class GraphCoreClient:
         )
 
     async def ingest_document(
-        self, collection_id: str, text: str, domain: str | None = None
+        self,
+        collection_id: str,
+        text: str,
+        domain: str | None = None,
+        document_path: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"text": text}
         if domain:
             body["domain"] = domain
+        if document_path:
+            body["document_path"] = document_path
         return await self._request(
             "POST", f"/collections/{collection_id}/ingest/doc", json=body
         )

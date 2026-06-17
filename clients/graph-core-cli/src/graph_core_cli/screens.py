@@ -1562,6 +1562,7 @@ class ConsoleScreen(Screen):
                 {
                     "collection_id": collection["id"],
                     "text": content,
+                    "document_path": str(file_path),
                     **({"domain": domain} if domain else {}),
                 },
             )
@@ -2465,6 +2466,7 @@ class ConsoleScreen(Screen):
                 {
                     "collection_id": collection_id,
                     "text": content,
+                    "document_path": str(file_path.relative_to(root)),
                     **({"domain": domain} if domain else {}),
                 },
             )
