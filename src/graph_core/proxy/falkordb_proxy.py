@@ -24,6 +24,7 @@ from graph_core.services.crypto import CredentialCrypto
 
 try:
     from redis.asyncio import Redis
+    from redis.exceptions import RedisError
 except ImportError as exc:  # pragma: no cover - only if optional deps missing
     raise RuntimeError("redis is required to run the FalkorDB proxy") from exc
 
@@ -291,7 +292,12 @@ class _ProxySession:
             await self._open_upstream()
         if self._upstream is None:
             raise ProxyError("upstream not connected")
-        return await self._upstream.execute_command(command, *args)
+        try:
+            return await self._upstream.execute_command(command, *args)
+        except RedisError as exc:
+            # Preserve a RESP error reply so the Browser sees a clean failure
+            # instead of a socket reset when FalkorDB rejects a probe command.
+            raise ProxyError(str(exc)) from exc
 
     def _ensure_allowed_graph_args(self, command: list[str]) -> None:
         if self._auth is None or len(command) < 2:
