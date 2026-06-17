@@ -79,6 +79,8 @@ async def _provision_namespace_falkordb_acl(
             "on",
             f">{secret}",
             "+AUTH",
+            "+ACL|GETUSER",
+            "+ACL|WHOAMI",
             "+INFO",
             "+EXISTS",
             "+MODULE|LIST",

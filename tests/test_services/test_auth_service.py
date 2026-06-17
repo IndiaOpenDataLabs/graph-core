@@ -105,6 +105,8 @@ async def test_provision_namespace_falkordb_credential_sets_acl_user(
             "on",
             ">falkor-secret",
             "+AUTH",
+            "+ACL|GETUSER",
+            "+ACL|WHOAMI",
             "+INFO",
             "+EXISTS",
             "+MODULE|LIST",

@@ -140,6 +140,13 @@ class FalkorDBTenantProxy:
                 db=db,
             )
 
+    @staticmethod
+    def _normalize_upstream_url(url: str) -> str:
+        normalized = (url or "").strip()
+        if normalized.startswith("falkordb://"):
+            normalized = "redis://" + normalized[len("falkordb://") :]
+        return normalized
+
 
 class _ProxySession:
     """Per-connection proxy state."""
@@ -245,28 +252,28 @@ class _ProxySession:
         if len(args) != 2:
             return ErrorReply("ERR wrong number of arguments for 'AUTH'")
         username, password = args
+        logger.info("Proxy AUTH attempt for username=%s", username)
         auth = await self._proxy._resolve_namespace_auth(username, password)
         if auth is None:
+            logger.info("Proxy AUTH rejected for username=%s", username)
             return ErrorReply(
                 "WRONGPASS invalid username-password pair or user is disabled."
             )
         await self._close_upstream()
         self._auth = auth
-        try:
-            await self._open_upstream()
-        except Exception:
-            await self._close_upstream()
-            self._auth = None
-            return ErrorReply(
-                "WRONGPASS invalid username-password pair or user is disabled."
-            )
+        logger.info(
+            "Proxy AUTH accepted for namespace_id=%s graph_prefix=%s",
+            auth.namespace_id,
+            auth.graph_prefix,
+        )
         return SimpleString("OK")
 
     async def _open_upstream(self) -> None:
         if self._auth is None:
             return
+        upstream_url = self._proxy._normalize_upstream_url(self._auth.upstream_url)
         self._upstream = Redis.from_url(
-            self._auth.upstream_url,
+            upstream_url,
             username=self._auth.username,
             password=self._auth.password,
             db=self._auth.db,
@@ -280,6 +287,8 @@ class _ProxySession:
             self._upstream = None
 
     async def _execute_upstream(self, command: str, args: list[str]) -> Any:
+        if self._upstream is None:
+            await self._open_upstream()
         if self._upstream is None:
             raise ProxyError("upstream not connected")
         return await self._upstream.execute_command(command, *args)
