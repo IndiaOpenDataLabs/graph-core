@@ -1738,7 +1738,7 @@ class ConsoleScreen(Screen):
                 "  status: pending"
             )
 
-            for _ in range(180):
+            for _ in range(300):
                 status_result = await client.call_result(
                     "get_job_status",
                     {"job_id": job_id},
