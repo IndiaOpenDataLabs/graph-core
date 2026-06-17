@@ -10,7 +10,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       REDIS_URL: redis://redis:6379/0
-      FALKORDB_URL: falkordb://falkordb:6379
+      FALKORDB_URL: falkordb://falkordb:6382
       REDIS_SEMAPHORE_URL: redis://redis:6379/0
     depends_on:
       postgres:
@@ -30,7 +30,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       REDIS_URL: redis://redis:6379/0
-      FALKORDB_URL: falkordb://falkordb:6379
+      FALKORDB_URL: falkordb://falkordb:6382
       REDIS_SEMAPHORE_URL: redis://redis:6379/0
       GRAPH_CORE_URL: http://app:8001
       GRAPH_CORE_ADMIN_MCP_PORT: 18102
@@ -51,7 +51,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       REDIS_URL: redis://redis:6379/0
-      FALKORDB_URL: falkordb://falkordb:6379
+      FALKORDB_URL: falkordb://falkordb:6382
       REDIS_SEMAPHORE_URL: redis://redis:6379/0
       GRAPH_CORE_URL: http://app:8001
       GRAPH_CORE_USER_MCP_PORT: 18103
@@ -72,7 +72,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       REDIS_URL: redis://redis:6379/0
-      FALKORDB_URL: falkordb://falkordb:6379
+      FALKORDB_URL: falkordb://falkordb:6382
       REDIS_SEMAPHORE_URL: redis://redis:6379/0
     command: ["dramatiq", "graph_core.workers", "--processes", "4", "--threads", "8"]
     depends_on:
@@ -104,10 +104,10 @@ services:
   falkordb:
     image: falkordb/falkordb:latest
     ports:
-      - "6382:6379"
+      - "6379:6379"
       - "3001:3000"
     environment:
-      REDIS_ARGS: "--appendonly yes --aclfile /var/lib/falkordb/data/users.acl"
+      REDIS_ARGS: "--port 6382 --appendonly yes --aclfile /var/lib/falkordb/data/users.acl"
     volumes:
       - falkordb_data:/var/lib/falkordb/data
       - ./scripts/falkordb/users.acl:/var/lib/falkordb/data/users.acl
@@ -121,15 +121,12 @@ services:
     build: .
     env_file:
       - .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: service:falkordb
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@postgres:5432/graphcore
       FALKORDB_PROXY_PORT: 6379
-      FALKORDB_PROXY_UPSTREAM_URL: falkordb://falkordb:6379
+      FALKORDB_PROXY_UPSTREAM_URL: falkordb://localhost:6382
     command: ["graph-core-falkordb-proxy"]
-    ports:
-      - "6379:6379"
     depends_on:
       postgres:
         condition: service_healthy
