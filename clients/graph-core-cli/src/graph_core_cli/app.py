@@ -18,7 +18,7 @@ class GraphCoreTUI(App):
     /* App-wide styles */
     """
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         from graph_core_cli.screens import ConsoleScreen, SetupScreen
 
         persisted = load_config()
@@ -32,16 +32,26 @@ class GraphCoreTUI(App):
             "namespace_id": persisted.get("namespace_id", ""),
             "namespace_name": persisted.get("namespace_name", ""),
         }
-        save_config(self._config)
 
         if self.ui_mode == "user" and self.namespace_token:
-            self.push_screen(ConsoleScreen())
+            if await self._validate_saved_namespace():
+                save_config(self._config)
+                self.push_screen(ConsoleScreen())
+            else:
+                if self.admin_jwt:
+                    self._config["ui_mode"] = "admin"
+                    save_config(self._config)
+                    self.push_screen(ConsoleScreen())
+                else:
+                    save_config(self._config)
+                    self.push_screen(SetupScreen())
         elif self.admin_jwt:
             if self.ui_mode != "admin":
                 self._config["ui_mode"] = "admin"
                 save_config(self._config)
             self.push_screen(ConsoleScreen())
         else:
+            save_config(self._config)
             self.push_screen(SetupScreen())
 
     def compose(self) -> ComposeResult:
@@ -107,6 +117,30 @@ class GraphCoreTUI(App):
         else:
             mcp_url = self.config.get("admin_mcp_url", "http://localhost:18102/mcp/")
         return AuthenticatedMCPClient(mcp_url, token)
+
+    async def _validate_saved_namespace(self) -> bool:
+        client = self.mcp_client_for_token(self.namespace_token, kind="user")
+        try:
+            await client.connect()
+            result = await client.call_result("get_current_namespace", {})
+            payload = dict(result.structuredContent or {})
+            namespace = dict(payload.get("namespace") or {})
+            namespace_id = str(namespace.get("id", "") or "")
+            namespace_name = str(namespace.get("name", "") or "")
+            if namespace_id:
+                self._config["namespace_id"] = namespace_id
+            if namespace_name:
+                self._config["namespace_name"] = namespace_name
+            self._config["ui_mode"] = "user"
+            return True
+        except Exception:
+            self._config["namespace_token"] = ""
+            self._config["namespace_id"] = ""
+            self._config["namespace_name"] = ""
+            self._config["ui_mode"] = "admin"
+            return False
+        finally:
+            await client.disconnect()
 
 
 async def main() -> None:
