@@ -1809,9 +1809,17 @@ class ConsoleScreen(Screen):
             self.app.config = cfg
             self._namespace_verified = bool(namespace_id and namespace_name)
         except Exception:
-            self._namespace_verified = bool(
-                cfg.get("namespace_id") and cfg.get("namespace_name")
-            )
+            if cfg.get("namespace_token"):
+                cfg["namespace_token"] = ""
+                cfg["namespace_id"] = ""
+                cfg["namespace_name"] = ""
+                cfg["ui_mode"] = "admin"
+                self.app.config = cfg
+                self._write(
+                    "Saved namespace token was not valid for this backend; "
+                    "cleared user session and returned to admin mode."
+                )
+            self._namespace_verified = False
         self._refresh_context()
 
     async def _resolve_collection(self, target: str) -> dict:
