@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import distinct, or_, select
+from sqlalchemy import distinct, func, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -21,6 +21,7 @@ from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
+from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.graph_rag import (
     EntityAlias,
     EntityDescription,
@@ -405,6 +406,12 @@ class GraphQueryArtifacts:
     route_profile: DerivedRouteProfile
 
 
+@dataclass
+class DocumentRoutingDecision:
+    use_all_documents: bool
+    document_ids: list[uuid.UUID]
+
+
 def _format_retrieval_query(instruction: str, query: str) -> str:
     return f"<Instruct>: {instruction}\n<Query>: {query}"
 
@@ -589,10 +596,123 @@ def _maybe_uuid_string(value: str) -> str | None:
         return None
 
 
+async def _load_document_candidates(
+    collection: Collection,
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(
+                IngestionRecord.document_id,
+                IngestionRecord.document_path,
+                func.count().label("chunk_count"),
+                func.max(IngestionRecord.ingested_at).label("last_ingested_at"),
+            )
+            .where(
+                IngestionRecord.collection_id == collection.id,
+                IngestionRecord.document_id.isnot(None),
+            )
+            .group_by(
+                IngestionRecord.document_id,
+                IngestionRecord.document_path,
+            )
+            .order_by(func.max(IngestionRecord.ingested_at).desc())
+            .limit(limit)
+        )
+
+    candidates: list[dict[str, Any]] = []
+    for document_id, document_path, chunk_count, _last_ingested_at in result.all():
+        document_id_str = str(document_id) if document_id else ""
+        if not document_id_str:
+            continue
+        candidates.append(
+            {
+                "document_id": document_id_str,
+                "document_path": document_path or "",
+                "chunk_count": int(chunk_count or 0),
+            }
+        )
+    return candidates
+
+
+async def _resolve_document_routing(
+    question: str,
+    collection: Collection,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
+) -> DocumentRoutingDecision:
+    candidates = await _load_document_candidates(collection)
+    if not candidates:
+        return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
+
+    llm_provider = await _resolve_llm_provider(
+        namespace_id=namespace_id,
+        llm_profile_id=llm_profile_id,
+    )
+    if isinstance(llm_provider, LocalEchoLLMProvider):
+        return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
+
+    candidate_lines = []
+    for index, candidate in enumerate(candidates[:20], start=1):
+        label = candidate["document_path"] or candidate["document_id"]
+        candidate_lines.append(
+            f"{index}. {label} | document_id={candidate['document_id']} | chunks={candidate['chunk_count']}"
+        )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "route": {
+                "type": "string",
+                "enum": ["all", "documents"],
+            },
+            "document_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["route", "document_ids"],
+    }
+
+    prompt = (
+        "You are routing a knowledge-graph question to the most relevant source documents.\n"
+        "Choose 'documents' only when the question clearly refers to one or more specific files, sources, or document subsets.\n"
+        "Otherwise choose 'all'.\n"
+        "Return only document_ids from the candidate list.\n"
+        "If the question is broad, comparative across the whole collection, or the target document is unclear, choose all.\n\n"
+        f"User question:\n{question}\n\n"
+        "Candidate documents:\n"
+        f"{chr(10).join(candidate_lines)}"
+    )
+
+    try:
+        result = await llm_provider.structured_extract(prompt=prompt, schema=schema)
+    except Exception:
+        return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
+
+    route = str(result.get("route") or "all").strip().lower()
+    selected_ids: list[uuid.UUID] = []
+    if route == "documents":
+        allowed_ids = {candidate["document_id"] for candidate in candidates}
+        for value in result.get("document_ids", []):
+            value_str = _maybe_uuid_string(str(value))
+            if value_str and value_str in allowed_ids:
+                try:
+                    selected_ids.append(uuid.UUID(value_str))
+                except ValueError:
+                    continue
+        selected_ids = list(dict.fromkeys(selected_ids))
+    if not selected_ids:
+        return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
+    return DocumentRoutingDecision(use_all_documents=False, document_ids=selected_ids)
+
+
 async def _search_entity_seeds(
     question: str,
     collection: Collection,
     query_embedding: list[float],
+    document_ids: list[uuid.UUID] | None = None,
 ) -> tuple[list[str], dict[str, float]]:
     top_k = 10
     seed_entity_ids: list[str] = []
@@ -602,6 +722,7 @@ async def _search_entity_seeds(
         collection_id=collection.id,
         query_embedding=query_embedding,
         top_k=top_k,
+        document_ids=document_ids,
     )
     for hit in entity_hits:
         entity_id_str = hit.metadata.get("entity_id", "")
@@ -613,19 +734,22 @@ async def _search_entity_seeds(
     keywords = _extract_query_keywords(question)
     async with AsyncSessionLocal() as session:
         for kw in keywords[:5]:
+            conditions = [
+                or_(
+                    EntityAlias.alias_name.ilike(f"% {kw} %"),
+                    EntityAlias.alias_name.ilike(f"{kw} %"),
+                    EntityAlias.alias_name.ilike(f"% {kw}"),
+                    EntityAlias.alias_name.ilike(kw),
+                ),
+                EntityAlias.collection_id == collection.id,
+                GraphEntity.collection_id == collection.id,
+            ]
+            if document_ids:
+                conditions.append(EntityAlias.document_id.in_(document_ids))
             alias_result = await session.execute(
                 select(EntityAlias)
                 .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
-                .where(
-                    or_(
-                        EntityAlias.alias_name.ilike(f"% {kw} %"),
-                        EntityAlias.alias_name.ilike(f"{kw} %"),
-                        EntityAlias.alias_name.ilike(f"% {kw}"),
-                        EntityAlias.alias_name.ilike(kw),
-                    ),
-                    EntityAlias.collection_id == collection.id,
-                    GraphEntity.collection_id == collection.id,
-                )
+                .where(*conditions)
                 .limit(5)
             )
             for alias in alias_result.scalars().all():
@@ -642,11 +766,13 @@ async def _top_entity_candidates(
     query_embedding: list[float],
     *,
     top_k: int = 50,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> list[tuple[str, str, float]]:
     hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
         top_k=top_k,
+        document_ids=document_ids,
     )
     candidates: list[tuple[str, str, float]] = []
     seen: set[str] = set()
@@ -670,11 +796,13 @@ async def _search_relationship_seeds(
     query_embedding: list[float],
     *,
     top_k: int = 10,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> list[tuple[str, float]]:
     hits = await _graph_rag_vectors.search_relationship_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
         top_k=top_k,
+        document_ids=document_ids,
     )
     rel_seeds: list[tuple[str, float]] = []
     seen: set[str] = set()
@@ -694,6 +822,7 @@ async def _score_relationship(
     cache: dict[str, float],
     *,
     top_k: int = 4,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> float:
     cached = cache.get(rel_id)
     if cached is not None:
@@ -703,6 +832,7 @@ async def _score_relationship(
         query_embedding=relationship_query_embedding,
         top_k=top_k,
         relationship_id=uuid.UUID(rel_id),
+        document_ids=document_ids,
     )
     score = max((1.0 - hit.distance for hit in rel_hits), default=0.0)
     cache[rel_id] = score
@@ -748,6 +878,7 @@ async def _entity_first_state(
     *,
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> GraphQueryState:
     top_k = 10
     min_edge_sim = settings.graph_rag_min_edge_similarity
@@ -759,6 +890,7 @@ async def _entity_first_state(
         question,
         collection,
         entity_query_embedding,
+        document_ids=document_ids,
     )
 
     async with AsyncSessionLocal() as session:
@@ -814,16 +946,36 @@ async def _entity_first_state(
         if depth >= max_depth:
             continue
 
-        edges = await graph_storage.get_node_edges(node_id, rel_types=rel_types)
+        edges = await graph_storage.get_node_edges(
+            node_id,
+            rel_types=rel_types,
+            document_ids=[str(doc_id) for doc_id in document_ids]
+            if document_ids
+            else None,
+        )
         scored_edges: list[tuple[float, str, str]] = []
         for src, tgt in edges:
             neighbor = tgt if src == node_id else src
             if neighbor in visited:
                 continue
 
-            edge_props = await graph_storage.get_edge(src, tgt, rel_types=rel_types)
+            edge_props = await graph_storage.get_edge(
+                src,
+                tgt,
+                rel_types=rel_types,
+                document_ids=[str(doc_id) for doc_id in document_ids]
+                if document_ids
+                else None,
+            )
             if not edge_props:
-                edge_props = await graph_storage.get_edge(tgt, src, rel_types=rel_types)
+                edge_props = await graph_storage.get_edge(
+                    tgt,
+                    src,
+                    rel_types=rel_types,
+                    document_ids=[str(doc_id) for doc_id in document_ids]
+                    if document_ids
+                    else None,
+                )
             if not (edge_props and edge_props.get("id")):
                 continue
 
@@ -885,6 +1037,7 @@ async def _find_relevant_path(
     query_tokens: set[str] | None = None,
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> tuple[list[str], list[str]] | None:
     queue: deque[tuple[str, list[str], list[str], int]] = deque(
         [(source_id, [source_id], [], 0)]
@@ -897,16 +1050,36 @@ async def _find_relevant_path(
         if depth >= max_depth:
             continue
 
-        edges = await graph_storage.get_node_edges(node_id, rel_types=rel_types)
+        edges = await graph_storage.get_node_edges(
+            node_id,
+            rel_types=rel_types,
+            document_ids=[str(doc_id) for doc_id in document_ids]
+            if document_ids
+            else None,
+        )
         candidates: list[tuple[float, str, str]] = []
         for src, tgt in edges:
             neighbor = tgt if src == node_id else src
             if neighbor in path_nodes:
                 continue
 
-            edge_props = await graph_storage.get_edge(src, tgt, rel_types=rel_types)
+            edge_props = await graph_storage.get_edge(
+                src,
+                tgt,
+                rel_types=rel_types,
+                document_ids=[str(doc_id) for doc_id in document_ids]
+                if document_ids
+                else None,
+            )
             if not edge_props:
-                edge_props = await graph_storage.get_edge(tgt, src, rel_types=rel_types)
+                edge_props = await graph_storage.get_edge(
+                    tgt,
+                    src,
+                    rel_types=rel_types,
+                    document_ids=[str(doc_id) for doc_id in document_ids]
+                    if document_ids
+                    else None,
+                )
             if not (edge_props and edge_props.get("id")):
                 continue
 
@@ -947,11 +1120,13 @@ async def _relationship_seed_state(
     query_tokens: set[str] | None = None,
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> GraphQueryState:
     rel_seeds = await _search_relationship_seeds(
         collection,
         relationship_query_embedding,
         top_k=top_k,
+        document_ids=document_ids,
     )
     if query_tokens is None:
         query_tokens = set()
@@ -995,12 +1170,18 @@ async def _relationship_seed_state(
                 str(rel.source_entity_id),
                 str(rel.target_entity_id),
                 rel_types=rel_types,
+                document_ids=[str(doc_id) for doc_id in document_ids]
+                if document_ids
+                else None,
             )
             if edge_props is None:
                 edge_props = await graph_storage.get_edge(
                     str(rel.target_entity_id),
                     str(rel.source_entity_id),
                     rel_types=rel_types,
+                    document_ids=[str(doc_id) for doc_id in document_ids]
+                    if document_ids
+                    else None,
                 )
             if not edge_props:
                 continue
@@ -1052,6 +1233,7 @@ async def _relationship_seed_state(
             query_tokens=query_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
+            document_ids=document_ids,
         )
         if not path:
             continue
@@ -1112,6 +1294,7 @@ async def _relationship_first_state(
     *,
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> GraphQueryState:
     query_tokens = _query_token_set(question)
     state = await _relationship_seed_state(
@@ -1124,12 +1307,14 @@ async def _relationship_first_state(
         query_tokens=query_tokens,
         rel_types=rel_types,
         dimension_weight=dimension_weight,
+        document_ids=document_ids,
     )
     return await _filter_relationship_state_by_entity_score(
         collection,
         state,
         entity_query_embedding,
         min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
+        document_ids=document_ids,
     )
 
 
@@ -1140,6 +1325,7 @@ async def _filter_relationship_state_by_entity_score(
     *,
     min_entity_score: float,
     top_k: int = 50,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> GraphQueryState:
     if not state.discovered_entity_ids:
         return state
@@ -1148,6 +1334,7 @@ async def _filter_relationship_state_by_entity_score(
         collection,
         entity_query_embedding,
         top_k=top_k,
+        document_ids=document_ids,
     )
     entity_score_by_name = {
         name.strip().lower(): score for name, _, score in candidates
@@ -1209,6 +1396,15 @@ async def _filter_relationship_state_by_entity_score(
                     str(source_entity_id) in kept_entity_ids
                     and str(target_entity_id) in kept_entity_ids
                 ):
+                    if document_ids:
+                        rel_desc_result = await session.execute(
+                            select(RelationshipDescription.document_id).where(
+                                RelationshipDescription.relationship_id == rel_id,
+                                RelationshipDescription.document_id.in_(document_ids),
+                            )
+                        )
+                        if rel_desc_result.scalar_one_or_none() is None:
+                            continue
                     filtered_rel_ids.append(rel_id_str)
                     if rel_id_str in state.rel_score_cache:
                         filtered_rel_score_cache[rel_id_str] = state.rel_score_cache[
@@ -1231,6 +1427,15 @@ async def _filter_relationship_state_by_entity_score(
             )
         )
         for rel in kept_rel_rows.scalars().all():
+            if document_ids:
+                rel_desc_result = await session.execute(
+                    select(RelationshipDescription.document_id).where(
+                        RelationshipDescription.relationship_id == rel.id,
+                        RelationshipDescription.document_id.in_(document_ids),
+                    )
+                )
+                if rel_desc_result.scalar_one_or_none() is None:
+                    continue
             rel_id_str = str(rel.id)
             if rel_id_str in filtered_rel_ids:
                 continue
@@ -1514,6 +1719,7 @@ async def _mix_state(
     *,
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> GraphQueryState:
     query_tokens = _query_token_set(question)
     await _log_exact_name_hits(collection, question)
@@ -1521,6 +1727,7 @@ async def _mix_state(
         collection,
         entity_query_embedding,
         top_k=50,
+        document_ids=document_ids,
     )
     top_entity_score = candidates[0][2] if candidates else 0.0
     logger.info(
@@ -1546,12 +1753,14 @@ async def _mix_state(
             query_tokens=query_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
+            document_ids=document_ids,
         )
         return await _filter_relationship_state_by_entity_score(
             collection,
             fallback_state,
             entity_query_embedding,
             min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
+            document_ids=document_ids,
         )
 
     llm_provider = await _resolve_llm_provider(
@@ -1585,6 +1794,7 @@ async def _mix_state(
             query_tokens=subquery_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
+            document_ids=document_ids,
         )
         subquery_entity_embedding = await _embed_entity_query(
             embedding_provider,
@@ -1595,6 +1805,7 @@ async def _mix_state(
             subquery_state,
             subquery_entity_embedding,
             min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
+            document_ids=document_ids,
         )
 
     concurrency = settings.graph_rag_query_embedding_concurrency
@@ -1749,6 +1960,7 @@ async def _build_context(
     collection: Collection,
     *,
     derived_context: str = "",
+    document_ids: list[uuid.UUID] | None = None,
 ) -> tuple[str, list[str], list[str], str]:
     max_entities = 10
     max_entity_descs = 4
@@ -1771,9 +1983,12 @@ async def _build_context(
             entity = await session.get(GraphEntity, eid)
             if not entity:
                 continue
+            entity_conditions = [EntityDescription.entity_id == eid]
+            if document_ids:
+                entity_conditions.append(EntityDescription.document_id.in_(document_ids))
             descs_result = await session.execute(
                 select(EntityDescription)
-                .where(EntityDescription.entity_id == eid)
+                .where(*entity_conditions)
                 .order_by(EntityDescription.weight.desc())
                 .limit(max_entity_descs)
             )
@@ -1802,9 +2017,14 @@ async def _build_context(
             tgt_entity = await session.get(GraphEntity, rel.target_entity_id)
             src_name = src_entity.canonical_name if src_entity else "?"
             tgt_name = tgt_entity.canonical_name if tgt_entity else "?"
+            rel_conditions = [RelationshipDescription.relationship_id == rel_uuid]
+            if document_ids:
+                rel_conditions.append(
+                    RelationshipDescription.document_id.in_(document_ids)
+                )
             descs_result = await session.execute(
                 select(RelationshipDescription)
-                .where(RelationshipDescription.relationship_id == rel_uuid)
+                .where(*rel_conditions)
                 .order_by(RelationshipDescription.weight.desc())
                 .limit(max_rel_descs)
             )
@@ -1930,6 +2150,7 @@ async def _build_graph_query_artifacts(
     namespace_id: uuid.UUID,
     mode: str | None = None,
     llm_profile_id: uuid.UUID | None = None,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> GraphQueryArtifacts:
     embedding_provider = await _resolve_embedding_provider(collection)
     entity_query_embedding = await _embed_entity_query(embedding_provider, question)
@@ -1961,6 +2182,7 @@ async def _build_graph_query_artifacts(
                 entity_query_embedding,
                 relationship_query_embedding,
                 **kwargs,
+                document_ids=document_ids,
             )
         if effective_mode == "mix":
             return await _mix_state(
@@ -1972,6 +2194,7 @@ async def _build_graph_query_artifacts(
                 entity_query_embedding,
                 relationship_query_embedding,
                 **kwargs,
+                document_ids=document_ids,
             )
         if effective_mode == "hybrid":
             entity_state = await _entity_first_state(
@@ -1980,6 +2203,7 @@ async def _build_graph_query_artifacts(
                 entity_query_embedding,
                 relationship_query_embedding,
                 **kwargs,
+                document_ids=document_ids,
             )
             relationship_state = await _relationship_first_state(
                 question,
@@ -1987,6 +2211,7 @@ async def _build_graph_query_artifacts(
                 entity_query_embedding,
                 relationship_query_embedding,
                 **kwargs,
+                document_ids=document_ids,
             )
             return _merge_states(entity_state, relationship_state)
         return await _entity_first_state(
@@ -1995,6 +2220,7 @@ async def _build_graph_query_artifacts(
             entity_query_embedding,
             relationship_query_embedding,
             **kwargs,
+            document_ids=document_ids,
         )
 
     state = await _fan_out_per_dimension(_build_state_for, dimensions)
@@ -2013,6 +2239,7 @@ async def _build_graph_query_artifacts(
     context, entities_used, relationships_used, rel_context = await _build_context(
         state,
         collection,
+        document_ids=document_ids,
     )
     logger.info(
         "graph_rag artifacts collection=%s mode=%s route=%s entities_used=%s relationships_used=%s",
@@ -2045,12 +2272,26 @@ async def graph_rag_query(
     mode: str | None = None,
     llm_profile_id: uuid.UUID | None = None,
 ) -> QueryResult:
+    routing = await _resolve_document_routing(
+        question,
+        collection,
+        namespace_id,
+        llm_profile_id,
+    )
+    document_ids = routing.document_ids if not routing.use_all_documents else None
+    logger.info(
+        "graph_rag document_routing collection=%s route=%s document_ids=%s",
+        collection.name,
+        "all" if routing.use_all_documents else "documents",
+        [str(document_id) for document_id in document_ids] if document_ids else [],
+    )
     base = await _build_graph_query_artifacts(
         question,
         collection,
         namespace_id,
         mode,
         llm_profile_id,
+        document_ids=document_ids,
     )
     meta_collections = await _load_meta_collections(collection)
     meta_artifacts: list[tuple[Collection, GraphQueryArtifacts]] = []
@@ -2064,6 +2305,7 @@ async def graph_rag_query(
                     namespace_id,
                     mode,
                     llm_profile_id,
+                    document_ids=document_ids,
                 ),
             )
         )

@@ -30,6 +30,21 @@ def _vector_cast_sql(dimensions: int) -> str:
     return f"::vector({dimensions})"
 
 
+def _expand_uuid_params(
+    values: list[uuid.UUID],
+    prefix: str,
+) -> tuple[str, dict[str, Any]]:
+    if not values:
+        return "", {}
+    params: dict[str, Any] = {}
+    placeholders: list[str] = []
+    for index, value in enumerate(values):
+        key = f"{prefix}_{index}"
+        placeholders.append(f":{key}")
+        params[key] = _uuid_for_sql(value)
+    return ", ".join(placeholders), params
+
+
 @dataclass
 class VectorSearchHit:
     id: str
@@ -100,6 +115,7 @@ class GraphRAGVectorStore:
         query_embedding: list[float],
         top_k: int,
         entity_id: uuid.UUID | None = None,
+        document_ids: list[uuid.UUID] | None = None,
     ) -> list[VectorSearchHit]:
         tbl = table_name(collection_id, "entity_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -117,6 +133,14 @@ class GraphRAGVectorStore:
         if entity_id:
             where_extra = "AND entity_id = :entity_id"
             params["entity_id"] = _uuid_for_sql(entity_id)
+        if document_ids:
+            document_clause, document_params = _expand_uuid_params(
+                document_ids, "document_id"
+            )
+            where_extra += (
+                f" AND document_id IN ({document_clause})" if document_clause else ""
+            )
+            params.update(document_params)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
@@ -197,6 +221,7 @@ class GraphRAGVectorStore:
         query_embedding: list[float],
         top_k: int,
         relationship_id: uuid.UUID | None = None,
+        document_ids: list[uuid.UUID] | None = None,
     ) -> list[VectorSearchHit]:
         tbl = table_name(collection_id, "relationship_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -214,6 +239,14 @@ class GraphRAGVectorStore:
         if relationship_id:
             where_extra = "AND relationship_id = :rel_id"
             params["rel_id"] = _uuid_for_sql(relationship_id)
+        if document_ids:
+            document_clause, document_params = _expand_uuid_params(
+                document_ids, "document_id"
+            )
+            where_extra += (
+                f" AND document_id IN ({document_clause})" if document_clause else ""
+            )
+            params.update(document_params)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
@@ -437,6 +470,7 @@ class GraphRAGVectorStore:
         collection_id: uuid.UUID,
         query_embedding: list[float],
         top_k: int,
+        document_ids: list[uuid.UUID] | None = None,
     ) -> list[VectorSearchHit]:
         tbl = table_name(collection_id, "chunk_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -446,6 +480,22 @@ class GraphRAGVectorStore:
         cast = _vector_cast_sql(dimensions)
 
         async with AsyncSessionLocal() as session:
+            where_extra = ""
+            params: dict[str, Any] = {
+                "cid": _uuid_for_sql(collection_id),
+                "top_k": top_k,
+                "qemb": _embedding_literal(query_embedding),
+            }
+            if document_ids:
+                document_clause, document_params = _expand_uuid_params(
+                    document_ids, "document_id"
+                )
+                where_extra = (
+                    f" AND document_id IN ({document_clause})"
+                    if document_clause
+                    else ""
+                )
+                params.update(document_params)
             result = await session.execute(
                 text(
                     f"""
@@ -454,16 +504,12 @@ class GraphRAGVectorStore:
                            1 - (embedding <=> (:qemb){cast}) as score,
                            embedding <=> (:qemb){cast} as distance
                     FROM {tbl}
-                    WHERE collection_id = :cid
+                    WHERE collection_id = :cid {where_extra}
                     ORDER BY distance
                     LIMIT :top_k
                     """
                 ),
-                {
-                    "cid": _uuid_for_sql(collection_id),
-                    "top_k": top_k,
-                    "qemb": _embedding_literal(query_embedding),
-                },
+                params,
             )
             return [
                 VectorSearchHit(

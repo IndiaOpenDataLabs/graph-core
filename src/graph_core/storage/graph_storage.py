@@ -812,22 +812,30 @@ class FalkorDBGraphStorage:
         self,
         node_id: str,
         rel_types: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[tuple[str, str]]:
         graph = await self._get_graph()
         label_pat = _edge_label_pattern(rel_types)
         if rel_types and not label_pat:
             return []
+        document_filter = ""
+        params: dict[str, Any] = {"node_id": node_id}
+        if document_ids:
+            document_filter = "coalesce(r.document_id, '') IN $document_ids"
+            params["document_ids"] = [str(document_id) for document_id in document_ids]
         if label_pat:
             cypher = (
                 f"MATCH (n:Entity {{id: $node_id}})-[r{label_pat}]-(m:Entity)"
+                f"{' WHERE ' + document_filter if document_filter else ''}"
                 " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
             )
         else:
             cypher = (
                 "MATCH (n:Entity {id: $node_id})-[r]-(m:Entity)"
+                f"{' WHERE ' + document_filter if document_filter else ''}"
                 " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
             )
-        result = await graph.query(cypher, {"node_id": node_id})
+        result = await graph.query(cypher, params)
         edges: list[tuple[str, str]] = []
         if result and result.result_set:
             for row in result.result_set:
@@ -840,23 +848,31 @@ class FalkorDBGraphStorage:
         self,
         node_id: str,
         rel_types: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[tuple[str, str, str]]:
         """Like get_node_edges but returns (source, target, rel_type) triples."""
         graph = await self._get_graph()
         label_pat = _edge_label_pattern(rel_types)
         if rel_types and not label_pat:
             return []
+        document_filter = ""
+        params: dict[str, Any] = {"node_id": node_id}
+        if document_ids:
+            document_filter = "coalesce(r.document_id, '') IN $document_ids"
+            params["document_ids"] = [str(document_id) for document_id in document_ids]
         if label_pat:
             cypher = (
                 f"MATCH (n:Entity {{id: $node_id}})-[r{label_pat}]-(m:Entity)"
+                f"{' WHERE ' + document_filter if document_filter else ''}"
                 " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
             )
         else:
             cypher = (
                 "MATCH (n:Entity {id: $node_id})-[r]-(m:Entity)"
+                f"{' WHERE ' + document_filter if document_filter else ''}"
                 " RETURN n.id as source, m.id as target, r.rel_type as rel_type"
             )
-        result = await graph.query(cypher, {"node_id": node_id})
+        result = await graph.query(cypher, params)
         edges: list[tuple[str, str, str]] = []
         if result and result.result_set:
             for row in result.result_set:
@@ -870,6 +886,7 @@ class FalkorDBGraphStorage:
         source_id: str,
         target_id: str,
         rel_types: list[str] | None = None,
+        document_ids: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Get edge properties between two entity IDs.
 
@@ -880,19 +897,24 @@ class FalkorDBGraphStorage:
         label_pat = _edge_label_pattern(rel_types)
         if rel_types and not label_pat:
             return None
+        document_filter = ""
+        params: dict[str, Any] = {"source_id": source_id, "target_id": target_id}
+        if document_ids:
+            document_filter = "coalesce(r.document_id, '') IN $document_ids"
+            params["document_ids"] = [str(document_id) for document_id in document_ids]
         if label_pat:
             cypher = (
                 f"MATCH (a:Entity {{id: $source_id}})-[r{label_pat}]->(b:Entity {{id: $target_id}})"
+                f"{' WHERE ' + document_filter if document_filter else ''}"
                 " RETURN r"
             )
         else:
             cypher = (
                 "MATCH (a:Entity {id: $source_id})-[r]->(b:Entity {id: $target_id})"
+                f"{' WHERE ' + document_filter if document_filter else ''}"
                 " RETURN r"
             )
-        result = await graph.query(
-            cypher, {"source_id": source_id, "target_id": target_id}
-        )
+        result = await graph.query(cypher, params)
         if result and result.result_set:
             edge = result.result_set[0][0]
             if edge:
