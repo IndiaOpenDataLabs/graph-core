@@ -228,3 +228,34 @@ async def test_proxy_formats_info_as_raw_text(monkeypatch):
     assert isinstance(info_reply, str)
     assert "redis_mode:standalone" in info_reply
     assert info_reply.endswith("\n")
+
+
+@pytest.mark.asyncio
+async def test_proxy_allows_udf_list_without_graph_prefix(monkeypatch):
+    fake_upstream = _FakeRedis()
+    fake_upstream.execute_command.side_effect = [["lib_a", "lib_b"]]
+
+    monkeypatch.setattr(
+        "graph_core.proxy.falkordb_proxy.Redis.from_url",
+        lambda *args, **kwargs: fake_upstream,
+    )
+
+    proxy = FalkorDBTenantProxy(upstream_default_url="redis://localhost:6379")
+    session = _ProxySession(proxy=proxy, reader=None, writer=None)  # type: ignore[arg-type]
+    session._proxy._resolve_namespace_auth = AsyncMock(
+        return_value=NamespaceAuth(
+            namespace_id="abc",
+            namespace_name="tenant-abc",
+            username="tenant_user",
+            password="tenant-secret",
+            graph_prefix="tenant:abc:",
+            upstream_url="redis://localhost:6379",
+            db=1,
+        )
+    )
+
+    auth_reply = await session.handle_command(["AUTH", "tenant_user", "tenant-secret"])
+    assert isinstance(auth_reply, SimpleString)
+
+    udf_reply = await session.handle_command(["GRAPH.UDF", "LIST"])
+    assert udf_reply == ["lib_a", "lib_b"]

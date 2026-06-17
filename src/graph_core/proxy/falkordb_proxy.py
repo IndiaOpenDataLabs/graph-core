@@ -235,6 +235,15 @@ class _ProxySession:
                     raise
                 return self._filter_graph_list(result)
 
+            if name == "GRAPH.UDF" and args and args[0].upper() == "LIST":
+                try:
+                    result = await self._execute_upstream(name, args)
+                except ProxyError as exc:
+                    if _is_permission_error_message(str(exc)):
+                        return []
+                    raise
+                return result if result is not None else []
+
             if name.startswith("GRAPH."):
                 self._ensure_allowed_graph_args(command)
                 try:
