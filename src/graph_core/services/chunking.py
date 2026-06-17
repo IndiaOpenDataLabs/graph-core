@@ -13,6 +13,8 @@ import tiktoken
 from chonkie import CodeChunker
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
+from graph_core.models.domain_config import get_domain_config
+
 
 class DocumentChunker:
     def __init__(self, chunk_size_tokens: int, chunk_overlap_tokens: int):
@@ -63,7 +65,7 @@ class DocumentChunker:
         if not text.strip():
             return []
 
-        if domain == "code":
+        if get_domain_config(domain).use_ast_chunking:
             return self._chunk_code(text)
         return self._clean_chunks(self._prose_splitter.split_text(text))
 

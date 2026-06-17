@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from graph_core.config import settings
 from graph_core.embedding.interface import EmbeddingProvider
+from graph_core.models.domain_config import get_domain_config
 from graph_core.models.graph_rag import (
     EntityAlias,
     EntityDescription,
@@ -80,6 +81,7 @@ class IncrementalEntityResolver:
         self._embedding = embedding_provider
         self._collection_id = collection_id
         self._domain = (domain or "").strip().lower() or None
+        self._domain_cfg = get_domain_config(self._domain)
         self._vstore = GraphRAGVectorStore()
         graph_name = (
             collection_graph_name(
@@ -1025,7 +1027,7 @@ class IncrementalEntityResolver:
         name: str,
         entity_type: str | None = None,
     ) -> bool:
-        if self._domain != "code":
+        if not self._domain_cfg.requires_exact_resolution:
             return False
         normalized_type = (entity_type or "").strip().upper()
         if normalized_type in {

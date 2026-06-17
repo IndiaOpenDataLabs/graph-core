@@ -12,10 +12,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from graph_core.llm.interface import LLMProvider
+from graph_core.models.domain_config import get_domain_config
 from graph_core.models.rel_types import (
     DEFAULT_REL_TYPE,
     normalize_rel_type,
-    rel_types_for_domain,
 )
 
 logger = logging.getLogger(__name__)
@@ -339,98 +339,20 @@ class LLMGraphExtractor:
         return out
 
     @staticmethod
-    def _domain_relationship_guidance(domain: str | None) -> str:
-        if domain != "code":
-            return (
-                "For non-code relationships, let rel_type labels capture the "
-                "ideas, reasoning, causal or explanatory logic, and conceptual "
-                "roles in the text. Reuse an existing rel_type from the current "
-                "set when it fits; if none fits, create a concise new upper-snake "
-                "rel_type that reflects the idea or logical role precisely."
-            )
-        return (
-            "For code-domain relationships, write the description in short "
-            "pseudo-code-flavored prose that captures execution semantics. "
-            "Mention guards, conditions, branches, loops, sequencing, fan-out, "
-            "or fan-in when the text supports them. Conditions may be written in "
-            "plain English, but keep the style compact and code-like using cues "
-            "such as IF, WHEN, THEN, ELSE, FOR EACH, WHILE, TRY/CATCH, RETURNS, "
-            "SPLITS INTO, or MERGES WITH. Do not invent control flow that is not "
-            "grounded in the text. Focus on extracting logic in terms of: "
-            "what is happening, where it happens, why it happens, how it "
-            "happens, and when it starts, ends, or switches path. When two "
-            "symbols are contrasted, preserve both sides of the contrast "
-            "explicitly instead of collapsing them into one generic summary. "
-            "Always preserve exact explicit structural relationships that are "
-            "directly present in the code or docs, such as imports, calls, "
-            "returns, assignments, configuration, state updates, and fallback "
-            "branches. In addition to those direct edges, extract richer logical "
-            "relationships between the same entities when the text supports "
-            "them. Choose concise rel_type labels only after you have identified "
-            "the underlying logic, data flow, control flow, conditions, "
-            "lifecycle, or purpose described in the text."
-        )
-
-    @staticmethod
-    def _domain_rel_type_guidance(domain: str | None) -> str:
-        if domain == "code":
-            return (
-                "Do not optimize for any fixed vocabulary. Derive concise "
-                "UPPER_SNAKE rel_type labels from the logic actually present in "
-                "the text. Preserve exact direct relationships when they are "
-                "explicit, for example calls, imports, returns, assigns, "
-                "updates, or configures. Add richer rel_type labels only when "
-                "they capture additional supported logic such as purpose, "
-                "condition, contrast, lifecycle, task fit, or fallback."
-            )
-        if domain is not None:
-            return (
-                "Prefer an existing rel_type from this current set when it truly "
-                "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
-                "that captures the underlying idea, logic, or conceptual role "
-                "more precisely."
-            )
-        return (
-            "Prefer an existing rel_type from this current set when it truly "
-            "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
-            "that is semantically precise."
-        )
-
-    @staticmethod
-    def _domain_entity_guidance(domain: str | None) -> str:
-        if domain != "code":
-            return (
-                "Use concise title case names and keep naming consistent across "
-                "the extraction."
-            )
-        return (
-            "For code-domain entities, prefer the exact symbol names that appear "
-            "in the source whenever the entity is a concrete class, function, "
-            "method, module, variable, exception, or config symbol. Preserve the "
-            "source casing and punctuation style for those symbols instead of "
-            "rewriting them into generic title case. Use broader natural-language "
-            "names only for genuinely higher-level code concepts that are "
-            "explicitly named in the source text or documentation. Do not invent "
-            "new conceptual node names just to represent logic that can be "
-            "captured as a relationship between existing entities. Prefer to put "
-            "what/where/why/how/when semantics into relationship descriptions and "
-            "rel_type labels unless the concept itself is explicitly named."
-        )
-
-    @staticmethod
     def _build_extraction_prompt(
         text: str,
         entity_types: str,
         rel_type_vocab: list[str],
         domain: str | None,
     ) -> str:
+        cfg = get_domain_config(domain)
         return (
             _EXTRACTION_SYSTEM_PROMPT.format(
                 entity_types=entity_types,
                 rel_type_vocab=", ".join(rel_type_vocab),
-                domain_entity_guidance=LLMGraphExtractor._domain_entity_guidance(domain),
-                domain_rel_type_guidance=LLMGraphExtractor._domain_rel_type_guidance(domain),
-                domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
+                domain_entity_guidance=cfg.entity_guidance,
+                domain_rel_type_guidance=cfg.rel_type_guidance,
+                domain_relationship_guidance=cfg.relationship_guidance,
             )
             + "\n\n"
             + _EXTRACTION_USER_PROMPT.format(text=text)
@@ -444,13 +366,14 @@ class LLMGraphExtractor:
         rel_type_vocab: list[str],
         domain: str | None,
     ) -> str:
+        cfg = get_domain_config(domain)
         return (
             _GLEANING_SYSTEM_PROMPT.format(
                 entity_types=entity_types,
                 rel_type_vocab=", ".join(rel_type_vocab),
-                domain_entity_guidance=LLMGraphExtractor._domain_entity_guidance(domain),
-                domain_rel_type_guidance=LLMGraphExtractor._domain_rel_type_guidance(domain),
-                domain_relationship_guidance=LLMGraphExtractor._domain_relationship_guidance(domain),
+                domain_entity_guidance=cfg.entity_guidance,
+                domain_rel_type_guidance=cfg.rel_type_guidance,
+                domain_relationship_guidance=cfg.relationship_guidance,
             )
             + "\n\n"
             + _GLEANING_USER_PROMPT.format(existing_info=existing_info, text=text)
@@ -468,7 +391,8 @@ class LLMGraphExtractor:
             return self._cache[content_hash]
 
         types_str = ", ".join(entity_types) if entity_types else "general"
-        rel_vocab = rel_types_for_domain(domain)
+        cfg = get_domain_config(domain)
+        rel_vocab = cfg.rel_types
         prompt = self._build_extraction_prompt(
             text=text,
             entity_types=types_str,
@@ -566,7 +490,8 @@ class LLMGraphExtractor:
         if not current_entities and not current_relationships:
             return result
 
-        rel_vocab = rel_types_for_domain(domain)
+        cfg = get_domain_config(domain)
+        rel_vocab = cfg.rel_types
         for gleaning_pass in range(max_gleaning):
             existing_info = "Already extracted:\n"
             existing_info += (
