@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from graph_core.database import AsyncSessionLocal
-from graph_core.models.namespace import Namespace
-from graph_core.services import auth_service
-from graph_core.services.graph import GraphService
+from graph_core.migrations.falkordb_acl import (
+    load_namespace_acl_payloads,
+    replay_namespace_acl_payloads,
+)
+from graph_core.migrations.falkordb_graph_names import (
+    load_collection_graph_payloads,
+    replay_collection_graph_names,
+)
 
 # revision identifiers, used by Alembic.
 revision = "0019_falkordb_namespace_acl"
@@ -24,19 +28,13 @@ depends_on = None
 
 
 async def _upgrade_async() -> None:
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Namespace).order_by(Namespace.created_at.asc())
-        )
-        namespaces = list(result.scalars().all())
-        for namespace in namespaces:
-            await auth_service.ensure_namespace_falkordb_credential(
-                session,
-                str(namespace.id),
-            )
+    bind = op.get_bind()
+    with Session(bind=bind) as session:
+        acl_payloads = load_namespace_acl_payloads(session)
+        graph_payloads = load_collection_graph_payloads(session)
 
-    service = GraphService()
-    await service.migrate_all_collection_graph_names()
+    await replay_namespace_acl_payloads(acl_payloads)
+    await replay_collection_graph_names(graph_payloads)
 
 
 def upgrade() -> None:
