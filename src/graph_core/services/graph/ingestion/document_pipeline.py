@@ -15,7 +15,12 @@ from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
-from graph_core.models.domain_config import detect_domain
+from graph_core.models.domain_config import (
+    DomainConfig,
+    classify_document,
+    get_domain_config,
+    register_domain,
+)
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.profile import Profile
 from graph_core.services.chunking import DocumentChunker
@@ -23,7 +28,10 @@ from graph_core.services.document_identity import (
     document_id_for_path,
     normalize_document_path,
 )
-from graph_core.services.graph.ingestion.chunk_processor import ingest_collection_chunk
+from graph_core.services.graph.ingestion.chunk_processor import (
+    ingest_collection_chunk,
+    resolve_llm_provider_from_collection,
+)
 
 UTC = UTC
 
@@ -150,10 +158,21 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
 
         text = str(job.payload["text"])
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
-        if domain is None:
-            domain = detect_domain(text)
+        domain_config_data = (
+            job.payload.get("domain_config") if isinstance(job.payload, dict) else None
+        )
+        if domain is None and domain_config_data is None:
+            llm = await resolve_llm_provider_from_collection(collection)
+            cfg = await classify_document(llm, text)
+            register_domain(cfg)
+            domain = cfg.name
             job.payload["domain"] = domain
+            job.payload["domain_config"] = cfg.to_dict()
             await session.commit()
+        elif domain_config_data and isinstance(domain_config_data, dict):
+            cfg = DomainConfig.from_dict(domain_config_data)
+            register_domain(cfg)
+            domain = cfg.name
         document_path = (
             normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
             if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))
@@ -358,8 +377,16 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
         collection = await session.get(Collection, job.collection_id)
         text = chunk.text
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
-        if domain is None:
-            domain = detect_domain(text)
+        domain_config_data = (
+            job.payload.get("domain_config") if isinstance(job.payload, dict) else None
+        )
+        if domain_config_data and isinstance(domain_config_data, dict):
+            cfg = DomainConfig.from_dict(domain_config_data)
+            register_domain(cfg)
+            domain = cfg.name
+        elif domain is None:
+            cfg = get_domain_config(None)
+            domain = cfg.name
         document_path = (
             normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
             if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))
