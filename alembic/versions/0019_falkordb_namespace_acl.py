@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
+from alembic import op
 from sqlalchemy.orm import Session
 
 from graph_core.migrations.falkordb_acl import (
