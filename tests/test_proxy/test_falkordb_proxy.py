@@ -193,3 +193,38 @@ async def test_proxy_uses_safe_fallbacks_for_permission_errors(monkeypatch):
         ]
     )
     assert graph_query == []
+
+
+@pytest.mark.asyncio
+async def test_proxy_formats_info_as_raw_text(monkeypatch):
+    fake_upstream = _FakeRedis()
+    fake_upstream.execute_command.side_effect = [
+        {"redis_mode": "standalone", "role": "master"},
+    ]
+
+    monkeypatch.setattr(
+        "graph_core.proxy.falkordb_proxy.Redis.from_url",
+        lambda *args, **kwargs: fake_upstream,
+    )
+
+    proxy = FalkorDBTenantProxy(upstream_default_url="redis://localhost:6379")
+    session = _ProxySession(proxy=proxy, reader=None, writer=None)  # type: ignore[arg-type]
+    session._proxy._resolve_namespace_auth = AsyncMock(
+        return_value=NamespaceAuth(
+            namespace_id="abc",
+            namespace_name="tenant-abc",
+            username="tenant_user",
+            password="tenant-secret",
+            graph_prefix="tenant:abc:",
+            upstream_url="redis://localhost:6379",
+            db=1,
+        )
+    )
+
+    auth_reply = await session.handle_command(["AUTH", "tenant_user", "tenant-secret"])
+    assert isinstance(auth_reply, SimpleString)
+
+    info_reply = await session.handle_command(["INFO"])
+    assert isinstance(info_reply, str)
+    assert "redis_mode:standalone" in info_reply
+    assert info_reply.endswith("\n")

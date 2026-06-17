@@ -254,7 +254,8 @@ class _ProxySession:
                 return await self._execute_upstream(name, args)
 
             if name == "INFO":
-                return await self._execute_upstream(name, args)
+                result = await self._execute_upstream(name, args)
+                return self._format_info_reply(result)
 
             if name == "COMMAND":
                 return await self._execute_upstream(name, args)
@@ -353,6 +354,27 @@ class _ProxySession:
                         filtered.append(item)
             return filtered
         return result
+
+    @staticmethod
+    def _format_info_reply(result: Any) -> str:
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            sections = [
+                "\n".join(f"{key}:{value}" for key, value in result.items())
+            ]
+            payload = "\n".join(section for section in sections if section)
+            return payload + ("\n" if payload else "")
+        if isinstance(result, (list, tuple)):
+            lines = [
+                str(item).rstrip("\r\n")
+                for item in result
+                if str(item).strip()
+            ]
+            payload = "\n".join(lines)
+            return payload + ("\n" if payload else "")
+        payload = str(result).rstrip("\r\n")
+        return payload + ("\n" if payload else "")
 
 
 def _parse_inline_command(line: bytes) -> list[str]:
