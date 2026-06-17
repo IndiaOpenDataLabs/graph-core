@@ -121,8 +121,6 @@ services:
     build: .
     env_file:
       - .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     network_mode: service:falkordb
     environment:
       DATABASE_URL: postgresql+asyncpg://graphcore:graphcore@host.docker.internal:5432/graphcore
