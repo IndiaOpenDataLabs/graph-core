@@ -25,7 +25,7 @@ def load_namespace_acl_payloads(
             Namespace.created_at.asc()
         )
     )
-    for namespace_id, metadata_json in namespace_rows.all():
+    for namespace_id, metadata_json, _created_at in namespace_rows.all():
         metadata = metadata_json or {}
         falkordb_meta = metadata.get("falkordb")
         credential: Credential | None = None
