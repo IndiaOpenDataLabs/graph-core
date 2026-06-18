@@ -29,6 +29,7 @@ class DocumentChunker:
 
         self._chunk_size = chunk_size_tokens
         self._chunk_overlap = chunk_overlap_tokens
+        self._code_overlap = 0
         self._encoding = tiktoken.get_encoding("cl100k_base")
         self._length_fn: Callable[[str], int] = self._token_length
         self._prose_splitter = RecursiveCharacterTextSplitter(
@@ -39,7 +40,7 @@ class DocumentChunker:
         )
         self._generic_code_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self._chunk_size,
-            chunk_overlap=self._chunk_overlap,
+            chunk_overlap=self._code_overlap,
             length_function=self._length_fn,
             separators=[
                 "\nclass ",
@@ -85,7 +86,7 @@ class DocumentChunker:
                     RecursiveCharacterTextSplitter.from_language(
                         language=langchain_language,
                         chunk_size=self._chunk_size,
-                        chunk_overlap=self._chunk_overlap,
+                        chunk_overlap=self._code_overlap,
                         length_function=self._length_fn,
                     ).split_text(text)
                 )
@@ -118,7 +119,9 @@ class DocumentChunker:
             if self._token_length(chunk) <= self._chunk_size:
                 buffer = chunk
             else:
-                packed.extend(self._clean_chunks(self._generic_code_splitter.split_text(chunk)))
+                packed.extend(
+                    self._clean_chunks(self._generic_code_splitter.split_text(chunk))
+                )
                 buffer = ""
         if buffer.strip():
             packed.append(buffer.strip())
