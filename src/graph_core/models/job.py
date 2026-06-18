@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.dialects.postgresql import UUID as UUIDType
 from sqlalchemy.orm import relationship
 
@@ -38,7 +39,7 @@ class Job(Base):
     )
     progress_percent = Column(Integer, default=0)
     error = Column(Text, nullable=True)
-    payload = Column(JSON, nullable=True)
+    payload = Column(MutableDict.as_mutable(JSON), nullable=True)
     chunks_total = Column(Integer, default=0)
     chunks_completed = Column(Integer, default=0)
 

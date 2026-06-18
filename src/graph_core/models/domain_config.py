@@ -2,8 +2,8 @@
 
 An LLM classifies document content, generates tailored extraction guidance,
 and returns a `DomainConfig` — no hardcoded regex or domain lists needed.
-The registry still holds well-known fallbacks (`general`, `code`) for when
-the LLM is unavailable or the caller provides an explicit domain name.
+The registry still holds well-known fallback domains so existing callers
+keep their current behavior while new domains can be added at runtime.
 """
 
 from __future__ import annotations
@@ -145,6 +145,76 @@ DOMAIN_CONFIGS: dict[str, DomainConfig] = {
         entity_guidance=_GENERIC_ENTITY_GUIDANCE,
         relationship_guidance=_GENERIC_RELATIONSHIP_GUIDANCE,
         rel_type_guidance=_GENERIC_REL_TYPE_GUIDANCE,
+    ),
+    "books": DomainConfig(
+        name="books",
+        rel_types=_REL_TYPES_GENERAL,
+        entity_guidance=_GENERIC_ENTITY_GUIDANCE,
+        relationship_guidance=_GENERIC_RELATIONSHIP_GUIDANCE,
+        rel_type_guidance=_GENERIC_REL_TYPE_GUIDANCE,
+    ),
+    "personal": DomainConfig(
+        name="personal",
+        rel_types=[
+            "RELATES_TO",
+            "REMEMBERS",
+            "MENTIONED",
+            "EXPLAINS_TO",
+            "PREFERS",
+            "DISLIKES",
+            "AVOIDS",
+            "FAVORITES",
+            "BELIEVES",
+            "OPINION_ABOUT",
+            "VALUES",
+            "WANTS",
+            "GOAL",
+            "PLANS",
+            "CONSIDERING",
+            "DECIDED",
+            "ABANDONED",
+            "TRIED",
+            "LEARNED",
+            "SUCCEEDED_AT",
+            "FAILED_AT",
+            "OWNS",
+            "USES",
+            "SUBSCRIBES_TO",
+            "WORKS_AT",
+            "STUDIES",
+            "LIVES_IN",
+            "VISITED",
+            "FROM",
+            "KNOWS",
+            "RELATED_TO",
+            "MET",
+            "COLLABORATES_WITH",
+            "SCHEDULED",
+            "ATTENDED",
+            "COMMITTED_TO",
+            "NEEDS",
+            "BLOCKED_BY",
+            "CONCERNED_ABOUT",
+            "CHANGED_MIND_ABOUT",
+            "UPGRADED_FROM",
+            "REPLACED",
+        ],
+        entity_guidance=(
+            "Use concise title case names and keep naming consistent across "
+            "the extraction."
+        ),
+        relationship_guidance=(
+            "Let rel_type labels capture the ideas, reasoning, causal or "
+            "explanatory logic, and conceptual roles in the text. Reuse an "
+            "existing rel_type from the current set when it fits; if none fits, "
+            "create a concise new upper-snake rel_type that reflects the idea "
+            "or logical role precisely."
+        ),
+        rel_type_guidance=(
+            "Prefer an existing rel_type from this current set when it truly "
+            "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
+            "that is semantically precise."
+        ),
     ),
     "code": DomainConfig(
         name="code",

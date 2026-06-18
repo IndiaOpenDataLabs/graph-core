@@ -166,8 +166,10 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             cfg = await classify_document(llm, text)
             register_domain(cfg)
             domain = cfg.name
-            job.payload["domain"] = domain
-            job.payload["domain_config"] = cfg.to_dict()
+            payload = dict(job.payload or {})
+            payload["domain"] = domain
+            payload["domain_config"] = cfg.to_dict()
+            job.payload = payload
             await session.commit()
         elif domain_config_data and isinstance(domain_config_data, dict):
             cfg = DomainConfig.from_dict(domain_config_data)
