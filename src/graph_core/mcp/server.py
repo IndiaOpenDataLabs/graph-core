@@ -3,7 +3,6 @@
 The admin and user surfaces run as separate MCP servers on different ports.
 """
 
-import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -581,6 +580,7 @@ async def ingest_document(
     text: str,
     ctx: Context,
     domain: str | None = None,
+    document_path: str | None = None,
 ) -> CallToolResult:
     """Ingest a full document into a collection (async, returns job_id).
 
@@ -589,39 +589,11 @@ async def ingest_document(
     Args:
         collection_id: The UUID of the target collection.
         text: The full document text.
+        document_path: Optional path for stable document identity (enables idempotent re-ingestion).
     """
     api_key = _extract_api_key(ctx)
     client = await get_client(api_key)
-    result = await client.ingest_document(collection_id, text, domain=domain)
-    return _result(
-        (
-            f"Document ingestion started:\n"
-            f"  job_id: {result['job_id']}\n"
-            f"  status: {result['status']}\n\n"
-            f"Track with get_job_status('{result['job_id']}')"
-        ),
-        {"job_id": result["job_id"], "status": result["status"]},
-    )
-
-
-@user_tool()
-async def ingest_file(collection_id: str, file_path: str, ctx: Context) -> CallToolResult:
-    """Read a local file and ingest its contents into a collection.
-
-    Args:
-        collection_id: The UUID of the target collection.
-        file_path: Absolute path to the text file.
-    """
-    loop = asyncio.get_event_loop()
-
-    def _read(path: str) -> str:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-
-    content = await loop.run_in_executor(None, _read, file_path)
-    api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.ingest_document(collection_id, content)
+    result = await client.ingest_document(collection_id, text, domain=domain, document_path=document_path)
     return _result(
         (
             f"Document ingestion started:\n"

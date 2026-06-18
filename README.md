@@ -202,7 +202,6 @@ uv run graph-core-admin-jwt --subject my-mcp-client
 | `list_collections`     | List collections in namespace      |
 | `ingest_chunk`         | Ingest a text chunk (sync)         |
 | `ingest_document`      | Ingest a document (async, returns job_id) |
-| `ingest_file`          | Ingest from a local file path      |
 | `query_collection`     | Query a collection with a question |
 | `create_chat_session`  | Create a chat session for follow-up memory |
 | `list_chat_sessions`   | List chat sessions for a collection |
