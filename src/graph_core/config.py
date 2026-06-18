@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     default_embedding_dimensions: int = 256
     default_distance_metric: str = "cosine"
 
-    chunk_size_tokens: int = 400
-    chunk_overlap_tokens: int = 40
+    chunk_size_tokens: int = 512
+    chunk_overlap_tokens: int = 0
     vector_query_top_k: int = 5
 
     default_llm_provider: str = "local_echo"
