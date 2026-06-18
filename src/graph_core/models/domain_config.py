@@ -256,8 +256,12 @@ _CLASSIFICATION_SCHEMA: dict[str, Any] = {
         "domain_name": {
             "type": "string",
             "description": "A short lowercase identifier for the content "
-                           "domain, e.g. 'stocks', 'job_posting', 'code', "
-                           "'medical', 'legal', 'academic_paper', 'personal'.",
+                           "domain a human would use to choose Graph RAG "
+                           "extraction behavior, e.g. 'job_posting', 'code', "
+                           "'medical', 'legal', 'academic_paper', 'personal'. "
+                           "Do not return a topic summary or any label that "
+                           "mentions graph, rag, extraction, specialist, "
+                           "assistant, system, prompt, or analysis.",
         },
         "entity_guidance": {
             "type": "string",
@@ -306,16 +310,31 @@ _CLASSIFICATION_SCHEMA: dict[str, Any] = {
 }
 
 _CLASSIFICATION_PROMPT = """\
-You are a Knowledge Graph domain specialist. Your job is to analyze the \
-content type of the provided text and generate tailored extraction \
-instructions for building a knowledge graph from it.
+You are a Knowledge Graph domain specialist for Graph RAG extraction. \
+Your job is to analyze the content type of the provided text and generate \
+tailored extraction instructions for building a knowledge graph from it.
 
-Analyze what kind of document this is — its subject matter, genre, \
+Analyze what kind of document this is — its document type, genre, \
 structure, and the kind of entities and relationships it is likely to contain.
 
-Then produce domain-specific guidance that will be inserted into the \
-extraction system prompt used by an LLM to extract entities and \
-relationships from chunks of this document.
+Then produce the kind of human-meaningful document classification a person \
+would use to choose extraction behavior for this document. Prefer a concise \
+stable label such as job_posting, research_paper, contract, code, email, \
+meeting_notes, resume, or report rather than a topical phrase.
+
+Return guidance that would actually help Graph RAG extraction. Ask yourself: \
+what classification would a human have in mind when deciding how to extract \
+entities and relationships from this document?
+
+Important:
+- Classify the document itself, not the system, model, workflow, or prompt.
+- Do not copy phrases from this prompt into the output.
+- The domain_name must be a document type label, not a description of the \
+  extraction task.
+- If the text is a job advertisement, prefer job_posting even if it mentions \
+  a technical topic like supply chain, forecasting, or AI.
+- If the text is a resume/CV, contract, policy, report, email, note, or \
+  meeting record, prefer that document type over the subject matter.
 
 Return your answer as structured JSON.
 
