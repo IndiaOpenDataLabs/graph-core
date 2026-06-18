@@ -2325,7 +2325,7 @@ async def graph_rag_query(
                     namespace_id,
                     mode,
                     llm_profile_id,
-                    document_ids=document_ids,
+                    document_ids=None,
                 ),
             )
         )

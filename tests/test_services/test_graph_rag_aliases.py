@@ -19,7 +19,12 @@ from graph_core.services.graph.analytics import (
     build_collection_understanding,
 )
 from graph_core.services.graph.query import graph_rag
-from graph_core.services.graph.query.graph_rag import GraphQueryState
+from graph_core.services.graph.query.graph_rag import (
+    DerivedRouteProfile,
+    DocumentRoutingDecision,
+    GraphQueryArtifacts,
+    GraphQueryState,
+)
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
 from graph_core.services.graph_rag.extractor import LLMGraphExtractor
 
@@ -801,4 +806,92 @@ async def test_load_meta_collections_prefers_leveled_l1_over_legacy(
 
     assert [collection.name for collection in collections] == [
         "graph-rag-collection__meta__l1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_graph_rag_query_does_not_apply_document_routing_to_meta_collections(
+    monkeypatch,
+    test_graph_rag_collection,
+):
+    meta_collection = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_graph_rag_collection.namespace_id,
+        name="graph-rag-collection__meta__l1",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    routed_document_id = uuid.uuid4()
+    build_calls: list[dict[str, object]] = []
+
+    async def _fake_resolve_document_routing(*args, **kwargs):
+        return DocumentRoutingDecision(
+            use_all_documents=False,
+            document_ids=[routed_document_id],
+        )
+
+    async def _fake_build_graph_query_artifacts(
+        question,
+        collection,
+        namespace_id,
+        mode,
+        llm_profile_id,
+        document_ids=None,
+    ):
+        build_calls.append(
+            {
+                "collection_name": collection.name,
+                "document_ids": document_ids,
+            }
+        )
+        return GraphQueryArtifacts(
+            context=f"context for {collection.name}",
+            entities_used=[],
+            relationships_used=[],
+            rel_context="",
+            route_profile=DerivedRouteProfile(
+                primary_route="entity",
+                route_scores={},
+                rel_type_scores={},
+            ),
+        )
+
+    async def _fake_load_meta_collections(collection):
+        return [meta_collection]
+
+    async def _fake_answer_from_context(*args, **kwargs):
+        return "ok"
+
+    monkeypatch.setattr(
+        graph_rag,
+        "_resolve_document_routing",
+        _fake_resolve_document_routing,
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_build_graph_query_artifacts",
+        _fake_build_graph_query_artifacts,
+    )
+    monkeypatch.setattr(graph_rag, "_load_meta_collections", _fake_load_meta_collections)
+    monkeypatch.setattr(
+        graph_rag,
+        "_answer_from_context",
+        _fake_answer_from_context,
+    )
+
+    await graph_rag.graph_rag_query(
+        "Which document mentions OAuth?",
+        test_graph_rag_collection,
+        test_graph_rag_collection.namespace_id,
+    )
+
+    assert build_calls == [
+        {
+            "collection_name": test_graph_rag_collection.name,
+            "document_ids": [routed_document_id],
+        },
+        {
+            "collection_name": meta_collection.name,
+            "document_ids": None,
+        },
     ]
