@@ -55,42 +55,29 @@ def _extract_api_key(ctx: Context) -> str:
     )
 
 
-_client_cache: dict[str, GraphCoreClient] = {}
-
-
-async def get_client(api_key: str, admin: bool = False) -> GraphCoreClient:
-    """Get or create a cached client for the given api key."""
-    cache_key = f"{'admin' if admin else 'ns'}:{api_key[:10]}"
-    if cache_key not in _client_cache:
-        _client_cache[cache_key] = GraphCoreClient(
-            base_url=_get_base_url(),
-            api_key=api_key,
-            is_admin=admin,
-        )
-    return _client_cache[cache_key]
-
-
 @asynccontextmanager
-async def server_lifespan(server: FastMCP):
+async def _client(api_key: str, admin: bool = False):
+    """Create a scoped HTTP client, closing it on exit."""
+    c = GraphCoreClient(
+        base_url=_get_base_url(),
+        api_key=api_key,
+        is_admin=admin,
+    )
     try:
-        yield
+        yield c
     finally:
-        for client in _client_cache.values():
-            await client.close()
-        _client_cache.clear()
+        await c.close()
 
 
 admin_mcp = FastMCP(
     name="graph-core-admin",
     instructions="MCP admin tools for namespace management",
-    lifespan=server_lifespan,
     streamable_http_path="/",
 )
 
 user_mcp = FastMCP(
     name="graph-core-user",
     instructions="MCP user tools scoped to a namespace",
-    lifespan=server_lifespan,
     streamable_http_path="/",
 )
 
@@ -236,17 +223,17 @@ async def create_namespace(name: str, ctx: Context) -> CallToolResult:
         name: Human-readable namespace name (must be unique).
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key, admin=True)
-    result = await client.create_namespace(name)
-    text = (
-        f"Created namespace:\n"
-        f"  id: {result['id']}\n"
-        f"  name: {result['name']}\n"
-        f"  token_type: {result['token_type']}\n"
-        f"  scope: {result['scope']}\n"
-        f"  token: {result['token']}\n"
-        f"  expires_at: {result['expires_at']}"
-    )
+    async with _client(api_key, admin=True) as client:
+        result = await client.create_namespace(name)
+        text = (
+            f"Created namespace:\n"
+            f"  id: {result['id']}\n"
+            f"  name: {result['name']}\n"
+            f"  token_type: {result['token_type']}\n"
+            f"  scope: {result['scope']}\n"
+            f"  token: {result['token']}\n"
+            f"  expires_at: {result['expires_at']}"
+        )
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structuredContent={
@@ -266,27 +253,27 @@ async def create_namespace(name: str, ctx: Context) -> CallToolResult:
 async def list_namespaces(ctx: Context) -> CallToolResult:
     """List all namespaces. Requires admin JWT."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key, admin=True)
-    namespaces = await client.list_namespaces()
-    if not namespaces:
-        text = "No namespaces found."
-        return CallToolResult(
-            content=[TextContent(type="text", text=text)],
-            structuredContent={"namespaces": []},
-        )
+    async with _client(api_key, admin=True) as client:
+        namespaces = await client.list_namespaces()
+        if not namespaces:
+            text = "No namespaces found."
+            return CallToolResult(
+                content=[TextContent(type="text", text=text)],
+                structuredContent={"namespaces": []},
+            )
 
-    lines = ["Namespaces:"]
-    items: list[dict[str, str]] = []
-    for ns in namespaces:
-        text_line = f"  - {ns['id']} | {ns['name']}"
-        lines.append(text_line)
-        items.append(
-            {
-                "id": ns["id"],
-                "name": ns["name"],
-            }
-        )
-    text = "\n".join(lines)
+        lines = ["Namespaces:"]
+        items: list[dict[str, str]] = []
+        for ns in namespaces:
+            text_line = f"  - {ns['id']} | {ns['name']}"
+            lines.append(text_line)
+            items.append(
+                {
+                    "id": ns["id"],
+                    "name": ns["name"],
+                }
+            )
+        text = "\n".join(lines)
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structuredContent={"namespaces": items},
@@ -297,9 +284,9 @@ async def list_namespaces(ctx: Context) -> CallToolResult:
 async def get_current_namespace(ctx: Context) -> CallToolResult:
     """Get info about the current authenticated namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    ns = await client.get_namespace_me()
-    text = f"Namespace: {ns['id']} | {ns['name']}"
+    async with _client(api_key) as client:
+        ns = await client.get_namespace_me()
+        text = f"Namespace: {ns['id']} | {ns['name']}"
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structuredContent={
@@ -320,21 +307,21 @@ async def issue_user_token(
 ) -> CallToolResult:
     """Issue a long-lived user JWT for an existing namespace. Requires admin JWT."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key, admin=True)
-    result = await client.issue_user_token(
-        namespace_id,
-        subject=subject,
-        expires_in_days=expires_in_days,
-    )
-    text = (
-        f"Issued user token:\n"
-        f"  namespace_id: {result['namespace_id']}\n"
-        f"  namespace_name: {result['namespace_name']}\n"
-        f"  token_type: {result['token_type']}\n"
-        f"  scope: {result['scope']}\n"
-        f"  token: {result['token']}\n"
-        f"  expires_at: {result['expires_at']}"
-    )
+    async with _client(api_key, admin=True) as client:
+        result = await client.issue_user_token(
+            namespace_id,
+            subject=subject,
+            expires_in_days=expires_in_days,
+        )
+        text = (
+            f"Issued user token:\n"
+            f"  namespace_id: {result['namespace_id']}\n"
+            f"  namespace_name: {result['namespace_name']}\n"
+            f"  token_type: {result['token_type']}\n"
+            f"  scope: {result['scope']}\n"
+            f"  token: {result['token']}\n"
+            f"  expires_at: {result['expires_at']}"
+        )
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structuredContent={
@@ -372,15 +359,15 @@ async def create_collection(
         gleaning_passes: Optional number of extra gleaning passes per chunk.
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.create_collection(
-        name=name,
-        strategy=strategy,
-        embedding_profile_id=embedding_profile_id,
-        llm_profile_id=llm_profile_id,
-        default_query_mode=default_query_mode,
-        gleaning_passes=gleaning_passes,
-    )
+    async with _client(api_key) as client:
+        result = await client.create_collection(
+            name=name,
+            strategy=strategy,
+            embedding_profile_id=embedding_profile_id,
+            llm_profile_id=llm_profile_id,
+            default_query_mode=default_query_mode,
+            gleaning_passes=gleaning_passes,
+        )
     return _result(
         (
             f"Created collection:\n"
@@ -408,30 +395,30 @@ async def create_collection(
 async def list_collections(ctx: Context) -> CallToolResult:
     """List all collections in the current namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    collections = await client.list_collections()
-    if not collections:
-        return CallToolResult(
-            content=[TextContent(type="text", text="No collections found.")],
-            structuredContent={"collections": []},
-        )
-    lines = ["Collections:"]
-    items: list[dict[str, str | None]] = []
-    for col in collections:
-        llm_profile_id = col.get("llm_profile_id")
-        llm_suffix = f" | llm={llm_profile_id}" if llm_profile_id else ""
-        lines.append(
-            f"  - {col['id']} | {col['name']} ({col['strategy']}){llm_suffix}"
-        )
-        items.append(
-            {
-                "id": col["id"],
-                "name": col["name"],
-                "strategy": col["strategy"],
-                "llm_profile_id": llm_profile_id,
-            }
-        )
-    text = "\n".join(lines)
+    async with _client(api_key) as client:
+        collections = await client.list_collections()
+        if not collections:
+            return CallToolResult(
+                content=[TextContent(type="text", text="No collections found.")],
+                structuredContent={"collections": []},
+            )
+        lines = ["Collections:"]
+        items: list[dict[str, str | None]] = []
+        for col in collections:
+            llm_profile_id = col.get("llm_profile_id")
+            llm_suffix = f" | llm={llm_profile_id}" if llm_profile_id else ""
+            lines.append(
+                f"  - {col['id']} | {col['name']} ({col['strategy']}){llm_suffix}"
+            )
+            items.append(
+                {
+                    "id": col["id"],
+                    "name": col["name"],
+                    "strategy": col["strategy"],
+                    "llm_profile_id": llm_profile_id,
+                }
+            )
+        text = "\n".join(lines)
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
         structuredContent={"collections": items},
@@ -453,27 +440,27 @@ async def update_collection(
 ) -> CallToolResult:
     """Update a collection in the current namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.update_collection(
-        collection_id=collection_id,
-        name=name,
-        strategy=strategy,
-        embedding_profile_id=embedding_profile_id,
-        llm_profile_id=llm_profile_id,
-        default_query_mode=default_query_mode,
-        gleaning_passes=gleaning_passes,
-        clear_llm_profile=clear_llm_profile,
-        clear_default_query_mode=clear_default_query_mode,
-    )
-    text = (
-        f"Updated collection:\n"
-        f"  id: {result['id']}\n"
-        f"  name: {result['name']}\n"
-        f"  strategy: {result['strategy']}\n"
-        f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
-        f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
-        f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
-    )
+    async with _client(api_key) as client:
+        result = await client.update_collection(
+            collection_id=collection_id,
+            name=name,
+            strategy=strategy,
+            embedding_profile_id=embedding_profile_id,
+            llm_profile_id=llm_profile_id,
+            default_query_mode=default_query_mode,
+            gleaning_passes=gleaning_passes,
+            clear_llm_profile=clear_llm_profile,
+            clear_default_query_mode=clear_default_query_mode,
+        )
+        text = (
+            f"Updated collection:\n"
+            f"  id: {result['id']}\n"
+            f"  name: {result['name']}\n"
+            f"  strategy: {result['strategy']}\n"
+            f"  embedding_profile_id: {result.get('embedding_profile_id') or 'N/A'}\n"
+            f"  llm_profile_id: {result.get('llm_profile_id') or 'N/A'}\n"
+            f"  gleaning_passes: {result.get('gleaning_passes', 1)}"
+        )
     return _result(
         text,
         {
@@ -493,9 +480,9 @@ async def update_collection(
 async def delete_collection(collection_id: str, ctx: Context) -> CallToolResult:
     """Delete a collection in the current namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.delete_collection(collection_id)
-    deleted_id = result.get("id", collection_id)
+    async with _client(api_key) as client:
+        result = await client.delete_collection(collection_id)
+        deleted_id = result.get("id", collection_id)
     return _result(f"Deleted collection {deleted_id}", {"collection_id": deleted_id})
 
 
@@ -509,17 +496,17 @@ async def enhance_collection(
     if ctx is None:
         raise ValueError("Context is required")
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.enhance_collection(collection_id, levels=levels)
-    text = (
-        f"Enhance queued:\n"
-        f"  job_id: {result['job_id']}\n"
-        f"  collection_id: {result['collection_id']}\n"
-        f"  namespace_id: {result['namespace_id']}\n"
-        f"  status: {result['status']}\n"
-        f"  type: {result['type']}\n\n"
-        f"Poll with get_job_status('{result['job_id']}')"
-    )
+    async with _client(api_key) as client:
+        result = await client.enhance_collection(collection_id, levels=levels)
+        text = (
+            f"Enhance queued:\n"
+            f"  job_id: {result['job_id']}\n"
+            f"  collection_id: {result['collection_id']}\n"
+            f"  namespace_id: {result['namespace_id']}\n"
+            f"  status: {result['status']}\n"
+            f"  type: {result['type']}\n\n"
+            f"Poll with get_job_status('{result['job_id']}')"
+        )
     return _result(
         text,
         {
@@ -552,13 +539,13 @@ async def ingest_chunk(
         text: The text content to ingest.
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.ingest_chunk(
-        collection_id,
-        text,
-        domain=domain,
-        document_path=document_path,
-    )
+    async with _client(api_key) as client:
+        result = await client.ingest_chunk(
+            collection_id,
+            text,
+            domain=domain,
+            document_path=document_path,
+        )
     return _result(
         (
             f"Ingested chunk:\n"
@@ -592,8 +579,8 @@ async def ingest_document(
         document_path: Optional path for stable document identity (enables idempotent re-ingestion).
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.ingest_document(collection_id, text, domain=domain, document_path=document_path)
+    async with _client(api_key) as client:
+        result = await client.ingest_document(collection_id, text, domain=domain, document_path=document_path)
     return _result(
         (
             f"Document ingestion started:\n"
@@ -625,22 +612,22 @@ async def query_collection(
         chat_id: Optional chat session UUID for follow-up memory.
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.query_collection(
-        collection_id,
-        question,
-        mode=mode,
-        chat_id=chat_id,
-    )
-    text = (
-        f"Query queued:\n"
-        f"  job_id: {result['job_id']}\n"
-        f"  collection_id: {result['collection_id']}\n"
-        f"  namespace_id: {result['namespace_id']}\n"
-        f"  status: {result['status']}\n"
-        f"  type: {result['type']}\n\n"
-        f"Poll with get_job_status('{result['job_id']}')"
-    )
+    async with _client(api_key) as client:
+        result = await client.query_collection(
+            collection_id,
+            question,
+            mode=mode,
+            chat_id=chat_id,
+        )
+        text = (
+            f"Query queued:\n"
+            f"  job_id: {result['job_id']}\n"
+            f"  collection_id: {result['collection_id']}\n"
+            f"  namespace_id: {result['namespace_id']}\n"
+            f"  status: {result['status']}\n"
+            f"  type: {result['type']}\n\n"
+            f"Poll with get_job_status('{result['job_id']}')"
+        )
     return _result(
         text,
         {
@@ -661,8 +648,8 @@ async def create_chat_session(
 ) -> CallToolResult:
     """Create a chat session for follow-up query context."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.create_chat_session(collection_id, title=title)
+    async with _client(api_key) as client:
+        result = await client.create_chat_session(collection_id, title=title)
     return _result(
         (
             f"Created chat session:\n"
@@ -690,24 +677,24 @@ async def list_chat_sessions(
 ) -> CallToolResult:
     """List chat sessions for a collection."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    rows = await client.list_chat_sessions(collection_id, limit=limit)
-    if not rows:
-        return _result("No chat sessions found.", {"chat_sessions": []})
-    lines = ["Chat sessions:"]
-    items: list[dict[str, object]] = []
-    for row in rows:
-        lines.append(
-            f"  - {row['id']} | turns={row.get('turn_count', 0)}"
-            f" | title={row.get('title') or '-'}"
-        )
-        items.append(
-            {
-                "id": row["id"],
-                "turn_count": row.get("turn_count", 0),
-                "title": row.get("title"),
-            }
-        )
+    async with _client(api_key) as client:
+        rows = await client.list_chat_sessions(collection_id, limit=limit)
+        if not rows:
+            return _result("No chat sessions found.", {"chat_sessions": []})
+        lines = ["Chat sessions:"]
+        items: list[dict[str, object]] = []
+        for row in rows:
+            lines.append(
+                f"  - {row['id']} | turns={row.get('turn_count', 0)}"
+                f" | title={row.get('title') or '-'}"
+            )
+            items.append(
+                {
+                    "id": row["id"],
+                    "turn_count": row.get("turn_count", 0),
+                    "title": row.get("title"),
+                }
+            )
     return _result("\n".join(lines), {"chat_sessions": items})
 
 
@@ -722,31 +709,31 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
         job_id: The UUID of the job.
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    job = await client.get_job(job_id)
-    lines = [
-        f"Job: {job.get('id', job_id)}",
-        f"  type: {job.get('type', job.get('job_type', 'N/A'))}",
-        f"  status: {job.get('status', 'unknown')}",
-        f"  progress: {job.get('progress_percent', 0)}%",
-    ]
-    if job.get("error"):
-        lines.append(f"  error: {job['error']}")
-    if job.get("chunks_total"):
-        lines.append(
-            f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
-        )
-    payload = job.get("payload") or {}
-    result = payload.get("result") if isinstance(payload, dict) else None
-    if isinstance(result, dict):
-        if "response" in result:
-            response = str(result.get("response") or "").strip()
-            if response:
-                lines.append(f"  response: {response[:240]}")
-        if "generated_levels" in result:
+    async with _client(api_key) as client:
+        job = await client.get_job(job_id)
+        lines = [
+            f"Job: {job.get('id', job_id)}",
+            f"  type: {job.get('type', job.get('job_type', 'N/A'))}",
+            f"  status: {job.get('status', 'unknown')}",
+            f"  progress: {job.get('progress_percent', 0)}%",
+        ]
+        if job.get("error"):
+            lines.append(f"  error: {job['error']}")
+        if job.get("chunks_total"):
             lines.append(
-                f"  generated_levels: {len(result.get('generated_levels') or [])}"
+                f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
             )
+        payload = job.get("payload") or {}
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict):
+            if "response" in result:
+                response = str(result.get("response") or "").strip()
+                if response:
+                    lines.append(f"  response: {response[:240]}")
+            if "generated_levels" in result:
+                lines.append(
+                    f"  generated_levels: {len(result.get('generated_levels') or [])}"
+                )
     return _result(
         "\n".join(lines),
         {
@@ -768,44 +755,44 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
 async def get_job_result(job_id: str, ctx: Context) -> CallToolResult:
     """Get the final result payload for a completed query or enhance job."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    result = await client.get_job_result(job_id)
-    payload = result.get("result") or {}
-    if result.get("type") == "query":
-        text = (
-            f"Query result:\n"
-            f"  job_id: {result['id']}\n"
-            f"  status: {result['status']}\n\n"
-            f"{payload.get('response', '')}"
-        )
-        return _result(
-            text,
-            {
-                "job_id": result["id"],
-                "status": result["status"],
-                "type": result["type"],
-                "result": payload,
-            },
-        )
-    if result.get("type") == "enhance":
-        summary = payload
-        generated_levels = summary.get("generated_levels") or []
-        text = (
-            f"Enhance result:\n"
-            f"  job_id: {result['id']}\n"
-            f"  status: {result['status']}\n"
-            f"  requested_levels: {summary.get('requested_levels', 1)}\n"
-            f"  generated_levels: {len(generated_levels)}"
-        )
-        return _result(
-            text,
-            {
-                "job_id": result["id"],
-                "status": result["status"],
-                "type": result["type"],
-                "result": summary,
-            },
-        )
+    async with _client(api_key) as client:
+        result = await client.get_job_result(job_id)
+        payload = result.get("result") or {}
+        if result.get("type") == "query":
+            text = (
+                f"Query result:\n"
+                f"  job_id: {result['id']}\n"
+                f"  status: {result['status']}\n\n"
+                f"{payload.get('response', '')}"
+            )
+            return _result(
+                text,
+                {
+                    "job_id": result["id"],
+                    "status": result["status"],
+                    "type": result["type"],
+                    "result": payload,
+                },
+            )
+        if result.get("type") == "enhance":
+            summary = payload
+            generated_levels = summary.get("generated_levels") or []
+            text = (
+                f"Enhance result:\n"
+                f"  job_id: {result['id']}\n"
+                f"  status: {result['status']}\n"
+                f"  requested_levels: {summary.get('requested_levels', 1)}\n"
+                f"  generated_levels: {len(generated_levels)}"
+            )
+            return _result(
+                text,
+                {
+                    "job_id": result["id"],
+                    "status": result["status"],
+                    "type": result["type"],
+                    "result": summary,
+                },
+            )
     return _result(
         f"Job result:\n  job_id: {result['id']}\n  status: {result['status']}",
         {
@@ -825,35 +812,35 @@ async def list_jobs(
 ) -> CallToolResult:
     """List recent jobs in the current namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    jobs = await client.list_jobs(limit=limit, collection_id=collection_id)
-    if not jobs:
-        return _result("No jobs found.", {"jobs": []})
-    lines = ["Jobs:"]
-    items: list[dict[str, object]] = []
-    for job in jobs:
-        chunks = ""
-        if job.get("chunks_total"):
-            chunks = (
-                f" | chunks {job.get('chunks_completed', 0)}/"
-                f"{job['chunks_total']}"
+    async with _client(api_key) as client:
+        jobs = await client.list_jobs(limit=limit, collection_id=collection_id)
+        if not jobs:
+            return _result("No jobs found.", {"jobs": []})
+        lines = ["Jobs:"]
+        items: list[dict[str, object]] = []
+        for job in jobs:
+            chunks = ""
+            if job.get("chunks_total"):
+                chunks = (
+                    f" | chunks {job.get('chunks_completed', 0)}/"
+                    f"{job['chunks_total']}"
+                )
+            lines.append(
+                f"  - {job['id']} | {job.get('type', 'N/A')} | "
+                f"{job.get('status', 'unknown')} | "
+                f"{job.get('progress_percent', 0)}%{chunks}"
             )
-        lines.append(
-            f"  - {job['id']} | {job.get('type', 'N/A')} | "
-            f"{job.get('status', 'unknown')} | "
-            f"{job.get('progress_percent', 0)}%{chunks}"
-        )
-        items.append(
-            {
-                "id": job["id"],
-                "type": job.get("type"),
-                "status": job.get("status"),
-                "progress_percent": job.get("progress_percent", 0),
-                "chunks_total": job.get("chunks_total"),
-                "chunks_completed": job.get("chunks_completed"),
-                "payload": job.get("payload"),
-            }
-        )
+            items.append(
+                {
+                    "id": job["id"],
+                    "type": job.get("type"),
+                    "status": job.get("status"),
+                    "progress_percent": job.get("progress_percent", 0),
+                    "chunks_total": job.get("chunks_total"),
+                    "chunks_completed": job.get("chunks_completed"),
+                    "payload": job.get("payload"),
+                }
+            )
     return _result("\n".join(lines), {"jobs": items})
 
 
@@ -884,24 +871,24 @@ async def create_embedding_profile(
         distance_metric: Optional distance metric.
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    credential = await client.register_credential(
-        provider=provider,
-        secret=secret,
-        label=label,
-        base_url=base_url,
-    )
-    profile = await client.create_profile(
-        kind="embedding",
-        provider=provider,
-        model=model,
-        credential_id=credential["credential_id"],
-        label=label,
-        base_url=base_url,
-        dimensions=dimensions,
-        distance_metric=distance_metric,
-        max_concurrent_calls=max_concurrent_calls,
-    )
+    async with _client(api_key) as client:
+        credential = await client.register_credential(
+            provider=provider,
+            secret=secret,
+            label=label,
+            base_url=base_url,
+        )
+        profile = await client.create_profile(
+            kind="embedding",
+            provider=provider,
+            model=model,
+            credential_id=credential["credential_id"],
+            label=label,
+            base_url=base_url,
+            dimensions=dimensions,
+            distance_metric=distance_metric,
+            max_concurrent_calls=max_concurrent_calls,
+        )
     return _result(
         (
             f"Created embedding profile:\n"
@@ -945,22 +932,22 @@ async def create_llm_profile(
         base_url: Optional custom API base URL.
     """
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    credential = await client.register_credential(
-        provider=provider,
-        secret=secret,
-        label=label,
-        base_url=base_url,
-    )
-    profile = await client.create_profile(
-        kind="llm",
-        provider=provider,
-        model=model,
-        credential_id=credential["credential_id"],
-        label=label,
-        base_url=base_url,
-        max_concurrent_calls=max_concurrent_calls,
-    )
+    async with _client(api_key) as client:
+        credential = await client.register_credential(
+            provider=provider,
+            secret=secret,
+            label=label,
+            base_url=base_url,
+        )
+        profile = await client.create_profile(
+            kind="llm",
+            provider=provider,
+            model=model,
+            credential_id=credential["credential_id"],
+            label=label,
+            base_url=base_url,
+            max_concurrent_calls=max_concurrent_calls,
+        )
     return _result(
         (
             f"Created llm profile:\n"
@@ -1012,9 +999,9 @@ def _format_profile_list(title: str, profiles: list[dict]) -> tuple[str, list[di
 async def list_embedding_profiles(ctx: Context) -> CallToolResult:
     """List embedding profiles in the current namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    profiles = await client.list_embedding_profiles()
-    text, items = _format_profile_list("Embedding Profiles", profiles)
+    async with _client(api_key) as client:
+        profiles = await client.list_embedding_profiles()
+        text, items = _format_profile_list("Embedding Profiles", profiles)
     return _result(text, {"profiles": items})
 
 
@@ -1022,9 +1009,9 @@ async def list_embedding_profiles(ctx: Context) -> CallToolResult:
 async def list_llm_profiles(ctx: Context) -> CallToolResult:
     """List LLM profiles in the current namespace."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    profiles = await client.list_llm_profiles()
-    text, items = _format_profile_list("LLM Profiles", profiles)
+    async with _client(api_key) as client:
+        profiles = await client.list_llm_profiles()
+        text, items = _format_profile_list("LLM Profiles", profiles)
     return _result(text, {"profiles": items})
 
 
@@ -1032,11 +1019,11 @@ async def list_llm_profiles(ctx: Context) -> CallToolResult:
 async def get_capabilities(ctx: Context) -> CallToolResult:
     """Get available capabilities: embedding profiles, LLM profiles, strategies."""
     api_key = _extract_api_key(ctx)
-    client = await get_client(api_key)
-    caps = await client.get_capabilities()
-    lines = ["Platform Capabilities:"]
-    for key, value in caps.items():
-        lines.append(f"  {key}: {value}")
+    async with _client(api_key) as client:
+        caps = await client.get_capabilities()
+        lines = ["Platform Capabilities:"]
+        for key, value in caps.items():
+            lines.append(f"  {key}: {value}")
     return _result("\n".join(lines), {"capabilities": caps})
 
 
