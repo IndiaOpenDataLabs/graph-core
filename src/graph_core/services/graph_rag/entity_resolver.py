@@ -8,6 +8,7 @@ Three-tier pipeline:
 
 from __future__ import annotations
 
+import hashlib
 import difflib
 import logging
 import re
@@ -575,6 +576,8 @@ class IncrementalEntityResolver:
         if entity is None:
             return
 
+        await self._acquire_entity_lock(session, entity_id)
+
         embed_text = f"{entity.canonical_name}: {description}"
         embedding = await self._embedding.embed_query(embed_text)
 
@@ -664,6 +667,25 @@ class IncrementalEntityResolver:
             update(GraphEntity)
             .where(GraphEntity.id == entity_id)
             .values(description_count=GraphEntity.description_count + 1)
+        )
+
+    async def _acquire_entity_lock(
+        self,
+        session: AsyncSession,
+        entity_id: uuid.UUID,
+    ) -> None:
+        """Serialize concurrent centroid updates for the same entity."""
+        bind = getattr(session, "bind", None)
+        dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+        if dialect_name != "postgresql":
+            return
+        lock_bytes = hashlib.sha256(
+            f"{self._collection_id}:{entity_id}".encode("utf-8")
+        ).digest()[:8]
+        lock_key = int.from_bytes(lock_bytes, "big") & ((1 << 63) - 1)
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
         )
 
     async def _add_relationship_description(

@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -99,7 +100,7 @@ async def test_resolve_entity_reuses_case_insensitive_canonical_match(
 
     result = await resolver.resolve_entity(
         db_session,
-        name="oauth",
+        name="OAuth",
         entity_type="Protocol",
         description="Authorization framework",
         source_chunk_hash="chunk-1",
@@ -124,6 +125,27 @@ async def test_add_or_increment_type_awaits_async_session_execute(
     await resolver._add_or_increment_type(session, uuid.uuid4(), "Protocol")
 
     session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_acquire_entity_lock_uses_advisory_lock(
+    test_graph_rag_collection,
+):
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        test_graph_rag_collection.id,
+    )
+    session = AsyncMock()
+    session.bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    entity_id = uuid.uuid4()
+
+    await resolver._acquire_entity_lock(session, entity_id)
+
+    session.execute.assert_awaited_once()
+    sql_text, params = session.execute.await_args.args
+    assert "pg_advisory_xact_lock" in str(sql_text)
+    assert isinstance(params["lock_key"], int)
+    assert params["lock_key"] >= 0
 
 
 @pytest.mark.asyncio
