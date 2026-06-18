@@ -100,6 +100,13 @@ async def enqueue_document_ingestion_job(
     """Create a pending ingest_document Job and return its result wrapper."""
     if not text.strip():
         raise ValueError("Cannot ingest an empty document")
+    logger.info(
+        "document_ingestion enqueue collection_id=%s namespace_id=%s domain=%s document_path=%s",
+        collection_id,
+        namespace_id,
+        domain or "",
+        normalize_document_path(document_path) if document_path else "",
+    )
     async with AsyncSessionLocal() as session:
         collection = await session.get(Collection, collection_id)
         if not collection:
@@ -162,6 +169,12 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             job.payload.get("domain_config") if isinstance(job.payload, dict) else None
         )
         if domain is None and domain_config_data is None:
+            logger.info(
+                "document_ingestion classify collection_id=%s job_id=%s document_path=%s",
+                collection.id,
+                job.id,
+                job.document_path or "",
+            )
             llm = await resolve_llm_provider_from_collection(collection)
             cfg = await classify_document(llm, text)
             register_domain(cfg)
@@ -171,10 +184,37 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             payload["domain_config"] = cfg.to_dict()
             job.payload = payload
             await session.commit()
+            logger.info(
+                "document_ingestion classified collection_id=%s job_id=%s domain=%s use_ast_chunking=%s requires_exact_resolution=%s entity_guidance=%s relationship_guidance=%s rel_type_guidance=%s persisted=true",
+                collection.id,
+                job.id,
+                cfg.name,
+                cfg.use_ast_chunking,
+                cfg.requires_exact_resolution,
+                cfg.entity_guidance,
+                cfg.relationship_guidance,
+                cfg.rel_type_guidance,
+            )
         elif domain_config_data and isinstance(domain_config_data, dict):
             cfg = DomainConfig.from_dict(domain_config_data)
             register_domain(cfg)
             domain = cfg.name
+            logger.info(
+                "document_ingestion loaded_classified_domain collection_id=%s job_id=%s domain=%s entity_guidance=%s relationship_guidance=%s rel_type_guidance=%s persisted=true",
+                collection.id,
+                job.id,
+                cfg.name,
+                cfg.entity_guidance,
+                cfg.relationship_guidance,
+                cfg.rel_type_guidance,
+            )
+        elif domain is not None:
+            logger.info(
+                "document_ingestion explicit_domain collection_id=%s job_id=%s domain=%s",
+                collection.id,
+                job.id,
+                domain,
+            )
         document_path = (
             normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
             if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))
