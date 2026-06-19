@@ -59,6 +59,13 @@ _NON_CODE_REL_TYPES = {
 _CODE_ONLY_REL_TYPES = _CODE_REL_TYPES - _NON_CODE_REL_TYPES
 
 
+# Enhancement defaults favor precision over recall.
+_ROLE_GROUP_OVERLAP_MIN = 4
+_ROLE_GROUP_COSINE_MIN = 0.3
+_ROLE_GROUP_JACCARD_MIN = 0.2
+_ROLE_GROUP_MIN_SIGNATURE = 1
+
+
 def _is_code_like_collection(relationship_records: list[dict[str, Any]]) -> bool:
     rel_types = {
         str(rel.get("rel_type") or "").upper()
@@ -153,10 +160,10 @@ def _build_role_similarity_groups(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
     *,
-    overlap_min: int = 2,
-    cosine_min: float = 0.0,
-    jaccard_min: float = 0.0,
-    min_signature: int = 1,
+    overlap_min: int = _ROLE_GROUP_OVERLAP_MIN,
+    cosine_min: float = _ROLE_GROUP_COSINE_MIN,
+    jaccard_min: float = _ROLE_GROUP_JACCARD_MIN,
+    min_signature: int = _ROLE_GROUP_MIN_SIGNATURE,
 ) -> list[dict[str, Any]]:
     if not relationships:
         return []
