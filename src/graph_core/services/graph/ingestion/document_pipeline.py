@@ -8,7 +8,10 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Iterable
 
+import redis.asyncio as aioredis
+from dramatiq.message import Message
 from sqlalchemy import func, select, text
 
 from graph_core.config import settings
@@ -88,6 +91,66 @@ async def _append_job_event(
         event = JobEvent(job_id=job_id, event_type=event_type, payload=payload)
         session.add(event)
         await session.commit()
+
+
+async def purge_queued_job_messages(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Remove queued or delayed Dramatiq messages for the given jobs."""
+    job_id_strings = {str(job_id) for job_id in job_ids if str(job_id)}
+    if not job_id_strings:
+        return 0
+
+    redis = aioredis.from_url(settings.redis_url)
+    removed = 0
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await redis.scan(
+                cursor=cursor,
+                match="dramatiq:*msgs",
+                count=100,
+            )
+            for key in keys:
+                key_name = key.decode() if isinstance(key, bytes) else str(key)
+                queue_key = key_name.removesuffix(".msgs")
+                inner_cursor = 0
+                fields_to_remove: list[str] = []
+
+                while True:
+                    inner_cursor, entries = await redis.hscan(
+                        key_name,
+                        cursor=inner_cursor,
+                        count=100,
+                    )
+                    for field, data in entries.items():
+                        try:
+                            raw_message = (
+                                data
+                                if isinstance(data, (bytes, bytearray, memoryview))
+                                else str(data).encode()
+                            )
+                            message = Message.decode(
+                                bytes(raw_message)
+                            )
+                        except Exception:
+                            continue
+                        if not message.args:
+                            continue
+                        if str(message.args[0]) in job_id_strings:
+                            fields_to_remove.append(
+                                field.decode() if isinstance(field, bytes) else str(field)
+                            )
+                    if inner_cursor == 0:
+                        break
+
+                if fields_to_remove:
+                    await redis.hdel(key_name, *fields_to_remove)
+                    await redis.zrem(queue_key, *fields_to_remove)
+                    removed += len(fields_to_remove)
+            if cursor == 0:
+                break
+        return removed
+    finally:
+        await redis.aclose()
 
 
 # ── Job enqueueing ──
@@ -420,6 +483,9 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
             return
 
         job = await session.get(Job, job_uuid)
+        if job is None:
+            logger.info("Skipping deleted or missing chunk job: job=%s chunk=%s", job_uuid, chunk_index)
+            return
         collection = await session.get(Collection, job.collection_id)
         text = chunk.text
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None

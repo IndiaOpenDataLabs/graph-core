@@ -47,6 +47,7 @@ from graph_core.services.graph.ingestion.document_pipeline import (
     enqueue_document_ingestion_job,
     ingest_document_pipeline,
     process_single_chunk,
+    purge_queued_job_messages,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     update_chunk_status as _update_chunk_status,
@@ -1577,6 +1578,16 @@ class GraphService:
             collection.namespace_id,
             root_name,
         )
+        collection_ids_to_delete = [collection.id, *(descendant.id for descendant in descendants)]
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Job.id).where(
+                    Job.collection_id.in_(collection_ids_to_delete),
+                )
+            )
+            job_ids = list(result.scalars().all())
+        if job_ids:
+            await purge_queued_job_messages(job_ids)
         for descendant in reversed(descendants):
             descendant_level = self._meta_collection_level(descendant.name)
             if descendant_level <= level:
