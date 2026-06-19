@@ -158,7 +158,8 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
         if not job:
-            raise ValueError(f"Job {job_id} not found")
+            logger.info("Skipping deleted or missing job: job=%s", job_id)
+            return
         if not job.payload or "text" not in job.payload:
             raise ValueError(f"Job {job_id} does not contain input text")
 
