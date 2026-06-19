@@ -82,6 +82,9 @@ async def _append_job_event(
     payload: dict | None = None,
 ) -> None:
     async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_id)
+        if not job:
+            return
         event = JobEvent(job_id=job_id, event_type=event_type, payload=payload)
         session.add(event)
         await session.commit()

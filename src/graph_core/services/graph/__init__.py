@@ -2629,6 +2629,9 @@ class GraphService:
         self, job_id: uuid.UUID, event_type: str, payload: dict | None = None
     ):
         async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                return
             event = JobEvent(job_id=job_id, event_type=event_type, payload=payload)
             session.add(event)
             await session.commit()
