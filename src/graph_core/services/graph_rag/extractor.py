@@ -273,8 +273,8 @@ entities and relationships from source code.
    - Return structured JSON with one object: "relationships".
    - Each relationship item must use endpoint objects for source and
      target:
-       source: {name (string), description (string)}
-       target: {name (string), description (string)}
+       source: {{name (string), description (string)}}
+       target: {{name (string), description (string)}}
    - Keep source and target descriptions separate from the relationship
      description. The endpoint descriptions are entity descriptions.
    - "relationships" must contain every category and every rel_type in
