@@ -19,6 +19,9 @@ from graph_core.services.graph import GraphService
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
     build_collection_understanding,
+    NodeRecord,
+    RelationshipRecord,
+    _build_role_similarity_groups,
 )
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import (
@@ -928,6 +931,68 @@ async def test_build_collection_understanding_tolerates_missing_relationship_cou
     )
 
     assert understanding["nodes"]
+
+
+def test_role_similarity_groups_ignore_rel_type_in_neighborhood_signature():
+    a = uuid.uuid4()
+    b = uuid.uuid4()
+    x = uuid.uuid4()
+    y = uuid.uuid4()
+
+    nodes = [
+        NodeRecord(id=a, name="A"),
+        NodeRecord(id=b, name="B"),
+        NodeRecord(id=x, name="X"),
+        NodeRecord(id=y, name="Y"),
+    ]
+    relationships = [
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=a,
+            source_name="A",
+            target_id=x,
+            target_name="X",
+            rel_type="CALLS",
+            weight=1,
+        ),
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=b,
+            source_name="B",
+            target_id=x,
+            target_name="X",
+            rel_type="USES",
+            weight=1,
+        ),
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=y,
+            source_name="Y",
+            target_id=a,
+            target_name="A",
+            rel_type="READS",
+            weight=1,
+        ),
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=y,
+            source_name="Y",
+            target_id=b,
+            target_name="B",
+            rel_type="WRITES",
+            weight=1,
+        ),
+    ]
+
+    groups = _build_role_similarity_groups(
+        nodes,
+        relationships,
+        overlap_min=1,
+        cosine_min=0.1,
+        jaccard_min=0.1,
+    )
+
+    assert any(set(group["node_ids"]) == {str(a), str(b)} for group in groups)
 
 
 @pytest.mark.asyncio

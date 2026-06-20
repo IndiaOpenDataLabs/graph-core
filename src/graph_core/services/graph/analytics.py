@@ -59,10 +59,10 @@ _NON_CODE_REL_TYPES = {
 _CODE_ONLY_REL_TYPES = _CODE_REL_TYPES - _NON_CODE_REL_TYPES
 
 
-# Enhancement defaults favor precision over recall.
-_ROLE_GROUP_OVERLAP_MIN = 4
-_ROLE_GROUP_COSINE_MIN = 0.3
-_ROLE_GROUP_JACCARD_MIN = 0.2
+# Enhancement defaults favor broader, burner-like recall.
+_ROLE_GROUP_OVERLAP_MIN = 2
+_ROLE_GROUP_COSINE_MIN = 0.2
+_ROLE_GROUP_JACCARD_MIN = 0.1
 _ROLE_GROUP_MIN_SIGNATURE = 1
 
 
@@ -177,18 +177,17 @@ def _build_role_similarity_groups(
     for rel in relationships:
         source_id = str(rel.source_id)
         target_id = str(rel.target_id)
-        rel_type = str(rel.rel_type or "RELATES_TO").upper()
         all_node_ids.add(source_id)
         all_node_ids.add(target_id)
-        out_pairs[source_id].add((rel_type, target_id))
-        in_pairs[target_id].add((source_id, rel_type))
+        out_pairs[source_id].add(("out", target_id))
+        in_pairs[target_id].add(("in", source_id))
         relationship_records_by_node[source_id].append(
             {
                 "source_id": source_id,
                 "source_name": rel.source_name,
                 "target_id": target_id,
                 "target_name": rel.target_name,
-                "rel_type": rel_type,
+                "rel_type": str(rel.rel_type or "RELATES_TO").upper(),
                 "weight": float(rel.weight or 0.0),
                 "direction": "out",
                 "relationship_id": str(rel.id),
@@ -200,7 +199,7 @@ def _build_role_similarity_groups(
                 "source_name": rel.source_name,
                 "target_id": target_id,
                 "target_name": rel.target_name,
-                "rel_type": rel_type,
+                "rel_type": str(rel.rel_type or "RELATES_TO").upper(),
                 "weight": float(rel.weight or 0.0),
                 "direction": "in",
                 "relationship_id": str(rel.id),
@@ -664,7 +663,7 @@ async def build_collection_understanding(
                 "description": (
                     f"Role-similarity clique of size {group['size']} with average cosine "
                     f"{group['avg_cosine']} and average jaccard {group['avg_jaccard']}; "
-                    f"total typed-signature overlap {group['total_overlap']}. "
+                    f"total neighborhood overlap {group['total_overlap']}. "
                     f"Members: {', '.join(entity_names) or 'none'}. "
                     f"Dominant relation types: {', '.join(rel_types) or 'none'}."
                 ),
@@ -747,7 +746,7 @@ async def build_collection_understanding(
             code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
             prompt = (
                 "You are inducing one reusable semantic concept from a role-similarity clique in a knowledge graph.\n"
-                "The member entities are grouped because they occupy similar typed graph positions.\n"
+                "The member entities are grouped because they occupy similar directed graph positions.\n"
                 "Do not return a mechanical label like cluster, graph region, connector, bridge, or clique.\n"
                 "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n"
                 "Prefer labels drawn directly from the collection's own terminology, especially source-language, tradition-specific, or text-native terms when they fit the evidence.\n"
