@@ -68,20 +68,53 @@ _REL_TYPES_GENERAL: list[str] = [
     "OCCURS_IN", "CONTRASTS_WITH", "SUPPORTS", "ELABORATES",
 ]
 
-_REL_TYPES_CODE: list[str] = [
-    "RELATES_TO", "CALLS", "USES", "IMPORTS", "DEFINES", "IMPLEMENTS",
-    "EXTENDS", "DEPENDS_ON", "RAISES", "CATCHES", "READS", "WRITES",
-    "RETURNS", "YIELDS", "LOOPS_OVER", "DECORATES", "GUARDS", "ASSIGNS",
-    "INITIALIZES", "MUTATES", "VALIDATES", "FILTERS", "MAPS", "REDUCES",
-    "TRANSFORMS", "SERIALIZES", "DESERIALIZES", "PARSES", "FORMATS",
-    "LOGS", "CONFIGURES", "AUTHENTICATES", "AUTHORIZES", "SENDS",
-    "RECEIVES", "SUBSCRIBES_TO", "EMITS", "AWAITS", "SPAWNS", "SCHEDULES",
-    "RETRIES", "TIMES_OUT", "LOCKS", "UNLOCKS", "ALLOCATES", "RELEASES",
-    "OPENS", "CLOSES", "CONNECTS_TO", "QUERIES", "UPDATES", "DELETES",
-    "CREATES", "MOCKS", "ASSERTS", "OVERRIDES", "ALIAS_OF", "CONTAINS",
-    "EXPOSES", "HIDES", "DEPRECATED_BY", "REPLACES", "IS_INSTANCE_OF",
-    "TESTS", "DOCUMENTS", "REFERENCES",
-]
+CODE_REL_TYPE_TAXONOMY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "value_operations",
+        (
+            "evaluate",
+            "compare",
+            "convert",
+            "construct",
+            "destructure",
+        ),
+    ),
+    (
+        "name_place_operations",
+        (
+            "bind",
+            "rebind",
+            "mutate",
+            "access",
+        ),
+    ),
+    (
+        "control_operations",
+        (
+            "branch",
+            "iterate",
+            "call",
+            "return",
+            "signal",
+            "handle",
+        ),
+    ),
+    (
+        "effect_operations",
+        (
+            "communicate",
+            "allocate_resource",
+            "release_resource",
+            "synchronize",
+        ),
+    ),
+)
+
+CODE_REL_TYPES: tuple[str, ...] = tuple(
+    operation.upper()
+    for _group, operations in CODE_REL_TYPE_TAXONOMY
+    for operation in operations
+)
 
 _GENERIC_ENTITY_GUIDANCE = (
     "Use concise title case names and keep naming consistent across "
@@ -89,17 +122,17 @@ _GENERIC_ENTITY_GUIDANCE = (
 )
 
 _CODE_ENTITY_GUIDANCE = (
-    "For code-domain entities, prefer the exact symbol names that appear "
-    "in the source whenever the entity is a concrete class, function, "
-    "method, module, variable, exception, or config symbol. Preserve the "
-    "source casing and punctuation style for those symbols instead of "
-    "rewriting them into generic title case. Use broader natural-language "
-    "names only for genuinely higher-level code concepts that are "
-    "explicitly named in the source text or documentation. Do not invent "
-    "new conceptual node names just to represent logic that can be "
-    "captured as a relationship between existing entities. Prefer to put "
-    "what/where/why/how/when semantics into relationship descriptions and "
-    "rel_type labels unless the concept itself is explicitly named."
+    "For code-domain entity records, use the relationship endpoints as the "
+    "source of truth. Preserve the endpoint name exactly as emitted by the "
+    "code-domain extractor when it is a concrete code object, symbol, or "
+    "named program element. Preserve the endpoint description exactly as "
+    "the entity description for that endpoint. Keep punctuation and casing "
+    "when the source text already names the object that way. Do not invent "
+    "standalone concept nodes just to restate logic that is already captured "
+    "by a relationship. Exclude ephemeral locals, loop counters, temporary "
+    "accumulators, and helper builtins unless they are semantically central "
+    "to the behavior. Relationship descriptions carry the logic; entity "
+    "records are the endpoint objects those relationships connect."
 )
 
 _GENERIC_RELATIONSHIP_GUIDANCE = (
@@ -121,21 +154,18 @@ _CODE_RELATIONSHIP_GUIDANCE = (
     "how it happens, and when it starts, ends, or switches path. "
     "Always preserve exact explicit structural relationships such as "
     "imports, calls, returns, assignments, configuration, state updates, "
-    "and fallback branches."
+    "and fallback branches. Relationship descriptions must explain the "
+    "behavior without needing to look back at the code. Do not use the "
+    "relationship endpoints to encode raw expressions or placeholder "
+    "labels; put the predicate or logic in the description instead. "
+    "Endpoint objects should carry the concrete code-object name and a "
+    "separate endpoint description."
 )
 
 _GENERIC_REL_TYPE_GUIDANCE = (
     "Prefer an existing rel_type from this current set when it truly "
     "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
     "that is semantically precise."
-)
-
-_CODE_REL_TYPE_GUIDANCE = (
-    "Do not optimize for any fixed vocabulary. Derive concise "
-    "UPPER_SNAKE rel_type labels from the logic actually present in "
-    "the text. Preserve exact direct relationships when they are "
-    "explicit, for example calls, imports, returns, assigns, "
-    "updates, or configures."
 )
 
 DOMAIN_CONFIGS: dict[str, DomainConfig] = {
@@ -218,10 +248,25 @@ DOMAIN_CONFIGS: dict[str, DomainConfig] = {
     ),
     "code": DomainConfig(
         name="code",
-        rel_types=_REL_TYPES_CODE,
+        rel_types=list(CODE_REL_TYPES),
         entity_guidance=_CODE_ENTITY_GUIDANCE,
         relationship_guidance=_CODE_RELATIONSHIP_GUIDANCE,
-        rel_type_guidance=_CODE_REL_TYPE_GUIDANCE,
+        rel_type_guidance=(
+            "Use only the fixed code taxonomy below. Every chunk must "
+            "return all categories and all rel_types, even when the "
+            "answer is empty. Leave unsupported rel_types as empty "
+            "arrays. Do not invent new rel_types for code ingestion. "
+            "Treat relationship descriptions as the primary carrier of "
+            "logic; entities are just the concrete code objects that the "
+            "relationships connect.\n"
+            "value_operations: EVALUATE, COMPARE, CONVERT, CONSTRUCT, "
+            "DESTRUCTURE\n"
+            "name_place_operations: BIND, REBIND, MUTATE, ACCESS\n"
+            "control_operations: BRANCH, ITERATE, CALL, RETURN, SIGNAL, "
+            "HANDLE\n"
+            "effect_operations: COMMUNICATE, ALLOCATE_RESOURCE, "
+            "RELEASE_RESOURCE, SYNCHRONIZE"
+        ),
         use_ast_chunking=True,
         requires_exact_resolution=True,
     ),
@@ -375,8 +420,9 @@ async def classify_document(
         rel_types = result.get("suggested_rel_types", [])
         if not rel_types or not isinstance(rel_types, list):
             rel_types = list(_DEFAULT_CONFIG.rel_types)
-        # Ensure RELATES_TO is always present
-        if "RELATES_TO" not in rel_types:
+        if domain_name == "code":
+            rel_types = list(CODE_REL_TYPES)
+        elif "RELATES_TO" not in rel_types:
             rel_types.insert(0, "RELATES_TO")
 
         cfg = DomainConfig(

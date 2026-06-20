@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from graph_core.llm.interface import LLMProvider
-from graph_core.models.domain_config import get_domain_config
+from graph_core.models.domain_config import (
+    CODE_REL_TYPE_TAXONOMY,
+    get_domain_config,
+)
 from graph_core.models.rel_types import (
     DEFAULT_REL_TYPE,
     normalize_rel_type,
@@ -44,7 +47,46 @@ class ExtractionResult:
     relationships: list[ExtractedRelationship]
 
 
-_EXTRACTION_SCHEMA: dict[str, Any] = {
+_RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "source": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["name", "description"],
+        },
+        "target": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["name", "description"],
+        },
+        "description": {"type": "string"},
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "weight": {"type": "number"},
+    },
+    "required": [
+        "source",
+        "target",
+        "description",
+        "keywords",
+        "weight",
+    ],
+}
+
+
+_GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
     "title": "graph_rag_extraction",
     "type": "object",
     "additionalProperties": False,
@@ -110,6 +152,43 @@ _EXTRACTION_SCHEMA: dict[str, Any] = {
 }
 
 
+def _build_code_taxonomy_schema() -> dict[str, Any]:
+    category_properties: dict[str, Any] = {}
+    category_required: list[str] = []
+    for category_name, rel_types in CODE_REL_TYPE_TAXONOMY:
+        category_required.append(category_name)
+        category_properties[category_name] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                rel_type.upper(): {
+                    "type": "array",
+                    "items": _RELATIONSHIP_ITEM_SCHEMA,
+                }
+                for rel_type in rel_types
+            },
+            "required": [rel_type.upper() for rel_type in rel_types],
+        }
+
+    return {
+        "title": "graph_rag_code_extraction",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "relationships": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": category_properties,
+                "required": category_required,
+            },
+        },
+        "required": ["relationships"],
+    }
+
+
+_CODE_EXTRACTION_SCHEMA = _build_code_taxonomy_schema()
+
+
 _EXTRACTION_SYSTEM_PROMPT = """---Role---
 You are a Knowledge Graph Specialist responsible for extracting
 entities and relationships from input text.
@@ -172,6 +251,203 @@ Output all entities first, then all relationships.
 """
 
 
+_CODE_EXTRACTION_SYSTEM_PROMPT = """---Role---
+You are a Knowledge Graph Specialist responsible for extracting
+entities and relationships from source code.
+
+---Instructions---
+1. Relationship extraction:
+   - Identify direct code relationships between concrete code objects.
+   - Use the fixed taxonomy below and keep the output structured by
+     category and rel_type.
+   - For every chunk, evaluate every rel_type, even when no evidence
+     exists. Emit an empty array for unsupported rel_types.
+   - Relationship descriptions should be short pseudo-code-flavored
+     statements grounded in the source text.
+   - Make each relationship description rich enough that a reader can
+     understand what happens, when, why, and with what effect without
+     needing to inspect the code again.
+   - {domain_relationship_guidance}
+
+2. Output requirements:
+   - Return structured JSON with one object: "relationships".
+   - Each relationship item must use endpoint objects for source and
+     target:
+       source: {name (string), description (string)}
+       target: {name (string), description (string)}
+   - Keep source and target descriptions separate from the relationship
+     description. The endpoint descriptions are entity descriptions.
+   - "relationships" must contain every category and every rel_type in
+     the fixed taxonomy below.
+   - Each rel_type field is an array of relationship objects with:
+       source      (endpoint object)
+       target      (endpoint object)
+       description (string)
+       keywords    (array of strings)
+       weight      (float 0..1)
+   - A rel_type array may be empty when the chunk does not support that
+     operation.
+   - {domain_rel_type_guidance}
+
+{taxonomy_guidance}
+
+3. Only extract relationships explicitly supported by the text.
+"""
+
+
+_CODE_RECONSTRUCTION_SYSTEM_PROMPT = """---Role---
+You are a Knowledge Graph Specialist responsible for refining a first-pass
+code extraction into a cleaner final graph.
+
+---Instructions---
+1. You will be given a first-pass graph extracted from code.
+2. Reconstruct the code logic from the graph.
+3. If the graph is missing code logic, add more relationships or update
+   the current ones.
+4. If the graph includes unnecessary or overly local relationship items,
+   remove them.
+5. If the graph includes relationships that are too generic or too
+   abstract to explain the code, replace them with better ones.
+6. Keep the final result grounded in the code's actual execution flow,
+   state changes, control flow, and API boundaries.
+7. Keep only semantically central code symbols, concepts, and operations.
+   Exclude ephemeral locals, loop counters, temporary accumulators, and
+   helper builtins unless they are essential to the logic.
+8. Relationship descriptions must be rich enough to understand what
+   happens, when, why, and with what effect without looking at the code.
+9. Use the fixed taxonomy below and keep the output structured by
+   category and rel_type.
+10. For every chunk, evaluate every rel_type, even when no evidence
+    exists. Emit an empty array for unsupported rel_types.
+11. Return the final graph, not a diff.
+12. Do not emit an entities section. The ingestion adapter will derive
+    entities from the relationship endpoints after parsing.
+13. {domain_relationship_guidance}
+
+{taxonomy_guidance}
+
+---Candidate Graph---
+{existing_info}
+
+---Source Code---
+{text}
+"""
+
+
+def _code_taxonomy_prompt() -> str:
+    lines = [
+        "   - Use only the fixed code rel_type taxonomy below.",
+        "   - For every chunk, return all categories and all rel_types.",
+        "   - Leave unsupported rel_types as empty arrays.",
+        "   - Do not invent new rel_types for code ingestion.",
+    ]
+    for category_name, rel_types in CODE_REL_TYPE_TAXONOMY:
+        rendered = ", ".join(rel_type.upper() for rel_type in rel_types)
+        lines.append(f"   - {category_name}: {rendered}")
+    return "\n".join(lines)
+
+
+def _format_code_existing_info(
+    existing_entities: list[str],
+    existing_relationships: list[tuple[str, str, str]],
+) -> str:
+    lines = ["Already extracted:"]
+    lines.append(
+        "Entities: " + ", ".join(existing_entities)
+        if existing_entities
+        else "Entities: (none)"
+    )
+    if existing_relationships:
+        rel_text = ", ".join(
+            f"{source} -[{rel_type}]-> {target}"
+            for source, target, rel_type in existing_relationships
+        )
+    else:
+        rel_text = "(none)"
+    lines.append("Relationships: " + rel_text)
+    return "\n".join(lines)
+
+
+def _format_code_candidate_graph(
+    entities: list[ExtractedEntity],
+    relationships: list[ExtractedRelationship],
+) -> str:
+    lines: list[str] = ["Entities:"]
+    if entities:
+        for entity in entities:
+            lines.append(
+                f"- {entity.name} [{entity.entity_type}]: {entity.description}"
+            )
+    else:
+        lines.append("- (none)")
+    lines.append("Relationships:")
+    if relationships:
+        for rel in relationships:
+            lines.append(
+                f"- {rel.source_name} -[{rel.rel_type}]-> {rel.target_name}: "
+                f"{rel.description} | keywords={', '.join(rel.keywords)} "
+                f"| weight={rel.weight}"
+            )
+    else:
+        lines.append("- (none)")
+    return "\n".join(lines)
+
+
+def _parse_code_endpoint(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name", "")
+    description = value.get("description", "")
+    if not isinstance(name, str) or not isinstance(description, str):
+        return None
+    normalized_name = _normalize_entity_name(name)
+    if not normalized_name:
+        return None
+    return normalized_name, description.strip()
+
+
+def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
+    if not isinstance(relationships, dict):
+        return []
+
+    entity_descriptions: dict[str, str] = {}
+    entity_order: list[str] = []
+
+    for category_name, rel_types in CODE_REL_TYPE_TAXONOMY:
+        category_value = relationships.get(category_name, {})
+        if not isinstance(category_value, dict):
+            continue
+        for rel_type in rel_types:
+            bucket = category_value.get(rel_type.upper(), [])
+            if isinstance(bucket, dict):
+                bucket = [bucket]
+            if not isinstance(bucket, list):
+                continue
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
+                for endpoint_key in ("source", "target"):
+                    parsed = _parse_code_endpoint(item.get(endpoint_key))
+                    if parsed is None:
+                        continue
+                    name, description = parsed
+                    if name not in entity_descriptions:
+                        entity_order.append(name)
+                        entity_descriptions[name] = description
+                        continue
+                    if description and len(description) > len(entity_descriptions[name]):
+                        entity_descriptions[name] = description
+
+    return [
+        ExtractedEntity(
+            name=name,
+            entity_type="CODE_OBJECT",
+            description=entity_descriptions.get(name, ""),
+        )
+        for name in entity_order
+    ]
+
+
 _GLEANING_SYSTEM_PROMPT = """---Role---
 You are a Knowledge Graph Specialist responsible for extracting
 entities and relationships from input text.
@@ -189,13 +465,11 @@ formatted entities and relationships.
 4. {domain_entity_guidance}
 5. Keep naming consistent with the previously extracted entities.
 6. Relationship descriptions must still explain the nature, context,
-   and significance of the connection.
+   and significance of the connection. Make them rich enough to
+   understand the behavior without looking at the code again.
 6a. {domain_relationship_guidance}
 7. Each relationship's "rel_type" must follow this guidance:
-   {domain_rel_type_guidance} DEFAULT TO A SINGLE rel_type PER PAIR; only
-   emit multiple when the text genuinely supports distinct,
-   simultaneously-true roles and you can write a meaningfully
-   different description for each. Pick the best single fit.
+   {domain_rel_type_guidance}
 8. Preserve multiple genuinely distinct rel_type entries for the same
    source/target pair when the text supports them; do not collapse them
    to one generic edge unless the evidence really supports only one.
@@ -240,6 +514,7 @@ class LLMGraphExtractor:
         fallback_weight: float,
         vocab: list[str] | None = None,
         domain: str | None = None,
+        strict_vocab: bool = False,
     ) -> list[dict[str, Any]]:
         """Normalize the LLM's ``rel_type`` field into a list of per-edge
         dicts, each carrying its own validated name, description,
@@ -255,11 +530,13 @@ class LLMGraphExtractor:
         Each entry's name is normalized (uppercase, snake_case,
         alpha-leading) and optionally validated against the active
         domain vocab. Unknown normalized rel_types are accepted when
-        the existing set is not expressive enough.
+        the existing set is not expressive enough unless ``strict_vocab``
+        is true.
 
-        Returns at least one entry; the fallback is
-        ``[{"name": DEFAULT_REL_TYPE, "description": ..., "keywords": ..., "weight": ...}]``
-        when the LLM emitted nothing usable.
+        Returns at least one entry for non-strict callers; the fallback
+        is ``[{"name": DEFAULT_REL_TYPE, ...}]`` when the LLM emitted
+        nothing usable. Strict callers receive an empty list when the
+        input does not match the active vocabulary.
         """
         if value is None:
             value = []
@@ -286,6 +563,13 @@ class LLMGraphExtractor:
                 continue
             name = normalize_rel_type(raw_name)
             if vocab_set is not None and name not in vocab_set:
+                if strict_vocab:
+                    logger.info(
+                        "Skipping rel_type=%r outside strict %s vocab",
+                        raw_name,
+                        domain,
+                    )
+                    continue
                 logger.info(
                     "LLM emitted new rel_type=%r outside active %s vocab; accepting normalized type %s",
                     raw_name,
@@ -329,7 +613,7 @@ class LLMGraphExtractor:
                 "weight": weight,
             })
 
-        if not out:
+        if not out and not strict_vocab:
             out.append({
                 "rel_type": DEFAULT_REL_TYPE,
                 "description": fallback_description,
@@ -359,6 +643,31 @@ class LLMGraphExtractor:
         )
 
     @staticmethod
+    def _build_code_extraction_prompt(
+        text: str,
+        entity_types: str,
+        domain: str | None,
+    ) -> str:
+        cfg = get_domain_config(domain)
+        return (
+            _CODE_EXTRACTION_SYSTEM_PROMPT.format(
+                entity_types=entity_types,
+                domain_entity_guidance=cfg.entity_guidance,
+                domain_rel_type_guidance=cfg.rel_type_guidance,
+                domain_relationship_guidance=cfg.relationship_guidance,
+                taxonomy_guidance=_code_taxonomy_prompt(),
+            )
+            + "\n\n"
+            + f"""Extract relationships only from the following code.
+
+Text:
+{text}
+
+Return only the structured relationships object.
+"""
+        )
+
+    @staticmethod
     def _build_gleaning_prompt(
         text: str,
         entity_types: str,
@@ -379,6 +688,225 @@ class LLMGraphExtractor:
             + _GLEANING_USER_PROMPT.format(existing_info=existing_info, text=text)
         )
 
+    @staticmethod
+    def _build_code_gleaning_prompt(
+        text: str,
+        entity_types: str,
+        existing_info: str,
+        domain: str | None,
+    ) -> str:
+        cfg = get_domain_config(domain)
+        return (
+            _CODE_EXTRACTION_SYSTEM_PROMPT.format(
+                entity_types=entity_types,
+                domain_entity_guidance=cfg.entity_guidance,
+                domain_rel_type_guidance=cfg.rel_type_guidance,
+                domain_relationship_guidance=cfg.relationship_guidance,
+                taxonomy_guidance=_code_taxonomy_prompt(),
+            )
+            + "\n\n"
+            + f"""Previously extracted relationships:
+{existing_info}
+
+Now extract any additional or corrected relationships from:
+
+{text}
+
+Only output the structured relationships object.
+"""
+        )
+
+    @staticmethod
+    def _build_code_reconstruction_prompt(
+        text: str,
+        entity_types: str,
+        existing_info: str,
+        domain: str | None,
+    ) -> str:
+        cfg = get_domain_config(domain)
+        return (
+            _CODE_RECONSTRUCTION_SYSTEM_PROMPT.format(
+                entity_types=entity_types,
+                domain_entity_guidance=cfg.entity_guidance,
+                domain_relationship_guidance=cfg.relationship_guidance,
+                taxonomy_guidance=_code_taxonomy_prompt(),
+                existing_info=existing_info,
+                text=text,
+            )
+        )
+
+    @staticmethod
+    def _parse_relationship_keywords(value: Any, fallback: list[str]) -> list[str]:
+        if isinstance(value, str):
+            return [k.strip() for k in value.split(",") if k.strip()]
+        if isinstance(value, list):
+            return [
+                str(item).strip()
+                for item in value
+                if item is not None and str(item).strip()
+            ]
+        return list(fallback)
+
+    @classmethod
+    def _extract_entities(cls, entities: Any) -> list[ExtractedEntity]:
+        extracted: list[ExtractedEntity] = []
+        if not isinstance(entities, list):
+            return extracted
+        for ent in entities:
+            if not isinstance(ent, dict):
+                continue
+            name = cls._normalize_entity_name(ent.get("name", ""))
+            if not name:
+                continue
+            extracted.append(
+                ExtractedEntity(
+                    name=name,
+                    entity_type=str(ent.get("type", "UNKNOWN")).upper(),
+                    description=str(ent.get("description", "") or ""),
+                )
+            )
+        return extracted
+
+    @classmethod
+    def _extract_generic_relationships(
+        cls,
+        relationships: Any,
+        rel_vocab: list[str],
+        domain: str | None,
+        strict_vocab: bool = False,
+    ) -> list[ExtractedRelationship]:
+        extracted: list[ExtractedRelationship] = []
+        if not isinstance(relationships, list):
+            return extracted
+
+        for rel in relationships:
+            if not isinstance(rel, dict):
+                continue
+            source = cls._normalize_entity_name(rel.get("source", ""))
+            target = cls._normalize_entity_name(rel.get("target", ""))
+            if not (source and target):
+                continue
+            rel_description = rel.get("description", "")
+            rel_keywords = cls._parse_relationship_keywords(
+                rel.get("keywords", []),
+                fallback=[],
+            )
+            try:
+                rel_weight = float(rel.get("weight", 1.0))
+                rel_weight = max(0.0, min(1.0, rel_weight))
+            except (ValueError, TypeError):
+                rel_weight = 1.0
+            for entry in cls._coerce_rel_type_entries(
+                rel.get("rel_type"),
+                fallback_description=rel_description,
+                fallback_keywords=rel_keywords,
+                fallback_weight=rel_weight,
+                vocab=rel_vocab,
+                domain=domain,
+                strict_vocab=strict_vocab,
+            ):
+                extracted.append(
+                    ExtractedRelationship(
+                        source_name=source,
+                        target_name=target,
+                        description=entry["description"],
+                        keywords=list(entry["keywords"]),
+                        weight=entry["weight"],
+                        rel_type=entry["rel_type"],
+                    )
+                )
+        return extracted
+
+    @classmethod
+    def _extract_code_relationships(
+        cls,
+        relationships: Any,
+        domain: str | None,
+    ) -> list[ExtractedRelationship]:
+        extracted: list[ExtractedRelationship] = []
+        if not isinstance(relationships, dict):
+            return extracted
+
+        relationship_keys = {str(key).lower(): key for key in relationships.keys()}
+
+        for category_name, rel_types in CODE_REL_TYPE_TAXONOMY:
+            category_key = relationship_keys.get(category_name.lower(), category_name)
+            category_value = relationships.get(category_key, {})
+            if not isinstance(category_value, dict):
+                continue
+            rel_type_keys = {
+                str(key).upper(): key for key in category_value.keys()
+            }
+            for rel_type in rel_types:
+                rel_key = rel_type.upper()
+                bucket_key = rel_type_keys.get(rel_key, rel_key)
+                bucket = category_value.get(bucket_key, [])
+                if isinstance(bucket, dict):
+                    bucket = [bucket]
+                if not isinstance(bucket, list):
+                    continue
+                for item in bucket:
+                    if not isinstance(item, dict):
+                        continue
+                    source_endpoint = _parse_code_endpoint(item.get("source"))
+                    target_endpoint = _parse_code_endpoint(item.get("target"))
+                    if not (source_endpoint and target_endpoint):
+                        continue
+                    source, _source_description = source_endpoint
+                    target, _target_description = target_endpoint
+                    description = item.get("description", "")
+                    if not isinstance(description, str):
+                        description = ""
+                    description = description.strip()
+                    keywords = cls._parse_relationship_keywords(
+                        item.get("keywords", []),
+                        fallback=[],
+                    )
+                    try:
+                        weight = float(item.get("weight", 1.0))
+                        weight = max(0.0, min(1.0, weight))
+                    except (ValueError, TypeError):
+                        weight = 1.0
+                    extracted.append(
+                        ExtractedRelationship(
+                            source_name=source,
+                            target_name=target,
+                            description=description,
+                            keywords=keywords,
+                            weight=weight,
+                            rel_type=rel_key,
+                        )
+                    )
+        return extracted
+
+    @classmethod
+    def _extract_relationships(
+        cls,
+        relationships: Any,
+        rel_vocab: list[str],
+        domain: str | None,
+        *,
+        is_code_domain: bool,
+    ) -> list[ExtractedRelationship]:
+        if is_code_domain:
+            extracted = cls._extract_code_relationships(
+                relationships,
+                domain=domain,
+            )
+            if extracted:
+                return extracted
+            return cls._extract_generic_relationships(
+                relationships,
+                rel_vocab=rel_vocab,
+                domain=domain,
+                strict_vocab=True,
+            )
+        return cls._extract_generic_relationships(
+            relationships,
+            rel_vocab=rel_vocab,
+            domain=domain,
+        )
+
     async def extract(
         self,
         text: str,
@@ -393,75 +921,54 @@ class LLMGraphExtractor:
         types_str = ", ".join(entity_types) if entity_types else "general"
         cfg = get_domain_config(domain)
         rel_vocab = cfg.rel_types
-        prompt = self._build_extraction_prompt(
-            text=text,
-            entity_types=types_str,
-            rel_type_vocab=rel_vocab,
-            domain=domain,
-        )
+        is_code_domain = (domain or "").strip().lower() == "code"
+        if is_code_domain:
+            prompt = self._build_code_extraction_prompt(
+                text=text,
+                entity_types=types_str,
+                domain=domain,
+            )
+            schema = _CODE_EXTRACTION_SCHEMA
+        else:
+            prompt = self._build_extraction_prompt(
+                text=text,
+                entity_types=types_str,
+                rel_type_vocab=rel_vocab,
+                domain=domain,
+            )
+            schema = _GENERIC_EXTRACTION_SCHEMA
 
         try:
             result = await self._llm.structured_extract(
                 prompt=prompt,
-                schema=_EXTRACTION_SCHEMA,
+                schema=schema,
             )
         except Exception as e:
             logger.warning("LLM extraction failed, retrying once: %s", e)
             try:
                 result = await self._llm.structured_extract(
                     prompt=prompt,
-                    schema=_EXTRACTION_SCHEMA,
+                    schema=schema,
                 )
             except Exception as e2:
                 logger.error("LLM extraction failed after retry: %s", e2)
                 return ExtractionResult(entities=[], relationships=[])
 
-        entities = []
-        for ent in result.get("entities", []):
-            name = self._normalize_entity_name(ent.get("name", ""))
-            if name:
-                entities.append(ExtractedEntity(
-                    name=name,
-                    entity_type=ent.get("type", "UNKNOWN").upper(),
-                    description=ent.get("description", ""),
-                ))
-
-        relationships = []
-        for rel in result.get("relationships", []):
-            source = self._normalize_entity_name(rel.get("source", ""))
-            target = self._normalize_entity_name(rel.get("target", ""))
-            if not (source and target):
-                continue
-            rel_description = rel.get("description", "")
-            rel_keywords_str = rel.get("keywords", [])
-            if isinstance(rel_keywords_str, str):
-                rel_keywords_str = [
-                    k.strip()
-                    for k in rel_keywords_str.split(",")
-                    if k.strip()
-                ]
-            rel_keywords_list = rel_keywords_str if isinstance(rel_keywords_str, list) else []
-            try:
-                rel_weight = float(rel.get("weight", 1.0))
-                rel_weight = max(0.0, min(1.0, rel_weight))
-            except (ValueError, TypeError):
-                rel_weight = 1.0
-            for entry in self._coerce_rel_type_entries(
-                rel.get("rel_type"),
-                fallback_description=rel_description,
-                fallback_keywords=rel_keywords_list,
-                fallback_weight=rel_weight,
-                vocab=rel_vocab,
+        if is_code_domain:
+            relationships_payload = result.get("relationships")
+            entities = _collect_code_entities(relationships_payload)
+            relationships = self._extract_code_relationships(
+                relationships_payload,
                 domain=domain,
-            ):
-                relationships.append(ExtractedRelationship(
-                    source_name=source,
-                    target_name=target,
-                    description=entry["description"],
-                    keywords=list(entry["keywords"]),
-                    weight=entry["weight"],
-                    rel_type=entry["rel_type"],
-                ))
+            )
+        else:
+            entities = self._extract_entities(result.get("entities"))
+            relationships = self._extract_relationships(
+                result.get("relationships"),
+                rel_vocab=rel_vocab,
+                domain=domain,
+                is_code_domain=is_code_domain,
+            )
 
         extraction_result = ExtractionResult(
             entities=entities,
@@ -492,31 +999,44 @@ class LLMGraphExtractor:
 
         cfg = get_domain_config(domain)
         rel_vocab = cfg.rel_types
+        is_code_domain = (domain or "").strip().lower() == "code"
         for gleaning_pass in range(max_gleaning):
-            existing_info = "Already extracted:\n"
-            existing_info += (
-                "Entities: "
-                + ", ".join(e.name for e in current_entities)
-                + "\n"
-            )
-            existing_info += "Relationships: " + ", ".join(
-                f"{r.source_name} -[{r.rel_type}]-> {r.target_name}"
-                for r in current_relationships
-            )
-
             types_str = ", ".join(entity_types) if entity_types else "general"
-            gleaning_prompt = self._build_gleaning_prompt(
-                text=text,
-                entity_types=types_str,
-                existing_info=existing_info,
-                rel_type_vocab=rel_vocab,
-                domain=domain,
-            )
+            if is_code_domain:
+                gleaning_prompt = self._build_code_reconstruction_prompt(
+                    text=text,
+                    entity_types=types_str,
+                    existing_info=_format_code_candidate_graph(
+                        current_entities,
+                        current_relationships,
+                    ),
+                    domain=domain,
+                )
+                schema = _CODE_EXTRACTION_SCHEMA
+            else:
+                existing_info = "Already extracted:\n"
+                existing_info += (
+                    "Entities: "
+                    + ", ".join(e.name for e in current_entities)
+                    + "\n"
+                )
+                existing_info += "Relationships: " + ", ".join(
+                    f"{r.source_name} -[{r.rel_type}]-> {r.target_name}"
+                    for r in current_relationships
+                )
+                gleaning_prompt = self._build_gleaning_prompt(
+                    text=text,
+                    entity_types=types_str,
+                    existing_info=existing_info,
+                    rel_type_vocab=rel_vocab,
+                    domain=domain,
+                )
+                schema = _GENERIC_EXTRACTION_SCHEMA
 
             try:
                 gleamed = await self._llm.structured_extract(
                     prompt=gleaning_prompt,
-                    schema=_EXTRACTION_SCHEMA,
+                    schema=schema,
                 )
             except Exception as e:
                 logger.warning("Gleaning failed: %s", e)
@@ -524,61 +1044,43 @@ class LLMGraphExtractor:
 
             prev_entity_count = len(current_entities)
             prev_rel_count = len(current_relationships)
-
-            for ent in gleamed.get("entities", []):
-                name = self._normalize_entity_name(ent.get("name", ""))
-                if name:
-                    current_entities.append(ExtractedEntity(
-                        name=name,
-                        entity_type=ent.get("type", "UNKNOWN").upper(),
-                        description=ent.get("description", ""),
-                    ))
-
-            current_entities = list({e.name: e for e in current_entities}.values())
-
-            for rel in gleamed.get("relationships", []):
-                source = self._normalize_entity_name(rel.get("source", ""))
-                target = self._normalize_entity_name(rel.get("target", ""))
-                if not (source and target):
-                    continue
-                rel_description = rel.get("description", "")
-                rel_keywords_str = rel.get("keywords", [])
-                if isinstance(rel_keywords_str, str):
-                    rel_keywords_str = [
-                        k.strip()
-                        for k in rel_keywords_str.split(",")
-                        if k.strip()
-                    ]
-                rel_keywords_list = (
-                    rel_keywords_str if isinstance(rel_keywords_str, list) else []
-                )
-                try:
-                    rel_weight = max(0.0, min(1.0, float(rel.get("weight", 1.0))))
-                except (ValueError, TypeError):
-                    rel_weight = 1.0
-                for entry in self._coerce_rel_type_entries(
-                    rel.get("rel_type"),
-                    fallback_description=rel_description,
-                    fallback_keywords=rel_keywords_list,
-                    fallback_weight=rel_weight,
-                    vocab=rel_vocab,
+            if is_code_domain:
+                relationships_payload = gleamed.get("relationships")
+                cleaned_entities = _collect_code_entities(relationships_payload)
+                cleaned_relationships = self._extract_code_relationships(
+                    relationships_payload,
                     domain=domain,
-                ):
-                    current_relationships.append(ExtractedRelationship(
-                        source_name=source,
-                        target_name=target,
-                        description=entry["description"],
-                        keywords=list(entry["keywords"]),
-                        weight=entry["weight"],
-                        rel_type=entry["rel_type"],
-                    ))
+                )
+                if cleaned_entities or cleaned_relationships:
+                    current_entities = cleaned_entities
+                    current_relationships = cleaned_relationships
+            else:
+                for ent in gleamed.get("entities", []):
+                    name = self._normalize_entity_name(ent.get("name", ""))
+                    if name:
+                        current_entities.append(ExtractedEntity(
+                            name=name,
+                            entity_type=ent.get("type", "UNKNOWN").upper(),
+                            description=ent.get("description", ""),
+                        ))
 
-            current_relationships = list(
-                {
-                    (r.source_name, r.target_name, r.rel_type): r
-                    for r in current_relationships
-                }.values()
-            )
+                current_entities = list({e.name: e for e in current_entities}.values())
+
+                new_relationships = self._extract_relationships(
+                    gleamed.get("relationships"),
+                    rel_vocab=rel_vocab,
+                    domain=domain,
+                    is_code_domain=False,
+                )
+
+                current_relationships.extend(new_relationships)
+
+                current_relationships = list(
+                    {
+                        (r.source_name, r.target_name, r.rel_type): r
+                        for r in current_relationships
+                    }.values()
+                )
 
             if (
                 len(current_entities) == prev_entity_count
