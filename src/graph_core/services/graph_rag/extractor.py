@@ -393,6 +393,15 @@ def _format_code_candidate_graph(
     return "\n".join(lines)
 
 
+def _normalize_code_entity_name(name: str) -> str:
+    if not name:
+        return ""
+    normalized = " ".join(name.strip().split())
+    if len(normalized) > 256:
+        normalized = normalized[:256]
+    return normalized
+
+
 def _parse_code_endpoint(value: Any) -> tuple[str, str] | None:
     if not isinstance(value, dict):
         return None
@@ -400,7 +409,7 @@ def _parse_code_endpoint(value: Any) -> tuple[str, str] | None:
     description = value.get("description", "")
     if not isinstance(name, str) or not isinstance(description, str):
         return None
-    normalized_name = _normalize_entity_name(name)
+    normalized_name = _normalize_code_entity_name(name)
     if not normalized_name:
         return None
     return normalized_name, description.strip()
