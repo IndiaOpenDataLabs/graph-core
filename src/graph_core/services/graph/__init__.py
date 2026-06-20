@@ -498,6 +498,7 @@ class GraphService:
         return await extractor.extract_with_gleaning(
             text=text,
             max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+            domain="chat",
         )
 
     async def _merge_chat_semantic_node(

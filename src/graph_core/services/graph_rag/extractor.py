@@ -87,37 +87,16 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
 
 
 _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
-    "title": "graph_rag_extraction",
+    "title": "graph_rag_relationship_extraction",
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "entities": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "name": {"type": "string"},
-                    "type": {"type": "string"},
-                    "description": {"type": "string"},
-                },
-                "required": ["name", "type", "description"],
-            },
-        },
         "relationships": {
             "type": "array",
             "items": {
-                "type": "object",
-                "additionalProperties": False,
+                **_RELATIONSHIP_ITEM_SCHEMA,
                 "properties": {
-                    "source": {"type": "string"},
-                    "target": {"type": "string"},
-                    "description": {"type": "string"},
-                    "keywords": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "weight": {"type": "number"},
+                    **_RELATIONSHIP_ITEM_SCHEMA["properties"],
                     "rel_type": {
                         "type": "array",
                         "items": {
@@ -148,7 +127,7 @@ _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["entities", "relationships"],
+    "required": ["relationships"],
 }
 
 
@@ -191,39 +170,36 @@ _CODE_EXTRACTION_SCHEMA = _build_code_taxonomy_schema()
 
 _EXTRACTION_SYSTEM_PROMPT = """---Role---
 You are a Knowledge Graph Specialist responsible for extracting
-entities and relationships from input text.
+relationships from input text.
 
 ---Instructions---
-1. Entity extraction:
-   - Identify clearly defined, meaningful entities that are
-     explicitly supported by the text.
-   - For each entity, extract: name, type, description.
-   - Entity types to consider: {entity_types}. If none apply, use "Other".
-   - {domain_entity_guidance}
-   - Do not extract generic filler terms or vague concepts that are
-     not functioning as real entities in context.
-
-2. Relationship extraction:
-   - Identify direct relationships between extracted entities.
+1. Relationship extraction:
+   - Identify direct relationships between concrete entities or concepts
+     that are explicitly supported by the text.
    - For N-ary relationships, decompose them into binary pairs.
-   - For each relationship, extract: source, target, description, keywords, weight, rel_type.
-   - Relationship descriptions must explain the nature of the
-     connection, the context in which it holds, and why it matters.
-   - Treat relationships as undirected unless the text clearly indicates direction.
+   - For each relationship, extract: source, target, description, keywords,
+     weight, rel_type.
+   - Relationship descriptions must explain the nature of the connection,
+     the context in which it holds, and why it matters.
+   - Treat relationships as undirected unless the text clearly indicates
+     direction.
    - Avoid duplicate relationships.
 
-3. Output requirements:
-   - Return structured JSON with two arrays: "entities" and "relationships".
-   - Each entity must have: name, type, description.
-   - Each relationship must have: source, target, rel_type.
+2. Output requirements:
+   - Return structured JSON with one object: "relationships".
+   - Each relationship item must use endpoint objects for source and target:
+       source: {{name (string), description (string)}}
+       target: {{name (string), description (string)}}
+   - Keep source and target descriptions separate from the relationship
+     description. The endpoint descriptions are entity descriptions.
    - Each relationship must also have top-level:
        description (string),
        keywords    (array of strings),
        weight      (float 0..1)
    - "rel_type" is a list of one or more objects, each with:
        name        (string)
-       description (string, role-specific: explains the connection
-                    in the semantic role of THIS rel_type entry)
+       description (string, role-specific: explains the connection in
+                    the semantic role of THIS rel_type entry)
        keywords    (array of strings, role-specific)
        weight      (float 0..1, role-specific confidence)
      {domain_rel_type_guidance}
@@ -232,22 +208,22 @@ entities and relationships from input text.
      carries different semantic roles. Each entry must have its own
      role-specific description and keywords. If two entries would say
      the same thing, collapse them to the single most specific one.
-   - Each entry becomes its own edge in the graph; emitting an
-     entry you cannot justify with a role-specific description
-     produces duplicate noise.
+   - Each entry becomes its own edge in the graph; emitting an entry you
+     cannot justify with a role-specific description produces duplicate
+     noise.
    - {domain_relationship_guidance}
    - Use third-person phrasing and avoid pronouns where possible.
-   - Only extract entities and relationships explicitly supported by the text.
+   - Only extract relationships explicitly supported by the text.
 """
 
 
-_EXTRACTION_USER_PROMPT = """Extract all entities and relationships
+_EXTRACTION_USER_PROMPT = """Extract all relationships
 from the following text.
 
 Text:
 {text}
 
-Output all entities first, then all relationships.
+Return only the structured relationships object.
 """
 
 
@@ -393,6 +369,13 @@ def _format_code_candidate_graph(
     return "\n".join(lines)
 
 
+def _format_candidate_graph(
+    entities: list[ExtractedEntity],
+    relationships: list[ExtractedRelationship],
+) -> str:
+    return _format_code_candidate_graph(entities, relationships)
+
+
 def _normalize_code_entity_name(name: str) -> str:
     if not name:
         return ""
@@ -402,17 +385,31 @@ def _normalize_code_entity_name(name: str) -> str:
     return normalized
 
 
-def _parse_code_endpoint(value: Any) -> tuple[str, str] | None:
+def _parse_relationship_endpoint(value: Any) -> tuple[str, str] | None:
+    if isinstance(value, str):
+        name = value.strip()
+        return (name, "") if name else None
     if not isinstance(value, dict):
         return None
     name = value.get("name", "")
     description = value.get("description", "")
     if not isinstance(name, str) or not isinstance(description, str):
         return None
-    normalized_name = _normalize_code_entity_name(name)
+    normalized_name = " ".join(name.strip().split())
     if not normalized_name:
         return None
     return normalized_name, description.strip()
+
+
+def _parse_code_endpoint(value: Any) -> tuple[str, str] | None:
+    parsed = _parse_relationship_endpoint(value)
+    if parsed is None:
+        return None
+    name, description = parsed
+    normalized_name = _normalize_code_entity_name(name)
+    if not normalized_name:
+        return None
+    return normalized_name, description
 
 
 def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
@@ -457,45 +454,76 @@ def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
     ]
 
 
+def _collect_generic_entities(relationships: Any) -> list[ExtractedEntity]:
+    if not isinstance(relationships, list):
+        return []
+
+    entity_descriptions: dict[str, str] = {}
+    entity_order: list[str] = []
+    for rel in relationships:
+        if not isinstance(rel, dict):
+            continue
+        for endpoint_key in ("source", "target"):
+            parsed = _parse_relationship_endpoint(rel.get(endpoint_key))
+            if parsed is None:
+                continue
+            name, description = parsed
+            if name not in entity_descriptions:
+                entity_order.append(name)
+                entity_descriptions[name] = description
+                continue
+            if description and len(description) > len(entity_descriptions[name]):
+                entity_descriptions[name] = description
+
+    return [
+        ExtractedEntity(
+            name=name,
+            entity_type="UNKNOWN",
+            description=entity_descriptions.get(name, ""),
+        )
+        for name in entity_order
+    ]
+
+
 _GLEANING_SYSTEM_PROMPT = """---Role---
-You are a Knowledge Graph Specialist responsible for extracting
-entities and relationships from input text.
+You are a Knowledge Graph Specialist responsible for refining a first-pass
+relationship graph into a cleaner final graph.
 
 ---Instructions---
 Based on the previous extraction, identify only missed or incorrectly
-formatted entities and relationships.
+formatted relationships.
 
-1. Do not repeat entities or relationships that were already extracted correctly.
+1. Do not repeat relationships that were already extracted correctly.
 2. Focus on:
-   - entities missed in the first pass
    - relationships missed in the first pass
-   - items that need correction to match the required structure
-3. Entity types to consider: {entity_types}. If none apply, use "Other".
-4. {domain_entity_guidance}
-5. Keep naming consistent with the previously extracted entities.
-6. Relationship descriptions must still explain the nature, context,
+   - relationships that need correction to match the required structure
+   - relationships that are too generic or too local to explain the text
+3. Keep naming consistent with the previously extracted endpoints.
+4. Relationship descriptions must still explain the nature, context,
    and significance of the connection. Make them rich enough to
-   understand the behavior without looking at the code again.
-6a. {domain_relationship_guidance}
-7. Each relationship's "rel_type" must follow this guidance:
+   understand the behavior without looking at the text again.
+4a. {domain_relationship_guidance}
+5. Each relationship's "rel_type" must follow this guidance:
    {domain_rel_type_guidance}
-8. Preserve multiple genuinely distinct rel_type entries for the same
+6. Preserve multiple genuinely distinct rel_type entries for the same
    source/target pair when the text supports them; do not collapse them
    to one generic edge unless the evidence really supports only one.
-9. Return only new or corrected items in the same JSON structure as
-   the main extraction.
+7. Return the final graph, not a diff.
+8. Do not emit an entities section. The ingestion adapter will derive
+   entities from the relationship endpoints after parsing.
+9. {domain_entity_guidance}
 10. Only include items explicitly supported by the text.
 """
 
 
-_GLEANING_USER_PROMPT = """Previously extracted:
+_GLEANING_USER_PROMPT = """Previously extracted relationships:
 {existing_info}
 
-Now extract any additional or corrected entities and relationships from:
+Now extract any additional or corrected relationships from:
 
 {text}
 
-Only output new or corrected items.
+Only output the structured relationships object.
 """
 
 
@@ -791,10 +819,12 @@ Only output the structured relationships object.
         for rel in relationships:
             if not isinstance(rel, dict):
                 continue
-            source = cls._normalize_entity_name(rel.get("source", ""))
-            target = cls._normalize_entity_name(rel.get("target", ""))
-            if not (source and target):
+            source_endpoint = _parse_relationship_endpoint(rel.get("source"))
+            target_endpoint = _parse_relationship_endpoint(rel.get("target"))
+            if not (source_endpoint and target_endpoint):
                 continue
+            source, _source_description = source_endpoint
+            target, _target_description = target_endpoint
             rel_description = rel.get("description", "")
             rel_keywords = cls._parse_relationship_keywords(
                 rel.get("keywords", []),
@@ -971,9 +1001,10 @@ Only output the structured relationships object.
                 domain=domain,
             )
         else:
-            entities = self._extract_entities(result.get("entities"))
+            relationships_payload = result.get("relationships")
+            entities = _collect_generic_entities(relationships_payload)
             relationships = self._extract_relationships(
-                result.get("relationships"),
+                relationships_payload,
                 rel_vocab=rel_vocab,
                 domain=domain,
                 is_code_domain=is_code_domain,
@@ -1023,20 +1054,13 @@ Only output the structured relationships object.
                 )
                 schema = _CODE_EXTRACTION_SCHEMA
             else:
-                existing_info = "Already extracted:\n"
-                existing_info += (
-                    "Entities: "
-                    + ", ".join(e.name for e in current_entities)
-                    + "\n"
-                )
-                existing_info += "Relationships: " + ", ".join(
-                    f"{r.source_name} -[{r.rel_type}]-> {r.target_name}"
-                    for r in current_relationships
-                )
                 gleaning_prompt = self._build_gleaning_prompt(
                     text=text,
                     entity_types=types_str,
-                    existing_info=existing_info,
+                    existing_info=_format_candidate_graph(
+                        current_entities,
+                        current_relationships,
+                    ),
                     rel_type_vocab=rel_vocab,
                     domain=domain,
                 )
@@ -1064,32 +1088,17 @@ Only output the structured relationships object.
                     current_entities = cleaned_entities
                     current_relationships = cleaned_relationships
             else:
-                for ent in gleamed.get("entities", []):
-                    name = self._normalize_entity_name(ent.get("name", ""))
-                    if name:
-                        current_entities.append(ExtractedEntity(
-                            name=name,
-                            entity_type=ent.get("type", "UNKNOWN").upper(),
-                            description=ent.get("description", ""),
-                        ))
-
-                current_entities = list({e.name: e for e in current_entities}.values())
-
+                relationships_payload = gleamed.get("relationships")
+                cleaned_entities = _collect_generic_entities(relationships_payload)
                 new_relationships = self._extract_relationships(
-                    gleamed.get("relationships"),
+                    relationships_payload,
                     rel_vocab=rel_vocab,
                     domain=domain,
                     is_code_domain=False,
                 )
-
-                current_relationships.extend(new_relationships)
-
-                current_relationships = list(
-                    {
-                        (r.source_name, r.target_name, r.rel_type): r
-                        for r in current_relationships
-                    }.values()
-                )
+                if cleaned_entities or new_relationships:
+                    current_entities = cleaned_entities
+                    current_relationships = new_relationships
 
             if (
                 len(current_entities) == prev_entity_count

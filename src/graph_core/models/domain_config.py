@@ -143,6 +143,36 @@ _GENERIC_RELATIONSHIP_GUIDANCE = (
     "or logical role precisely."
 )
 
+_CHAT_ENTITY_GUIDANCE = (
+    "For chat-domain entity records, preserve concrete participants, "
+    "named subjects, tools, tasks, constraints, and salient concepts "
+    "that appear in the conversation. Preserve names exactly when the "
+    "message text uses a stable label. Do not invent abstract summary "
+    "nodes when the same meaning is already captured by a relationship. "
+    "Prefer entities that help track who said what, what was asked, what "
+    "was answered, what was corrected, and what state or preference the "
+    "conversation established."
+)
+
+_CHAT_RELATIONSHIP_GUIDANCE = (
+    "Write relationship descriptions so they preserve the flow of the "
+    "conversation. Capture user questions, assistant answers, follow-ups, "
+    "corrections, clarifications, requests, commitments, preferences, and "
+    "referenced facts. Keep the relationship grounded in the actual message "
+    "content and speaker roles. When a conversation references prior chat "
+    "turns, surface that linkage explicitly rather than collapsing it into a "
+    "generic topic edge. Relationship descriptions should explain what was "
+    "said, by whom, and why it matters to the ongoing chat state."
+)
+
+_CHAT_REL_TYPE_GUIDANCE = (
+    "Prefer an existing rel_type from this current set when it truly fits. "
+    "If none fits, create a concise new UPPER_SNAKE rel_type that is "
+    "semantically precise for chat interactions. Favor rel_types that track "
+    "questions, answers, follow-ups, corrections, references, preferences, "
+    "and commitments when those are supported by the conversation."
+)
+
 _CODE_RELATIONSHIP_GUIDANCE = (
     "Write the description in short pseudo-code-flavored prose that "
     "captures execution semantics. Mention guards, conditions, branches, "
@@ -245,6 +275,14 @@ DOMAIN_CONFIGS: dict[str, DomainConfig] = {
             "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
             "that is semantically precise."
         ),
+    ),
+    "chat": DomainConfig(
+        name="chat",
+        rel_types=_REL_TYPES_GENERAL,
+        entity_guidance=_CHAT_ENTITY_GUIDANCE,
+        relationship_guidance=_CHAT_RELATIONSHIP_GUIDANCE,
+        rel_type_guidance=_CHAT_REL_TYPE_GUIDANCE,
+        requires_exact_resolution=False,
     ),
     "code": DomainConfig(
         name="code",
