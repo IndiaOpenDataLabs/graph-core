@@ -238,6 +238,108 @@ class IncrementalEntityResolver:
         document_path: str | None = None,
     ) -> EntityResolutionResult:
         normalized_name = self._normalize_entity_name(name)
+        exact_resolution = entity_type == "base_entity_ref" or self._requires_exact_name_resolution(
+            normalized_name,
+            entity_type,
+        )
+
+        if exact_resolution:
+            existing_result = await session.execute(
+                select(GraphEntity).where(
+                    GraphEntity.canonical_name == normalized_name,
+                    GraphEntity.collection_id == self._collection_id,
+                )
+            )
+            existing = existing_result.scalar_one_or_none()
+            if existing:
+                logger.debug("Exact canonical match: %s", normalized_name)
+                search_text = f"{normalized_name}: {description}"
+                context_embedding = await self._embedding.embed_query(search_text)
+                await self._add_description_and_update_centroid(
+                    session,
+                    existing.id,
+                    existing,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_or_increment_type(session, existing.id, entity_type)
+                return EntityResolutionResult(
+                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                )
+
+            new_id = uuid.uuid4()
+            stmt = (
+                pg_insert(GraphEntity)
+                .values(
+                    id=new_id,
+                    canonical_name=normalized_name,
+                    primary_type=entity_type,
+                    description_count=0,
+                    collection_id=self._collection_id,
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_graph_entities_canonical_name_collection_id"
+                )
+                .returning(GraphEntity.id)
+            )
+            result = await session.execute(stmt)
+            row = result.fetchone()
+            if row:
+                entity_id = row[0]
+                entity = await session.get(GraphEntity, entity_id)
+                search_text = f"{normalized_name}: {description}"
+                context_embedding = await self._embedding.embed_query(search_text)
+                await self._add_alias(
+                    session,
+                    entity_id,
+                    normalized_name,
+                    source_chunk_hash,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_description_and_update_centroid(
+                    session,
+                    entity_id,
+                    entity,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_or_increment_type(session, entity_id, entity_type)
+                return EntityResolutionResult(
+                    is_new=True, entity_id=entity_id, canonical_name=normalized_name
+                )
+
+            existing_result = await session.execute(
+                select(GraphEntity).where(
+                    GraphEntity.canonical_name == normalized_name,
+                    GraphEntity.collection_id == self._collection_id,
+                )
+            )
+            existing = existing_result.scalar_one_or_none()
+            if existing:
+                search_text = f"{normalized_name}: {description}"
+                context_embedding = await self._embedding.embed_query(search_text)
+                await self._add_description_and_update_centroid(
+                    session,
+                    existing.id,
+                    existing,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_or_increment_type(session, existing.id, entity_type)
+                return EntityResolutionResult(
+                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                )
+
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
             select(EntityAlias)
