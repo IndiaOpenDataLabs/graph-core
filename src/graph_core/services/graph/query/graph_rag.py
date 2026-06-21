@@ -816,6 +816,7 @@ async def _search_relationship_seeds(
     query_embedding: list[float],
     *,
     top_k: int = 10,
+    min_similarity: float | None = None,
     document_ids: list[uuid.UUID] | None = None,
 ) -> list[tuple[str, float]]:
     hits = await _graph_rag_vectors.search_relationship_embeddings(
@@ -824,14 +825,18 @@ async def _search_relationship_seeds(
         top_k=top_k,
         document_ids=document_ids,
     )
+    threshold = settings.graph_rag_min_edge_similarity if min_similarity is None else min_similarity
     rel_seeds: list[tuple[str, float]] = []
     seen: set[str] = set()
     for hit in hits:
         rel_id = hit.metadata.get("relationship_id") or hit.metadata.get("id")
         if not rel_id or rel_id in seen:
             continue
+        sim = 1.0 - hit.distance
+        if sim < threshold:
+            continue
         seen.add(rel_id)
-        rel_seeds.append((str(rel_id), 1.0 - hit.distance))
+        rel_seeds.append((str(rel_id), sim))
     return rel_seeds
 
 
@@ -1146,6 +1151,7 @@ async def _relationship_seed_state(
         collection,
         relationship_query_embedding,
         top_k=top_k,
+        min_similarity=settings.graph_rag_min_edge_similarity,
         document_ids=document_ids,
     )
     if query_tokens is None:
