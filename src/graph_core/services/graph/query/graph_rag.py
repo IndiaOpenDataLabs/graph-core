@@ -734,7 +734,7 @@ async def _search_entity_seeds(
     query_embedding: list[float],
     document_ids: list[uuid.UUID] | None = None,
 ) -> tuple[list[str], dict[str, float]]:
-    top_k = 10
+    top_k = 20
     seed_entity_ids: list[str] = []
     entity_relevance: dict[str, float] = {}
 
@@ -1322,8 +1322,8 @@ async def _relationship_first_state(
         relationship_query_embedding,
         debug_label=f"relationship_first:{question}",
         top_k=10,
-        max_endpoints=20,
-        max_pairs=30,
+        max_endpoints=30,
+        max_pairs=40,
         query_tokens=query_tokens,
         rel_types=rel_types,
         dimension_weight=dimension_weight,
@@ -1753,35 +1753,37 @@ async def _mix_state(
     logger.info(
         "graph_rag mix_state_start collection=%s question=%r top_entity_score=%.6f threshold=%.6f rel_types=%s",
         collection.name,
-        question,
-        top_entity_score,
-        _MIX_REWRITE_MIN_SCORE,
-        rel_types,
+            question,
+            top_entity_score,
+            _MIX_REWRITE_MIN_SCORE,
+            rel_types,
+        )
+
+    rel_base_state = await _relationship_seed_state(
+        collection,
+        relationship_query_embedding,
+        debug_label=f"mix_base:{question}",
+        top_k=10,
+        max_endpoints=30,
+        max_pairs=40,
+        query_tokens=query_tokens,
+        rel_types=rel_types,
+        dimension_weight=dimension_weight,
+        document_ids=document_ids,
+    )
+    rel_base_state = await _filter_relationship_state_by_entity_score(
+        collection,
+        rel_base_state,
+        entity_query_embedding,
+        min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
+        document_ids=document_ids,
     )
     if top_entity_score < _MIX_REWRITE_MIN_SCORE:
         logger.info(
             "graph_rag mix_state_fallback collection=%s reason=top_entity_score_below_threshold",
             collection.name,
         )
-        fallback_state = await _relationship_seed_state(
-            collection,
-            relationship_query_embedding,
-            debug_label=f"mix_fallback:{question}",
-            top_k=10,
-            max_endpoints=20,
-            max_pairs=30,
-            query_tokens=query_tokens,
-            rel_types=rel_types,
-            dimension_weight=dimension_weight,
-            document_ids=document_ids,
-        )
-        return await _filter_relationship_state_by_entity_score(
-            collection,
-            fallback_state,
-            entity_query_embedding,
-            min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
-            document_ids=document_ids,
-        )
+        return rel_base_state
 
     llm_provider = await _resolve_llm_provider(
         namespace_id=namespace_id,
@@ -1808,9 +1810,9 @@ async def _mix_state(
             collection,
             embedding,
             debug_label=f"mix_subquery:{subquery}",
-            top_k=8,
-            max_endpoints=16,
-            max_pairs=20,
+            top_k=10,
+            max_endpoints=20,
+            max_pairs=30,
             query_tokens=subquery_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
@@ -1850,16 +1852,9 @@ async def _mix_state(
     )
 
     if not states:
-        return await _relationship_first_state(
-            question,
-            collection,
-            entity_query_embedding,
-            relationship_query_embedding,
-            rel_types=rel_types,
-            dimension_weight=dimension_weight,
-        )
+        return rel_base_state
 
-    return _merge_states(*states)
+    return _merge_states(rel_base_state, *states)
 
 
 def _normalize_scalar_map(scores: dict[str, float]) -> dict[str, float]:
