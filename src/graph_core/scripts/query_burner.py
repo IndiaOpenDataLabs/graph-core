@@ -237,6 +237,7 @@ async def main() -> None:
     top_candidates = await query_logic._top_entity_candidates(
         collection,
         entity_query_embedding,
+        question=args.question,
         top_k=20,
     )
     top_entity_score = top_candidates[0][2] if top_candidates else 0.0
@@ -253,6 +254,24 @@ async def main() -> None:
             args.question,
             top_candidates,
             llm_provider,
+        )
+        print(  # noqa: E501
+            f"Mix interpretation: "
+            f"selected_entities={mix_interpretation.selected_entities}",
+            file=sys.stderr,
+        )
+        anchor_state = await query_logic._entity_anchor_state(
+            collection,
+            mix_interpretation.selected_entities,
+            query_tokens=query_logic._query_token_set(args.question),
+        )
+        subquery_states.append(
+            {
+                "subquery": "__anchor__",
+                "discovered_entity_ids": sorted(anchor_state.discovered_entity_ids),
+                "entity_relevance": anchor_state.entity_relevance,
+                "traversed_rel_ids": anchor_state.traversed_rel_ids[:20],
+            }
         )
         rel_type_for_sub = None
         if mix_interpretation.retrieval_subqueries:

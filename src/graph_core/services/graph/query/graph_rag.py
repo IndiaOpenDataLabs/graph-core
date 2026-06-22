@@ -580,6 +580,112 @@ def _query_token_set(question: str) -> set[str]:
     return {w.lower() for w in _extract_query_keywords(question)}
 
 
+def _contains_entity_mention(question: str, candidate: str) -> bool:
+    candidate = str(candidate or "").strip()
+    if len(candidate) < 3:
+        return False
+    question_norm = f" {question.casefold()} "
+    candidate_norm = " ".join(candidate.casefold().split())
+    if not candidate_norm:
+        return False
+    padded = f" {candidate_norm} "
+    if padded in question_norm:
+        return True
+    stripped = candidate_norm.strip(string.punctuation)
+    return bool(stripped and f" {stripped} " in question_norm)
+
+
+async def _mentioned_entity_rows(
+    collection: Collection,
+    question: str,
+    *,
+    document_ids: list[uuid.UUID] | None = None,
+    limit: int = 20,
+) -> list[tuple[str, str, str, float]]:
+    """Return entities explicitly named in the question before vector ranking.
+
+    Vector retrieval can miss short proper nouns when the query is phrased as a
+    recommendation or why-question. This pass keeps literal entity mentions
+    from being lost before mix-mode interpretation.
+    """
+    async with AsyncSessionLocal() as session:
+        entity_rows = (
+            await session.execute(
+                select(
+                    GraphEntity.id,
+                    GraphEntity.canonical_name,
+                    GraphEntity.primary_type,
+                ).where(GraphEntity.collection_id == collection.id)
+            )
+        ).all()
+        alias_rows = (
+            await session.execute(
+                select(
+                    EntityAlias.entity_id,
+                    EntityAlias.alias_name,
+                ).where(EntityAlias.collection_id == collection.id)
+            )
+        ).all()
+
+        matched_ids: dict[str, tuple[str, float]] = {}
+        entity_name_by_id = {
+            str(entity_id): str(canonical_name or "").strip()
+            for entity_id, canonical_name, _ in entity_rows
+        }
+        for entity_id, canonical_name, _ in entity_rows:
+            name = str(canonical_name or "").strip()
+            if _contains_entity_mention(question, name):
+                matched_ids[str(entity_id)] = (name, 1.0)
+        for entity_id, alias_name in alias_rows:
+            alias = str(alias_name or "").strip()
+            if not _contains_entity_mention(question, alias):
+                continue
+            entity_id_str = str(entity_id)
+            name = entity_name_by_id.get(entity_id_str, alias)
+            # Alias matches are still exact mentions, but canonical-name matches
+            # should win if both are present.
+            matched_ids.setdefault(entity_id_str, (name, 0.98))
+
+        if not matched_ids:
+            return []
+
+        desc_conditions = [
+            EntityDescription.entity_id.in_(
+                [uuid.UUID(entity_id) for entity_id in matched_ids]
+            )
+        ]
+        if document_ids:
+            desc_conditions.append(EntityDescription.document_id.in_(document_ids))
+        desc_rows = (
+            await session.execute(
+                select(
+                    EntityDescription.entity_id,
+                    EntityDescription.description,
+                    EntityDescription.weight,
+                )
+                .where(*desc_conditions)
+                .order_by(EntityDescription.weight.desc())
+            )
+        ).all()
+
+    descriptions_by_id: dict[str, str] = {}
+    for entity_id, description, _ in desc_rows:
+        descriptions_by_id.setdefault(str(entity_id), str(description or "").strip())
+
+    rows = [
+        (
+            entity_id,
+            name,
+            descriptions_by_id.get(entity_id, name),
+            score,
+        )
+        for entity_id, (name, score) in matched_ids.items()
+        if name
+    ]
+    rows.sort(key=lambda item: (item[3], len(item[1])), reverse=True)
+    return rows[:limit]
+
+
 def _parse_source_ids(value: Any) -> list[str]:
     if value is None:
         return []
@@ -617,6 +723,7 @@ async def _load_document_candidates_from_query_entities(
     limit: int = 20,
 ) -> list[DocumentRoutingCandidate]:
     query_embedding = await _embed_entity_query(embedding_provider, question)
+    mentioned_rows = await _mentioned_entity_rows(collection, question, limit=10)
     entity_hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
@@ -624,6 +731,33 @@ async def _load_document_candidates_from_query_entities(
     )
 
     candidate_map: dict[str, DocumentRoutingCandidate] = {}
+    async with AsyncSessionLocal() as session:
+        for entity_id, name, _, score in mentioned_rows:
+            desc_rows = (
+                await session.execute(
+                    select(
+                        EntityDescription.document_id,
+                    ).where(EntityDescription.entity_id == uuid.UUID(entity_id))
+                )
+            ).all()
+            for (document_id,) in desc_rows:
+                if document_id is None:
+                    continue
+                document_id_str = str(document_id)
+                candidate = candidate_map.get(document_id_str)
+                if candidate is None:
+                    candidate_map[document_id_str] = DocumentRoutingCandidate(
+                        document_id=document_id_str,
+                        document_path="",
+                        best_score=score,
+                        matched_entities=[name],
+                    )
+                    continue
+                if score > candidate.best_score:
+                    candidate.best_score = score
+                if name not in candidate.matched_entities:
+                    candidate.matched_entities.append(name)
+
     for hit in entity_hits:
         document_id = str(hit.metadata.get("document_id") or "").strip()
         if not document_id:
@@ -744,6 +878,16 @@ async def _search_entity_seeds(
     seed_entity_ids: list[str] = []
     entity_relevance: dict[str, float] = {}
 
+    for entity_id, _, _, score in await _mentioned_entity_rows(
+        collection,
+        question,
+        document_ids=document_ids,
+        limit=20,
+    ):
+        if entity_id not in seed_entity_ids:
+            seed_entity_ids.append(entity_id)
+            entity_relevance[entity_id] = score
+
     entity_hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
@@ -791,6 +935,7 @@ async def _top_entity_candidates(
     collection: Collection,
     query_embedding: list[float],
     *,
+    question: str = "",
     top_k: int = 50,
     document_ids: list[uuid.UUID] | None = None,
 ) -> list[tuple[str, str, float]]:
@@ -802,6 +947,17 @@ async def _top_entity_candidates(
     )
     candidates: list[tuple[str, str, float]] = []
     seen: set[str] = set()
+    if question:
+        for _, name, description, score in await _mentioned_entity_rows(
+            collection,
+            question,
+            document_ids=document_ids,
+            limit=20,
+        ):
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            candidates.append((name, description, score))
     for hit in hits:
         name = str(hit.metadata.get("name") or "").strip()
         if not name or name in seen:
@@ -1345,8 +1501,128 @@ async def _relationship_first_state(
         collection,
         state,
         entity_query_embedding,
+        question=question,
         min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
         document_ids=document_ids,
+    )
+
+
+async def _entity_anchor_state(
+    collection: Collection,
+    entity_names: list[str],
+    *,
+    query_tokens: set[str],
+    document_ids: list[uuid.UUID] | None = None,
+    max_relationships: int = 40,
+) -> GraphQueryState:
+    wanted_names = [name for name in entity_names if str(name).strip()]
+    if not wanted_names:
+        return GraphQueryState(
+            discovered_entity_ids=set(),
+            entity_relevance={},
+            traversed_rel_ids=[],
+            rel_score_cache={},
+            rel_combined_score_cache={},
+        )
+
+    wanted_keys = {name.casefold() for name in wanted_names}
+    discovered_entity_ids: set[str] = set()
+    entity_relevance: dict[str, float] = {}
+    traversed_rel_ids: list[str] = []
+    rel_score_cache: dict[str, float] = {}
+    rel_combined_score_cache: dict[str, float] = {}
+
+    async with AsyncSessionLocal() as session:
+        entity_rows = (
+            await session.execute(
+                select(GraphEntity.id, GraphEntity.canonical_name).where(
+                    GraphEntity.collection_id == collection.id,
+                    func.lower(GraphEntity.canonical_name).in_(
+                        {key.lower() for key in wanted_keys}
+                    ),
+                )
+            )
+        ).all()
+        alias_rows = (
+            await session.execute(
+                select(EntityAlias.entity_id, EntityAlias.alias_name)
+                .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
+                .where(
+                    EntityAlias.collection_id == collection.id,
+                    GraphEntity.collection_id == collection.id,
+                    func.lower(EntityAlias.alias_name).in_(
+                        {key.lower() for key in wanted_keys}
+                    ),
+                )
+            )
+        ).all()
+        anchor_ids = {str(entity_id) for entity_id, _ in entity_rows}
+        anchor_ids.update(str(entity_id) for entity_id, _ in alias_rows)
+        if not anchor_ids:
+            return GraphQueryState(
+                discovered_entity_ids=set(),
+                entity_relevance={},
+                traversed_rel_ids=[],
+                rel_score_cache={},
+                rel_combined_score_cache={},
+            )
+
+        for entity_id in anchor_ids:
+            discovered_entity_ids.add(entity_id)
+            entity_relevance[entity_id] = 1.0
+
+        rel_conditions = [
+            GraphRelationship.collection_id == collection.id,
+            or_(
+                GraphRelationship.source_entity_id.in_(
+                    [uuid.UUID(entity_id) for entity_id in anchor_ids]
+                ),
+                GraphRelationship.target_entity_id.in_(
+                    [uuid.UUID(entity_id) for entity_id in anchor_ids]
+                ),
+            ),
+        ]
+        if document_ids:
+            rel_conditions.append(
+                GraphRelationship.id.in_(
+                    select(RelationshipDescription.relationship_id).where(
+                        RelationshipDescription.document_id.in_(document_ids)
+                    )
+                )
+            )
+        rel_rows = (
+            await session.execute(
+                select(GraphRelationship)
+                .where(*rel_conditions)
+                .order_by(GraphRelationship.weight.desc())
+                .limit(max_relationships)
+            )
+        ).scalars().all()
+
+    for rel in rel_rows:
+        rel_id = str(rel.id)
+        edge_props = {
+            "weight": rel.weight or 1,
+            "keywords": rel.keywords or [],
+            "rel_type": rel.rel_type,
+        }
+        combined = _combined_edge_score(0.95, edge_props, query_tokens)
+        traversed_rel_ids.append(rel_id)
+        rel_score_cache[rel_id] = 0.95
+        rel_combined_score_cache[rel_id] = combined
+        for endpoint_id in (str(rel.source_entity_id), str(rel.target_entity_id)):
+            discovered_entity_ids.add(endpoint_id)
+            entity_relevance[endpoint_id] = max(
+                entity_relevance.get(endpoint_id, 0.0),
+                combined,
+            )
+
+    return GraphQueryState(
+        discovered_entity_ids=discovered_entity_ids,
+        entity_relevance=entity_relevance,
+        traversed_rel_ids=traversed_rel_ids,
+        rel_score_cache=rel_score_cache,
+        rel_combined_score_cache=rel_combined_score_cache,
     )
 
 
@@ -1355,6 +1631,7 @@ async def _filter_relationship_state_by_entity_score(
     state: GraphQueryState,
     entity_query_embedding: list[float],
     *,
+    question: str = "",
     min_entity_score: float,
     top_k: int = 50,
     document_ids: list[uuid.UUID] | None = None,
@@ -1365,6 +1642,7 @@ async def _filter_relationship_state_by_entity_score(
     candidates = await _top_entity_candidates(
         collection,
         entity_query_embedding,
+        question=question,
         top_k=top_k,
         document_ids=document_ids,
     )
@@ -1560,38 +1838,19 @@ def _fallback_mix_interpretation(
     if not names:
         return MixInterpretation(selected_entities=[], retrieval_subqueries=[])
     subqueries: list[str] = []
-    if "Rajas" in names and "The Mind" in names:
+    if len(names) >= 2:
+        group_a = names[: max(1, len(names) // 2)]
+        group_b = names[max(1, len(names) // 2) :]
         subqueries.append(
-            "Why does sustained focused activity of Rajas in The Mind "
-            "still lead to exhaustion?"
+            "How do " + ", ".join(group_a) + " relate to each other?"
         )
-    if "Prana" in names or "Ojas" in names:
-        subqueries.append(
-            "How do Prana and Ojas explain mental drain, reduced steadiness, "
-            "and loss of endurance after overwork?"
-        )
-    if "Samkalpa" in names:
-        subqueries.append(
-            "What is the relationship between Samkalpa, repeated mental effort, "
-            "and exhaustion from solving one problem after another?"
-        )
-    if "Pratyahara" in names:
-        subqueries.append(
-            "Does lack of Pratyahara or stopping allow The Mind to keep spending "
-            "energy without recovery?"
-        )
+        if group_b:
+            subqueries.append(
+                "How do " + ", ".join(group_b) + " relate to each other?"
+            )
     if not subqueries:
         subqueries = [
-            (
-                "How do "
-                + ", ".join(names[:4])
-                + " explain continuous mental effort and exhaustion?"
-            ),
-            (
-                "How do "
-                + ", ".join(names[4:8])
-                + " relate to steadiness, recovery, and endurance?"
-            ),
+            "How does " + names[0] + " relate to the question?",
         ]
     return MixInterpretation(
         selected_entities=names,
@@ -1758,6 +2017,7 @@ async def _mix_state(
     candidates = await _top_entity_candidates(
         collection,
         entity_query_embedding,
+        question=question,
         top_k=50,
         document_ids=document_ids,
     )
@@ -1787,6 +2047,7 @@ async def _mix_state(
         collection,
         rel_base_state,
         entity_query_embedding,
+        question=question,
         min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
         document_ids=document_ids,
     )
@@ -1802,6 +2063,13 @@ async def _mix_state(
         llm_profile_id=llm_profile_id,
     )
     interpretation = await _interpret_mix_queries(question, candidates, llm_provider)
+
+    anchor_state = await _entity_anchor_state(
+        collection,
+        interpretation.selected_entities,
+        query_tokens=query_tokens,
+        document_ids=document_ids,
+    )
 
     # Batch-embed all subquery relationship queries in one API call.
     subqueries = interpretation.retrieval_subqueries
@@ -1838,6 +2106,7 @@ async def _mix_state(
             collection,
             subquery_state,
             subquery_entity_embedding,
+            question=subquery,
             min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
             document_ids=document_ids,
         )
@@ -1864,9 +2133,9 @@ async def _mix_state(
     )
 
     if not states:
-        return rel_base_state
+        return _merge_states(rel_base_state, anchor_state)
 
-    return _merge_states(rel_base_state, *states)
+    return _merge_states(rel_base_state, anchor_state, *states)
 
 
 def _normalize_scalar_map(scores: dict[str, float]) -> dict[str, float]:
