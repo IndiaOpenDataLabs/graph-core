@@ -1724,7 +1724,7 @@ async def _filter_relationship_state_by_entity_score(
                             select(RelationshipDescription.document_id).where(
                                 RelationshipDescription.relationship_id == rel_id,
                                 RelationshipDescription.document_id.in_(document_ids),
-                            ).limit(1)
+                            )
                         )
                         if rel_desc_result.scalar_one_or_none() is None:
                             continue
@@ -1755,7 +1755,7 @@ async def _filter_relationship_state_by_entity_score(
                     select(RelationshipDescription.document_id).where(
                         RelationshipDescription.relationship_id == rel.id,
                         RelationshipDescription.document_id.in_(document_ids),
-                    ).limit(1)
+                    )
                 )
                 if rel_desc_result.scalar_one_or_none() is None:
                     continue
