@@ -39,6 +39,7 @@ from graph_core.models.rel_types import rel_types_for_domain
 class NodeRecord:
     id: uuid.UUID
     name: str
+    primary_type: str = ""
 
 
 @dataclass(slots=True)
@@ -947,11 +948,21 @@ async def _load_graph_records(
 
         nodes = (
             await session.execute(
-                select(GraphEntity.id, GraphEntity.canonical_name).where(
+                select(
+                    GraphEntity.id,
+                    GraphEntity.canonical_name,
+                    GraphEntity.primary_type,
+                ).where(
                     GraphEntity.collection_id == collection_id
                 )
             )
         ).all()
+
+        non_ref_entity_ids = {
+            entity_id
+            for entity_id, _, primary_type in nodes
+            if str(primary_type or "").strip() != "base_entity_ref"
+        }
 
         source_entity = aliased(GraphEntity)
         target_entity = aliased(GraphEntity)
@@ -999,7 +1010,11 @@ async def _load_graph_records(
 
     return (
         collection,
-        [NodeRecord(id=node_id, name=name) for node_id, name in nodes],
+        [
+            NodeRecord(id=node_id, name=name, primary_type=str(primary_type or ""))
+            for node_id, name, primary_type in nodes
+            if node_id in non_ref_entity_ids
+        ],
         [
             RelationshipRecord(
                 id=rel_id,
@@ -1019,6 +1034,7 @@ async def _load_graph_records(
                 rel_type,
                 weight,
             ) in relationships
+            if source_id in non_ref_entity_ids and target_id in non_ref_entity_ids
         ],
         {
             entity_id: sorted({alias for alias in aliases})
@@ -1075,6 +1091,7 @@ async def analyze_collection_graph(
         {
             "id": str(node.id),
             "name": node.name,
+            "primary_type": node.primary_type,
         }
         for node in nodes
     ]
@@ -1092,6 +1109,9 @@ async def build_collection_understanding(
     collection = analysis["collection"]
     max_deterministic_link_pairs = 64
     max_deterministic_meta_edges = 96
+    min_concept_link_direct_count = 2
+    min_concept_link_direct_weight = 3.0
+    min_concept_link_distinct_rel_types = 2
     entity_aliases_by_id: dict[str, list[str]] = dict(
         analysis.get("entity_aliases_by_id") or {}
     )
@@ -1200,7 +1220,11 @@ async def build_collection_understanding(
     candidate_regions: list[dict[str, Any]] = []
     role_profiles: list[dict[str, Any]] = []
     analysis_nodes = [
-        NodeRecord(id=uuid.UUID(str(node["id"])), name=str(node["name"]))
+        NodeRecord(
+            id=uuid.UUID(str(node["id"])),
+            name=str(node["name"]),
+            primary_type=str(node.get("primary_type") or ""),
+        )
         for node in analysis.get("node_records", [])
         if str(node.get("id") or "").strip()
     ]
@@ -1464,6 +1488,11 @@ async def build_collection_understanding(
     concept_labels_by_id: dict[str, str] = {}
     concept_descriptions_by_id: dict[str, str] = {}
     concept_region_ids_by_id: dict[str, list[str]] = {}
+    concept_label_keys = {
+        str(region_entry["concept"].get("label") or "").strip().casefold()
+        for region_entry in region_concepts
+        if str(region_entry["concept"].get("label") or "").strip()
+    }
     for region_entry in region_concepts:
         concept = region_entry["concept"]
         label = str(concept.get("label") or "").strip()
@@ -1537,6 +1566,7 @@ async def build_collection_understanding(
             str(value).strip()
             for value in concept.get("member_entity_names", [])
             if str(value).strip()
+            and str(value).strip().casefold() not in concept_label_keys
         ]
         for name in member_names[:10]:
             ref_id = ensure_entity_ref(name, supporting_ids=source_ids)
@@ -1607,7 +1637,13 @@ async def build_collection_understanding(
         )
 
     ranked_pairs = sorted(
-        pair_aggregates.values(),
+        (
+            bucket
+            for bucket in pair_aggregates.values()
+            if int(bucket["direct_count"]) >= min_concept_link_direct_count
+            or float(bucket["direct_weight"]) >= min_concept_link_direct_weight
+            or len(bucket["rel_counter"]) >= min_concept_link_distinct_rel_types
+        ),
         key=lambda item: (
             item["direct_weight"],
             item["direct_count"],
