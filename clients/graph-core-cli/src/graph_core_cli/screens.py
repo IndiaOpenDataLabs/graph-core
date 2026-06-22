@@ -1738,7 +1738,7 @@ class ConsoleScreen(Screen):
                 "  status: pending"
             )
 
-            for _ in range(300):
+            for _ in range(360):
                 status_result = await client.call_result(
                     "get_job_status",
                     {"job_id": job_id},
@@ -1777,7 +1777,7 @@ class ConsoleScreen(Screen):
                     raise ValueError(
                         f"Query job failed: {job.get('error') or 'unknown error'}"
                     )
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
         finally:
             await client.disconnect()
 
