@@ -2555,11 +2555,36 @@ class GraphService:
                     node_id_map=node_id_map,
                 )
 
+            async def on_meta_edge(edge: dict[str, Any]) -> None:
+                nonlocal meta_collection, embedding_provider, graph_storage
+                if meta_collection is None:
+                    meta_collection = await self._prepare_meta_collection(
+                        source_collection,
+                        namespace_id,
+                        target_level,
+                    )
+                    embedding_provider = (
+                        await self._resolve_collection_embedding_provider(
+                            meta_collection
+                        )
+                    )
+                    graph_storage = self._graph_storage(meta_collection)
+                if embedding_provider is None or graph_storage is None:
+                    raise RuntimeError("Enhance meta collection was not initialized")
+                await self._materialize_meta_edges(
+                    meta_collection,
+                    [edge],
+                    node_id_map,
+                    embedding_provider=embedding_provider,
+                    graph_storage=graph_storage,
+                )
+
             understanding = await build_collection_understanding(
                 analysis,
                 llm_provider=llm_provider,
                 region_batch_size=region_batch_size,
                 on_region_concept=on_region_concept,
+                on_meta_edge=on_meta_edge,
             )
             candidate_region_count = int(
                 understanding.get("candidate_region_count") or 0
@@ -2573,14 +2598,6 @@ class GraphService:
                 )
             if embedding_provider is None or graph_storage is None:
                 raise RuntimeError("Enhance did not initialize materialization state")
-            await self._materialize_meta_edges(
-                meta_collection,
-                list(understanding.get("edges") or []),
-                node_id_map,
-                embedding_provider=embedding_provider,
-                graph_storage=graph_storage,
-            )
-
             kind_counts: dict[str, int] = {}
             for node in understanding["nodes"]:
                 node_type = str(node.get("type") or "unknown")
