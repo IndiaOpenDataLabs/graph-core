@@ -803,6 +803,36 @@ class IncrementalEntityResolver:
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
     ) -> None:
+        # Check for exact (relationship_id, document_id) match first
+        if document_id:
+            existing_exact = await session.execute(
+                select(RelationshipDescription.id).where(
+                    RelationshipDescription.relationship_id == relationship_id,
+                    RelationshipDescription.document_id == document_id,
+                ).limit(1)
+            )
+            existing_exact_id = existing_exact.scalar_one_or_none()
+            if existing_exact_id:
+                # Update existing description, don't create duplicate
+                hashes_result = await session.execute(
+                    select(RelationshipDescription.source_chunk_hashes).where(
+                        RelationshipDescription.id == existing_exact_id,
+                    )
+                )
+                hashes_row = hashes_result.first()
+                hashes = list(hashes_row[0] or []) if hashes_row else []
+                if source_chunk_hash not in hashes:
+                    hashes.append(source_chunk_hash)
+                await session.execute(
+                    update(RelationshipDescription)
+                    .where(RelationshipDescription.id == existing_exact_id)
+                    .values(
+                        weight=RelationshipDescription.weight + 1,
+                        source_chunk_hashes=hashes,
+                    )
+                )
+                return
+
         embed_text = relationship_embedding_text(
             source_name,
             target_name,
