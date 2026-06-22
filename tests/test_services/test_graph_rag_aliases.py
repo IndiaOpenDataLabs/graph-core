@@ -1143,6 +1143,13 @@ async def test_graph_rag_query_does_not_apply_document_routing_to_meta_collectio
                 route_scores={},
                 rel_type_scores={},
             ),
+            state=GraphQueryState(
+                discovered_entity_ids=set(),
+                entity_relevance={},
+                traversed_rel_ids=[],
+                rel_score_cache={},
+                rel_combined_score_cache={},
+            ),
         )
 
     async def _fake_load_meta_collections(collection):

@@ -7,11 +7,11 @@ import logging
 import string
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import distinct, or_, select
+from sqlalchemy import distinct, func, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -61,6 +61,10 @@ _RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
 )
 _MIX_REWRITE_MIN_SCORE = 0.55
 _REL_ENDPOINT_ENTITY_SCORE_MIN = 0.0
+_META_PROJECTION_ENTITY_SCORE = 0.96
+_META_PROJECTION_EDGE_BASE_SCORE = 0.72
+_META_PROJECTION_MAX_BASE_REFS = 40
+_META_PROJECTION_MAX_BASE_RELS = 80
 _MODE_ALIASES = {
     "local": "entity-first",
     "ent": "entity-first",
@@ -403,6 +407,7 @@ class GraphQueryArtifacts:
     relationships_used: list[str]
     rel_context: str
     route_profile: DerivedRouteProfile
+    state: GraphQueryState
 
 
 @dataclass
@@ -2082,6 +2087,217 @@ async def _build_context(
     return context, entities_used, list(dict.fromkeys(relationships_used)), rel_context
 
 
+async def _meta_base_ref_names_from_artifacts(
+    meta_artifacts: list[tuple[Collection, GraphQueryArtifacts]],
+) -> list[str]:
+    """Project selected meta concepts back to their base entity references."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    async with AsyncSessionLocal() as session:
+        for meta_collection, artifacts in meta_artifacts:
+            discovered_ids = [
+                uuid.UUID(entity_id)
+                for entity_id in artifacts.state.discovered_entity_ids
+                if entity_id
+            ]
+            traversed_rel_ids = [
+                uuid.UUID(rel_id) for rel_id in artifacts.state.traversed_rel_ids if rel_id
+            ]
+            if not discovered_ids and not traversed_rel_ids:
+                continue
+
+            candidate_entity_ids: set[uuid.UUID] = set(discovered_ids)
+            if traversed_rel_ids:
+                rel_rows = await session.execute(
+                    select(
+                        GraphRelationship.source_entity_id,
+                        GraphRelationship.target_entity_id,
+                    ).where(
+                        GraphRelationship.collection_id == meta_collection.id,
+                        GraphRelationship.id.in_(traversed_rel_ids),
+                    )
+                )
+                for source_id, target_id in rel_rows.all():
+                    candidate_entity_ids.add(source_id)
+                    candidate_entity_ids.add(target_id)
+
+            if discovered_ids:
+                evidence_rows = await session.execute(
+                    select(
+                        GraphRelationship.source_entity_id,
+                        GraphRelationship.target_entity_id,
+                    ).where(
+                        GraphRelationship.collection_id == meta_collection.id,
+                        GraphRelationship.rel_type == "EVIDENCED_BY",
+                        or_(
+                            GraphRelationship.source_entity_id.in_(discovered_ids),
+                            GraphRelationship.target_entity_id.in_(discovered_ids),
+                        ),
+                    )
+                )
+                for source_id, target_id in evidence_rows.all():
+                    candidate_entity_ids.add(source_id)
+                    candidate_entity_ids.add(target_id)
+
+            if not candidate_entity_ids:
+                continue
+            entity_rows = await session.execute(
+                select(
+                    GraphEntity.canonical_name,
+                    GraphEntity.primary_type,
+                ).where(
+                    GraphEntity.collection_id == meta_collection.id,
+                    GraphEntity.id.in_(list(candidate_entity_ids)),
+                )
+            )
+            for canonical_name, primary_type in entity_rows.all():
+                if primary_type != "base_entity_ref":
+                    continue
+                name = str(canonical_name or "").strip()
+                key = name.casefold()
+                if name and key not in seen:
+                    seen.add(key)
+                    names.append(name)
+                if len(names) >= _META_PROJECTION_MAX_BASE_REFS:
+                    return names
+
+    return names
+
+
+async def _base_entity_ids_for_names(
+    collection: Collection,
+    names: list[str],
+) -> dict[str, float]:
+    if not names:
+        return {}
+    lowered = {name.lower() for name in names if name.strip()}
+    if not lowered:
+        return {}
+
+    entity_scores: dict[str, float] = {}
+    async with AsyncSessionLocal() as session:
+        entity_rows = await session.execute(
+            select(GraphEntity.id, GraphEntity.canonical_name).where(
+                GraphEntity.collection_id == collection.id,
+                func.lower(GraphEntity.canonical_name).in_(lowered),
+            )
+        )
+        for entity_id, canonical_name in entity_rows.all():
+            score = _META_PROJECTION_ENTITY_SCORE
+            if str(canonical_name or "").lower() in lowered:
+                entity_scores[str(entity_id)] = score
+
+        alias_rows = await session.execute(
+            select(EntityAlias.entity_id, EntityAlias.alias_name)
+            .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
+            .where(
+                EntityAlias.collection_id == collection.id,
+                GraphEntity.collection_id == collection.id,
+                func.lower(EntityAlias.alias_name).in_(lowered),
+            )
+        )
+        for entity_id, alias_name in alias_rows.all():
+            if str(alias_name or "").lower() in lowered:
+                entity_scores[str(entity_id)] = _META_PROJECTION_ENTITY_SCORE
+
+    return entity_scores
+
+
+async def _meta_projection_state(
+    question: str,
+    collection: Collection,
+    meta_artifacts: list[tuple[Collection, GraphQueryArtifacts]],
+    *,
+    document_ids: list[uuid.UUID] | None = None,
+) -> GraphQueryState:
+    base_ref_names = await _meta_base_ref_names_from_artifacts(meta_artifacts)
+    projected_entity_scores = await _base_entity_ids_for_names(
+        collection,
+        base_ref_names,
+    )
+    if not projected_entity_scores:
+        return GraphQueryState(
+            discovered_entity_ids=set(),
+            entity_relevance={},
+            traversed_rel_ids=[],
+            rel_score_cache={},
+            rel_combined_score_cache={},
+        )
+
+    projected_entity_ids = set(projected_entity_scores)
+    query_tokens = _query_token_set(question)
+    rel_score_cache: dict[str, float] = {}
+    rel_combined_score_cache: dict[str, float] = {}
+    traversed_rel_ids: list[str] = []
+
+    async with AsyncSessionLocal() as session:
+        rel_conditions = [
+            GraphRelationship.collection_id == collection.id,
+            or_(
+                GraphRelationship.source_entity_id.in_(
+                    [uuid.UUID(entity_id) for entity_id in projected_entity_ids]
+                ),
+                GraphRelationship.target_entity_id.in_(
+                    [uuid.UUID(entity_id) for entity_id in projected_entity_ids]
+                ),
+            ),
+        ]
+        if document_ids:
+            rel_conditions.append(
+                GraphRelationship.id.in_(
+                    select(RelationshipDescription.relationship_id).where(
+                        RelationshipDescription.document_id.in_(document_ids)
+                    )
+                )
+            )
+        rel_rows = await session.execute(
+            select(GraphRelationship)
+            .where(*rel_conditions)
+            .order_by(GraphRelationship.weight.desc())
+            .limit(_META_PROJECTION_MAX_BASE_RELS)
+        )
+        for rel in rel_rows.scalars().all():
+            rel_id = str(rel.id)
+            edge_props = {
+                "weight": rel.weight or 1,
+                "keywords": rel.keywords or [],
+                "rel_type": rel.rel_type,
+            }
+            combined = _combined_edge_score(
+                _META_PROJECTION_EDGE_BASE_SCORE,
+                edge_props,
+                query_tokens,
+            )
+            rel_score_cache[rel_id] = _META_PROJECTION_EDGE_BASE_SCORE
+            rel_combined_score_cache[rel_id] = combined
+            traversed_rel_ids.append(rel_id)
+            for endpoint_id in (str(rel.source_entity_id), str(rel.target_entity_id)):
+                projected_entity_ids.add(endpoint_id)
+                previous = projected_entity_scores.get(endpoint_id, 0.0)
+                if combined > previous:
+                    projected_entity_scores[endpoint_id] = combined
+
+    traversed_rel_ids.sort(
+        key=lambda rel_id: rel_combined_score_cache.get(rel_id, 0.0),
+        reverse=True,
+    )
+    logger.info(
+        "graph_rag mix_meta_projection collection=%s refs=%s projected_entities=%d projected_rels=%d",
+        collection.name,
+        base_ref_names[:20],
+        len(projected_entity_ids),
+        len(traversed_rel_ids),
+    )
+    return GraphQueryState(
+        discovered_entity_ids=projected_entity_ids,
+        entity_relevance=projected_entity_scores,
+        traversed_rel_ids=traversed_rel_ids,
+        rel_score_cache=rel_score_cache,
+        rel_combined_score_cache=rel_combined_score_cache,
+    )
+
+
 async def _answer_from_context(
     question: str,
     namespace_id: uuid.UUID,
@@ -2283,6 +2499,7 @@ async def _build_graph_query_artifacts(
         relationships_used=relationships_used,
         rel_context=rel_context,
         route_profile=route_profile,
+        state=state,
     )
 
 
@@ -2330,6 +2547,35 @@ async def graph_rag_query(
                 ),
             )
         )
+
+    effective_mode = _MODE_ALIASES.get((mode or "mix").lower(), "mix")
+    if effective_mode == "mix" and meta_artifacts:
+        projection_state = await _meta_projection_state(
+            question,
+            collection,
+            meta_artifacts,
+            document_ids=document_ids,
+        )
+        if projection_state.discovered_entity_ids or projection_state.traversed_rel_ids:
+            projected_base_state = _merge_states(base.state, projection_state)
+            (
+                projected_context,
+                projected_entities_used,
+                projected_relationships_used,
+                projected_rel_context,
+            ) = await _build_context(
+                projected_base_state,
+                collection,
+                document_ids=document_ids,
+            )
+            base = replace(
+                base,
+                context=projected_context,
+                entities_used=projected_entities_used,
+                relationships_used=projected_relationships_used,
+                rel_context=projected_rel_context,
+                state=projected_base_state,
+            )
 
     if meta_artifacts:
         meta_sections = "\n\n".join(
