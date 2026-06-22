@@ -59,7 +59,7 @@ _RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
     "Retrieve relationship descriptions that best explain the user's question, "
     "especially causes, mechanisms, tensions, and energy depletion."
 )
-_MIX_REWRITE_MIN_SCORE = 0.55
+_MIX_REWRITE_MIN_SCORE = 0.1
 _REL_ENDPOINT_ENTITY_SCORE_MIN = 0.0
 _META_PROJECTION_ENTITY_SCORE = 0.96
 _META_PROJECTION_EDGE_BASE_SCORE = 0.72
@@ -1905,17 +1905,17 @@ async def _interpret_mix_queries(
     }
 
     prompt = (
-        "You are preparing retrieval queries for a knowledge graph.\n"
-        "Use only the entity names from the candidate list.\n"
-        "Select up to 8 relevant entities for the user's question.\n"
-        "Then produce 2 to 4 longer retrieval subqueries.\n"
-        "Each subquery should be one sentence, around 12 to 30 words, and target "
-        "a separate explanatory dimension of the question.\n"
-        "Use selected entity names heavily, but keep the subqueries semantically "
-        "specific instead of turning them into short keyword bags.\n"
-        "Favor dimensions like mechanism, energetic depletion, counterbalance, "
-        "and the user's stated contrast or objection.\n"
-        "Preserve the user's distinctions and negations.\n\n"
+        "You are rewriting a user's question using entity names from a knowledge "
+        "graph so that vector retrieval can find relevant relationships.\n"
+        "The original question may not mention any graph entities by name.\n"
+        "Your job is to reformulate it using the candidate entity names so the "
+        "graph's stored relationships are more likely to match.\n\n"
+        "Select up to 8 relevant entities from the candidate list.\n"
+        "Then produce 2 to 4 short retrieval subqueries.\n"
+        "Each subquery should be a concise phrase or simple question (under 10 "
+        "words) that uses selected entity names and targets the topic of the "
+        "original question.\n"
+        "Think of these as search queries, not essay questions.\n\n"
         f"User question:\n{question}\n\n"
         "Candidate entities:\n"
         f"{chr(10).join(entity_lines)}"
