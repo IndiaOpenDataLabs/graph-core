@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 @dramatiq.actor(
     queue_name="enhance_jobs",
     max_retries=3,
-    max_age=7200000,
+    max_age=3600000,
     time_limit=float("inf"),
 )
 async def run_enhance(job_id: str):

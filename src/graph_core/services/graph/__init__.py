@@ -2638,7 +2638,7 @@ class GraphService:
             if status in ("completed", "failed", "cancelled"):
                 job.completed_at = datetime.now(UTC)
             await session.commit()
-        if job_type == "enhance" and status in ("completed", "failed", "cancelled"):
+        if job_type in {"query", "enhance"} and status in ("completed", "failed", "cancelled"):
             await purge_queued_job_messages([job_id])
 
     async def append_job_event(

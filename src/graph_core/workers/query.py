@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 @dramatiq.actor(
     queue_name="query_jobs",
     max_retries=0,
-    max_age=604800000,
+    max_age=3600000,
     time_limit=float("inf"),
 )
 async def run_query(job_id: str):
