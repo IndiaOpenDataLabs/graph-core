@@ -584,15 +584,20 @@ def _contains_entity_mention(question: str, candidate: str) -> bool:
     candidate = str(candidate or "").strip()
     if len(candidate) < 3:
         return False
-    question_norm = f" {question.casefold()} "
+    # Strip punctuation from the question so "aurobindo?" matches "aurobindo".
+    question_clean = question.casefold()
+    for ch in string.punctuation:
+        question_clean = question_clean.replace(ch, " ")
+    question_norm = " ".join(question_clean.split())
     candidate_norm = " ".join(candidate.casefold().split())
     if not candidate_norm:
         return False
-    padded = f" {candidate_norm} "
-    if padded in question_norm:
+    # Direct substring match after full punctuation stripping.
+    if candidate_norm in question_norm:
         return True
+    # Fuzzy: strip punctuation from candidate and check word boundary match.
     stripped = candidate_norm.strip(string.punctuation)
-    return bool(stripped and f" {stripped} " in question_norm)
+    return bool(stripped and stripped in question_norm)
 
 
 async def _mentioned_entity_rows(
@@ -683,7 +688,15 @@ async def _mentioned_entity_rows(
         if name
     ]
     rows.sort(key=lambda item: (item[3], len(item[1])), reverse=True)
-    return rows[:limit]
+    result = rows[:limit]
+    logger.info(
+        "graph_rag mentioned_entities collection=%s question=%r found=%d results=%s",
+        collection.name,
+        question,
+        len(result),
+        [(name, round(score, 4)) for _, name, _, score in result],
+    )
+    return result
 
 
 def _parse_source_ids(value: Any) -> list[str]:
