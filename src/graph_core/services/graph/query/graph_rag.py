@@ -66,7 +66,6 @@ _META_PROJECTION_ENTITY_SCORE = 0.96
 _META_PROJECTION_EDGE_BASE_SCORE = 0.72
 _META_PROJECTION_MAX_BASE_REFS = 40
 _META_PROJECTION_MAX_BASE_RELS = 80
-_BASE_ENTITY_REF_SUFFIX = " [base entity]"
 _MODE_ALIASES = {
     "local": "entity-first",
     "ent": "entity-first",
@@ -2477,8 +2476,6 @@ async def _meta_base_ref_names_from_artifacts(
                 if primary_type != "base_entity_ref":
                     continue
                 name = str(canonical_name or "").strip()
-                if name.endswith(_BASE_ENTITY_REF_SUFFIX):
-                    name = name[: -len(_BASE_ENTITY_REF_SUFFIX)].strip()
                 key = name.casefold()
                 if name and key not in seen:
                     seen.add(key)

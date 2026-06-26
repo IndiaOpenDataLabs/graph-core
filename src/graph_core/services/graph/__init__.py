@@ -2120,9 +2120,6 @@ class GraphService:
                     :96
                 ]
 
-            def base_ref_name(name: str) -> str:
-                return f"{name} [base entity]"
-
             async with AsyncSessionLocal() as session:
                 node_id_map: dict[str, uuid.UUID] = {}
                 for region_entry in region_entries:
@@ -2181,19 +2178,12 @@ class GraphService:
                             source_chunk_hash,
                         )
                     for name in member_names[:10]:
-                        resolved_ref_name = base_ref_name(name)
                         ref_id = await resolver.resolve_entity(
                             session=session,
-                            name=resolved_ref_name,
+                            name=name,
                             entity_type="base_entity_ref",
                             description=f"Reference to base graph entity: {name}.",
                             source_chunk_hash=source_chunk_hash,
-                        )
-                        await resolver._add_alias(
-                            session,
-                            ref_id.entity_id,
-                            name,
-                            source_chunk_hash,
                         )
                         member_ref_ids[name] = ref_id.entity_id
                         rel_result = await resolver.resolve_relationship(
@@ -2232,7 +2222,7 @@ class GraphService:
                             [
                                 {
                                     "id": str(ref_entity_id),
-                                    "name": base_ref_name(name),
+                                    "name": name,
                                     "collection_id": str(meta_collection.id),
                                 }
                             ]
@@ -2352,19 +2342,13 @@ class GraphService:
                 primary_type = (
                     str(node.get("primary_type") or "concept").strip() or "concept"
                 )
-                original_canonical_name = canonical_name
-                resolved_name = (
-                    f"{canonical_name} [base entity]"
-                    if primary_type == "base_entity_ref"
-                    else canonical_name
-                )
                 descriptions = [
                     str(value).strip()
                     for value in node.get("descriptions", [])
                     if str(value).strip()
                 ]
                 description = (
-                    max(descriptions, key=len) if descriptions else original_canonical_name
+                    max(descriptions, key=len) if descriptions else canonical_name
                 )
                 source_ids = sorted(
                     {
@@ -2378,19 +2362,12 @@ class GraphService:
                 ).hexdigest()
                 resolved = await resolver.resolve_entity(
                     session=session,
-                    name=resolved_name,
+                    name=canonical_name,
                     entity_type=primary_type,
                     description=description,
                     source_chunk_hash=source_chunk_hash,
                 )
                 canonical_name_to_entity_id[canonical_name] = resolved.entity_id
-                if primary_type == "base_entity_ref":
-                    await resolver._add_alias(
-                        session,
-                        resolved.entity_id,
-                        original_canonical_name,
-                        source_chunk_hash,
-                    )
                 for alias in sorted(
                     {
                         str(value).strip()
