@@ -119,6 +119,58 @@ async def test_update_collection_rejects_direct_meta_rename(service, test_namesp
 
 
 @pytest.mark.asyncio
+async def test_delete_collection_purges_active_jobs(service, test_namespace):
+    root_id = uuid.uuid4()
+    active_job_id = uuid.uuid4()
+    inactive_job_id = uuid.uuid4()
+
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Collection(
+                id=root_id,
+                namespace_id=test_namespace.id,
+                name="deleting",
+                strategy="vector",
+                embedding_dimensions=256,
+            )
+        )
+        session.add(
+            Job(
+                id=active_job_id,
+                namespace_id=test_namespace.id,
+                collection_id=root_id,
+                job_type="ingest_document",
+                status="running",
+            )
+        )
+        session.add(
+            Job(
+                id=inactive_job_id,
+                namespace_id=test_namespace.id,
+                collection_id=root_id,
+                job_type="ingest_document",
+                status="completed",
+            )
+        )
+        await session.commit()
+
+    fake_storage = AsyncMock()
+    fake_storage.drop = AsyncMock()
+
+    with (
+        patch("graph_core.services.graph.purge_queued_job_messages", new=AsyncMock()) as mock_purge,
+        patch("graph_core.services.graph.drop_all_tables", new=AsyncMock()),
+        patch("graph_core.services.graph.FalkorDBGraphStorage", return_value=fake_storage),
+    ):
+        await service.delete_collection(root_id)
+
+    mock_purge.assert_awaited_once()
+    purged_job_ids = list(mock_purge.await_args.args[0])
+    assert active_job_id in purged_job_ids
+    assert inactive_job_id in purged_job_ids
+
+
+@pytest.mark.asyncio
 async def test_create_collection_invalid_namespace(service):
     with pytest.raises(ValueError, match="not found"):
         await service.create_collection(
@@ -407,9 +459,21 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
                     "evidence_region_ids": ["role_group_1"],
                 },
             )
+        on_meta_edge = kwargs.get("on_meta_edge")
+        meta_edge = {
+            "source_id": "concept-1",
+            "target_id": "concept-2",
+            "id": "concept-1__CONNECTS_TO__concept-2",
+            "rel_type": "CONNECTS_TO",
+            "description": "concept link",
+            "keywords": [],
+            "source_ids": ["node-1"],
+        }
+        if on_meta_edge is not None:
+            await on_meta_edge(meta_edge)
         return {
             "nodes": [{"id": "concept-1", "type": "derived_concept"}],
-            "edges": [],
+            "edges": [meta_edge],
             "chunks": [],
             "candidate_region_count": 1,
         }

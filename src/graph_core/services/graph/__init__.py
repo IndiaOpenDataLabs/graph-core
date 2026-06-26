@@ -46,7 +46,10 @@ from graph_core.services.graph.ingestion.document_pipeline import (
     DocumentIngestionResult,
     enqueue_document_ingestion_job,
     ingest_document_pipeline,
+    is_job_cancelled,
+    mark_jobs_cancelled,
     process_single_chunk,
+    purge_queued_job_messages,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     update_chunk_status as _update_chunk_status,
@@ -497,6 +500,7 @@ class GraphService:
         return await extractor.extract_with_gleaning(
             text=text,
             max_gleaning=max(0, int(collection.gleaning_passes or 0)),
+            domain="chat",
         )
 
     async def _merge_chat_semantic_node(
@@ -1577,6 +1581,16 @@ class GraphService:
             collection.namespace_id,
             root_name,
         )
+        collection_ids_to_delete = [collection.id, *(descendant.id for descendant in descendants)]
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Job.id).where(
+                    Job.collection_id.in_(collection_ids_to_delete),
+                )
+            )
+            job_ids = list(result.scalars().all())
+        if job_ids:
+            await purge_queued_job_messages(job_ids)
         for descendant in reversed(descendants):
             descendant_level = self._meta_collection_level(descendant.name)
             if descendant_level <= level:
@@ -2543,11 +2557,36 @@ class GraphService:
                     node_id_map=node_id_map,
                 )
 
+            async def on_meta_edge(edge: dict[str, Any]) -> None:
+                nonlocal meta_collection, embedding_provider, graph_storage
+                if meta_collection is None:
+                    meta_collection = await self._prepare_meta_collection(
+                        source_collection,
+                        namespace_id,
+                        target_level,
+                    )
+                    embedding_provider = (
+                        await self._resolve_collection_embedding_provider(
+                            meta_collection
+                        )
+                    )
+                    graph_storage = self._graph_storage(meta_collection)
+                if embedding_provider is None or graph_storage is None:
+                    raise RuntimeError("Enhance meta collection was not initialized")
+                await self._materialize_meta_edges(
+                    meta_collection,
+                    [edge],
+                    node_id_map,
+                    embedding_provider=embedding_provider,
+                    graph_storage=graph_storage,
+                )
+
             understanding = await build_collection_understanding(
                 analysis,
                 llm_provider=llm_provider,
                 region_batch_size=region_batch_size,
                 on_region_concept=on_region_concept,
+                on_meta_edge=on_meta_edge,
             )
             candidate_region_count = int(
                 understanding.get("candidate_region_count") or 0
@@ -2561,14 +2600,6 @@ class GraphService:
                 )
             if embedding_provider is None or graph_storage is None:
                 raise RuntimeError("Enhance did not initialize materialization state")
-            await self._materialize_meta_edges(
-                meta_collection,
-                list(understanding.get("edges") or []),
-                node_id_map,
-                embedding_provider=embedding_provider,
-                graph_storage=graph_storage,
-            )
-
             kind_counts: dict[str, int] = {}
             for node in understanding["nodes"]:
                 node_type = str(node.get("type") or "unknown")
@@ -2629,6 +2660,9 @@ class GraphService:
         self, job_id: uuid.UUID, event_type: str, payload: dict | None = None
     ):
         async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                return
             event = JobEvent(job_id=job_id, event_type=event_type, payload=payload)
             session.add(event)
             await session.commit()

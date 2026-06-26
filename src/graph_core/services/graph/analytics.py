@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from collections import Counter, defaultdict
@@ -37,6 +39,7 @@ from graph_core.models.rel_types import rel_types_for_domain
 class NodeRecord:
     id: uuid.UUID
     name: str
+    primary_type: str = ""
 
 
 @dataclass(slots=True)
@@ -57,6 +60,70 @@ _NON_CODE_REL_TYPES = {
     for value in rel_types_for_domain(domain)
 }
 _CODE_ONLY_REL_TYPES = _CODE_REL_TYPES - _NON_CODE_REL_TYPES
+
+
+# Enhancement defaults favor broader, burner-like recall.
+_ROLE_GROUP_OVERLAP_MIN = 2
+_ROLE_GROUP_COSINE_MIN = 0.2
+_ROLE_GROUP_JACCARD_MIN = 0.1
+_ROLE_GROUP_MIN_SIGNATURE = 1
+
+_EDGE_FAMILY_ORDER: tuple[str, ...] = (
+    "definitional",
+    "taxonomic",
+    "compositional",
+    "causal",
+    "regulatory",
+    "therapeutic",
+    "constraint",
+    "temporal",
+    "supporting_evidence",
+    "representation",
+    "application_use",
+    "location_path",
+    "bibliographic",
+    "associative",
+    "generic_other",
+)
+
+_ROLE_TOKEN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "of",
+    "on",
+    "or",
+    "part",
+    "the",
+    "to",
+    "with",
+}
+
+_FLOW_TEMPLATES: dict[str, list[dict[str, object]]] = {
+    "definition_to_representation": [
+        {"step": "definition_or_taxonomy", "families": {"definitional", "taxonomic", "compositional"}},
+        {"step": "representation_or_expression", "families": {"representation", "supporting_evidence", "application_use"}},
+    ],
+    "constraint_to_complexity": [
+        {"step": "constraint_or_contrast", "families": {"constraint"}},
+        {"step": "extension_or_generalization", "families": {"taxonomic", "causal", "representation"}},
+    ],
+    "application_to_theory": [
+        {"step": "application_or_use", "families": {"application_use", "regulatory", "therapeutic"}},
+        {"step": "evidence_or_theory", "families": {"supporting_evidence", "representation", "definitional"}},
+    ],
+    "causal_evidence_flow": [
+        {"step": "cause_or_mechanism", "families": {"causal", "regulatory", "therapeutic"}},
+        {"step": "support_or_evidence", "families": {"supporting_evidence", "representation", "definitional"}},
+    ],
+}
 
 
 def _is_code_like_collection(relationship_records: list[dict[str, Any]]) -> bool:
@@ -94,6 +161,197 @@ def _code_concept_prompt_guidance() -> str:
         "WHILE, TRY/CATCH, RETURNS, SPLITS INTO, or MERGES WITH. Do not invent "
         "control flow beyond the evidence."
     )
+
+
+def _edge_family_for(
+    *,
+    rel_type: str,
+    source_name: str,
+    target_name: str,
+) -> str:
+    text = " ".join(
+        [
+            rel_type.upper().replace("_", " "),
+            source_name.lower(),
+            target_name.lower(),
+        ]
+    )
+    rel = rel_type.upper()
+
+    if any(token in rel for token in ("AUTHOR", "PUBLISHER", "PUBLICATION", "CITES")):
+        return "bibliographic"
+    if any(token in rel for token in ("CONTRA", "LIMIT", "AVOID", "PROHIBIT", "RESTRICT")):
+        return "constraint"
+    if any(token in rel for token in ("PRECEDE", "FOLLOW", "BEFORE", "AFTER", "DURATION", "SEQUENCE")):
+        return "temporal"
+    if any(token in rel for token in ("LOCATED", "TRAVEL", "PASS", "EXTEND", "PATH", "THROUGH", "NEAR", "BETWEEN", "ALONG")):
+        return "location_path"
+    if any(token in rel for token in ("PART", "CONTAIN", "INCLUDE", "COMPOSE", "CHAPTER", "COMPONENT")):
+        return "compositional"
+    if any(token in rel for token in ("IS_A", "INSTANCE", "VARIATION", "SUBTYPE", "CLASSIF", "CATEGOR", "LINEAGE")):
+        return "taxonomic"
+    if any(token in rel for token in ("DEFINE", "ATTRIBUTE", "QUALITY", "CHARACTER", "IDENTIF", "INDICATE")):
+        return "definitional"
+    if any(token in rel for token in ("SUPPORT", "EVIDENCE", "INFORM", "REFERENCE", "DISCUSS", "COVER", "TOPIC", "EXAMPLE", "STUDIED")):
+        return "supporting_evidence"
+    if any(token in rel for token in ("CONNECT", "CORRESPOND", "DESCRIBE", "EXPLAIN", "REPRESENT", "MAP", "SYMBOL")):
+        return "representation"
+    if any(token in rel for token in ("USE", "UTILIZ", "APPL", "REQUIRE", "INVOLVE", "TARGET", "GUIDE", "FACILITATE", "ENABLE", "ASSIST")):
+        return "application_use"
+    if any(token in rel for token in ("CONTROL", "REGULAT", "BALANCE", "MAINTAIN", "GOVERN", "STIMULAT", "ACTIVAT", "AWAKEN", "ENHANCE")):
+        return "regulatory"
+    if any(token in rel for token in ("TREAT", "ALLEVIAT", "CALM", "IMPROVE", "REDUCE", "ELIMINAT", "PURIF", "STRENGTHEN", "BENEFIT")):
+        return "therapeutic"
+    if any(token in rel for token in ("CAUSE", "LEAD", "RESULT", "INFLUENCE", "PRODUCE", "INDUCE", "TRIGGER", "CREATE", "AFFECT", "ALTER", "DEVELOP")):
+        return "causal"
+    if any(token in text for token in ("practice", "technique", "method", "uses", "used in")):
+        return "application_use"
+    if any(token in text for token in ("effect", "outcome", "state", "sensation", "manifests")):
+        return "causal"
+    if any(token in rel for token in ("ASSOCIATED", "RELATED", "INTERACT", "COMBINED", "CO_EQUAL")):
+        return "associative"
+    return "generic_other"
+
+
+def _tokens_for_role_name(name: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z][a-z0-9]{2,}", name.lower())
+        if token not in _ROLE_TOKEN_STOPWORDS and not token.isdigit()
+    ]
+
+
+def _primary_family(counts: Counter[str]) -> str:
+    non_generic = Counter(
+        {
+            family: count
+            for family, count in counts.items()
+            if family != "generic_other" and count > 0
+        }
+    )
+    source = non_generic or counts
+    if not source:
+        return "generic_other"
+    return max(
+        source,
+        key=lambda family: (
+            source[family],
+            -_EDGE_FAMILY_ORDER.index(family)
+            if family in _EDGE_FAMILY_ORDER
+            else -len(_EDGE_FAMILY_ORDER),
+        ),
+    )
+
+
+def _direction_role(out_count: int, in_count: int) -> str:
+    total = out_count + in_count
+    if total == 0:
+        return "isolated"
+    if out_count >= in_count * 2:
+        return "source"
+    if in_count >= out_count * 2:
+        return "sink"
+    return "bridge"
+
+
+def _dynamic_role_label(
+    *,
+    primary_family: str,
+    direction_role: str,
+    top_tokens: list[str],
+) -> str:
+    token_text = " / ".join(top_tokens[:3]) if top_tokens else "mixed terms"
+    return f"{primary_family.replace('_', ' ').title()} {direction_role.title()}: {token_text}"
+
+
+def _json_from_llm_text(text: str) -> Any:
+    content = text.strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+    return json.loads(content)
+
+
+def _find_template_paths_for_anchor(
+    relationships: list[RelationshipRecord],
+    *,
+    start_name: str,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    out_edges: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for rel in relationships:
+        raw_rel_type = str(rel.rel_type or "RELATES_TO").upper()
+        family = _edge_family_for(
+            rel_type=raw_rel_type,
+            source_name=rel.source_name,
+            target_name=rel.target_name,
+        )
+        out_edges[rel.source_name].append(
+            {
+                "source": rel.source_name,
+                "target": rel.target_name,
+                "rel_type": raw_rel_type,
+                "edge_family": family,
+                "weight": float(rel.weight or 0.0),
+            }
+        )
+
+    paths: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[tuple[str, str, str], ...]]] = set()
+    for template_name, template in _FLOW_TEMPLATES.items():
+        if len(template) != 2:
+            continue
+        first_allowed = set(template[0]["families"])
+        second_allowed = set(template[1]["families"])
+        first_edges = [
+            edge for edge in out_edges.get(start_name, [])
+            if edge["edge_family"] in first_allowed
+        ]
+        first_edges.sort(
+            key=lambda edge: (-float(edge["weight"]), str(edge["edge_family"]), str(edge["target"]))
+        )
+        for first in first_edges[:12]:
+            second_edges = [
+                edge for edge in out_edges.get(str(first["target"]), [])
+                if edge["edge_family"] in second_allowed
+            ]
+            second_edges.sort(
+                key=lambda edge: (-float(edge["weight"]), str(edge["edge_family"]), str(edge["target"]))
+            )
+            for second in second_edges[:8]:
+                key = (
+                    template_name,
+                    (
+                        (first["source"], first["rel_type"], first["target"]),
+                        (second["source"], second["rel_type"], second["target"]),
+                    ),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                paths.append(
+                    {
+                        "template": template_name,
+                        "steps": [str(template[0]["step"]), str(template[1]["step"])],
+                        "nodes": [first["source"], first["target"], second["target"]],
+                        "edges": [first, second],
+                        "score": round(float(first["weight"]) + float(second["weight"]), 3),
+                    }
+                )
+    paths.sort(
+        key=lambda item: (
+            -float(item["score"]),
+            str(item["template"]),
+            tuple(str(node) for node in item["nodes"]),
+        )
+    )
+    return paths[:limit]
 
 
 def _format_connects_to_description(
@@ -153,10 +411,10 @@ def _build_role_similarity_groups(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
     *,
-    overlap_min: int = 2,
-    cosine_min: float = 0.0,
-    jaccard_min: float = 0.0,
-    min_signature: int = 1,
+    overlap_min: int = _ROLE_GROUP_OVERLAP_MIN,
+    cosine_min: float = _ROLE_GROUP_COSINE_MIN,
+    jaccard_min: float = _ROLE_GROUP_JACCARD_MIN,
+    min_signature: int = _ROLE_GROUP_MIN_SIGNATURE,
 ) -> list[dict[str, Any]]:
     if not relationships:
         return []
@@ -170,18 +428,17 @@ def _build_role_similarity_groups(
     for rel in relationships:
         source_id = str(rel.source_id)
         target_id = str(rel.target_id)
-        rel_type = str(rel.rel_type or "RELATES_TO").upper()
         all_node_ids.add(source_id)
         all_node_ids.add(target_id)
-        out_pairs[source_id].add((rel_type, target_id))
-        in_pairs[target_id].add((source_id, rel_type))
+        out_pairs[source_id].add(("out", target_id))
+        in_pairs[target_id].add(("in", source_id))
         relationship_records_by_node[source_id].append(
             {
                 "source_id": source_id,
                 "source_name": rel.source_name,
                 "target_id": target_id,
                 "target_name": rel.target_name,
-                "rel_type": rel_type,
+                "rel_type": str(rel.rel_type or "RELATES_TO").upper(),
                 "weight": float(rel.weight or 0.0),
                 "direction": "out",
                 "relationship_id": str(rel.id),
@@ -193,7 +450,7 @@ def _build_role_similarity_groups(
                 "source_name": rel.source_name,
                 "target_id": target_id,
                 "target_name": rel.target_name,
-                "rel_type": rel_type,
+                "rel_type": str(rel.rel_type or "RELATES_TO").upper(),
                 "weight": float(rel.weight or 0.0),
                 "direction": "in",
                 "relationship_id": str(rel.id),
@@ -317,6 +574,299 @@ def _build_role_similarity_groups(
     return ranked_groups
 
 
+def _build_dynamic_anchor_regions(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+    *,
+    role_count: int = 100,
+    min_bucket_size: int = 5,
+    anchors_per_role: int = 1,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not relationships:
+        return [], []
+
+    node_name_by_id = {str(node.id): node.name for node in nodes}
+    incident_family_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    out_family_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    in_family_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    incident_rel_type_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    incident_rels: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    all_node_ids: set[str] = set()
+
+    for rel in relationships:
+        source_id = str(rel.source_id)
+        target_id = str(rel.target_id)
+        raw_rel_type = str(rel.rel_type or "RELATES_TO").upper()
+        family = _edge_family_for(
+            rel_type=raw_rel_type,
+            source_name=rel.source_name,
+            target_name=rel.target_name,
+        )
+        weight = float(rel.weight or 0.0)
+        all_node_ids.update((source_id, target_id))
+        out_family_counts[source_id][family] += 1
+        in_family_counts[target_id][family] += 1
+        for node_id, direction in ((source_id, "out"), (target_id, "in")):
+            incident_family_counts[node_id][family] += 1
+            incident_rel_type_counts[node_id][raw_rel_type] += 1
+            incident_rels[node_id].append(
+                {
+                    "source_id": source_id,
+                    "source_name": rel.source_name,
+                    "target_id": target_id,
+                    "target_name": rel.target_name,
+                    "rel_type": raw_rel_type,
+                    "edge_family": family,
+                    "weight": weight,
+                    "direction": direction,
+                    "relationship_id": str(rel.id),
+                }
+            )
+
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    for node_id in sorted(all_node_ids):
+        node_name = node_name_by_id.get(node_id, node_id)
+        family = _primary_family(incident_family_counts[node_id])
+        out_count = sum(out_family_counts[node_id].values())
+        in_count = sum(in_family_counts[node_id].values())
+        direction = _direction_role(out_count, in_count)
+        bucket = buckets.setdefault(
+            (family, direction),
+            {
+                "primary_family": family,
+                "direction_role": direction,
+                "nodes": [],
+                "family_counts": Counter(),
+                "rel_type_counts": Counter(),
+                "token_counts": Counter(),
+                "total_degree": 0,
+            },
+        )
+        degree = out_count + in_count
+        bucket["nodes"].append(
+            {
+                "node_id": node_id,
+                "node_name": node_name,
+                "degree": degree,
+                "out_degree": out_count,
+                "in_degree": in_count,
+                "edge_family_counts": dict(incident_family_counts[node_id].most_common()),
+                "rel_type_counts": dict(incident_rel_type_counts[node_id].most_common(8)),
+            }
+        )
+        bucket["family_counts"].update(incident_family_counts[node_id])
+        bucket["rel_type_counts"].update(incident_rel_type_counts[node_id])
+        bucket["token_counts"].update(_tokens_for_role_name(node_name))
+        bucket["total_degree"] += degree
+
+    role_profiles: list[dict[str, Any]] = []
+    for (family, direction), bucket in buckets.items():
+        bucket_nodes = bucket["nodes"]
+        if len(bucket_nodes) < min_bucket_size:
+            continue
+        top_tokens = [token for token, _ in bucket["token_counts"].most_common(8)]
+        role_id = f"{family}_{direction}"
+        role_profiles.append(
+            {
+                "role_id": role_id,
+                "label": _dynamic_role_label(
+                    primary_family=family,
+                    direction_role=direction,
+                    top_tokens=top_tokens,
+                ),
+                "primary_family": family,
+                "direction_role": direction,
+                "node_count": len(bucket_nodes),
+                "total_degree": bucket["total_degree"],
+                "top_tokens": top_tokens,
+                "edge_family_counts": dict(bucket["family_counts"].most_common()),
+                "rel_type_counts": dict(bucket["rel_type_counts"].most_common(12)),
+                "sample_nodes": [
+                    item["node_name"]
+                    for item in sorted(
+                        bucket_nodes,
+                        key=lambda item: (-int(item["degree"]), str(item["node_name"])),
+                    )[:12]
+                ],
+                "_nodes": bucket_nodes,
+            }
+        )
+    role_profiles.sort(
+        key=lambda item: (
+            item["primary_family"] == "generic_other",
+            -int(item["node_count"]),
+            -int(item["total_degree"]),
+            str(item["role_id"]),
+        )
+    )
+    selected_profiles = role_profiles[: max(0, role_count)]
+
+    candidate_regions: list[dict[str, Any]] = []
+    selected_anchor_ids: set[str] = set()
+    for profile in selected_profiles:
+        ranked_nodes = sorted(
+            profile["_nodes"],
+            key=lambda item: (-int(item["degree"]), str(item["node_name"])),
+        )
+        kept = 0
+        for anchor in ranked_nodes:
+            anchor_id = str(anchor["node_id"])
+            anchor_name = str(anchor["node_name"])
+            if anchor_id in selected_anchor_ids:
+                continue
+            selected_anchor_ids.add(anchor_id)
+            kept += 1
+            rels = sorted(
+                incident_rels.get(anchor_id, []),
+                key=lambda item: (
+                    -float(item["weight"]),
+                    str(item["edge_family"]),
+                    str(item["source_name"]),
+                    str(item["target_name"]),
+                ),
+            )
+            representative_edges = rels[:16]
+            source_ids = {anchor_id}
+            entity_names = {anchor_name}
+            for rel in representative_edges[:10]:
+                source_ids.add(str(rel["source_id"]))
+                source_ids.add(str(rel["target_id"]))
+                entity_names.add(str(rel["source_name"]))
+                entity_names.add(str(rel["target_name"]))
+            template_paths = _find_template_paths_for_anchor(
+                relationships,
+                start_name=anchor_name,
+                limit=3,
+            )
+            for path in template_paths:
+                entity_names.update(str(node) for node in path.get("nodes", []))
+            role_id = str(profile["role_id"])
+            role_profile = {
+                key: value
+                for key, value in profile.items()
+                if key != "_nodes"
+            }
+            candidate_regions.append(
+                {
+                    "region_id": f"dynamic_{role_id}_{len(candidate_regions) + 1}",
+                    "kind": "dynamic_anchor",
+                    "title": f"{anchor_name} [{role_profile['label']}]",
+                    "description": (
+                        f"Dynamic anchor '{anchor_name}' selected from role "
+                        f"{role_profile['label']} ({role_id}). "
+                        f"Primary edge family: {profile['primary_family']}; "
+                        f"directional role: {profile['direction_role']}; "
+                        f"degree: {anchor['degree']}."
+                    ),
+                    "source_ids": sorted(source_ids),
+                    "entity_names": sorted(entity_names),
+                    "rel_types": list(anchor["rel_type_counts"].keys()),
+                    "representative_edges": representative_edges,
+                    "pair_metrics": [],
+                    "anchor": anchor_name,
+                    "anchor_id": anchor_id,
+                    "dynamic_role": role_profile,
+                    "template_paths": template_paths,
+                }
+            )
+            if kept >= anchors_per_role:
+                break
+
+    diagnostics = [
+        {
+            key: value
+            for key, value in profile.items()
+            if key != "_nodes"
+        }
+        for profile in selected_profiles
+    ]
+    return candidate_regions, diagnostics
+
+
+async def _refine_dynamic_role_profiles(
+    collection_name: str,
+    role_profiles: list[dict[str, Any]],
+    llm_provider: LLMProvider | None,
+) -> dict[str, dict[str, str]]:
+    if not llm_provider or isinstance(llm_provider, LocalEchoLLMProvider) or not role_profiles:
+        return {}
+    compact_profiles = [
+        {
+            "role_id": profile["role_id"],
+            "structural_label": profile["label"],
+            "primary_family": profile["primary_family"],
+            "direction_role": profile["direction_role"],
+            "node_count": profile["node_count"],
+            "top_tokens": profile["top_tokens"][:8],
+            "top_rel_types": list(profile["rel_type_counts"])[:8],
+            "sample_nodes": profile["sample_nodes"][:10],
+        }
+        for profile in role_profiles
+    ]
+    schema = {
+        "type": "object",
+        "properties": {
+            "roles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "description": {"type": "string"},
+                        "anchor_selection_hint": {"type": "string"},
+                    },
+                    "required": ["role_id", "label", "description", "anchor_selection_hint"],
+                },
+            }
+        },
+        "required": ["roles"],
+    }
+    prompt = (
+        "You name graph role buckets for concept induction. "
+        "The buckets were created structurally from edge-family and directionality. "
+        "Convert each bucket into a concise, domain-meaningful human role label while preserving role_id exactly. "
+        "Prefer ontology roles such as Graph Representations, Foundational Definitions, Empirical Evidence, "
+        "Applications, Constraints, Components, or domain-specific equivalents when sample nodes support them.\n\n"
+        f"Collection: {collection_name}\n"
+        f"Role buckets: {json.dumps(compact_profiles, ensure_ascii=True)}"
+    )
+    try:
+        parsed = await llm_provider.structured_extract(prompt=prompt, schema=schema)
+    except Exception:
+        try:
+            raw = await llm_provider.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "Return only valid JSON with key roles.",
+                    },
+                    {"role": "user", "content": prompt},
+                ]
+            )
+            parsed = _json_from_llm_text(raw)
+        except Exception:
+            return {}
+    roles = parsed.get("roles") if isinstance(parsed, dict) else parsed
+    if not isinstance(roles, list):
+        return {}
+    valid_role_ids = {str(profile["role_id"]) for profile in role_profiles}
+    refinements: dict[str, dict[str, str]] = {}
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        role_id = str(role.get("role_id") or "")
+        label = str(role.get("label") or "").strip()
+        if role_id not in valid_role_ids or not label:
+            continue
+        refinements[role_id] = {
+            "label": label,
+            "description": str(role.get("description") or "").strip(),
+            "anchor_selection_hint": str(role.get("anchor_selection_hint") or "").strip(),
+        }
+    return refinements
+
+
 def _shortest_paths_between_sets(
     adjacency: dict[uuid.UUID, list[tuple[uuid.UUID, str, float]]],
     starts: set[uuid.UUID],
@@ -398,11 +948,21 @@ async def _load_graph_records(
 
         nodes = (
             await session.execute(
-                select(GraphEntity.id, GraphEntity.canonical_name).where(
+                select(
+                    GraphEntity.id,
+                    GraphEntity.canonical_name,
+                    GraphEntity.primary_type,
+                ).where(
                     GraphEntity.collection_id == collection_id
                 )
             )
         ).all()
+
+        non_ref_entity_ids = {
+            entity_id
+            for entity_id, _, primary_type in nodes
+            if str(primary_type or "").strip() != "base_entity_ref"
+        }
 
         source_entity = aliased(GraphEntity)
         target_entity = aliased(GraphEntity)
@@ -450,7 +1010,11 @@ async def _load_graph_records(
 
     return (
         collection,
-        [NodeRecord(id=node_id, name=name) for node_id, name in nodes],
+        [
+            NodeRecord(id=node_id, name=name, primary_type=str(primary_type or ""))
+            for node_id, name, primary_type in nodes
+            if node_id in non_ref_entity_ids
+        ],
         [
             RelationshipRecord(
                 id=rel_id,
@@ -470,6 +1034,7 @@ async def _load_graph_records(
                 rel_type,
                 weight,
             ) in relationships
+            if source_id in non_ref_entity_ids and target_id in non_ref_entity_ids
         ],
         {
             entity_id: sorted({alias for alias in aliases})
@@ -522,6 +1087,14 @@ async def analyze_collection_graph(
         }
         for rel in relationships
     ]
+    analysis["node_records"] = [
+        {
+            "id": str(node.id),
+            "name": node.name,
+            "primary_type": node.primary_type,
+        }
+        for node in nodes
+    ]
     return analysis
 
 
@@ -531,10 +1104,14 @@ async def build_collection_understanding(
     region_batch_size: int = 1,
     on_region_concept: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
     | None = None,
+    on_meta_edge: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
     max_deterministic_link_pairs = 64
     max_deterministic_meta_edges = 96
+    min_concept_link_direct_count = 2
+    min_concept_link_direct_weight = 3.0
+    min_concept_link_distinct_rel_types = 2
     entity_aliases_by_id: dict[str, list[str]] = dict(
         analysis.get("entity_aliases_by_id") or {}
     )
@@ -613,24 +1190,24 @@ async def build_collection_understanding(
         description: str,
         source_ids: list[str] | None = None,
         keywords: list[str] | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         edge_id = f"{source_id}__{rel_type}__{target_id}"
         if edge_id in seen_edge_ids:
-            return
+            return None
         seen_edge_ids.add(edge_id)
-        edges.append(
-            {
-                "source_id": source_id,
-                "target_id": target_id,
-                "id": edge_id,
-                "collection_id": collection["id"],
-                "object_type": "relationship",
-                "rel_type": rel_type,
-                "description": description,
-                "keywords": keywords or [],
-                "source_ids": source_ids or [],
-            }
-        )
+        edge = {
+            "source_id": source_id,
+            "target_id": target_id,
+            "id": edge_id,
+            "collection_id": collection["id"],
+            "object_type": "relationship",
+            "rel_type": rel_type,
+            "description": description,
+            "keywords": keywords or [],
+            "source_ids": source_ids or [],
+        }
+        edges.append(edge)
+        return edge
 
     def normalize_map(scores: dict[str, float]) -> dict[str, float]:
         if not scores:
@@ -641,33 +1218,95 @@ async def build_collection_understanding(
         return {key: float(value) / float(max_value) for key, value in scores.items()}
 
     candidate_regions: list[dict[str, Any]] = []
-    role_groups = list(analysis.get("role_groups") or [])
-    for idx, group in enumerate(role_groups, start=1):
-        if int(group.get("size", 0)) < 2:
-            continue
-        representative_edges = group.get("representative_edges", [])
-        entity_names = list(group.get("node_names", []))[:24]
-        rel_types = list(group.get("top_rel_types", []))
-        pair_metrics = list(group.get("pair_metrics", []))
-        candidate_regions.append(
-            {
-                "region_id": f"role_group_{idx}",
-                "kind": "role_clique",
-                "title": f"Role clique of size {group['size']}: {', '.join(entity_names[:6])}",
-                "description": (
-                    f"Role-similarity clique of size {group['size']} with average cosine "
-                    f"{group['avg_cosine']} and average jaccard {group['avg_jaccard']}; "
-                    f"total typed-signature overlap {group['total_overlap']}. "
-                    f"Members: {', '.join(entity_names) or 'none'}. "
-                    f"Dominant relation types: {', '.join(rel_types) or 'none'}."
-                ),
-                "source_ids": list(group.get("node_ids", [])),
-                "entity_names": entity_names,
-                "rel_types": rel_types,
-                "representative_edges": representative_edges,
-                "pair_metrics": pair_metrics,
-            }
+    role_profiles: list[dict[str, Any]] = []
+    analysis_nodes = [
+        NodeRecord(
+            id=uuid.UUID(str(node["id"])),
+            name=str(node["name"]),
+            primary_type=str(node.get("primary_type") or ""),
         )
+        for node in analysis.get("node_records", [])
+        if str(node.get("id") or "").strip()
+    ]
+    analysis_relationships = [
+        RelationshipRecord(
+            id=uuid.UUID(str(rel["id"])),
+            source_id=uuid.UUID(str(rel["source_id"])),
+            source_name=str(rel["source_name"]),
+            target_id=uuid.UUID(str(rel["target_id"])),
+            target_name=str(rel["target_name"]),
+            rel_type=str(rel.get("rel_type") or "RELATES_TO"),
+            weight=int(rel.get("weight") or 0),
+        )
+        for rel in relationship_records
+        if str(rel.get("id") or "").strip()
+    ]
+    if analysis_nodes and analysis_relationships:
+        candidate_regions, role_profiles = _build_dynamic_anchor_regions(
+            analysis_nodes,
+            analysis_relationships,
+            role_count=100,
+            min_bucket_size=5,
+            anchors_per_role=1,
+        )
+        role_refinements = await _refine_dynamic_role_profiles(
+            str(collection["name"]),
+            role_profiles,
+            llm_provider,
+        )
+        if role_refinements:
+            for profile in role_profiles:
+                refinement = role_refinements.get(str(profile["role_id"]))
+                if refinement:
+                    profile["structural_label"] = profile["label"]
+                    profile["label"] = refinement["label"]
+                    profile["description"] = refinement["description"]
+                    profile["anchor_selection_hint"] = refinement["anchor_selection_hint"]
+            for region in candidate_regions:
+                role = dict(region.get("dynamic_role") or {})
+                refinement = role_refinements.get(str(role.get("role_id")))
+                if not refinement:
+                    continue
+                role["structural_label"] = role.get("label")
+                role["label"] = refinement["label"]
+                role["description"] = refinement["description"]
+                role["anchor_selection_hint"] = refinement["anchor_selection_hint"]
+                region["dynamic_role"] = role
+                region["title"] = f"{region.get('anchor')} [{role['label']}]"
+                region["description"] = (
+                    f"Dynamic anchor '{region.get('anchor')}' selected from role "
+                    f"{role['label']} ({role.get('role_id')}). "
+                    f"{role.get('description') or ''}"
+                ).strip()
+
+    if not candidate_regions:
+        role_groups = list(analysis.get("role_groups") or [])
+        for idx, group in enumerate(role_groups, start=1):
+            if int(group.get("size", 0)) < 2:
+                continue
+            representative_edges = group.get("representative_edges", [])
+            entity_names = list(group.get("node_names", []))[:24]
+            rel_types = list(group.get("top_rel_types", []))
+            pair_metrics = list(group.get("pair_metrics", []))
+            candidate_regions.append(
+                {
+                    "region_id": f"role_group_{idx}",
+                    "kind": "role_clique",
+                    "title": f"Role clique of size {group['size']}: {', '.join(entity_names[:6])}",
+                    "description": (
+                        f"Role-similarity clique of size {group['size']} with average cosine "
+                        f"{group['avg_cosine']} and average jaccard {group['avg_jaccard']}; "
+                        f"total neighborhood overlap {group['total_overlap']}. "
+                        f"Members: {', '.join(entity_names) or 'none'}. "
+                        f"Dominant relation types: {', '.join(rel_types) or 'none'}."
+                    ),
+                    "source_ids": list(group.get("node_ids", [])),
+                    "entity_names": entity_names,
+                    "rel_types": rel_types,
+                    "representative_edges": representative_edges,
+                    "pair_metrics": pair_metrics,
+                }
+            )
 
     fallback_concepts = []
     for region in candidate_regions:
@@ -714,6 +1353,12 @@ async def build_collection_understanding(
 
         async def induce_region_concept(region: dict[str, Any]) -> dict[str, Any]:
             rel_type = region["rel_types"][0] if region["rel_types"] else "RELATES_TO"
+            dynamic_role = dict(region.get("dynamic_role") or {})
+            template_paths_text = (
+                json.dumps(region.get("template_paths", [])[:3], ensure_ascii=True)
+                if region.get("template_paths")
+                else "none"
+            )
             directed_edges = (
                 "; ".join(
                     (
@@ -739,8 +1384,9 @@ async def build_collection_understanding(
             )
             code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
             prompt = (
-                "You are inducing one reusable semantic concept from a role-similarity clique in a knowledge graph.\n"
-                "The member entities are grouped because they occupy similar typed graph positions.\n"
+                "You are inducing one reusable semantic concept from a candidate region in a knowledge graph.\n"
+                "The candidate may be a dynamic anchor neighborhood or a role-similarity clique.\n"
+                "If a dynamic role label is present, center the concept on that functional role and its local evidence.\n"
                 "Do not return a mechanical label like cluster, graph region, connector, bridge, or clique.\n"
                 "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n"
                 "Prefer labels drawn directly from the collection's own terminology, especially source-language, tradition-specific, or text-native terms when they fit the evidence.\n"
@@ -756,12 +1402,16 @@ async def build_collection_understanding(
                 "Do not describe the answer as a graph, clique, cluster, or evidence chain. Describe the underlying mechanism or workflow itself.\n\n"
                 f"Collection: {collection['name']}\n"
                 f"Candidate id: {region['region_id']}\n"
+                f"Candidate kind: {region.get('kind')}\n"
                 f"Candidate title: {region['title']}\n"
                 f"Candidate description: {region['description']}\n"
+                f"Anchor: {region.get('anchor') or 'none'}\n"
+                f"Dynamic role: {json.dumps(dynamic_role, ensure_ascii=True) if dynamic_role else 'none'}\n"
                 f"Entities: {', '.join(region['entity_names'][:16]) or 'none'}\n"
                 f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
                 f"Pairwise role-similarity evidence: {pair_metrics_text}\n"
                 f"Representative neighborhood edges: {directed_edges}\n"
+                f"Template traversal paths: {template_paths_text}\n"
             )
             try:
                 concept = await llm_provider.structured_extract(
@@ -838,6 +1488,11 @@ async def build_collection_understanding(
     concept_labels_by_id: dict[str, str] = {}
     concept_descriptions_by_id: dict[str, str] = {}
     concept_region_ids_by_id: dict[str, list[str]] = {}
+    concept_label_keys = {
+        str(region_entry["concept"].get("label") or "").strip().casefold()
+        for region_entry in region_concepts
+        if str(region_entry["concept"].get("label") or "").strip()
+    }
     for region_entry in region_concepts:
         concept = region_entry["concept"]
         label = str(concept.get("label") or "").strip()
@@ -911,6 +1566,7 @@ async def build_collection_understanding(
             str(value).strip()
             for value in concept.get("member_entity_names", [])
             if str(value).strip()
+            and str(value).strip().casefold() not in concept_label_keys
         ]
         for name in member_names[:10]:
             ref_id = ensure_entity_ref(name, supporting_ids=source_ids)
@@ -981,7 +1637,13 @@ async def build_collection_understanding(
         )
 
     ranked_pairs = sorted(
-        pair_aggregates.values(),
+        (
+            bucket
+            for bucket in pair_aggregates.values()
+            if int(bucket["direct_count"]) >= min_concept_link_direct_count
+            or float(bucket["direct_weight"]) >= min_concept_link_direct_weight
+            or len(bucket["rel_counter"]) >= min_concept_link_distinct_rel_types
+        ),
         key=lambda item: (
             item["direct_weight"],
             item["direct_count"],
@@ -1041,7 +1703,7 @@ async def build_collection_understanding(
             | set(str(value) for value in bucket["source_ids"])
             | path_source_ids
         )
-        add_edge(
+        created_edge = add_edge(
             source_concept_id,
             target_concept_id,
             rel_type="CONNECTS_TO",
@@ -1061,6 +1723,8 @@ async def build_collection_understanding(
             source_ids=edge_source_ids,
             keywords=top_rel_types,
         )
+        if created_edge is not None and on_meta_edge is not None:
+            await on_meta_edge(created_edge)
         if len(
             [edge for edge in edges if "__EVIDENCED_BY__" not in edge["id"]]
         ) >= max_deterministic_meta_edges:

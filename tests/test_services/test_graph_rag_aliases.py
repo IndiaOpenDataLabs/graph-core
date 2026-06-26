@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,14 +13,23 @@ from graph_core.models.graph_rag import (
     GraphRelationshipType,
     RelationshipTypeAlias,
 )
+from graph_core.models.domain_config import CODE_REL_TYPE_TAXONOMY, get_domain_config
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
     build_collection_understanding,
+    NodeRecord,
+    RelationshipRecord,
+    _build_role_similarity_groups,
 )
 from graph_core.services.graph.query import graph_rag
-from graph_core.services.graph.query.graph_rag import GraphQueryState
+from graph_core.services.graph.query.graph_rag import (
+    DerivedRouteProfile,
+    DocumentRoutingDecision,
+    GraphQueryArtifacts,
+    GraphQueryState,
+)
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
 from graph_core.services.graph_rag.extractor import LLMGraphExtractor
 
@@ -48,6 +58,25 @@ class _FakeLLMProvider(LLMProvider):
             "importance_reason": "Useful for higher-level navigation.",
             "member_entity_names": ["Source", "Target"],
         }
+
+
+class _CodeExtractionLLMProvider(LLMProvider):
+    def __init__(self, response: dict) -> None:
+        self.response = response
+        self.prompts: list[str] = []
+        self.schemas: list[dict] = []
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "ok"
+
+    async def chat_stream(self, messages: list[dict]):
+        if False:
+            yield ""
+
+    async def structured_extract(self, prompt: str, schema: dict) -> dict:
+        self.prompts.append(prompt)
+        self.schemas.append(schema)
+        return self.response
 
 
 class _SessionFactory:
@@ -94,7 +123,7 @@ async def test_resolve_entity_reuses_case_insensitive_canonical_match(
 
     result = await resolver.resolve_entity(
         db_session,
-        name="oauth",
+        name="OAuth",
         entity_type="Protocol",
         description="Authorization framework",
         source_chunk_hash="chunk-1",
@@ -119,6 +148,27 @@ async def test_add_or_increment_type_awaits_async_session_execute(
     await resolver._add_or_increment_type(session, uuid.uuid4(), "Protocol")
 
     session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_acquire_entity_lock_uses_advisory_lock(
+    test_graph_rag_collection,
+):
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        test_graph_rag_collection.id,
+    )
+    session = AsyncMock()
+    session.bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    entity_id = uuid.uuid4()
+
+    await resolver._acquire_entity_lock(session, entity_id)
+
+    session.execute.assert_awaited_once()
+    sql_text, params = session.execute.await_args.args
+    assert "pg_advisory_xact_lock" in str(sql_text)
+    assert isinstance(params["lock_key"], int)
+    assert params["lock_key"] >= 0
 
 
 @pytest.mark.asyncio
@@ -185,6 +235,343 @@ def test_extractor_normalize_entity_name_preserves_casing():
     assert LLMGraphExtractor._normalize_entity_name("  OAuth SDK  ") == "OAuth SDK"
     assert LLMGraphExtractor._normalize_entity_name("iOS") == "iOS"
     assert LLMGraphExtractor._normalize_entity_name("JSON-LD") == "JSON-LD"
+
+
+@pytest.mark.asyncio
+async def test_code_domain_extractor_uses_fixed_taxonomy_buckets():
+    response = {
+        "relationships": {
+            "value_operations": {
+                "EVALUATE": [],
+                "COMPARE": [],
+                "CONVERT": [],
+                "CONSTRUCT": [],
+                "DESTRUCTURE": [],
+            },
+            "name_place_operations": {
+                "BIND": [],
+                "REBIND": [],
+                "MUTATE": [],
+                "ACCESS": [],
+            },
+            "control_operations": {
+                "BRANCH": [],
+                "ITERATE": [],
+                "CALL": [
+                    {
+                        "source": {
+                            "name": "build_query",
+                            "description": "Builds a query object.",
+                        },
+                        "target": {
+                            "name": "sanitize_input",
+                            "description": "Normalizes incoming input before assembly.",
+                        },
+                        "description": "build_query calls sanitize_input before query assembly.",
+                        "keywords": ["calls", "sanitize"],
+                        "weight": 0.95,
+                    }
+                ],
+                "RETURN": [],
+                "SIGNAL": [],
+                "HANDLE": [],
+            },
+            "effect_operations": {
+                "COMMUNICATE": [],
+                "ALLOCATE_RESOURCE": [],
+                "RELEASE_RESOURCE": [],
+                "SYNCHRONIZE": [],
+            },
+        },
+    }
+    llm = _CodeExtractionLLMProvider(response)
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract(
+        "def build_query():\n    sanitize_input(value)\n",
+        domain="code",
+    )
+
+    assert len(llm.schemas) == 1
+    assert llm.schemas[0]["title"] == "graph_rag_code_extraction"
+    prompt = llm.prompts[0]
+    for category_name, rel_types in CODE_REL_TYPE_TAXONOMY:
+        assert category_name in prompt
+        for rel_type in rel_types:
+            assert rel_type.upper() in prompt
+    assert [rel.rel_type for rel in result.relationships] == ["CALL"]
+    assert result.relationships[0].source_name == "build_query"
+    assert result.relationships[0].target_name == "sanitize_input"
+
+
+@pytest.mark.asyncio
+async def test_code_domain_gleaning_keeps_taxonomy_schema():
+    response = {
+        "relationships": {
+            "value_operations": {
+                "EVALUATE": [],
+                "COMPARE": [],
+                "CONVERT": [],
+                "CONSTRUCT": [],
+                "DESTRUCTURE": [],
+            },
+            "name_place_operations": {
+                "BIND": [],
+                "REBIND": [],
+                "MUTATE": [],
+                "ACCESS": [],
+            },
+            "control_operations": {
+                "BRANCH": [],
+                "ITERATE": [],
+                "CALL": [
+                    {
+                        "source": {
+                            "name": "build_query",
+                            "description": "Builds a query object.",
+                        },
+                        "target": {
+                            "name": "sanitize_input",
+                            "description": "Normalizes incoming input before assembly.",
+                        },
+                        "description": "build_query calls sanitize_input before return.",
+                        "keywords": ["calls"],
+                        "weight": 0.9,
+                    }
+                ],
+                "RETURN": [],
+                "SIGNAL": [],
+                "HANDLE": [],
+            },
+            "effect_operations": {
+                "COMMUNICATE": [],
+                "ALLOCATE_RESOURCE": [],
+                "RELEASE_RESOURCE": [],
+                "SYNCHRONIZE": [],
+            },
+        },
+    }
+    llm = _CodeExtractionLLMProvider(response)
+    extractor = LLMGraphExtractor(llm)
+
+    await extractor.extract_with_gleaning(
+        "def build_query():\n    return sanitize_input(value)\n",
+        max_gleaning=1,
+        domain="code",
+    )
+
+    assert len(llm.schemas) == 2
+    assert llm.schemas[0]["title"] == "graph_rag_code_extraction"
+    assert llm.schemas[1]["title"] == "graph_rag_code_extraction"
+    assert "Leave unsupported rel_types as empty arrays." in llm.prompts[0]
+    assert "Leave unsupported rel_types as empty arrays." in llm.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_generic_extractor_uses_relationship_endpoint_objects():
+    response = {
+        "relationships": [
+            {
+                "source": {
+                    "name": "Arjuna",
+                    "description": "The primary recipient of the teaching.",
+                },
+                "target": {
+                    "name": "Krishna",
+                    "description": "The teacher in the passage.",
+                },
+                "description": "Arjuna receives guidance from Krishna.",
+                "keywords": ["guidance", "teaching"],
+                "weight": 0.9,
+                "rel_type": [
+                    {
+                        "name": "DEFINES",
+                        "description": "Krishna defines Arjuna's duty.",
+                        "keywords": ["defines"],
+                        "weight": 0.9,
+                    }
+                ],
+            }
+        ]
+    }
+    llm = _CodeExtractionLLMProvider(response)
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract(
+        "Arjuna receives guidance from Krishna.",
+        domain="general",
+    )
+
+    assert len(llm.schemas) == 1
+    assert llm.schemas[0]["title"] == "graph_rag_relationship_extraction"
+    assert result.entities[0].name == "Arjuna"
+    assert result.entities[0].description == "The primary recipient of the teaching."
+    assert result.relationships[0].source_name == "Arjuna"
+    assert result.relationships[0].target_name == "Krishna"
+    assert result.relationships[0].rel_type == "DEFINES"
+
+
+def test_chat_domain_uses_chat_specific_guidance():
+    cfg = get_domain_config("chat")
+
+    assert cfg.name == "chat"
+    assert "conversation" in cfg.relationship_guidance.lower()
+    assert "follow-up" in cfg.rel_type_guidance.lower()
+
+
+class _SequencedLLMProvider(LLMProvider):
+    """Returns a different structured payload for each successive call."""
+
+    def __init__(self, responses: list[dict]) -> None:
+        self._responses = responses
+        self.prompts: list[str] = []
+        self.calls = 0
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "ok"
+
+    async def chat_stream(self, messages: list[dict]):
+        if False:
+            yield ""
+
+    async def structured_extract(self, prompt: str, schema: dict) -> dict:
+        self.prompts.append(prompt)
+        index = min(self.calls, len(self._responses) - 1)
+        self.calls += 1
+        return self._responses[index]
+
+
+def _generic_rel(source: str, target: str, rel_type: str) -> dict:
+    return {
+        "source": {"name": source, "description": f"{source} description"},
+        "target": {"name": target, "description": f"{target} description"},
+        "description": f"{source} {rel_type} {target}.",
+        "keywords": [rel_type.lower()],
+        "weight": 0.8,
+        "rel_type": [
+            {"name": rel_type, "description": "", "keywords": [], "weight": 0.8}
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_generic_gleaning_is_additive_and_never_drops_first_pass_edges():
+    first_pass = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    # The gleaning pass omits the first-pass edge entirely and adds a new one.
+    gleaning_pass = {"relationships": [_generic_rel("Krishna", "Dharma", "EXPLAINS")]}
+    llm = _SequencedLLMProvider([first_pass, gleaning_pass])
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract_with_gleaning(
+        "Arjuna receives guidance from Krishna about Dharma.",
+        max_gleaning=1,
+        domain="general",
+    )
+
+    edges = {(r.source_name, r.target_name, r.rel_type) for r in result.relationships}
+    # First-pass edge survives even though gleaning did not re-emit it.
+    assert ("Arjuna", "Krishna", "RELATES_TO") in edges
+    # Gleaning addition is merged in.
+    assert ("Krishna", "Dharma", "EXPLAINS") in edges
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_generic_gleaning_corrects_existing_edge_in_place():
+    first_pass = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    corrected = _generic_rel("Arjuna", "Krishna", "RELATES_TO")
+    corrected["description"] = "Corrected: Arjuna is counseled by Krishna."
+    gleaning_pass = {"relationships": [corrected]}
+    llm = _SequencedLLMProvider([first_pass, gleaning_pass])
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract_with_gleaning(
+        "Arjuna receives guidance from Krishna.",
+        max_gleaning=1,
+        domain="general",
+    )
+
+    matching = [
+        r
+        for r in result.relationships
+        if (r.source_name, r.target_name, r.rel_type)
+        == ("Arjuna", "Krishna", "RELATES_TO")
+    ]
+    # Edge is not duplicated; description is corrected in place.
+    assert len(matching) == 1
+    assert matching[0].description == "Corrected: Arjuna is counseled by Krishna."
+
+
+@pytest.mark.asyncio
+async def test_generic_gleaning_stops_when_no_new_edges_added():
+    same = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    # Three identical responses available; loop should stop after the first
+    # gleaning pass adds nothing new.
+    llm = _SequencedLLMProvider([same, same, same])
+    extractor = LLMGraphExtractor(llm)
+
+    await extractor.extract_with_gleaning(
+        "Arjuna receives guidance from Krishna.",
+        max_gleaning=5,
+        domain="general",
+    )
+
+    # 1 initial extract + 1 gleaning pass (which added nothing) = 2 calls.
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_code_gleaning_is_additive_across_passes():
+    def code_payload(rel_type: str, source: str, target: str) -> dict:
+        buckets: dict[str, dict[str, list]] = {
+            "value_operations": {
+                k: []
+                for k in ("EVALUATE", "COMPARE", "CONVERT", "CONSTRUCT", "DESTRUCTURE")
+            },
+            "name_place_operations": {
+                k: [] for k in ("BIND", "REBIND", "MUTATE", "ACCESS")
+            },
+            "control_operations": {
+                k: []
+                for k in ("BRANCH", "ITERATE", "CALL", "RETURN", "SIGNAL", "HANDLE")
+            },
+            "effect_operations": {
+                k: []
+                for k in (
+                    "COMMUNICATE",
+                    "ALLOCATE_RESOURCE",
+                    "RELEASE_RESOURCE",
+                    "SYNCHRONIZE",
+                )
+            },
+        }
+        for category, rel_types in buckets.items():
+            if rel_type in rel_types:
+                rel_types[rel_type] = [
+                    {
+                        "source": {"name": source, "description": f"{source} desc"},
+                        "target": {"name": target, "description": f"{target} desc"},
+                        "description": f"{source} {rel_type} {target}.",
+                        "keywords": [rel_type.lower()],
+                        "weight": 0.9,
+                    }
+                ]
+        return {"relationships": buckets}
+
+    first_pass = code_payload("CALL", "build_query", "sanitize_input")
+    gleaning_pass = code_payload("RETURN", "build_query", "result")
+    llm = _SequencedLLMProvider([first_pass, gleaning_pass])
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract_with_gleaning(
+        "def build_query():\n    return sanitize_input(value)\n",
+        max_gleaning=1,
+        domain="code",
+    )
+
+    edges = {(r.source_name, r.target_name, r.rel_type) for r in result.relationships}
+    assert ("build_query", "sanitize_input", "CALL") in edges
+    assert ("build_query", "result", "RETURN") in edges
 
 
 @pytest.mark.asyncio
@@ -387,14 +774,14 @@ async def test_find_relevant_path_records_combined_scores_for_bridge_edges(
     bridge_rel_id = str(uuid.uuid4())
 
     class _GraphStorage:
-        async def get_node_edges(self, node_id, rel_types=None):
+        async def get_node_edges(self, node_id, rel_types=None, document_ids=None):  # noqa: ARG002
             if node_id == "source":
                 return [("source", "mid")]
             if node_id == "mid":
                 return [("source", "mid"), ("mid", "target")]
             return []
 
-        async def get_edge(self, src, tgt, rel_types=None):
+        async def get_edge(self, src, tgt, rel_types=None, document_ids=None):  # noqa: ARG002
             edge_ids = {
                 ("source", "mid"): first_rel_id,
                 ("mid", "target"): bridge_rel_id,
@@ -463,7 +850,7 @@ async def test_entity_first_state_prioritizes_high_scoring_edges(
     low_rel_ids = [str(uuid.uuid4()) for _ in range(6)]
 
     class _GraphStorage:
-        async def get_node_edges(self, node_id, rel_types=None):
+        async def get_node_edges(self, node_id, rel_types=None, document_ids=None):  # noqa: ARG002
             if node_id != str(entity_ids["seed"]):
                 return []
             edges = [(str(entity_ids["seed"]), str(entity_ids["high"]))]
@@ -473,7 +860,7 @@ async def test_entity_first_state_prioritizes_high_scoring_edges(
             )
             return edges
 
-        async def get_edge(self, src, tgt, rel_types=None):
+        async def get_edge(self, src, tgt, rel_types=None, document_ids=None):  # noqa: ARG002
             if tgt == str(entity_ids["high"]):
                 return {"id": high_rel_id, "weight": 1, "keywords": []}
             for idx in range(6):
@@ -701,6 +1088,68 @@ async def test_build_collection_understanding_tolerates_missing_relationship_cou
     assert understanding["nodes"]
 
 
+def test_role_similarity_groups_ignore_rel_type_in_neighborhood_signature():
+    a = uuid.uuid4()
+    b = uuid.uuid4()
+    x = uuid.uuid4()
+    y = uuid.uuid4()
+
+    nodes = [
+        NodeRecord(id=a, name="A"),
+        NodeRecord(id=b, name="B"),
+        NodeRecord(id=x, name="X"),
+        NodeRecord(id=y, name="Y"),
+    ]
+    relationships = [
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=a,
+            source_name="A",
+            target_id=x,
+            target_name="X",
+            rel_type="CALLS",
+            weight=1,
+        ),
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=b,
+            source_name="B",
+            target_id=x,
+            target_name="X",
+            rel_type="USES",
+            weight=1,
+        ),
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=y,
+            source_name="Y",
+            target_id=a,
+            target_name="A",
+            rel_type="READS",
+            weight=1,
+        ),
+        RelationshipRecord(
+            id=uuid.uuid4(),
+            source_id=y,
+            source_name="Y",
+            target_id=b,
+            target_name="B",
+            rel_type="WRITES",
+            weight=1,
+        ),
+    ]
+
+    groups = _build_role_similarity_groups(
+        nodes,
+        relationships,
+        overlap_min=1,
+        cosine_min=0.1,
+        jaccard_min=0.1,
+    )
+
+    assert any(set(group["node_ids"]) == {str(a), str(b)} for group in groups)
+
+
 @pytest.mark.asyncio
 async def test_materialize_meta_collection_persists_derived_chunks(
     test_graph_rag_collection,
@@ -801,4 +1250,99 @@ async def test_load_meta_collections_prefers_leveled_l1_over_legacy(
 
     assert [collection.name for collection in collections] == [
         "graph-rag-collection__meta__l1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_graph_rag_query_does_not_apply_document_routing_to_meta_collections(
+    monkeypatch,
+    test_graph_rag_collection,
+):
+    meta_collection = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_graph_rag_collection.namespace_id,
+        name="graph-rag-collection__meta__l1",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    routed_document_id = uuid.uuid4()
+    build_calls: list[dict[str, object]] = []
+
+    async def _fake_resolve_document_routing(*args, **kwargs):
+        return DocumentRoutingDecision(
+            use_all_documents=False,
+            document_ids=[routed_document_id],
+        )
+
+    async def _fake_build_graph_query_artifacts(
+        question,
+        collection,
+        namespace_id,
+        mode,
+        llm_profile_id,
+        document_ids=None,
+    ):
+        build_calls.append(
+            {
+                "collection_name": collection.name,
+                "document_ids": document_ids,
+            }
+        )
+        return GraphQueryArtifacts(
+            context=f"context for {collection.name}",
+            entities_used=[],
+            relationships_used=[],
+            rel_context="",
+            route_profile=DerivedRouteProfile(
+                primary_route="entity",
+                route_scores={},
+                rel_type_scores={},
+            ),
+            state=GraphQueryState(
+                discovered_entity_ids=set(),
+                entity_relevance={},
+                traversed_rel_ids=[],
+                rel_score_cache={},
+                rel_combined_score_cache={},
+            ),
+        )
+
+    async def _fake_load_meta_collections(collection):
+        return [meta_collection]
+
+    async def _fake_answer_from_context(*args, **kwargs):
+        return "ok"
+
+    monkeypatch.setattr(
+        graph_rag,
+        "_resolve_document_routing",
+        _fake_resolve_document_routing,
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_build_graph_query_artifacts",
+        _fake_build_graph_query_artifacts,
+    )
+    monkeypatch.setattr(graph_rag, "_load_meta_collections", _fake_load_meta_collections)
+    monkeypatch.setattr(
+        graph_rag,
+        "_answer_from_context",
+        _fake_answer_from_context,
+    )
+
+    await graph_rag.graph_rag_query(
+        "Which document mentions OAuth?",
+        test_graph_rag_collection,
+        test_graph_rag_collection.namespace_id,
+    )
+
+    assert build_calls == [
+        {
+            "collection_name": test_graph_rag_collection.name,
+            "document_ids": [routed_document_id],
+        },
+        {
+            "collection_name": meta_collection.name,
+            "document_ids": None,
+        },
     ]

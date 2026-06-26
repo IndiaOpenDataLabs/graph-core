@@ -96,7 +96,7 @@ async def _resolve_embedding_provider(collection: Collection) -> EmbeddingProvid
         )
 
 
-async def _resolve_llm_provider(
+async def resolve_llm_provider(
     namespace_id: uuid.UUID,
     llm_profile_id: uuid.UUID | None = None,
 ) -> LLMProvider:
@@ -119,6 +119,16 @@ async def _resolve_llm_provider(
             profile_id=str(profile.id),
             max_concurrent_calls=profile.max_concurrent_calls,
         )
+
+
+async def resolve_llm_provider_from_collection(
+    collection: Collection,
+) -> LLMProvider:
+    """Resolve the LLM provider using a collection's llm_profile_id."""
+    return await resolve_llm_provider(
+        namespace_id=collection.namespace_id,
+        llm_profile_id=collection.llm_profile_id,
+    )
 
 
 # ── Utility functions ──
@@ -275,7 +285,7 @@ async def _ingest_graph_chunk(
 ) -> ChunkIngestionResult:
     """Full Graph RAG pipeline: extract → resolve → store."""
     embedding_provider = await _resolve_embedding_provider(collection)
-    llm_provider = await _resolve_llm_provider(
+    llm_provider = await resolve_llm_provider(
         namespace_id=collection.namespace_id,
         llm_profile_id=collection.llm_profile_id,
     )
@@ -507,7 +517,7 @@ async def _ingest_lightrag_chunk(
     FalkorDB nodes/edges directly.
     """
     embedding_provider = await _resolve_embedding_provider(collection)
-    llm_provider = await _resolve_llm_provider(
+    llm_provider = await resolve_llm_provider(
         namespace_id=collection.namespace_id,
         llm_profile_id=collection.llm_profile_id,
     )

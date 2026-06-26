@@ -8,21 +8,33 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Iterable
 
+import redis.asyncio as aioredis
+from dramatiq.message import Message
 from sqlalchemy import func, select, text
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
+from graph_core.models.domain_config import (
+    DomainConfig,
+    classify_document,
+    get_domain_config,
+    register_domain,
+)
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.profile import Profile
+from graph_core.services.chunking import DocumentChunker
 from graph_core.services.document_identity import (
     document_id_for_path,
     normalize_document_path,
 )
-from graph_core.services.chunking import DocumentChunker
-from graph_core.services.graph.ingestion.chunk_processor import ingest_collection_chunk
+from graph_core.services.graph.ingestion.chunk_processor import (
+    ingest_collection_chunk,
+    resolve_llm_provider_from_collection,
+)
 
 UTC = UTC
 
@@ -73,9 +85,117 @@ async def _append_job_event(
     payload: dict | None = None,
 ) -> None:
     async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_id)
+        if not job:
+            return
         event = JobEvent(job_id=job_id, event_type=event_type, payload=payload)
         session.add(event)
         await session.commit()
+
+
+_CANCELLED_JOBS_KEY = "graph_core:cancelled_jobs"
+_CANCELLED_JOBS_TTL = 86400  # 24 hours — long enough for any in-flight message
+
+
+async def mark_jobs_cancelled(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Add job IDs to the cancelled set so workers bail out early."""
+    job_id_strings = [str(job_id) for job_id in job_ids if str(job_id)]
+    if not job_id_strings:
+        return 0
+    redis = aioredis.from_url(settings.redis_url)
+    try:
+        added = await redis.sadd(_CANCELLED_JOBS_KEY, *job_id_strings)
+        await redis.expire(_CANCELLED_JOBS_KEY, _CANCELLED_JOBS_TTL)
+        return int(added)
+    finally:
+        await redis.aclose()
+
+
+async def is_job_cancelled(job_id: uuid.UUID | str) -> bool:
+    """Check whether a job has been marked as cancelled."""
+    redis = aioredis.from_url(settings.redis_url)
+    try:
+        return bool(await redis.sismember(_CANCELLED_JOBS_KEY, str(job_id)))
+    finally:
+        await redis.aclose()
+
+
+async def purge_queued_job_messages(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Remove queued or delayed Dramatiq messages for the given jobs.
+
+    Also marks jobs as cancelled so in-flight workers bail out early.
+    Use only for collection deletion or explicit cancellation — not on
+    normal job completion.
+    """
+    job_id_strings = {str(job_id) for job_id in job_ids if str(job_id)}
+    if not job_id_strings:
+        return 0
+
+    redis = aioredis.from_url(settings.redis_url)
+    removed = 0
+    max_keys = 500
+    scanned_keys = 0
+    try:
+        # Mark cancelled so workers that already dequeued can bail out.
+        await redis.sadd(_CANCELLED_JOBS_KEY, *job_id_strings)
+        await redis.expire(_CANCELLED_JOBS_KEY, _CANCELLED_JOBS_TTL)
+
+        cursor = 0
+        while True:
+            cursor, keys = await redis.scan(
+                cursor=cursor,
+                match="dramatiq:*msgs",
+                count=100,
+            )
+            for key in keys:
+                scanned_keys += 1
+                if scanned_keys > max_keys:
+                    logger.warning(
+                        "purge_queued_job_messages hit scan limit (%d keys), stopping early",
+                        max_keys,
+                    )
+                    return removed
+                key_name = key.decode() if isinstance(key, bytes) else str(key)
+                queue_key = key_name.removesuffix(".msgs")
+                inner_cursor = 0
+                fields_to_remove: list[str] = []
+
+                while True:
+                    inner_cursor, entries = await redis.hscan(
+                        key_name,
+                        cursor=inner_cursor,
+                        count=100,
+                    )
+                    for field, data in entries.items():
+                        try:
+                            raw_message = (
+                                data
+                                if isinstance(data, (bytes, bytearray, memoryview))
+                                else str(data).encode()
+                            )
+                            message = Message.decode(
+                                bytes(raw_message)
+                            )
+                        except Exception:
+                            continue
+                        if not message.args:
+                            continue
+                        if str(message.args[0]) in job_id_strings:
+                            fields_to_remove.append(
+                                field.decode() if isinstance(field, bytes) else str(field)
+                            )
+                    if inner_cursor == 0:
+                        break
+
+                if fields_to_remove:
+                    await redis.hdel(key_name, *fields_to_remove)
+                    await redis.zrem(queue_key, *fields_to_remove)
+                    removed += len(fields_to_remove)
+            if cursor == 0:
+                break
+        return removed
+    finally:
+        await redis.aclose()
 
 
 # ── Job enqueueing ──
@@ -91,6 +211,13 @@ async def enqueue_document_ingestion_job(
     """Create a pending ingest_document Job and return its result wrapper."""
     if not text.strip():
         raise ValueError("Cannot ingest an empty document")
+    logger.info(
+        "document_ingestion enqueue collection_id=%s namespace_id=%s domain=%s document_path=%s",
+        collection_id,
+        namespace_id,
+        domain or "",
+        normalize_document_path(document_path) if document_path else "",
+    )
     async with AsyncSessionLocal() as session:
         collection = await session.get(Collection, collection_id)
         if not collection:
@@ -139,7 +266,8 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
         if not job:
-            raise ValueError(f"Job {job_id} not found")
+            logger.info("Skipping deleted or missing job: job=%s", job_id)
+            return
         if not job.payload or "text" not in job.payload:
             raise ValueError(f"Job {job_id} does not contain input text")
 
@@ -149,6 +277,56 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
 
         text = str(job.payload["text"])
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
+        domain_config_data = (
+            job.payload.get("domain_config") if isinstance(job.payload, dict) else None
+        )
+        if domain is None and domain_config_data is None:
+            logger.info(
+                "document_ingestion classify collection_id=%s job_id=%s document_path=%s",
+                collection.id,
+                job.id,
+                job.document_path or "",
+            )
+            llm = await resolve_llm_provider_from_collection(collection)
+            cfg = await classify_document(llm, text)
+            register_domain(cfg)
+            domain = cfg.name
+            if job.payload is None:
+                job.payload = {}
+            job.payload["domain"] = domain
+            job.payload["domain_config"] = cfg.to_dict()
+            await session.commit()
+            logger.info(
+                "document_ingestion classified collection_id=%s job_id=%s domain=%s use_ast_chunking=%s requires_exact_resolution=%s entity_guidance=%s relationship_guidance=%s rel_type_guidance=%s persisted=true",
+                collection.id,
+                job.id,
+                cfg.name,
+                cfg.use_ast_chunking,
+                cfg.requires_exact_resolution,
+                cfg.entity_guidance,
+                cfg.relationship_guidance,
+                cfg.rel_type_guidance,
+            )
+        elif domain_config_data and isinstance(domain_config_data, dict):
+            cfg = DomainConfig.from_dict(domain_config_data)
+            register_domain(cfg)
+            domain = cfg.name
+            logger.info(
+                "document_ingestion loaded_classified_domain collection_id=%s job_id=%s domain=%s entity_guidance=%s relationship_guidance=%s rel_type_guidance=%s persisted=true",
+                collection.id,
+                job.id,
+                cfg.name,
+                cfg.entity_guidance,
+                cfg.relationship_guidance,
+                cfg.rel_type_guidance,
+            )
+        elif domain is not None:
+            logger.info(
+                "document_ingestion explicit_domain collection_id=%s job_id=%s domain=%s",
+                collection.id,
+                job.id,
+                domain,
+            )
         document_path = (
             normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
             if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))
@@ -350,9 +528,22 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
             return
 
         job = await session.get(Job, job_uuid)
+        if job is None:
+            logger.info("Skipping deleted or missing chunk job: job=%s chunk=%s", job_uuid, chunk_index)
+            return
         collection = await session.get(Collection, job.collection_id)
         text = chunk.text
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
+        domain_config_data = (
+            job.payload.get("domain_config") if isinstance(job.payload, dict) else None
+        )
+        if domain_config_data and isinstance(domain_config_data, dict):
+            cfg = DomainConfig.from_dict(domain_config_data)
+            register_domain(cfg)
+            domain = cfg.name
+        elif domain is None:
+            cfg = get_domain_config(None)
+            domain = cfg.name
         document_path = (
             normalize_document_path(str(job.document_path or job.payload.get("document_path") or ""))
             if (getattr(job, "document_path", None) or (isinstance(job.payload, dict) and job.payload.get("document_path")))

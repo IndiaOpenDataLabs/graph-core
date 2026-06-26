@@ -306,45 +306,27 @@ class GraphRAGVectorStore:
             session = AsyncSessionLocal()
 
         try:
-            existing = await session.execute(
-                text(f"SELECT id FROM {tbl} WHERE entity_id = :eid"),
-                {"eid": _uuid_for_sql(entity_id)},
+            await session.execute(
+                text(
+                    f"INSERT INTO {tbl} "
+                    f"(entity_id, collection_id, canonical_name, primary_type, "
+                    f"description_count, embedding) "
+                    f"VALUES (:eid, :cid, :cn, :pt, :dc, (:emb){cast}) "
+                    f"ON CONFLICT (entity_id) DO UPDATE SET "
+                    f"embedding = (:emb){cast}, "
+                    f"canonical_name = :cn, "
+                    f"primary_type = :pt, "
+                    f"description_count = :dc"
+                ),
+                {
+                    "eid": _uuid_for_sql(entity_id),
+                    "cid": _uuid_for_sql(collection_id),
+                    "cn": canonical_name,
+                    "pt": primary_type,
+                    "dc": description_count,
+                    "emb": emb_str,
+                },
             )
-            if existing.scalar_one_or_none():
-                await session.execute(
-                    text(
-                        f"UPDATE {tbl} SET "
-                        f"embedding = (:emb){cast}, "
-                        f"canonical_name = :cn, "
-                        f"primary_type = :pt, "
-                        f"description_count = :dc "
-                        f"WHERE entity_id = :eid"
-                    ),
-                    {
-                        "cn": canonical_name,
-                        "pt": primary_type,
-                        "dc": description_count,
-                        "eid": _uuid_for_sql(entity_id),
-                        "emb": emb_str,
-                    },
-                )
-            else:
-                await session.execute(
-                    text(
-                        f"INSERT INTO {tbl} "
-                        f"(entity_id, collection_id, canonical_name, primary_type, "
-                        f"description_count, embedding) "
-                        f"VALUES (:eid, :cid, :cn, :pt, :dc, (:emb){cast})"
-                    ),
-                    {
-                        "eid": _uuid_for_sql(entity_id),
-                        "cid": _uuid_for_sql(collection_id),
-                        "cn": canonical_name,
-                        "pt": primary_type,
-                        "dc": description_count,
-                        "emb": emb_str,
-                    },
-                )
             if owns_session:
                 await session.commit()
         finally:

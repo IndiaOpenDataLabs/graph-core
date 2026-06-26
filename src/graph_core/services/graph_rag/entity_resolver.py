@@ -8,6 +8,7 @@ Three-tier pipeline:
 
 from __future__ import annotations
 
+import hashlib
 import difflib
 import logging
 import re
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from graph_core.config import settings
 from graph_core.embedding.interface import EmbeddingProvider
+from graph_core.models.domain_config import get_domain_config
 from graph_core.models.graph_rag import (
     EntityAlias,
     EntityDescription,
@@ -80,6 +82,7 @@ class IncrementalEntityResolver:
         self._embedding = embedding_provider
         self._collection_id = collection_id
         self._domain = (domain or "").strip().lower() or None
+        self._domain_cfg = get_domain_config(self._domain)
         self._vstore = GraphRAGVectorStore()
         graph_name = (
             collection_graph_name(
@@ -235,6 +238,121 @@ class IncrementalEntityResolver:
         document_path: str | None = None,
     ) -> EntityResolutionResult:
         normalized_name = self._normalize_entity_name(name)
+        exact_resolution = entity_type == "base_entity_ref" or self._requires_exact_name_resolution(
+            normalized_name,
+            entity_type,
+        )
+
+        if exact_resolution:
+            existing_result = await session.execute(
+                select(GraphEntity).where(
+                    GraphEntity.canonical_name == normalized_name,
+                    GraphEntity.collection_id == self._collection_id,
+                )
+            )
+            existing = existing_result.scalar_one_or_none()
+            if existing:
+                logger.debug("Exact canonical match: %s", normalized_name)
+                search_text = f"{normalized_name}: {description}"
+                context_embedding = await self._embedding.embed_query(search_text)
+                await self._add_description_and_update_centroid(
+                    session,
+                    existing.id,
+                    existing,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_or_increment_type(session, existing.id, entity_type)
+                return EntityResolutionResult(
+                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                )
+
+            new_id = uuid.uuid4()
+            stmt = (
+                pg_insert(GraphEntity)
+                .values(
+                    id=new_id,
+                    canonical_name=normalized_name,
+                    primary_type=entity_type,
+                    description_count=0,
+                    collection_id=self._collection_id,
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_graph_entities_canonical_name_collection_id"
+                )
+                .returning(GraphEntity.id)
+            )
+            result = await session.execute(stmt)
+            row = result.fetchone()
+            if row:
+                entity_id = row[0]
+                entity = await session.get(GraphEntity, entity_id)
+                search_text = f"{normalized_name}: {description}"
+                context_embedding = await self._embedding.embed_query(search_text)
+                await self._add_alias(
+                    session,
+                    entity_id,
+                    normalized_name,
+                    source_chunk_hash,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_description_and_update_centroid(
+                    session,
+                    entity_id,
+                    entity,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_or_increment_type(session, entity_id, entity_type)
+                return EntityResolutionResult(
+                    is_new=True, entity_id=entity_id, canonical_name=normalized_name
+                )
+
+            existing_result = await session.execute(
+                select(GraphEntity).where(
+                    GraphEntity.canonical_name == normalized_name,
+                    GraphEntity.collection_id == self._collection_id,
+                )
+            )
+            existing = existing_result.scalar_one_or_none()
+            if existing:
+                search_text = f"{normalized_name}: {description}"
+                context_embedding = await self._embedding.embed_query(search_text)
+                await self._add_description_and_update_centroid(
+                    session,
+                    existing.id,
+                    existing,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+                await self._add_or_increment_type(session, existing.id, entity_type)
+                return EntityResolutionResult(
+                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                )
+
+            # ON CONFLICT fired but entity is now gone — collection likely
+            # deleted mid-ingestion.  Abort gracefully.
+            logger.warning(
+                "Exact resolution race: entity %r vanished from collection %s "
+                "(collection likely deleted mid-ingestion)",
+                normalized_name,
+                self._collection_id,
+            )
+            raise RuntimeError(
+                f"Entity {normalized_name!r} could not be resolved: "
+                f"collection {self._collection_id} may have been deleted"
+            )
+
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
             select(EntityAlias)
@@ -573,6 +691,8 @@ class IncrementalEntityResolver:
         if entity is None:
             return
 
+        await self._acquire_entity_lock(session, entity_id)
+
         embed_text = f"{entity.canonical_name}: {description}"
         embedding = await self._embedding.embed_query(embed_text)
 
@@ -664,6 +784,25 @@ class IncrementalEntityResolver:
             .values(description_count=GraphEntity.description_count + 1)
         )
 
+    async def _acquire_entity_lock(
+        self,
+        session: AsyncSession,
+        entity_id: uuid.UUID,
+    ) -> None:
+        """Serialize concurrent centroid updates for the same entity."""
+        bind = getattr(session, "bind", None)
+        dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+        if dialect_name != "postgresql":
+            return
+        lock_bytes = hashlib.sha256(
+            f"{self._collection_id}:{entity_id}".encode("utf-8")
+        ).digest()[:8]
+        lock_key = int.from_bytes(lock_bytes, "big") & ((1 << 63) - 1)
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+
     async def _add_relationship_description(
         self,
         session: AsyncSession,
@@ -677,6 +816,30 @@ class IncrementalEntityResolver:
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
     ) -> None:
+        # Check for exact (relationship_id, document_id) match
+        if document_id:
+            existing_exact = await session.execute(
+                select(RelationshipDescription).where(
+                    RelationshipDescription.relationship_id == relationship_id,
+                    RelationshipDescription.document_id == document_id,
+                ).limit(1)
+            )
+            existing_desc = existing_exact.scalar_one_or_none()
+            if existing_desc:
+                # Update existing description, don't create duplicate
+                hashes = list(existing_desc.source_chunk_hashes or [])
+                if source_chunk_hash not in hashes:
+                    hashes.append(source_chunk_hash)
+                await session.execute(
+                    update(RelationshipDescription)
+                    .where(RelationshipDescription.id == existing_desc.id)
+                    .values(
+                        weight=RelationshipDescription.weight + 1,
+                        source_chunk_hashes=hashes,
+                    )
+                )
+                return
+
         embed_text = relationship_embedding_text(
             source_name,
             target_name,
@@ -685,39 +848,6 @@ class IncrementalEntityResolver:
             keywords,
         )
         embedding = await self._embedding.embed_query(embed_text)
-
-        existing_descs = await self._vstore.search_relationship_embeddings(
-            collection_id=self._collection_id,
-            query_embedding=embedding,
-            top_k=1,
-            relationship_id=relationship_id,
-        )
-        if existing_descs:
-            best_match = existing_descs[0]
-            cosine_sim = 1.0 - best_match.distance
-            if cosine_sim >= self.DESCRIPTION_SIMILARITY_THRESHOLD:
-                desc_id = best_match.metadata.get("description_id")
-                if desc_id:
-                    try:
-                        existing_desc_id = uuid.UUID(desc_id)
-                    except ValueError:
-                        existing_desc_id = None
-                    if existing_desc_id:
-                        existing_desc = await session.get(
-                            RelationshipDescription, existing_desc_id
-                        )
-                        hashes = list(existing_desc.source_chunk_hashes or []) if existing_desc else []
-                        if source_chunk_hash not in hashes:
-                            hashes.append(source_chunk_hash)
-                        await session.execute(
-                            update(RelationshipDescription)
-                            .where(RelationshipDescription.id == existing_desc_id)
-                            .values(
-                                weight=RelationshipDescription.weight + 1,
-                                source_chunk_hashes=hashes,
-                            )
-                        )
-                        return
 
         desc = RelationshipDescription(
             id=uuid.uuid4(),
@@ -1025,7 +1155,7 @@ class IncrementalEntityResolver:
         name: str,
         entity_type: str | None = None,
     ) -> bool:
-        if self._domain != "code":
+        if not self._domain_cfg.requires_exact_resolution:
             return False
         normalized_type = (entity_type or "").strip().upper()
         if normalized_type in {

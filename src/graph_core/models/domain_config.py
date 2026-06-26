@@ -1,0 +1,491 @@
+"""Domain-specific extraction configuration for Custom Graph RAG.
+
+An LLM classifies document content, generates tailored extraction guidance,
+and returns a `DomainConfig` — no hardcoded regex or domain lists needed.
+The registry still holds well-known fallback domains so existing callers
+keep their current behavior while new domains can be added at runtime.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Domain configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DomainConfig:
+    """All extraction parameters for one content domain."""
+
+    name: str
+    rel_types: list[str]
+    entity_guidance: str
+    relationship_guidance: str
+    rel_type_guidance: str
+    use_ast_chunking: bool = False
+    requires_exact_resolution: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DomainConfig:
+        return cls(
+            name=data["name"],
+            rel_types=data.get("rel_types", list(DOMAIN_CONFIGS["general"].rel_types)),
+            entity_guidance=data.get("entity_guidance", ""),
+            relationship_guidance=data.get("relationship_guidance", ""),
+            rel_type_guidance=data.get("rel_type_guidance", ""),
+            use_ast_chunking=data.get("use_ast_chunking", False),
+            requires_exact_resolution=data.get("requires_exact_resolution", False),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Static fallback configs (LLM unavailable / explicit name match)
+# ---------------------------------------------------------------------------
+
+_REL_TYPES_GENERAL: list[str] = [
+    "RELATES_TO", "DEFINES", "DESCRIBES", "EXPLAINS", "MENTIONED_IN",
+    "QUOTES", "CITES", "IS_AN_EXAMPLE_OF", "IS_ANALOGY_OF", "INTRODUCES",
+    "PREDICTS", "PROPOSES", "ARGUES", "CLAIMS", "CONCLUDES", "RECOMMENDS",
+    "CAUSES", "LEADS_TO", "RESULTS_IN", "INFLUENCES", "DEPENDS_ON",
+    "PRECEDES", "FOLLOWS", "PROVIDES_EVIDENCE_FOR", "JUSTIFIES",
+    "CHALLENGES", "REFUTES", "CRITIQUES", "QUALIFIES", "LIMITS",
+    "COMPARES", "CATEGORIZES", "CLASSIFIES", "GENERALIZES", "SPECIALIZES",
+    "ILLUSTRATES", "DEMONSTRATES", "MOTIVATES", "SUMMARIZES", "SYNTHESIZES",
+    "DERIVES", "PROVES", "ASSUMES", "IMPLIES", "HISTORICAL_CONTEXT_FOR",
+    "BACKGROUND_FOR", "APPLICATION_OF", "EXTENSION_OF", "AUTHORED_BY",
+    "ABOUT", "TARGETS", "INFLUENCED_BY", "CONTAINS", "PART_OF",
+    "HAS_CHAPTER", "HAS_SECTION", "FEATURES", "CHARACTERIZES",
+    "OCCURS_IN", "CONTRASTS_WITH", "SUPPORTS", "ELABORATES",
+]
+
+CODE_REL_TYPE_TAXONOMY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "value_operations",
+        (
+            "evaluate",
+            "compare",
+            "convert",
+            "construct",
+            "destructure",
+        ),
+    ),
+    (
+        "name_place_operations",
+        (
+            "bind",
+            "rebind",
+            "mutate",
+            "access",
+        ),
+    ),
+    (
+        "control_operations",
+        (
+            "branch",
+            "iterate",
+            "call",
+            "return",
+            "signal",
+            "handle",
+        ),
+    ),
+    (
+        "effect_operations",
+        (
+            "communicate",
+            "allocate_resource",
+            "release_resource",
+            "synchronize",
+        ),
+    ),
+)
+
+CODE_REL_TYPES: tuple[str, ...] = tuple(
+    operation.upper()
+    for _group, operations in CODE_REL_TYPE_TAXONOMY
+    for operation in operations
+)
+
+_GENERIC_ENTITY_GUIDANCE = (
+    "Use concise title case names and keep naming consistent across "
+    "the extraction."
+)
+
+_CODE_ENTITY_GUIDANCE = (
+    "For code-domain entity records, use the relationship endpoints as the "
+    "source of truth. Preserve the endpoint name exactly as emitted by the "
+    "code-domain extractor when it is a concrete code object, symbol, or "
+    "named program element. Preserve the endpoint description exactly as "
+    "the entity description for that endpoint. Keep punctuation and casing "
+    "when the source text already names the object that way. Do not invent "
+    "standalone concept nodes just to restate logic that is already captured "
+    "by a relationship. Exclude ephemeral locals, loop counters, temporary "
+    "accumulators, and helper builtins unless they are semantically central "
+    "to the behavior. Relationship descriptions carry the logic; entity "
+    "records are the endpoint objects those relationships connect."
+)
+
+_GENERIC_RELATIONSHIP_GUIDANCE = (
+    "Let rel_type labels capture the ideas, reasoning, causal or "
+    "explanatory logic, and conceptual roles in the text. Reuse an "
+    "existing rel_type from the current set when it fits; if none fits, "
+    "create a concise new upper-snake rel_type that reflects the idea "
+    "or logical role precisely."
+)
+
+_CHAT_ENTITY_GUIDANCE = (
+    "For chat-domain entity records, preserve concrete participants, "
+    "named subjects, tools, tasks, constraints, and salient concepts "
+    "that appear in the conversation. Preserve names exactly when the "
+    "message text uses a stable label. Do not invent abstract summary "
+    "nodes when the same meaning is already captured by a relationship. "
+    "Prefer entities that help track who said what, what was asked, what "
+    "was answered, what was corrected, and what state or preference the "
+    "conversation established."
+)
+
+_CHAT_RELATIONSHIP_GUIDANCE = (
+    "Write relationship descriptions so they preserve the flow of the "
+    "conversation. Capture user questions, assistant answers, follow-ups, "
+    "corrections, clarifications, requests, commitments, preferences, and "
+    "referenced facts. Keep the relationship grounded in the actual message "
+    "content and speaker roles. When a conversation references prior chat "
+    "turns, surface that linkage explicitly rather than collapsing it into a "
+    "generic topic edge. Relationship descriptions should explain what was "
+    "said, by whom, and why it matters to the ongoing chat state."
+)
+
+_CHAT_REL_TYPE_GUIDANCE = (
+    "Prefer an existing rel_type from this current set when it truly fits. "
+    "If none fits, create a concise new UPPER_SNAKE rel_type that is "
+    "semantically precise for chat interactions. Favor rel_types that track "
+    "questions, answers, follow-ups, corrections, references, preferences, "
+    "and commitments when those are supported by the conversation."
+)
+
+_CODE_RELATIONSHIP_GUIDANCE = (
+    "Write the description in short pseudo-code-flavored prose that "
+    "captures execution semantics. Mention guards, conditions, branches, "
+    "loops, sequencing, fan-out, or fan-in when the text supports them. "
+    "Use cues such as IF, WHEN, THEN, ELSE, FOR EACH, WHILE, TRY/CATCH, "
+    "RETURNS, SPLITS INTO, or MERGES WITH. Do not invent control flow "
+    "that is not grounded in the text. Focus on extracting logic in "
+    "terms of: what is happening, where it happens, why it happens, "
+    "how it happens, and when it starts, ends, or switches path. "
+    "Always preserve exact explicit structural relationships such as "
+    "imports, calls, returns, assignments, configuration, state updates, "
+    "and fallback branches. Relationship descriptions must explain the "
+    "behavior without needing to look back at the code. Do not use the "
+    "relationship endpoints to encode raw expressions or placeholder "
+    "labels; put the predicate or logic in the description instead. "
+    "Endpoint objects should carry the concrete code-object name and a "
+    "separate endpoint description."
+)
+
+_GENERIC_REL_TYPE_GUIDANCE = (
+    "Prefer an existing rel_type from this current set when it truly "
+    "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
+    "that is semantically precise."
+)
+
+DOMAIN_CONFIGS: dict[str, DomainConfig] = {
+    "general": DomainConfig(
+        name="general",
+        rel_types=_REL_TYPES_GENERAL,
+        entity_guidance=_GENERIC_ENTITY_GUIDANCE,
+        relationship_guidance=_GENERIC_RELATIONSHIP_GUIDANCE,
+        rel_type_guidance=_GENERIC_REL_TYPE_GUIDANCE,
+    ),
+    "books": DomainConfig(
+        name="books",
+        rel_types=_REL_TYPES_GENERAL,
+        entity_guidance=_GENERIC_ENTITY_GUIDANCE,
+        relationship_guidance=_GENERIC_RELATIONSHIP_GUIDANCE,
+        rel_type_guidance=_GENERIC_REL_TYPE_GUIDANCE,
+    ),
+    "personal": DomainConfig(
+        name="personal",
+        rel_types=[
+            "RELATES_TO",
+            "REMEMBERS",
+            "MENTIONED",
+            "EXPLAINS_TO",
+            "PREFERS",
+            "DISLIKES",
+            "AVOIDS",
+            "FAVORITES",
+            "BELIEVES",
+            "OPINION_ABOUT",
+            "VALUES",
+            "WANTS",
+            "GOAL",
+            "PLANS",
+            "CONSIDERING",
+            "DECIDED",
+            "ABANDONED",
+            "TRIED",
+            "LEARNED",
+            "SUCCEEDED_AT",
+            "FAILED_AT",
+            "OWNS",
+            "USES",
+            "SUBSCRIBES_TO",
+            "WORKS_AT",
+            "STUDIES",
+            "LIVES_IN",
+            "VISITED",
+            "FROM",
+            "KNOWS",
+            "RELATED_TO",
+            "MET",
+            "COLLABORATES_WITH",
+            "SCHEDULED",
+            "ATTENDED",
+            "COMMITTED_TO",
+            "NEEDS",
+            "BLOCKED_BY",
+            "CONCERNED_ABOUT",
+            "CHANGED_MIND_ABOUT",
+            "UPGRADED_FROM",
+            "REPLACED",
+        ],
+        entity_guidance=(
+            "Use concise title case names and keep naming consistent across "
+            "the extraction."
+        ),
+        relationship_guidance=(
+            "Let rel_type labels capture the ideas, reasoning, causal or "
+            "explanatory logic, and conceptual roles in the text. Reuse an "
+            "existing rel_type from the current set when it fits; if none fits, "
+            "create a concise new upper-snake rel_type that reflects the idea "
+            "or logical role precisely."
+        ),
+        rel_type_guidance=(
+            "Prefer an existing rel_type from this current set when it truly "
+            "fits. If none fits, create a concise new UPPER_SNAKE rel_type "
+            "that is semantically precise."
+        ),
+    ),
+    "chat": DomainConfig(
+        name="chat",
+        rel_types=_REL_TYPES_GENERAL,
+        entity_guidance=_CHAT_ENTITY_GUIDANCE,
+        relationship_guidance=_CHAT_RELATIONSHIP_GUIDANCE,
+        rel_type_guidance=_CHAT_REL_TYPE_GUIDANCE,
+        requires_exact_resolution=False,
+    ),
+    "code": DomainConfig(
+        name="code",
+        rel_types=list(CODE_REL_TYPES),
+        entity_guidance=_CODE_ENTITY_GUIDANCE,
+        relationship_guidance=_CODE_RELATIONSHIP_GUIDANCE,
+        rel_type_guidance=(
+            "Use only the fixed code taxonomy below. Every chunk must "
+            "return all categories and all rel_types, even when the "
+            "answer is empty. Leave unsupported rel_types as empty "
+            "arrays. Do not invent new rel_types for code ingestion. "
+            "Treat relationship descriptions as the primary carrier of "
+            "logic; entities are just the concrete code objects that the "
+            "relationships connect.\n"
+            "value_operations: EVALUATE, COMPARE, CONVERT, CONSTRUCT, "
+            "DESTRUCTURE\n"
+            "name_place_operations: BIND, REBIND, MUTATE, ACCESS\n"
+            "control_operations: BRANCH, ITERATE, CALL, RETURN, SIGNAL, "
+            "HANDLE\n"
+            "effect_operations: COMMUNICATE, ALLOCATE_RESOURCE, "
+            "RELEASE_RESOURCE, SYNCHRONIZE"
+        ),
+        use_ast_chunking=True,
+        requires_exact_resolution=True,
+    ),
+}
+
+_ALL_DOMAIN_NAMES: tuple[str, ...] = tuple(DOMAIN_CONFIGS.keys())
+ALL_DOMAIN_NAMES = _ALL_DOMAIN_NAMES
+_DEFAULT_CONFIG: DomainConfig = DOMAIN_CONFIGS["general"]
+
+
+def get_domain_config(domain: str | None) -> DomainConfig:
+    """Return the config for *domain*, falling back to ``general``."""
+    if not domain:
+        return _DEFAULT_CONFIG
+    return DOMAIN_CONFIGS.get(domain, _DEFAULT_CONFIG)
+
+
+def register_domain(config: DomainConfig) -> None:
+    """Register a new domain configuration at runtime."""
+    DOMAIN_CONFIGS[config.name] = config
+
+
+# ---------------------------------------------------------------------------
+# LLM-based domain classification
+# ---------------------------------------------------------------------------
+
+_CLASSIFICATION_SCHEMA: dict[str, Any] = {
+    "title": "domain_classification",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "domain_name": {
+            "type": "string",
+            "description": "A short lowercase identifier for the content "
+                           "domain a human would use to choose Graph RAG "
+                           "extraction behavior, e.g. 'job_posting', 'code', "
+                           "'medical', 'legal', 'academic_paper', 'personal'. "
+                           "Do not return a topic summary or any label that "
+                           "mentions graph, rag, extraction, specialist, "
+                           "assistant, system, prompt, or analysis.",
+        },
+        "entity_guidance": {
+            "type": "string",
+            "description": "Tailored instructions for how to name and "
+                           "describe entities in this type of content. "
+                           "Be specific to the domain.",
+        },
+        "relationship_guidance": {
+            "type": "string",
+            "description": "Tailored instructions for how to write "
+                           "relationship descriptions in this type of "
+                           "content. Describe the style, what to capture, "
+                           "and what to omit.",
+        },
+        "rel_type_guidance": {
+            "type": "string",
+            "description": "Instructions for choosing or inventing "
+                           "UPPER_SNAKE rel_type labels for this domain.",
+        },
+        "suggested_rel_types": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "A list of 20-50 UPPER_SNAKE rel_type labels "
+                           "that are most relevant for this content domain. "
+                           "Always include RELATES_TO as the first entry.",
+        },
+        "use_ast_chunking": {
+            "type": "boolean",
+            "description": "True if this content should be chunked with "
+                           "AST-aware code splitting (only for source code).",
+        },
+        "requires_exact_resolution": {
+            "type": "boolean",
+            "description": "True if entity names must match exactly (no "
+                           "fuzzy matching) — typically only for source code "
+                           "symbols.",
+        },
+    },
+    "required": [
+        "domain_name",
+        "entity_guidance",
+        "relationship_guidance",
+        "rel_type_guidance",
+        "suggested_rel_types",
+    ],
+}
+
+_CLASSIFICATION_PROMPT = """\
+You are a Knowledge Graph domain specialist for Graph RAG extraction. \
+Your job is to analyze the content type of the provided text and generate \
+tailored extraction instructions for building a knowledge graph from it.
+
+Analyze what kind of document this is — its document type, genre, \
+structure, and the kind of entities and relationships it is likely to contain.
+
+Then produce the kind of human-meaningful document classification a person \
+would use to choose extraction behavior for this document. Prefer a concise \
+stable label such as job_posting, research_paper, contract, code, email, \
+meeting_notes, resume, or report rather than a topical phrase.
+
+Return guidance that would actually help Graph RAG extraction. Ask yourself: \
+what classification would a human have in mind when deciding how to extract \
+entities and relationships from this document?
+
+Important:
+- Classify the document itself, not the system, model, workflow, or prompt.
+- Do not copy phrases from this prompt into the output.
+- The domain_name must be a document type label, not a description of the \
+  extraction task.
+- If the text is a job advertisement, prefer job_posting even if it mentions \
+  a technical topic like supply chain, forecasting, or AI.
+- If the text is a resume/CV, contract, policy, report, email, note, or \
+  meeting record, prefer that document type over the subject matter.
+
+Return your answer as structured JSON.
+
+Text to analyze:
+{text}
+"""
+
+
+async def classify_document(
+    llm: Any,
+    text: str,
+) -> DomainConfig:
+    """Ask the LLM to classify document content and generate extraction guidance.
+
+    Samples the first 4000 characters for classification (covers the \
+    document's genre, structure, and subject without wasting tokens).
+
+    Falls back to ``general`` config on any error.
+    """
+    sample = text[:4000] if len(text) > 4000 else text
+
+    try:
+        result = await llm.structured_extract(
+            prompt=_CLASSIFICATION_PROMPT.format(text=sample),
+            schema=_CLASSIFICATION_SCHEMA,
+        )
+    except Exception as e:
+        logger.warning(
+            "LLM domain classification failed, falling back to general: %s", e
+        )
+        return _DEFAULT_CONFIG
+
+    try:
+        domain_name = result.get("domain_name", "general").lower().strip()
+        if not domain_name:
+            domain_name = "general"
+
+        rel_types = result.get("suggested_rel_types", [])
+        if not rel_types or not isinstance(rel_types, list):
+            rel_types = list(_DEFAULT_CONFIG.rel_types)
+        if domain_name == "code":
+            rel_types = list(CODE_REL_TYPES)
+        elif "RELATES_TO" not in rel_types:
+            rel_types.insert(0, "RELATES_TO")
+
+        cfg = DomainConfig(
+            name=domain_name,
+            rel_types=rel_types,
+            entity_guidance=result.get("entity_guidance", _DEFAULT_CONFIG.entity_guidance)
+                or _DEFAULT_CONFIG.entity_guidance,
+            relationship_guidance=result.get("relationship_guidance", _DEFAULT_CONFIG.relationship_guidance)
+                or _DEFAULT_CONFIG.relationship_guidance,
+            rel_type_guidance=result.get("rel_type_guidance", _DEFAULT_CONFIG.rel_type_guidance)
+                or _DEFAULT_CONFIG.rel_type_guidance,
+            use_ast_chunking=bool(result.get("use_ast_chunking", False)),
+            requires_exact_resolution=bool(result.get("requires_exact_resolution", False)),
+        )
+
+        logger.info(
+            "LLM classified document domain: %s (%d rel_types)",
+            domain_name,
+            len(rel_types),
+        )
+        return cfg
+
+    except Exception as e:
+        logger.error(
+            "Failed to parse LLM domain classification result, "
+            "falling back to general: %s", e
+        )
+        return _DEFAULT_CONFIG

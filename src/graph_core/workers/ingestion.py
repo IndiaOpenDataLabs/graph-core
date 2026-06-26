@@ -11,6 +11,7 @@ from graph_core.services.graph import GraphService
 from graph_core.services.graph.ingestion.document_pipeline import (
     dispatch_pending_chunks,
     increment_chunk_counter,
+    is_job_cancelled,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 )
 async def run_ingestion(job_id: str):
     """Parent actor — dispatches chunk workers for graph RAG collections."""
+    if await is_job_cancelled(job_id):
+        logger.info("Skipping cancelled ingestion job: %s", job_id)
+        return
+
     service = GraphService()
     job_uuid = uuid.UUID(job_id)
 
@@ -48,6 +53,10 @@ async def run_ingestion(job_id: str):
 )
 async def run_chunk(job_id: str, chunk_index: int):
     """Child actor — processes a single chunk with full Graph RAG pipeline."""
+    if await is_job_cancelled(job_id):
+        logger.info("Skipping cancelled chunk job: %s chunk=%d", job_id, chunk_index)
+        return
+
     service = GraphService()
 
     try:
