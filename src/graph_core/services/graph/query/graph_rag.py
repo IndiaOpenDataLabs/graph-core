@@ -59,7 +59,7 @@ _RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
     "Retrieve relationship descriptions that best explain the user's question, "
     "especially causes, mechanisms, tensions, and energy depletion."
 )
-_MIX_REWRITE_MIN_SCORE = 0.1
+_MIX_REWRITE_MIN_SCORE = 0.3
 _REL_ENDPOINT_ENTITY_SCORE_MIN = 0.0
 _META_PROJECTION_ENTITY_SCORE = 0.96
 _META_PROJECTION_EDGE_BASE_SCORE = 0.72
@@ -2039,11 +2039,11 @@ async def _mix_state(
     logger.info(
         "graph_rag mix_state_start collection=%s question=%r top_entity_score=%.6f threshold=%.6f rel_types=%s",
         collection.name,
-            question,
-            top_entity_score,
-            _MIX_REWRITE_MIN_SCORE,
-            rel_types,
-        )
+        question,
+        top_entity_score,
+        _MIX_REWRITE_MIN_SCORE,
+        rel_types,
+    )
 
     rel_base_state = await _relationship_seed_state(
         collection,

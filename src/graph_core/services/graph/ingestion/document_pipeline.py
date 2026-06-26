@@ -93,15 +93,53 @@ async def _append_job_event(
         await session.commit()
 
 
+_CANCELLED_JOBS_KEY = "graph_core:cancelled_jobs"
+_CANCELLED_JOBS_TTL = 86400  # 24 hours — long enough for any in-flight message
+
+
+async def mark_jobs_cancelled(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Add job IDs to the cancelled set so workers bail out early."""
+    job_id_strings = [str(job_id) for job_id in job_ids if str(job_id)]
+    if not job_id_strings:
+        return 0
+    redis = aioredis.from_url(settings.redis_url)
+    try:
+        added = await redis.sadd(_CANCELLED_JOBS_KEY, *job_id_strings)
+        await redis.expire(_CANCELLED_JOBS_KEY, _CANCELLED_JOBS_TTL)
+        return int(added)
+    finally:
+        await redis.aclose()
+
+
+async def is_job_cancelled(job_id: uuid.UUID | str) -> bool:
+    """Check whether a job has been marked as cancelled."""
+    redis = aioredis.from_url(settings.redis_url)
+    try:
+        return bool(await redis.sismember(_CANCELLED_JOBS_KEY, str(job_id)))
+    finally:
+        await redis.aclose()
+
+
 async def purge_queued_job_messages(job_ids: Iterable[uuid.UUID | str]) -> int:
-    """Remove queued or delayed Dramatiq messages for the given jobs."""
+    """Remove queued or delayed Dramatiq messages for the given jobs.
+
+    Also marks jobs as cancelled so in-flight workers bail out early.
+    Use only for collection deletion or explicit cancellation — not on
+    normal job completion.
+    """
     job_id_strings = {str(job_id) for job_id in job_ids if str(job_id)}
     if not job_id_strings:
         return 0
 
     redis = aioredis.from_url(settings.redis_url)
     removed = 0
+    max_keys = 500
+    scanned_keys = 0
     try:
+        # Mark cancelled so workers that already dequeued can bail out.
+        await redis.sadd(_CANCELLED_JOBS_KEY, *job_id_strings)
+        await redis.expire(_CANCELLED_JOBS_KEY, _CANCELLED_JOBS_TTL)
+
         cursor = 0
         while True:
             cursor, keys = await redis.scan(
@@ -110,6 +148,13 @@ async def purge_queued_job_messages(job_ids: Iterable[uuid.UUID | str]) -> int:
                 count=100,
             )
             for key in keys:
+                scanned_keys += 1
+                if scanned_keys > max_keys:
+                    logger.warning(
+                        "purge_queued_job_messages hit scan limit (%d keys), stopping early",
+                        max_keys,
+                    )
+                    return removed
                 key_name = key.decode() if isinstance(key, bytes) else str(key)
                 queue_key = key_name.removesuffix(".msgs")
                 inner_cursor = 0

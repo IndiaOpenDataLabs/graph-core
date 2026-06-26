@@ -340,6 +340,19 @@ class IncrementalEntityResolver:
                     is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
                 )
 
+            # ON CONFLICT fired but entity is now gone — collection likely
+            # deleted mid-ingestion.  Abort gracefully.
+            logger.warning(
+                "Exact resolution race: entity %r vanished from collection %s "
+                "(collection likely deleted mid-ingestion)",
+                normalized_name,
+                self._collection_id,
+            )
+            raise RuntimeError(
+                f"Entity {normalized_name!r} could not be resolved: "
+                f"collection {self._collection_id} may have been deleted"
+            )
+
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
             select(EntityAlias)

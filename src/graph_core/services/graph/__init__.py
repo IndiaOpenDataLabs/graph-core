@@ -46,6 +46,8 @@ from graph_core.services.graph.ingestion.document_pipeline import (
     DocumentIngestionResult,
     enqueue_document_ingestion_job,
     ingest_document_pipeline,
+    is_job_cancelled,
+    mark_jobs_cancelled,
     process_single_chunk,
     purge_queued_job_messages,
 )
@@ -2662,12 +2664,10 @@ class GraphService:
         progress_percent: int | None = None,
         error: str | None = None,
     ):
-        job_type: str | None = None
         async with AsyncSessionLocal() as session:
             job = await session.get(Job, job_id)
             if not job:
                 return
-            job_type = job.job_type
             job.status = status  # type: ignore[assignment]
             if progress_percent is not None:
                 job.progress_percent = progress_percent
@@ -2678,8 +2678,6 @@ class GraphService:
             if status in ("completed", "failed", "cancelled"):
                 job.completed_at = datetime.now(UTC)
             await session.commit()
-        if job_type in {"query", "enhance"} and status in ("completed", "failed", "cancelled"):
-            await purge_queued_job_messages([job_id])
 
     async def append_job_event(
         self, job_id: uuid.UUID, event_type: str, payload: dict | None = None
