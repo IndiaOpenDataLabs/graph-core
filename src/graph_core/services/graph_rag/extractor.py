@@ -272,30 +272,33 @@ entities and relationships from source code.
 
 
 _CODE_RECONSTRUCTION_SYSTEM_PROMPT = """---Role---
-You are a Knowledge Graph Specialist responsible for refining a first-pass
-code extraction into a cleaner final graph.
+You are a Knowledge Graph Specialist completing a first-pass code
+extraction so the graph fully captures the logic of the source code.
 
 ---Instructions---
-1. You will be given a first-pass graph extracted from code.
-2. Reconstruct the code logic from the graph.
-3. If the graph is missing code logic, add more relationships or update
-   the current ones.
-4. If the graph includes unnecessary or overly local relationship items,
-   remove them.
-5. If the graph includes relationships that are too generic or too
-   abstract to explain the code, replace them with better ones.
-6. Keep the final result grounded in the code's actual execution flow,
-   state changes, control flow, and API boundaries.
-7. Keep only semantically central code symbols, concepts, and operations.
-   Exclude ephemeral locals, loop counters, temporary accumulators, and
-   helper builtins unless they are essential to the logic.
+1. You will be given a first-pass graph extracted from the code.
+2. Try to reconstruct the code's logic using only the extracted
+   relationships. Identify what is missing to recreate that logic.
+3. Emit only the additional relationships needed to recreate the logic,
+   plus corrected versions of existing relationships whose description,
+   keywords, weight, or endpoints do not yet match the code.
+4. Do not repeat relationships that were already extracted correctly.
+5. Keep naming consistent with the previously extracted endpoints so that
+   corrections attach to the same (source, target, rel_type) edges.
+6. Keep additions grounded in the code's actual execution flow, state
+   changes, control flow, and API boundaries.
+7. Prefer semantically central code symbols, concepts, and operations.
+   Do not add edges for ephemeral locals, loop counters, temporary
+   accumulators, or helper builtins unless they are essential to the logic.
 8. Relationship descriptions must be rich enough to understand what
    happens, when, why, and with what effect without looking at the code.
 9. Use the fixed taxonomy below and keep the output structured by
    category and rel_type.
 10. For every chunk, evaluate every rel_type, even when no evidence
     exists. Emit an empty array for unsupported rel_types.
-11. Return the final graph, not a diff.
+11. Return only new or corrected relationships, not the whole graph. The
+    additions are merged into the existing graph; nothing you omit is
+    deleted.
 12. Do not emit an entities section. The ingestion adapter will derive
     entities from the relationship endpoints after parsing.
 13. {domain_relationship_guidance}
@@ -486,19 +489,23 @@ def _collect_generic_entities(relationships: Any) -> list[ExtractedEntity]:
 
 
 _GLEANING_SYSTEM_PROMPT = """---Role---
-You are a Knowledge Graph Specialist responsible for refining a first-pass
-relationship graph into a cleaner final graph.
+You are a Knowledge Graph Specialist completing a first-pass relationship
+graph so it fully captures the logic of the source passage.
 
 ---Instructions---
-Based on the previous extraction, identify only missed or incorrectly
-formatted relationships.
+Read the source passage and the relationships already extracted from it.
+Ask yourself: using only the extracted relationships, could a reader
+reconstruct the meaning and logic of the passage? Identify what is missing
+to recreate that logic, and emit only those additions or corrections.
 
 1. Do not repeat relationships that were already extracted correctly.
 2. Focus on:
-   - relationships missed in the first pass
-   - relationships that need correction to match the required structure
-   - relationships that are too generic or too local to explain the text
-3. Keep naming consistent with the previously extracted endpoints.
+   - relationships needed to recreate the passage's logic that the first
+     pass missed
+   - relationships that need a corrected description, keywords, weight, or
+     rel_type to match the required structure or the passage's meaning
+3. Keep naming consistent with the previously extracted endpoints so that
+   corrections attach to the same (source, target, rel_type) edges.
 4. Relationship descriptions must still explain the nature, context,
    and significance of the connection. Make them rich enough to
    understand the behavior without looking at the text again.
@@ -508,7 +515,9 @@ formatted relationships.
 6. Preserve multiple genuinely distinct rel_type entries for the same
    source/target pair when the text supports them; do not collapse them
    to one generic edge unless the evidence really supports only one.
-7. Return the final graph, not a diff.
+7. Return only new or corrected relationships, not the whole graph. The
+   additions are merged into the existing graph; nothing you omit is
+   deleted.
 8. Do not emit an entities section. The ingestion adapter will derive
    entities from the relationship endpoints after parsing.
 9. {domain_entity_guidance}
@@ -519,11 +528,13 @@ formatted relationships.
 _GLEANING_USER_PROMPT = """Previously extracted relationships:
 {existing_info}
 
-Now extract any additional or corrected relationships from:
+Identify what is still missing to recreate the logic of the passage, then
+extract those additional or corrected relationships from:
 
 {text}
 
-Only output the structured relationships object.
+Only output new or corrected relationships in the structured relationships
+object.
 """
 
 
@@ -946,6 +957,70 @@ Only output the structured relationships object.
             domain=domain,
         )
 
+    @staticmethod
+    def _merge_relationships(
+        current: list[ExtractedRelationship],
+        additions: list[ExtractedRelationship],
+    ) -> tuple[list[ExtractedRelationship], int]:
+        """Additively merge gleaned relationships into the current set.
+
+        New ``(source, target, rel_type)`` edges are appended. When an
+        edge already exists, the gleaned version replaces it in place so
+        descriptions/keywords/weights can be corrected — but no existing
+        edge is ever dropped. Returns the merged list and the count of
+        newly added edges.
+        """
+        merged: dict[tuple[str, str, str], ExtractedRelationship] = {}
+        order: list[tuple[str, str, str]] = []
+        for rel in current:
+            key = (rel.source_name, rel.target_name, rel.rel_type)
+            if key not in merged:
+                order.append(key)
+            merged[key] = rel
+
+        added = 0
+        for rel in additions:
+            key = (rel.source_name, rel.target_name, rel.rel_type)
+            if key not in merged:
+                order.append(key)
+                added += 1
+            merged[key] = rel
+
+        return [merged[key] for key in order], added
+
+    @staticmethod
+    def _merge_entities(
+        current: list[ExtractedEntity],
+        additions: list[ExtractedEntity],
+    ) -> tuple[list[ExtractedEntity], int]:
+        """Additively merge entities by name, preferring the richer
+        (longer) description and never dropping an existing entity.
+        Returns the merged list and the count of newly added entities.
+        """
+        merged: dict[str, ExtractedEntity] = {}
+        order: list[str] = []
+        for ent in current:
+            if ent.name not in merged:
+                order.append(ent.name)
+            merged[ent.name] = ent
+
+        added = 0
+        for ent in additions:
+            existing = merged.get(ent.name)
+            if existing is None:
+                order.append(ent.name)
+                merged[ent.name] = ent
+                added += 1
+                continue
+            if len(ent.description or "") > len(existing.description or ""):
+                merged[ent.name] = ExtractedEntity(
+                    name=existing.name,
+                    entity_type=existing.entity_type or ent.entity_type,
+                    description=ent.description,
+                )
+
+        return [merged[name] for name in order], added
+
     async def extract(
         self,
         text: str,
@@ -1075,35 +1150,37 @@ Only output the structured relationships object.
                 logger.warning("Gleaning failed: %s", e)
                 break
 
-            prev_entity_count = len(current_entities)
-            prev_rel_count = len(current_relationships)
             if is_code_domain:
                 relationships_payload = gleamed.get("relationships")
-                cleaned_entities = _collect_code_entities(relationships_payload)
-                cleaned_relationships = self._extract_code_relationships(
+                gleaned_entities = _collect_code_entities(relationships_payload)
+                gleaned_relationships = self._extract_code_relationships(
                     relationships_payload,
                     domain=domain,
                 )
-                if cleaned_entities or cleaned_relationships:
-                    current_entities = cleaned_entities
-                    current_relationships = cleaned_relationships
             else:
                 relationships_payload = gleamed.get("relationships")
-                cleaned_entities = _collect_generic_entities(relationships_payload)
-                new_relationships = self._extract_relationships(
+                gleaned_entities = _collect_generic_entities(relationships_payload)
+                gleaned_relationships = self._extract_relationships(
                     relationships_payload,
                     rel_vocab=rel_vocab,
                     domain=domain,
                     is_code_domain=False,
                 )
-                if cleaned_entities or new_relationships:
-                    current_entities = cleaned_entities
-                    current_relationships = new_relationships
 
-            if (
-                len(current_entities) == prev_entity_count
-                and len(current_relationships) == prev_rel_count
-            ):
+            current_relationships, added_rels = self._merge_relationships(
+                current_relationships,
+                gleaned_relationships,
+            )
+            current_entities, added_entities = self._merge_entities(
+                current_entities,
+                gleaned_entities,
+            )
+
+            # Stop once a pass introduces nothing new. Corrections to
+            # existing edges still take effect because merging happens
+            # before this check; we only bail when no edges/entities were
+            # added.
+            if added_rels == 0 and added_entities == 0:
                 break
 
         return ExtractionResult(

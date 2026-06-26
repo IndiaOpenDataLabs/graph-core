@@ -419,6 +419,161 @@ def test_chat_domain_uses_chat_specific_guidance():
     assert "follow-up" in cfg.rel_type_guidance.lower()
 
 
+class _SequencedLLMProvider(LLMProvider):
+    """Returns a different structured payload for each successive call."""
+
+    def __init__(self, responses: list[dict]) -> None:
+        self._responses = responses
+        self.prompts: list[str] = []
+        self.calls = 0
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "ok"
+
+    async def chat_stream(self, messages: list[dict]):
+        if False:
+            yield ""
+
+    async def structured_extract(self, prompt: str, schema: dict) -> dict:
+        self.prompts.append(prompt)
+        index = min(self.calls, len(self._responses) - 1)
+        self.calls += 1
+        return self._responses[index]
+
+
+def _generic_rel(source: str, target: str, rel_type: str) -> dict:
+    return {
+        "source": {"name": source, "description": f"{source} description"},
+        "target": {"name": target, "description": f"{target} description"},
+        "description": f"{source} {rel_type} {target}.",
+        "keywords": [rel_type.lower()],
+        "weight": 0.8,
+        "rel_type": [
+            {"name": rel_type, "description": "", "keywords": [], "weight": 0.8}
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_generic_gleaning_is_additive_and_never_drops_first_pass_edges():
+    first_pass = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    # The gleaning pass omits the first-pass edge entirely and adds a new one.
+    gleaning_pass = {"relationships": [_generic_rel("Krishna", "Dharma", "EXPLAINS")]}
+    llm = _SequencedLLMProvider([first_pass, gleaning_pass])
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract_with_gleaning(
+        "Arjuna receives guidance from Krishna about Dharma.",
+        max_gleaning=1,
+        domain="general",
+    )
+
+    edges = {(r.source_name, r.target_name, r.rel_type) for r in result.relationships}
+    # First-pass edge survives even though gleaning did not re-emit it.
+    assert ("Arjuna", "Krishna", "RELATES_TO") in edges
+    # Gleaning addition is merged in.
+    assert ("Krishna", "Dharma", "EXPLAINS") in edges
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_generic_gleaning_corrects_existing_edge_in_place():
+    first_pass = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    corrected = _generic_rel("Arjuna", "Krishna", "RELATES_TO")
+    corrected["description"] = "Corrected: Arjuna is counseled by Krishna."
+    gleaning_pass = {"relationships": [corrected]}
+    llm = _SequencedLLMProvider([first_pass, gleaning_pass])
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract_with_gleaning(
+        "Arjuna receives guidance from Krishna.",
+        max_gleaning=1,
+        domain="general",
+    )
+
+    matching = [
+        r
+        for r in result.relationships
+        if (r.source_name, r.target_name, r.rel_type)
+        == ("Arjuna", "Krishna", "RELATES_TO")
+    ]
+    # Edge is not duplicated; description is corrected in place.
+    assert len(matching) == 1
+    assert matching[0].description == "Corrected: Arjuna is counseled by Krishna."
+
+
+@pytest.mark.asyncio
+async def test_generic_gleaning_stops_when_no_new_edges_added():
+    same = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    # Three identical responses available; loop should stop after the first
+    # gleaning pass adds nothing new.
+    llm = _SequencedLLMProvider([same, same, same])
+    extractor = LLMGraphExtractor(llm)
+
+    await extractor.extract_with_gleaning(
+        "Arjuna receives guidance from Krishna.",
+        max_gleaning=5,
+        domain="general",
+    )
+
+    # 1 initial extract + 1 gleaning pass (which added nothing) = 2 calls.
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_code_gleaning_is_additive_across_passes():
+    def code_payload(rel_type: str, source: str, target: str) -> dict:
+        buckets: dict[str, dict[str, list]] = {
+            "value_operations": {
+                k: []
+                for k in ("EVALUATE", "COMPARE", "CONVERT", "CONSTRUCT", "DESTRUCTURE")
+            },
+            "name_place_operations": {
+                k: [] for k in ("BIND", "REBIND", "MUTATE", "ACCESS")
+            },
+            "control_operations": {
+                k: []
+                for k in ("BRANCH", "ITERATE", "CALL", "RETURN", "SIGNAL", "HANDLE")
+            },
+            "effect_operations": {
+                k: []
+                for k in (
+                    "COMMUNICATE",
+                    "ALLOCATE_RESOURCE",
+                    "RELEASE_RESOURCE",
+                    "SYNCHRONIZE",
+                )
+            },
+        }
+        for category, rel_types in buckets.items():
+            if rel_type in rel_types:
+                rel_types[rel_type] = [
+                    {
+                        "source": {"name": source, "description": f"{source} desc"},
+                        "target": {"name": target, "description": f"{target} desc"},
+                        "description": f"{source} {rel_type} {target}.",
+                        "keywords": [rel_type.lower()],
+                        "weight": 0.9,
+                    }
+                ]
+        return {"relationships": buckets}
+
+    first_pass = code_payload("CALL", "build_query", "sanitize_input")
+    gleaning_pass = code_payload("RETURN", "build_query", "result")
+    llm = _SequencedLLMProvider([first_pass, gleaning_pass])
+    extractor = LLMGraphExtractor(llm)
+
+    result = await extractor.extract_with_gleaning(
+        "def build_query():\n    return sanitize_input(value)\n",
+        max_gleaning=1,
+        domain="code",
+    )
+
+    edges = {(r.source_name, r.target_name, r.rel_type) for r in result.relationships}
+    assert ("build_query", "sanitize_input", "CALL") in edges
+    assert ("build_query", "result", "RETURN") in edges
+
+
 @pytest.mark.asyncio
 async def test_active_dimensions_consolidates_aliases(
     db_session,
