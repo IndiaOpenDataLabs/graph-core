@@ -291,10 +291,10 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             cfg = await classify_document(llm, text)
             register_domain(cfg)
             domain = cfg.name
-            payload = dict(job.payload or {})
-            payload["domain"] = domain
-            payload["domain_config"] = cfg.to_dict()
-            job.payload = payload
+            if job.payload is None:
+                job.payload = {}
+            job.payload["domain"] = domain
+            job.payload["domain_config"] = cfg.to_dict()
             await session.commit()
             logger.info(
                 "document_ingestion classified collection_id=%s job_id=%s domain=%s use_ast_chunking=%s requires_exact_resolution=%s entity_guidance=%s relationship_guidance=%s rel_type_guidance=%s persisted=true",

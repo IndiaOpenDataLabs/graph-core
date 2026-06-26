@@ -822,7 +822,7 @@ class IncrementalEntityResolver:
                 select(RelationshipDescription).where(
                     RelationshipDescription.relationship_id == relationship_id,
                     RelationshipDescription.document_id == document_id,
-                )
+                ).limit(1)
             )
             existing_desc = existing_exact.scalar_one_or_none()
             if existing_desc:
