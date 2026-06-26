@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import string
+import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
@@ -580,39 +581,120 @@ def _query_token_set(question: str) -> set[str]:
     return {w.lower() for w in _extract_query_keywords(question)}
 
 
-def _contains_entity_mention(question: str, candidate: str) -> bool:
-    candidate = str(candidate or "").strip()
-    if len(candidate) < 3:
-        return False
-    # Strip punctuation from the question so "aurobindo?" matches "aurobindo".
-    question_clean = question.casefold()
-    for ch in string.punctuation:
-        question_clean = question_clean.replace(ch, " ")
-    question_norm = " ".join(question_clean.split())
-    candidate_norm = " ".join(candidate.casefold().split())
-    if not candidate_norm:
-        return False
-    # Direct substring match after full punctuation stripping.
-    if candidate_norm in question_norm:
-        return True
-    # Fuzzy: strip punctuation from candidate and check word boundary match.
-    stripped = candidate_norm.strip(string.punctuation)
-    return bool(stripped and stripped in question_norm)
+# ---------------------------------------------------------------------------
+# Entity mention index — ngram-based, cached per collection
+# ---------------------------------------------------------------------------
+
+_MENTION_INDEX_TTL_SECONDS = 300  # 5 minutes
+_MENTION_INDEX_MAX_NGRAM = 4
 
 
-async def _mentioned_entity_rows(
-    collection: Collection,
-    question: str,
-    *,
-    document_ids: list[uuid.UUID] | None = None,
-    limit: int = 20,
-) -> list[tuple[str, str, str, float]]:
-    """Return entities explicitly named in the question before vector ranking.
+@dataclass
+class _MentionMatch:
+    entity_id: str
+    canonical_name: str
+    score: float  # 1.0 for canonical match, 0.98 for alias match
 
-    Vector retrieval can miss short proper nouns when the query is phrased as a
-    recommendation or why-question. This pass keeps literal entity mentions
-    from being lost before mix-mode interpretation.
+
+class _EntityMentionIndex:
+    """Pre-loaded entity/alias name index for fast ngram-based mention detection.
+
+    Instead of iterating all entities and doing substring matching per entity,
+    this tokenizes the query into 1-4 word ngrams and looks them up in a set
+    of known entity names. O(question_length^2) lookups in a hash set vs
+    O(entity_count * question_length) substring scans.
     """
+
+    def __init__(
+        self,
+        entity_rows: list[tuple[Any, str, str]],
+        alias_rows: list[tuple[Any, str]],
+    ) -> None:
+        # canonical_key -> (entity_id_str, canonical_name)
+        self._canonical_map: dict[str, tuple[str, str]] = {}
+        # alias_key -> (entity_id_str, canonical_name)
+        self._alias_map: dict[str, tuple[str, str]] = {}
+        self._entity_name_by_id: dict[str, str] = {}
+
+        for entity_id, canonical_name, _primary_type in entity_rows:
+            name = str(canonical_name or "").strip()
+            if not name or len(name) < 3:
+                continue
+            entity_id_str = str(entity_id)
+            self._entity_name_by_id[entity_id_str] = name
+            key = self._normalize_key(name)
+            if key:
+                self._canonical_map[key] = (entity_id_str, name)
+
+        for entity_id, alias_name in alias_rows:
+            alias = str(alias_name or "").strip()
+            if not alias or len(alias) < 3:
+                continue
+            entity_id_str = str(entity_id)
+            key = self._normalize_key(alias)
+            if key and key not in self._canonical_map:
+                canonical = self._entity_name_by_id.get(entity_id_str, alias)
+                self._alias_map.setdefault(key, (entity_id_str, canonical))
+
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        """Lowercase, strip punctuation, collapse whitespace."""
+        lowered = name.casefold()
+        cleaned = lowered.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+        return " ".join(cleaned.split())
+
+    @staticmethod
+    def _question_ngrams(question: str) -> list[str]:
+        """Generate 1 to _MENTION_INDEX_MAX_NGRAM word ngrams from the question."""
+        cleaned = question.casefold()
+        cleaned = cleaned.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+        words = cleaned.split()
+        ngrams: list[str] = []
+        for n in range(1, min(_MENTION_INDEX_MAX_NGRAM + 1, len(words) + 1)):
+            for i in range(len(words) - n + 1):
+                ngrams.append(" ".join(words[i : i + n]))
+        return ngrams
+
+    def find_mentions(self, question: str, *, limit: int = 20) -> list[_MentionMatch]:
+        """Find entities whose names appear as ngrams in the question."""
+        ngrams = self._question_ngrams(question)
+        matched: dict[str, _MentionMatch] = {}
+
+        for ngram in ngrams:
+            if ngram in self._canonical_map:
+                entity_id, name = self._canonical_map[ngram]
+                if entity_id not in matched or matched[entity_id].score < 1.0:
+                    matched[entity_id] = _MentionMatch(
+                        entity_id=entity_id,
+                        canonical_name=name,
+                        score=1.0,
+                    )
+            elif ngram in self._alias_map:
+                entity_id, name = self._alias_map[ngram]
+                if entity_id not in matched:
+                    matched[entity_id] = _MentionMatch(
+                        entity_id=entity_id,
+                        canonical_name=name,
+                        score=0.98,
+                    )
+
+        results = sorted(matched.values(), key=lambda m: (-m.score, -len(m.canonical_name)))
+        return results[:limit]
+
+
+# Module-level cache: collection_id -> (index, timestamp)
+_mention_index_cache: dict[uuid.UUID, tuple[_EntityMentionIndex, float]] = {}
+
+
+async def _get_mention_index(collection: Collection) -> _EntityMentionIndex:
+    """Return (possibly cached) mention index for a collection."""
+    now = time.monotonic()
+    cached = _mention_index_cache.get(collection.id)
+    if cached is not None:
+        index, created_at = cached
+        if now - created_at < _MENTION_INDEX_TTL_SECONDS:
+            return index
+
     async with AsyncSessionLocal() as session:
         entity_rows = (
             await session.execute(
@@ -632,71 +714,15 @@ async def _mentioned_entity_rows(
             )
         ).all()
 
-        matched_ids: dict[str, tuple[str, float]] = {}
-        entity_name_by_id = {
-            str(entity_id): str(canonical_name or "").strip()
-            for entity_id, canonical_name, _ in entity_rows
-        }
-        for entity_id, canonical_name, _ in entity_rows:
-            name = str(canonical_name or "").strip()
-            if _contains_entity_mention(question, name):
-                matched_ids[str(entity_id)] = (name, 1.0)
-        for entity_id, alias_name in alias_rows:
-            alias = str(alias_name or "").strip()
-            if not _contains_entity_mention(question, alias):
-                continue
-            entity_id_str = str(entity_id)
-            name = entity_name_by_id.get(entity_id_str, alias)
-            # Alias matches are still exact mentions, but canonical-name matches
-            # should win if both are present.
-            matched_ids.setdefault(entity_id_str, (name, 0.98))
-
-        if not matched_ids:
-            return []
-
-        desc_conditions = [
-            EntityDescription.entity_id.in_(
-                [uuid.UUID(entity_id) for entity_id in matched_ids]
-            )
-        ]
-        if document_ids:
-            desc_conditions.append(EntityDescription.document_id.in_(document_ids))
-        desc_rows = (
-            await session.execute(
-                select(
-                    EntityDescription.entity_id,
-                    EntityDescription.description,
-                    EntityDescription.weight,
-                )
-                .where(*desc_conditions)
-                .order_by(EntityDescription.weight.desc())
-            )
-        ).all()
-
-    descriptions_by_id: dict[str, str] = {}
-    for entity_id, description, _ in desc_rows:
-        descriptions_by_id.setdefault(str(entity_id), str(description or "").strip())
-
-    rows = [
-        (
-            entity_id,
-            name,
-            descriptions_by_id.get(entity_id, name),
-            score,
-        )
-        for entity_id, (name, score) in matched_ids.items()
-        if name
-    ]
-    rows.sort(key=lambda item: (item[3], len(item[1])), reverse=True)
-    result = rows[:limit]
+    index = _EntityMentionIndex(entity_rows, alias_rows)
+    _mention_index_cache[collection.id] = (index, now)
     logger.info(
-        "graph_rag mentioned_entities collection=%s question=%r found=%d results=%s",
+        "graph_rag mention_index_built collection=%s entities=%d aliases=%d",
         collection.name,
-        question,
-        len(result),
-        [(name, round(score, 4)) for _, name, _, score in result],
+        len(entity_rows),
+        len(alias_rows),
     )
-    return result
+    return index
 
 
 def _parse_source_ids(value: Any) -> list[str]:
@@ -733,10 +759,13 @@ async def _load_document_candidates_from_query_entities(
     collection: Collection,
     embedding_provider: EmbeddingProvider,
     *,
+    mention_index: _EntityMentionIndex | None = None,
     limit: int = 20,
 ) -> list[DocumentRoutingCandidate]:
     query_embedding = await _embed_entity_query(embedding_provider, question)
-    mentioned_rows = await _mentioned_entity_rows(collection, question, limit=10)
+    if mention_index is None:
+        mention_index = await _get_mention_index(collection)
+    mentions = mention_index.find_mentions(question, limit=10)
     entity_hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
         query_embedding=query_embedding,
@@ -745,12 +774,12 @@ async def _load_document_candidates_from_query_entities(
 
     candidate_map: dict[str, DocumentRoutingCandidate] = {}
     async with AsyncSessionLocal() as session:
-        for entity_id, name, _, score in mentioned_rows:
+        for match in mentions:
             desc_rows = (
                 await session.execute(
                     select(
                         EntityDescription.document_id,
-                    ).where(EntityDescription.entity_id == uuid.UUID(entity_id))
+                    ).where(EntityDescription.entity_id == uuid.UUID(match.entity_id))
                 )
             ).all()
             for (document_id,) in desc_rows:
@@ -762,14 +791,14 @@ async def _load_document_candidates_from_query_entities(
                     candidate_map[document_id_str] = DocumentRoutingCandidate(
                         document_id=document_id_str,
                         document_path="",
-                        best_score=score,
-                        matched_entities=[name],
+                        best_score=match.score,
+                        matched_entities=[match.canonical_name],
                     )
                     continue
-                if score > candidate.best_score:
-                    candidate.best_score = score
-                if name not in candidate.matched_entities:
-                    candidate.matched_entities.append(name)
+                if match.score > candidate.best_score:
+                    candidate.best_score = match.score
+                if match.canonical_name not in candidate.matched_entities:
+                    candidate.matched_entities.append(match.canonical_name)
 
     for hit in entity_hits:
         document_id = str(hit.metadata.get("document_id") or "").strip()
@@ -886,20 +915,18 @@ async def _search_entity_seeds(
     collection: Collection,
     query_embedding: list[float],
     document_ids: list[uuid.UUID] | None = None,
+    mention_index: _EntityMentionIndex | None = None,
 ) -> tuple[list[str], dict[str, float]]:
     top_k = 20
     seed_entity_ids: list[str] = []
     entity_relevance: dict[str, float] = {}
 
-    for entity_id, _, _, score in await _mentioned_entity_rows(
-        collection,
-        question,
-        document_ids=document_ids,
-        limit=20,
-    ):
-        if entity_id not in seed_entity_ids:
-            seed_entity_ids.append(entity_id)
-            entity_relevance[entity_id] = score
+    if mention_index is None:
+        mention_index = await _get_mention_index(collection)
+    for match in mention_index.find_mentions(question, limit=20):
+        if match.entity_id not in seed_entity_ids:
+            seed_entity_ids.append(match.entity_id)
+            entity_relevance[match.entity_id] = match.score
 
     entity_hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
@@ -951,6 +978,7 @@ async def _top_entity_candidates(
     question: str = "",
     top_k: int = 50,
     document_ids: list[uuid.UUID] | None = None,
+    mention_index: _EntityMentionIndex | None = None,
 ) -> list[tuple[str, str, float]]:
     hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
@@ -961,16 +989,14 @@ async def _top_entity_candidates(
     candidates: list[tuple[str, str, float]] = []
     seen: set[str] = set()
     if question:
-        for _, name, description, score in await _mentioned_entity_rows(
-            collection,
-            question,
-            document_ids=document_ids,
-            limit=20,
-        ):
+        if mention_index is None:
+            mention_index = await _get_mention_index(collection)
+        for match in mention_index.find_mentions(question, limit=20):
+            name = match.canonical_name
             if not name or name in seen:
                 continue
             seen.add(name)
-            candidates.append((name, description, score))
+            candidates.append((name, name, match.score))
     for hit in hits:
         name = str(hit.metadata.get("name") or "").strip()
         if not name or name in seen:
@@ -1079,6 +1105,7 @@ async def _entity_first_state(
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
     document_ids: list[uuid.UUID] | None = None,
+    mention_index: _EntityMentionIndex | None = None,
 ) -> GraphQueryState:
     top_k = 10
     min_edge_sim = settings.graph_rag_min_edge_similarity
@@ -1091,6 +1118,7 @@ async def _entity_first_state(
         collection,
         entity_query_embedding,
         document_ids=document_ids,
+        mention_index=mention_index,
     )
 
     async with AsyncSessionLocal() as session:
@@ -1496,6 +1524,7 @@ async def _relationship_first_state(
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
     document_ids: list[uuid.UUID] | None = None,
+    mention_index: _EntityMentionIndex | None = None,
 ) -> GraphQueryState:
     query_tokens = _query_token_set(question)
     state = await _relationship_seed_state(
@@ -1517,6 +1546,7 @@ async def _relationship_first_state(
         question=question,
         min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
         document_ids=document_ids,
+        mention_index=mention_index,
     )
 
 
@@ -1648,6 +1678,7 @@ async def _filter_relationship_state_by_entity_score(
     min_entity_score: float,
     top_k: int = 50,
     document_ids: list[uuid.UUID] | None = None,
+    mention_index: _EntityMentionIndex | None = None,
 ) -> GraphQueryState:
     if not state.discovered_entity_ids:
         return state
@@ -1658,6 +1689,7 @@ async def _filter_relationship_state_by_entity_score(
         question=question,
         top_k=top_k,
         document_ids=document_ids,
+        mention_index=mention_index,
     )
     entity_score_by_name = {
         name.strip().lower(): score for name, _, score in candidates
@@ -2025,7 +2057,10 @@ async def _mix_state(
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
     document_ids: list[uuid.UUID] | None = None,
+    mention_index: _EntityMentionIndex | None = None,
 ) -> GraphQueryState:
+    if mention_index is None:
+        mention_index = await _get_mention_index(collection)
     query_tokens = _query_token_set(question)
     await _log_exact_name_hits(collection, question)
     candidates = await _top_entity_candidates(
@@ -2034,6 +2069,7 @@ async def _mix_state(
         question=question,
         top_k=50,
         document_ids=document_ids,
+        mention_index=mention_index,
     )
     top_entity_score = candidates[0][2] if candidates else 0.0
     logger.info(
@@ -2064,6 +2100,7 @@ async def _mix_state(
         question=question,
         min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
         document_ids=document_ids,
+        mention_index=mention_index,
     )
     if top_entity_score < _MIX_REWRITE_MIN_SCORE:
         logger.info(
@@ -2123,6 +2160,7 @@ async def _mix_state(
             question=subquery,
             min_entity_score=_REL_ENDPOINT_ENTITY_SCORE_MIN,
             document_ids=document_ids,
+            mention_index=mention_index,
         )
 
     concurrency = settings.graph_rag_query_embedding_concurrency
@@ -2677,6 +2715,7 @@ async def _build_graph_query_artifacts(
 ) -> GraphQueryArtifacts:
     embedding_provider = await _resolve_embedding_provider(collection)
     entity_query_embedding = await _embed_entity_query(embedding_provider, question)
+    mention_index = await _get_mention_index(collection)
 
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
@@ -2706,6 +2745,7 @@ async def _build_graph_query_artifacts(
                 relationship_query_embedding,
                 **kwargs,
                 document_ids=document_ids,
+                mention_index=mention_index,
             )
         if effective_mode == "mix":
             return await _mix_state(
@@ -2718,6 +2758,7 @@ async def _build_graph_query_artifacts(
                 relationship_query_embedding,
                 **kwargs,
                 document_ids=document_ids,
+                mention_index=mention_index,
             )
         if effective_mode == "hybrid":
             entity_state = await _entity_first_state(
@@ -2727,6 +2768,7 @@ async def _build_graph_query_artifacts(
                 relationship_query_embedding,
                 **kwargs,
                 document_ids=document_ids,
+                mention_index=mention_index,
             )
             relationship_state = await _relationship_first_state(
                 question,
@@ -2735,6 +2777,7 @@ async def _build_graph_query_artifacts(
                 relationship_query_embedding,
                 **kwargs,
                 document_ids=document_ids,
+                mention_index=mention_index,
             )
             return _merge_states(entity_state, relationship_state)
         return await _entity_first_state(
@@ -2744,6 +2787,7 @@ async def _build_graph_query_artifacts(
             relationship_query_embedding,
             **kwargs,
             document_ids=document_ids,
+            mention_index=mention_index,
         )
 
     state = await _fan_out_per_dimension(_build_state_for, dimensions)
