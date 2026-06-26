@@ -459,9 +459,21 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
                     "evidence_region_ids": ["role_group_1"],
                 },
             )
+        on_meta_edge = kwargs.get("on_meta_edge")
+        meta_edge = {
+            "source_id": "concept-1",
+            "target_id": "concept-2",
+            "id": "concept-1__CONNECTS_TO__concept-2",
+            "rel_type": "CONNECTS_TO",
+            "description": "concept link",
+            "keywords": [],
+            "source_ids": ["node-1"],
+        }
+        if on_meta_edge is not None:
+            await on_meta_edge(meta_edge)
         return {
             "nodes": [{"id": "concept-1", "type": "derived_concept"}],
-            "edges": [],
+            "edges": [meta_edge],
             "chunks": [],
             "candidate_region_count": 1,
         }

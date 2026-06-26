@@ -14,7 +14,25 @@ class _FakeRedis:
     def __init__(self, hashes: dict[str, dict[str, bytes]], zsets: dict[str, dict[str, int]]):
         self.hashes = hashes
         self.zsets = zsets
+        self.sets: dict[str, set[str]] = {}
+        self.expirations: dict[str, int] = {}
         self.closed = False
+
+    async def sadd(self, key_name, *members):  # noqa: ANN001
+        table = self.sets.setdefault(key_name, set())
+        added = 0
+        for member in members:
+            if member not in table:
+                table.add(member)
+                added += 1
+        return added
+
+    async def expire(self, key_name, ttl):  # noqa: ANN001
+        self.expirations[key_name] = ttl
+        return True
+
+    async def sismember(self, key_name, member):  # noqa: ANN001
+        return member in self.sets.get(key_name, set())
 
     async def scan(self, cursor=0, match=None, count=None):  # noqa: ANN001
         import fnmatch
@@ -91,4 +109,5 @@ async def test_purge_queued_job_messages_removes_matching_dramatiq_entries(monke
     assert "target" not in fake_redis.zsets["dramatiq:ingestion_control.XQ"]
     assert "other" in fake_redis.hashes["dramatiq:ingestion_control.XQ.msgs"]
     assert "other" in fake_redis.zsets["dramatiq:ingestion_control.XQ"]
+    assert str(target_job_id) in fake_redis.sets[document_pipeline._CANCELLED_JOBS_KEY]
     assert fake_redis.closed is True
