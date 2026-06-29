@@ -21,6 +21,8 @@ class AuthenticatedMCPClient:
         self._session: ClientSession | None = None
         self._transport_ctx = None
         self._http_client: httpx.AsyncClient | None = None
+        self._transport_entered = False
+        self._session_entered = False
 
     async def connect(self) -> None:
         self._http_client = httpx.AsyncClient(
@@ -39,6 +41,7 @@ class AuthenticatedMCPClient:
             )
             self._transport_ctx = transport
             streams = await transport.__aenter__()
+            self._transport_entered = True
             if len(streams) == 2:
                 read_stream, write_stream = streams
             elif len(streams) == 3:
@@ -50,6 +53,7 @@ class AuthenticatedMCPClient:
                 )
             self._session = ClientSession(read_stream, write_stream)
             await self._session.__aenter__()
+            self._session_entered = True
             await self._session.initialize()
         except Exception:
             await self.disconnect()
@@ -58,20 +62,22 @@ class AuthenticatedMCPClient:
             ) from None
 
     async def disconnect(self) -> None:
-        if self._session:
+        if self._session and self._session_entered:
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(
                     self._session.__aexit__(None, None, None),
                     timeout=2.0,
                 )
-            self._session = None
-        if self._transport_ctx:
+        self._session = None
+        self._session_entered = False
+        if self._transport_ctx and self._transport_entered:
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(
                     self._transport_ctx.__aexit__(None, None, None),
                     timeout=2.0,
                 )
-            self._transport_ctx = None
+        self._transport_ctx = None
+        self._transport_entered = False
         if self._http_client:
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(self._http_client.aclose(), timeout=2.0)
