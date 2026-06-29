@@ -37,6 +37,8 @@ async def run_ingestion(job_id: str):
 
     try:
         await service.ingest_document_pipeline(job_uuid)
+        if await is_job_cancelled(job_uuid):
+            return
         await dispatch_pending_chunks(job_uuid)
         await service.append_job_event(job_uuid, "chunks_dispatched")
     except Exception as e:
@@ -59,10 +61,6 @@ async def run_chunk(
     llm_slot_token: str | None = None,
 ):
     """Child actor — processes a single chunk with full Graph RAG pipeline."""
-    if await is_job_cancelled(job_id):
-        logger.info("Skipping cancelled chunk job: %s chunk=%d", job_id, chunk_index)
-        return
-
     service = GraphService()
 
     try:
@@ -81,6 +79,14 @@ async def run_chunk(
             e,
         )
         job_uuid = uuid.UUID(job_id)
+        if await is_job_cancelled(job_id):
+            await service.update_chunk_status(
+                job_uuid,
+                chunk_index,
+                "cancelled",
+                error=str(e),
+            )
+            return
         await service.update_chunk_status(job_uuid, chunk_index, "failed", error=str(e))
         await increment_chunk_counter(job_uuid)
         await service.append_job_event(

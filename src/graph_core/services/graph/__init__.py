@@ -45,11 +45,13 @@ from graph_core.services.graph.ingestion.chunk_processor import (
 from graph_core.services.graph.ingestion.document_pipeline import (
     DocumentIngestionResult,
     enqueue_document_ingestion_job,
+    finalize_cancelled_jobs,
     ingest_document_pipeline,
     is_job_cancelled,
     mark_jobs_cancelled,
     process_single_chunk,
     purge_queued_job_messages,
+    wait_for_chunk_drain,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     update_chunk_status as _update_chunk_status,
@@ -1597,13 +1599,14 @@ class GraphService:
         collection_ids_to_delete = [collection.id, *(descendant.id for descendant in descendants)]
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(Job.id).where(
-                    Job.collection_id.in_(collection_ids_to_delete),
-                )
+                select(Job.id).where(Job.collection_id.in_(collection_ids_to_delete))
             )
             job_ids = list(result.scalars().all())
         if job_ids:
+            await mark_jobs_cancelled(job_ids)
+            await finalize_cancelled_jobs(job_ids)
             await purge_queued_job_messages(job_ids)
+            await wait_for_chunk_drain(job_ids)
         for descendant in reversed(descendants):
             descendant_level = self._meta_collection_level(descendant.name)
             if descendant_level <= level:

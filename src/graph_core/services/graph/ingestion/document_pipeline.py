@@ -4,10 +4,12 @@ Module-level async functions that handle the full document ingestion lifecycle:
 job enqueueing, chunking, fan-out, per-chunk processing, and progress tracking.
 """
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Iterable
 
 import redis.asyncio as aioredis
@@ -121,6 +123,30 @@ async def mark_jobs_cancelled(job_ids: Iterable[uuid.UUID | str]) -> int:
         return int(added)
     finally:
         await redis.aclose()
+
+
+async def finalize_cancelled_jobs(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Persist cancelled status for active jobs in the database."""
+    job_id_values = [uuid.UUID(str(job_id)) for job_id in job_ids if str(job_id)]
+    if not job_id_values:
+        return 0
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Job).where(Job.id.in_(job_id_values)))
+        jobs = result.scalars().all()
+        if not jobs:
+            return 0
+
+        now = datetime.now(UTC)
+        updated = 0
+        for job in jobs:
+            if job.status in ("completed", "failed", "cancelled"):
+                continue
+            job.status = "cancelled"  # type: ignore[assignment]
+            job.completed_at = now
+            updated += 1
+        await session.commit()
+        return updated
 
 
 async def is_job_cancelled(job_id: uuid.UUID | str) -> bool:
@@ -282,6 +308,9 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             return
         if not job.payload or "text" not in job.payload:
             raise ValueError(f"Job {job_id} does not contain input text")
+        if job.status == "cancelled" or await is_job_cancelled(job_id):
+            await _update_job_status(job_id, "cancelled")
+            return
 
         collection = await session.get(Collection, job.collection_id)
         if not collection:
@@ -446,10 +475,14 @@ def _resolve_chunk_dispatch_limit(
 
 async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -> int:
     """Reserve and enqueue the next bounded window of pending chunks."""
+    if await is_job_cancelled(job_id):
+        return 0
     await reclaim_stale_processing_chunks(job_id)
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
         if not job or not job.collection_id:
+            return 0
+        if job.status == "cancelled":
             return 0
 
         collection = await session.get(Collection, job.collection_id)
@@ -583,6 +616,9 @@ async def process_single_chunk(
         if job is None:
             logger.info("Skipping deleted or missing chunk job: job=%s chunk=%s", job_uuid, chunk_index)
             return
+        if job.status == "cancelled" or await is_job_cancelled(job_uuid):
+            await update_chunk_status(job_uuid, chunk_index, "cancelled")
+            return
         collection = await session.get(Collection, job.collection_id)
         text = chunk.text
         domain = job.payload.get("domain") if isinstance(job.payload, dict) else None
@@ -634,6 +670,12 @@ async def process_single_chunk(
                 max_concurrent_calls=llm_limit,
             )
 
+    async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_uuid)
+        if job and job.status == "cancelled":
+            await update_chunk_status(job_uuid, chunk_index, "cancelled")
+            return
+
     await update_chunk_status(job_uuid, chunk_index, "completed")
 
     await increment_chunk_counter(job_uuid)
@@ -674,7 +716,7 @@ async def update_chunk_status(
         chunk.status = status  # type: ignore[assignment]
         if error:
             chunk.error = error  # type: ignore[attr-defined]
-        if status in ("completed", "failed"):
+        if status in ("completed", "failed", "cancelled"):
             chunk.completed_at = datetime.now(UTC)  # type: ignore[attr-defined]
             chunk.processing_started_at = None  # type: ignore[attr-defined]
             chunk.lease_expires_at = None  # type: ignore[attr-defined]
@@ -687,10 +729,12 @@ async def reclaim_stale_processing_chunks(job_id: uuid.UUID | None = None) -> in
     async with AsyncSessionLocal() as session:
         query = (
             select(IngestionChunk)
+            .join(Job, Job.id == IngestionChunk.job_id)
             .where(
                 IngestionChunk.status == "processing",
                 IngestionChunk.lease_expires_at.isnot(None),
                 IngestionChunk.lease_expires_at <= now,
+                Job.status != "cancelled",
             )
         )
         if job_id is not None:
@@ -711,9 +755,49 @@ async def reclaim_stale_processing_chunks(job_id: uuid.UUID | None = None) -> in
         return len(chunks)
 
 
+async def count_active_processing_chunks(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Count currently processing chunks for the given jobs."""
+    job_id_values = [uuid.UUID(str(job_id)) for job_id in job_ids if str(job_id)]
+    if not job_id_values:
+        return 0
+
+    async with AsyncSessionLocal() as session:
+        result = await session.scalar(
+            select(func.count())
+            .select_from(IngestionChunk)
+            .where(
+                IngestionChunk.job_id.in_(job_id_values),
+                IngestionChunk.status == "processing",
+            )
+        )
+        return int(result or 0)
+
+
+async def wait_for_chunk_drain(
+    job_ids: Iterable[uuid.UUID | str],
+    *,
+    timeout_seconds: float = 300.0,
+    poll_interval_seconds: float = 2.0,
+) -> None:
+    """Wait for all active chunks to finish after cancellation."""
+    deadline = monotonic() + timeout_seconds
+    while True:
+        remaining = await count_active_processing_chunks(job_ids)
+        if remaining <= 0:
+            return
+        if monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {remaining} active chunk(s) to drain"
+            )
+        await asyncio.sleep(poll_interval_seconds)
+
+
 async def increment_chunk_counter(job_id: uuid.UUID) -> int:
     """Atomically increment chunks_completed and return progress percent."""
     async with AsyncSessionLocal() as session:
+        current_status = await session.scalar(
+            select(Job.status).where(Job.id == job_id)
+        )
         result = await session.execute(
             text(
                 "UPDATE jobs SET chunks_completed = chunks_completed + 1, "
@@ -721,6 +805,8 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
                 "((chunks_completed + 1)::float / NULLIF(chunks_total, 0) * 100) "
                 "AS integer), "
                 "status = CASE "
+                "WHEN :current_status = 'cancelled' "
+                "THEN CAST('cancelled' AS job_status) "
                 "WHEN chunks_completed + 1 >= chunks_total AND EXISTS ("
                 "  SELECT 1 FROM ingestion_chunks "
                 "  WHERE job_id = :jid AND status = 'failed'"
@@ -731,7 +817,7 @@ async def increment_chunk_counter(job_id: uuid.UUID) -> int:
                 "WHERE id = :jid "
                 "RETURNING chunks_completed, chunks_total, status"
             ),
-            {"jid": job_id},
+            {"jid": job_id, "current_status": current_status},
         )
         row = result.fetchone()
         if row:
