@@ -741,6 +741,7 @@ class GraphService:
 
     async def _load_semantic_region(
         self,
+        namespace_id: uuid.UUID,
         chat_id: uuid.UUID,
         source_message_ids: set[str],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -905,7 +906,11 @@ class GraphService:
             for message in recent_messages[-2:]:
                 selected_message_ids.add(str(message.id))
 
-        nodes, edges = await self._load_semantic_region(chat_id, selected_message_ids)
+        nodes, edges = await self._load_semantic_region(
+            collection.namespace_id,
+            chat_id,
+            selected_message_ids,
+        )
         semantic_context = self._format_semantic_context(nodes, edges)
         rewritten = await self._rewrite_chat_question(
             collection,
