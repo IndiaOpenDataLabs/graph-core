@@ -75,6 +75,25 @@ class _RedisSemaphore:
             wait = min(self._poll_seconds, remaining)
             await asyncio.sleep(wait)
 
+    async def try_acquire(self, scope: str, limit: int) -> str | None:
+        if limit <= 0:
+            return None
+        token = str(uuid.uuid4())
+        key = f"{self._key_prefix}:{scope}"
+        now_ms = int(time.time() * 1000)
+        acquired = await self._redis.eval(
+            _ACQUIRE_SCRIPT,
+            1,
+            key,
+            token,
+            now_ms,
+            now_ms + self._lease_ms,
+            limit,
+        )
+        if acquired:
+            return token
+        return None
+
     async def release(self, scope: str, token: str | None, limit: int) -> None:
         if limit <= 0 or not token:
             return
@@ -116,6 +135,20 @@ async def reserve_llm_call_slot(
     )
     semaphore_scope = scope or "default"
     return await _llm_semaphore.acquire(semaphore_scope, limit)
+
+
+async def try_reserve_llm_call_slot(
+    scope: str | None = None,
+    max_concurrent_calls: int | None = None,
+) -> str | None:
+    """Attempt to reserve a slot once without waiting for capacity."""
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    semaphore_scope = scope or "default"
+    return await _llm_semaphore.try_acquire(semaphore_scope, limit)
 
 
 async def release_llm_call_slot(

@@ -20,6 +20,7 @@ from graph_core.services.graph import (
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     cancel_processing_chunks,
+    dispatch_pending_chunks,
     fan_out_chunks,
     process_single_chunk,
     reclaim_stale_processing_chunks,
@@ -658,6 +659,67 @@ async def test_fan_out_chunks_is_idempotent(service, test_collection):
 
     assert len(rows) == 3
     assert sorted(row.chunk_index for row in rows) == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pending_chunks_stops_when_llm_capacity_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    test_collection,
+):
+    chunks = ["chunk 0", "chunk 1", "chunk 2"]
+
+    async with AsyncSessionLocal() as session:
+        job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            payload={"text": "ignored"},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+
+        for index, text in enumerate(chunks):
+            session.add(
+                IngestionChunk(
+                    job_id=job.id,
+                    chunk_index=index,
+                    text=text,
+                    status="pending",
+                )
+            )
+        await session.commit()
+
+    import graph_core.services.graph.ingestion.document_pipeline as document_pipeline
+
+    monkeypatch.setattr(
+        document_pipeline,
+        "_resolve_chunk_dispatch_limit",
+        lambda *args, **kwargs: 2,
+    )
+    monkeypatch.setattr(
+        document_pipeline,
+        "try_reserve_llm_call_slot",
+        AsyncMock(side_effect=["token-1", None]),
+    )
+
+    with patch("graph_core.workers.ingestion.run_chunk.send") as mock_send:
+        dispatched = await dispatch_pending_chunks(job.id)
+
+    assert dispatched == 1
+    mock_send.assert_called_once()
+
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(IngestionChunk)
+                .where(IngestionChunk.job_id == job.id)
+                .order_by(IngestionChunk.chunk_index)
+            )
+        ).scalars().all()
+
+    assert [row.status for row in rows] == ["processing", "pending", "pending"]
 
 
 @pytest.mark.asyncio

@@ -31,7 +31,7 @@ from graph_core.models.profile import Profile
 from graph_core.provider_semaphore import (
     adopt_llm_call_slot,
     release_llm_call_slot,
-    reserve_llm_call_slot,
+    try_reserve_llm_call_slot,
 )
 from graph_core.services.chunking import DocumentChunker
 from graph_core.services.document_identity import (
@@ -550,7 +550,27 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
         if not pending_chunks:
             return 0
 
+        llm_profile_id = collection.llm_profile_id
+        llm_scope = str(llm_profile_id) if llm_profile_id is not None else "default"
+        llm_limit = (
+            llm_profile.max_concurrent_calls
+            if llm_profile and llm_profile.max_concurrent_calls
+            else settings.llm_max_concurrent_calls
+        )
+        reserved_chunks: list[tuple[IngestionChunk, str | None]] = []
         for chunk in pending_chunks:
+            token = await try_reserve_llm_call_slot(
+                scope=llm_scope,
+                max_concurrent_calls=llm_limit,
+            )
+            if token is None:
+                break
+            reserved_chunks.append((chunk, token))
+
+        if not reserved_chunks:
+            return 0
+
+        for chunk, _ in reserved_chunks:
             chunk.status = "processing"  # type: ignore[assignment]
             started_at = datetime.now(UTC)
             chunk.processing_started_at = started_at
@@ -559,25 +579,13 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
             )
 
         await session.commit()
-        dispatch_indices = [chunk.chunk_index for chunk in pending_chunks]
-        llm_profile_id = collection.llm_profile_id
-        llm_scope = str(llm_profile_id) if llm_profile_id is not None else "default"
-        llm_limit = (
-            llm_profile.max_concurrent_calls
-            if llm_profile and llm_profile.max_concurrent_calls
-            else settings.llm_max_concurrent_calls
-        )
 
     from graph_core.workers.ingestion import run_chunk
 
-    reserved_slots: list[tuple[int, str | None]] = []
     try:
-        for chunk_index in dispatch_indices:
-            token = await reserve_llm_call_slot(
-                scope=llm_scope,
-                max_concurrent_calls=llm_limit,
-            )
-            reserved_slots.append((chunk_index, token))
+        for chunk_index, token in (
+            (chunk.chunk_index, token) for chunk, token in reserved_chunks
+        ):
             run_chunk.send(  # type: ignore[attr-defined]
                 str(job_id),
                 chunk_index,
@@ -586,7 +594,7 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
                 token,
             )
     except Exception:
-        for _, token in reserved_slots:
+        for _, token in reserved_chunks:
             await release_llm_call_slot(
                 scope=llm_scope,
                 token=token,
@@ -594,7 +602,7 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
             )
         raise
 
-    return len(dispatch_indices)
+    return len(reserved_chunks)
 
 
 # ── Single-chunk processing ──
