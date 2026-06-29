@@ -19,6 +19,7 @@ from graph_core.services.graph import (
     GraphService,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
+    fan_out_chunks,
     process_single_chunk,
     reclaim_stale_processing_chunks,
     update_chunk_status,
@@ -582,6 +583,36 @@ async def test_reclaim_stale_processing_chunks_resets_expired_rows(
         assert chunk.processing_started_at is None
         assert chunk.lease_expires_at is None
         assert chunk.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_fan_out_chunks_is_idempotent(service, test_collection):
+    chunks = ["chunk 0", "chunk 1", "chunk 2"]
+
+    async with AsyncSessionLocal() as session:
+        job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            payload={"text": "ignored"},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+
+    await fan_out_chunks(job.id, test_collection.id, chunks)
+    await fan_out_chunks(job.id, test_collection.id, chunks)
+
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(IngestionChunk).where(IngestionChunk.job_id == job.id)
+            )
+        ).scalars().all()
+
+    assert len(rows) == 3
+    assert sorted(row.chunk_index for row in rows) == [0, 1, 2]
 
 
 @pytest.mark.asyncio

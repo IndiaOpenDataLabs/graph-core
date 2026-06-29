@@ -430,18 +430,32 @@ async def fan_out_chunks(
     document_id: uuid.UUID | None = None,
     document_path: str | None = None,
 ) -> None:
-    """Create chunk records. Worker is responsible for enqueuing."""
+    """Create chunk records, reusing any rows already created for this job."""
     async with AsyncSessionLocal() as session:
-        for index, chunk_text in enumerate(chunks):
-            chunk = IngestionChunk(
-                job_id=job_id,
-                chunk_index=index,
-                text=chunk_text,
-                document_id=document_id,
-                document_path=document_path,
-                status="pending",
+        existing_rows = (
+            await session.execute(
+                select(IngestionChunk).where(IngestionChunk.job_id == job_id)
             )
-            session.add(chunk)
+        ).scalars().all()
+        existing_by_index = {chunk.chunk_index: chunk for chunk in existing_rows}
+
+        for index, chunk_text in enumerate(chunks):
+            chunk = existing_by_index.get(index)
+            if chunk is None:
+                session.add(
+                    IngestionChunk(
+                        job_id=job_id,
+                        chunk_index=index,
+                        text=chunk_text,
+                        document_id=document_id,
+                        document_path=document_path,
+                        status="pending",
+                    )
+                )
+            elif chunk.status == "pending":
+                chunk.text = chunk_text
+                chunk.document_id = document_id
+                chunk.document_path = document_path
 
         await session.execute(
             text("UPDATE jobs SET chunks_total = :total WHERE id = :jid"),
