@@ -1702,9 +1702,22 @@ class GraphService:
         """Main pipeline — delegates to ingestion submodule."""
         await ingest_document_pipeline(job_id)
 
-    async def process_single_chunk(self, job_id: str, chunk_index: int) -> None:
+    async def process_single_chunk(
+        self,
+        job_id: str,
+        chunk_index: int,
+        llm_scope: str | None = None,
+        llm_limit: int | None = None,
+        llm_slot_token: str | None = None,
+    ) -> None:
         """Process a single chunk — called by run_chunk worker."""
-        await process_single_chunk(job_id, chunk_index)
+        await process_single_chunk(
+            job_id,
+            chunk_index,
+            llm_scope=llm_scope,
+            llm_limit=llm_limit,
+            llm_slot_token=llm_slot_token,
+        )
 
     async def update_chunk_status(
         self, job_id: uuid.UUID, chunk_index: int, status: str, error: str | None = None

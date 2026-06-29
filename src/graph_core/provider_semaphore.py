@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import time
 import uuid
@@ -95,6 +96,64 @@ async def _release_slot(
 
 _llm_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:llm")
 _embedding_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:embedding")
+_active_llm_reservation: contextvars.ContextVar[tuple[str, int] | None] = (
+    contextvars.ContextVar("active_llm_reservation", default=None)
+)
+
+
+def _reservation_key(scope: str | None, limit: int) -> tuple[str, int]:
+    return (scope or "default", limit)
+
+
+async def reserve_llm_call_slot(
+    scope: str | None = None,
+    max_concurrent_calls: int | None = None,
+) -> str | None:
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    semaphore_scope = scope or "default"
+    return await _llm_semaphore.acquire(semaphore_scope, limit)
+
+
+async def release_llm_call_slot(
+    scope: str | None = None,
+    token: str | None = None,
+    max_concurrent_calls: int | None = None,
+) -> None:
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    semaphore_scope = scope or "default"
+    await _release_slot(_llm_semaphore, semaphore_scope, token, limit)
+
+
+@asynccontextmanager
+async def adopt_llm_call_slot(
+    scope: str | None = None,
+    token: str | None = None,
+    max_concurrent_calls: int | None = None,
+) -> AsyncIterator[None]:
+    """Adopt a previously reserved LLM slot for nested provider calls."""
+    if not token:
+        yield
+        return
+
+    limit = (
+        max_concurrent_calls
+        if max_concurrent_calls is not None
+        else settings.llm_max_concurrent_calls
+    )
+    reservation = _reservation_key(scope, limit)
+    previous = _active_llm_reservation.set(reservation)
+    try:
+        yield
+    finally:
+        _active_llm_reservation.reset(previous)
 
 
 @asynccontextmanager
@@ -108,10 +167,16 @@ async def llm_call_slot(
         else settings.llm_max_concurrent_calls
     )
     semaphore_scope = scope or "default"
+    reservation = _reservation_key(semaphore_scope, limit)
+    if _active_llm_reservation.get() == reservation:
+        yield
+        return
     token = await _llm_semaphore.acquire(semaphore_scope, limit)
+    reservation_token = _active_llm_reservation.set(reservation)
     try:
         yield
     finally:
+        _active_llm_reservation.reset(reservation_token)
         await _release_slot(_llm_semaphore, semaphore_scope, token, limit)
 
 

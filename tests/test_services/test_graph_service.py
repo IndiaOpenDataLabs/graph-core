@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.collection import Collection
+from graph_core.models.chunk import IngestionChunk
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job
 from graph_core.models.profile import Profile
@@ -19,6 +20,7 @@ from graph_core.services.graph import (
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     process_single_chunk,
+    reclaim_stale_processing_chunks,
     update_chunk_status,
 )
 
@@ -528,6 +530,52 @@ async def test_process_single_chunk_ignores_missing_chunk_row(service, test_coll
 @pytest.mark.asyncio
 async def test_update_chunk_status_ignores_missing_chunk_row(service):
     await update_chunk_status(uuid.uuid4(), 42, "failed", error="stale")
+
+
+@pytest.mark.asyncio
+async def test_reclaim_stale_processing_chunks_resets_expired_rows(
+    service, test_collection
+):
+    from datetime import UTC, datetime, timedelta
+
+    async with AsyncSessionLocal() as session:
+        job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            payload={"text": "ignored"},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+
+        chunk = IngestionChunk(
+            job_id=job.id,
+            chunk_index=0,
+            text="chunk text",
+            status="processing",
+            processing_started_at=datetime.now(UTC) - timedelta(hours=3),
+            lease_expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        session.add(chunk)
+        await session.commit()
+
+    reclaimed = await reclaim_stale_processing_chunks(job.id)
+    assert reclaimed == 1
+
+    async with AsyncSessionLocal() as session:
+        chunk = await session.execute(
+            select(IngestionChunk).where(
+                IngestionChunk.job_id == job.id,
+                IngestionChunk.chunk_index == 0,
+            )
+        )
+        chunk = chunk.scalar_one()
+        assert chunk.status == "pending"
+        assert chunk.processing_started_at is None
+        assert chunk.lease_expires_at is None
+        assert chunk.completed_at is None
 
 
 @pytest.mark.asyncio

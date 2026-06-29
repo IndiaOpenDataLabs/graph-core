@@ -7,7 +7,7 @@ job enqueueing, chunking, fan-out, per-chunk processing, and progress tracking.
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
 import redis.asyncio as aioredis
@@ -26,6 +26,11 @@ from graph_core.models.domain_config import (
 )
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.profile import Profile
+from graph_core.provider_semaphore import (
+    adopt_llm_call_slot,
+    release_llm_call_slot,
+    reserve_llm_call_slot,
+)
 from graph_core.services.chunking import DocumentChunker
 from graph_core.services.document_identity import (
     document_id_for_path,
@@ -77,6 +82,13 @@ async def _update_job_status(
         if status in ("completed", "failed", "cancelled"):
             job.completed_at = datetime.now(UTC)
         await session.commit()
+
+
+def _chunk_processing_lease_seconds() -> int:
+    """Return the chunk lease window used for crash recovery."""
+    worker_window = max(int(settings.ingest_chunk_time_limit_ms / 1000), 1)
+    semaphore_window = max(settings.provider_semaphore_lease_seconds, 1)
+    return max(worker_window, semaphore_window) + 300
 
 
 async def _append_job_event(
@@ -434,6 +446,7 @@ def _resolve_chunk_dispatch_limit(
 
 async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -> int:
     """Reserve and enqueue the next bounded window of pending chunks."""
+    await reclaim_stale_processing_chunks(job_id)
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
         if not job or not job.collection_id:
@@ -492,14 +505,47 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
 
         for chunk in pending_chunks:
             chunk.status = "processing"  # type: ignore[assignment]
+            started_at = datetime.now(UTC)
+            chunk.processing_started_at = started_at
+            chunk.lease_expires_at = started_at + timedelta(
+                seconds=_chunk_processing_lease_seconds()
+            )
 
         await session.commit()
         dispatch_indices = [chunk.chunk_index for chunk in pending_chunks]
+        llm_profile_id = collection.llm_profile_id
+        llm_scope = str(llm_profile_id) if llm_profile_id is not None else "default"
+        llm_limit = (
+            llm_profile.max_concurrent_calls
+            if llm_profile and llm_profile.max_concurrent_calls
+            else settings.llm_max_concurrent_calls
+        )
 
     from graph_core.workers.ingestion import run_chunk
 
-    for chunk_index in dispatch_indices:
-        run_chunk.send(str(job_id), chunk_index)  # type: ignore[attr-defined]
+    reserved_slots: list[tuple[int, str | None]] = []
+    try:
+        for chunk_index in dispatch_indices:
+            token = await reserve_llm_call_slot(
+                scope=llm_scope,
+                max_concurrent_calls=llm_limit,
+            )
+            reserved_slots.append((chunk_index, token))
+            run_chunk.send(  # type: ignore[attr-defined]
+                str(job_id),
+                chunk_index,
+                llm_scope,
+                llm_limit,
+                token,
+            )
+    except Exception:
+        for _, token in reserved_slots:
+            await release_llm_call_slot(
+                scope=llm_scope,
+                token=token,
+                max_concurrent_calls=llm_limit,
+            )
+        raise
 
     return len(dispatch_indices)
 
@@ -507,7 +553,13 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
 # ── Single-chunk processing ──
 
 
-async def process_single_chunk(job_id: str, chunk_index: int) -> None:
+async def process_single_chunk(
+    job_id: str,
+    chunk_index: int,
+    llm_scope: str | None = None,
+    llm_limit: int | None = None,
+    llm_slot_token: str | None = None,
+) -> None:
     """Process a single chunk — called by run_chunk worker."""
     job_uuid = uuid.UUID(job_id)
 
@@ -559,15 +611,28 @@ async def process_single_chunk(job_id: str, chunk_index: int) -> None:
             )
         )
 
-    result = await ingest_collection_chunk(
-        text=text,
-        collection=collection,
-        namespace_id=collection.namespace_id,
-        chunk_index=chunk_index,
-        domain=domain,
-        document_id=document_id,
-        document_path=document_path,
-    )
+    try:
+        async with adopt_llm_call_slot(
+            scope=llm_scope,
+            token=llm_slot_token,
+            max_concurrent_calls=llm_limit,
+        ):
+            result = await ingest_collection_chunk(
+                text=text,
+                collection=collection,
+                namespace_id=collection.namespace_id,
+                chunk_index=chunk_index,
+                domain=domain,
+                document_id=document_id,
+                document_path=document_path,
+            )
+    finally:
+        if llm_slot_token:
+            await release_llm_call_slot(
+                scope=llm_scope,
+                token=llm_slot_token,
+                max_concurrent_calls=llm_limit,
+            )
 
     await update_chunk_status(job_uuid, chunk_index, "completed")
 
@@ -611,7 +676,39 @@ async def update_chunk_status(
             chunk.error = error  # type: ignore[attr-defined]
         if status in ("completed", "failed"):
             chunk.completed_at = datetime.now(UTC)  # type: ignore[attr-defined]
+            chunk.processing_started_at = None  # type: ignore[attr-defined]
+            chunk.lease_expires_at = None  # type: ignore[attr-defined]
         await session.commit()
+
+
+async def reclaim_stale_processing_chunks(job_id: uuid.UUID | None = None) -> int:
+    """Move expired processing chunks back to pending so they can be retried."""
+    now = datetime.now(UTC)
+    async with AsyncSessionLocal() as session:
+        query = (
+            select(IngestionChunk)
+            .where(
+                IngestionChunk.status == "processing",
+                IngestionChunk.lease_expires_at.isnot(None),
+                IngestionChunk.lease_expires_at <= now,
+            )
+        )
+        if job_id is not None:
+            query = query.where(IngestionChunk.job_id == job_id)
+
+        chunks = (await session.execute(query.with_for_update(skip_locked=True))).scalars().all()
+        if not chunks:
+            return 0
+
+        for chunk in chunks:
+            chunk.status = "pending"  # type: ignore[assignment]
+            chunk.error = None  # type: ignore[attr-defined]
+            chunk.processing_started_at = None  # type: ignore[attr-defined]
+            chunk.lease_expires_at = None  # type: ignore[attr-defined]
+            chunk.completed_at = None  # type: ignore[attr-defined]
+
+        await session.commit()
+        return len(chunks)
 
 
 async def increment_chunk_counter(job_id: uuid.UUID) -> int:

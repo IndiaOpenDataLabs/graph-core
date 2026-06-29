@@ -51,7 +51,13 @@ async def run_ingestion(job_id: str):
     max_age=settings.ingest_chunk_max_age_ms,
     time_limit=settings.ingest_chunk_time_limit_ms,
 )
-async def run_chunk(job_id: str, chunk_index: int):
+async def run_chunk(
+    job_id: str,
+    chunk_index: int,
+    llm_scope: str | None = None,
+    llm_limit: int | None = None,
+    llm_slot_token: str | None = None,
+):
     """Child actor — processes a single chunk with full Graph RAG pipeline."""
     if await is_job_cancelled(job_id):
         logger.info("Skipping cancelled chunk job: %s chunk=%d", job_id, chunk_index)
@@ -60,7 +66,13 @@ async def run_chunk(job_id: str, chunk_index: int):
     service = GraphService()
 
     try:
-        await service.process_single_chunk(job_id, chunk_index)
+        await service.process_single_chunk(
+            job_id,
+            chunk_index,
+            llm_scope=llm_scope,
+            llm_limit=llm_limit,
+            llm_slot_token=llm_slot_token,
+        )
     except Exception as e:
         logger.exception(
             "run_chunk failed: job=%s chunk=%d error=%s",

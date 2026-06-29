@@ -40,6 +40,8 @@ class IngestionChunk(Base):
     )
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     job = relationship("Job", back_populates="chunks")
