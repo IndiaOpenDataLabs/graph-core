@@ -32,42 +32,48 @@ class AuthenticatedMCPClient:
         )
         await self._http_client.__aenter__()
 
-        transport = streamable_http_client(
-            self.mcp_url,
-            http_client=self._http_client,
-        )
-        self._transport_ctx = transport
-        streams = await transport.__aenter__()
-        if len(streams) == 2:
-            read_stream, write_stream = streams
-        elif len(streams) == 3:
-            read_stream, write_stream, _ = streams
-        else:
-            raise RuntimeError(
-                f"Unexpected stream count: {len(streams)}. "
-                f"Check MCP library version."
+        try:
+            transport = streamable_http_client(
+                self.mcp_url,
+                http_client=self._http_client,
             )
-        self._session = ClientSession(read_stream, write_stream)
-        await self._session.__aenter__()
-        await self._session.initialize()
+            self._transport_ctx = transport
+            streams = await transport.__aenter__()
+            if len(streams) == 2:
+                read_stream, write_stream = streams
+            elif len(streams) == 3:
+                read_stream, write_stream, _ = streams
+            else:
+                raise RuntimeError(
+                    f"Unexpected stream count: {len(streams)}. "
+                    f"Check MCP library version."
+                )
+            self._session = ClientSession(read_stream, write_stream)
+            await self._session.__aenter__()
+            await self._session.initialize()
+        except Exception:
+            await self.disconnect()
+            raise RuntimeError(
+                f"Unable to connect to MCP server at {self.mcp_url}"
+            ) from None
 
     async def disconnect(self) -> None:
         if self._session:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await asyncio.wait_for(
                     self._session.__aexit__(None, None, None),
                     timeout=2.0,
                 )
             self._session = None
         if self._transport_ctx:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await asyncio.wait_for(
                     self._transport_ctx.__aexit__(None, None, None),
                     timeout=2.0,
                 )
             self._transport_ctx = None
         if self._http_client:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(BaseException):
                 await asyncio.wait_for(self._http_client.aclose(), timeout=2.0)
             self._http_client = None
 
