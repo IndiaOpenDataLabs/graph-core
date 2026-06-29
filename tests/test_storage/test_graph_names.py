@@ -1,6 +1,7 @@
 import uuid
 
 from graph_core.storage.graph_names import (
+    chat_graph_name,
     collection_graph_name,
     legacy_collection_graph_name,
 )
@@ -31,6 +32,27 @@ def test_collection_graph_name_without_namespace_keeps_legacy_shape():
     )
 
     assert graph_name == "collection_ayurveda_corpus_v2_12345678"
+
+
+def test_chat_graph_name_uses_tenant_prefix():
+    namespace_id = uuid.UUID("87654321-4321-8765-4321-876543218765")
+    chat_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+
+    graph_name = chat_graph_name(namespace_id=namespace_id, chat_id=chat_id)
+
+    assert (
+        graph_name
+        == "tenant:87654321-4321-8765-4321-876543218765:chat:"
+        "chat_12345678123456781234567812345678"
+    )
+
+
+def test_chat_graph_name_without_namespace_keeps_legacy_shape():
+    chat_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+
+    graph_name = chat_graph_name(chat_id=chat_id)
+
+    assert graph_name == "chat_12345678123456781234567812345678"
 
 
 def test_legacy_collection_graph_name_uses_uuid_hex():

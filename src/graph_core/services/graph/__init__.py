@@ -72,6 +72,7 @@ from graph_core.services.graph_rag.extractor import (
 )
 from graph_core.services.sanitizer import TextSanitizer
 from graph_core.storage.graph_names import (
+    chat_graph_name,
     collection_graph_name,
     legacy_collection_graph_name,
 )
@@ -116,11 +117,18 @@ class GraphService:
     # ── Collections ──
 
     @staticmethod
-    def _chat_graph_name(chat_id: uuid.UUID) -> str:
-        return f"chat_{str(chat_id).replace('-', '')}"
+    def _chat_graph_name(namespace_id: uuid.UUID, chat_id: uuid.UUID) -> str:
+        return chat_graph_name(namespace_id=namespace_id, chat_id=chat_id)
 
-    def _chat_storage(self, chat_id: uuid.UUID) -> FalkorDBGraphStorage:
-        return FalkorDBGraphStorage(self._chat_graph_name(chat_id))
+    async def _chat_storage(
+        self,
+        chat_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+    ) -> FalkorDBGraphStorage:
+        return FalkorDBGraphStorage(
+            self._chat_graph_name(namespace_id, chat_id),
+            namespace_id=namespace_id,
+        )
 
     @staticmethod
     def _graph_name(collection: Collection) -> str:
@@ -626,7 +634,7 @@ class GraphService:
         if not extraction.entities and not extraction.relationships:
             return
 
-        storage = self._chat_storage(chat_id)
+        storage = await self._chat_storage(chat_id, namespace_id)
         vector_chunks: list[dict[str, Any]] = []
 
         for index, entity in enumerate(extraction.entities):
@@ -736,7 +744,7 @@ class GraphService:
         chat_id: uuid.UUID,
         source_message_ids: set[str],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        storage = self._chat_storage(chat_id)
+        storage = await self._chat_storage(chat_id, namespace_id)
         nodes_by_id: dict[str, dict[str, Any]] = {}
         edges_by_id: dict[str, dict[str, Any]] = {}
         for message_id in source_message_ids:

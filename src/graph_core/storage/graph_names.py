@@ -33,6 +33,18 @@ def collection_graph_name(
     return f"tenant:{namespace_id}:collection:{graph_name}"
 
 
+def chat_graph_name(
+    *,
+    namespace_id: uuid.UUID | None = None,
+    chat_id: uuid.UUID,
+) -> str:
+    """Return a readable, unique FalkorDB graph name for a chat session."""
+    graph_name = f"chat_{chat_id.hex}"
+    if namespace_id is None:
+        return graph_name
+    return f"tenant:{namespace_id}:chat:{graph_name}"
+
+
 def legacy_collection_graph_name(collection_id: uuid.UUID) -> str:
     """Return the legacy collection graph name based only on UUID."""
     return f"collection_{collection_id.hex}"
