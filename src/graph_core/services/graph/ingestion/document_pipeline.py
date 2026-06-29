@@ -769,6 +769,36 @@ async def reclaim_stale_processing_chunks(job_id: uuid.UUID | None = None) -> in
         return len(chunks)
 
 
+async def cancel_processing_chunks(job_ids: Iterable[uuid.UUID | str]) -> int:
+    """Force active chunks for cancelled jobs into a terminal state."""
+    job_id_values = [uuid.UUID(str(job_id)) for job_id in job_ids if str(job_id)]
+    if not job_id_values:
+        return 0
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(IngestionChunk)
+            .where(
+                IngestionChunk.job_id.in_(job_id_values),
+                IngestionChunk.status == "processing",
+            )
+            .with_for_update(skip_locked=True)
+        )
+        chunks = result.scalars().all()
+        if not chunks:
+            return 0
+
+        now = datetime.now(UTC)
+        for chunk in chunks:
+            chunk.status = "cancelled"  # type: ignore[assignment]
+            chunk.completed_at = now  # type: ignore[attr-defined]
+            chunk.processing_started_at = None  # type: ignore[attr-defined]
+            chunk.lease_expires_at = None  # type: ignore[attr-defined]
+
+        await session.commit()
+        return len(chunks)
+
+
 async def count_active_processing_chunks(job_ids: Iterable[uuid.UUID | str]) -> int:
     """Count currently processing chunks for the given jobs."""
     job_id_values = [uuid.UUID(str(job_id)) for job_id in job_ids if str(job_id)]

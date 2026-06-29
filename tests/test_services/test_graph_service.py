@@ -19,6 +19,7 @@ from graph_core.services.graph import (
     GraphService,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
+    cancel_processing_chunks,
     fan_out_chunks,
     process_single_chunk,
     reclaim_stale_processing_chunks,
@@ -164,6 +165,7 @@ async def test_delete_collection_purges_active_jobs(service, test_namespace):
         patch("graph_core.services.graph.mark_jobs_cancelled", new=AsyncMock()) as mock_mark,
         patch("graph_core.services.graph.finalize_cancelled_jobs", new=AsyncMock()) as mock_finalize,
         patch("graph_core.services.graph.purge_queued_job_messages", new=AsyncMock()) as mock_purge,
+        patch("graph_core.services.graph.cancel_processing_chunks", new=AsyncMock()) as mock_cancel,
         patch("graph_core.services.graph.wait_for_chunk_drain", new=AsyncMock()) as mock_wait,
         patch("graph_core.services.graph.drop_all_tables", new=AsyncMock()),
         patch("graph_core.services.graph.FalkorDBGraphStorage", return_value=fake_storage),
@@ -173,6 +175,7 @@ async def test_delete_collection_purges_active_jobs(service, test_namespace):
     mock_mark.assert_awaited_once()
     mock_finalize.assert_awaited_once()
     mock_purge.assert_awaited_once()
+    mock_cancel.assert_awaited_once()
     mock_wait.assert_awaited_once()
     purged_job_ids = list(mock_purge.await_args.args[0])
     assert active_job_id in purged_job_ids
@@ -192,6 +195,48 @@ async def test_create_collection_invalid_namespace(service):
 async def test_list_collections(service, test_namespace, test_collection):
     collections = await service.list_collections(test_namespace.id)
     assert any(c.name == "test-collection" for c in collections)
+
+
+@pytest.mark.asyncio
+async def test_cancel_processing_chunks_clears_active_rows(service, test_namespace):
+    job_id = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=job_id,
+                namespace_id=test_namespace.id,
+                collection_id=None,
+                job_type="ingest_document",
+                status="cancelled",
+            )
+        )
+        session.add(
+            IngestionChunk(
+                job_id=job_id,
+                chunk_index=0,
+                text="chunk",
+                status="processing",
+                processing_started_at=None,
+                lease_expires_at=None,
+            )
+        )
+        await session.commit()
+
+    changed = await cancel_processing_chunks([job_id])
+    assert changed == 1
+
+    async with AsyncSessionLocal() as session:
+        chunk = (
+            await session.execute(
+                select(IngestionChunk).where(
+                    IngestionChunk.job_id == job_id,
+                    IngestionChunk.chunk_index == 0,
+                )
+            )
+        ).scalar_one()
+    assert chunk.status == "cancelled"
+    assert chunk.processing_started_at is None
+    assert chunk.lease_expires_at is None
 
 
 @pytest.mark.asyncio

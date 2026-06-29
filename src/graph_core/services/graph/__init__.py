@@ -44,6 +44,7 @@ from graph_core.services.graph.ingestion.chunk_processor import (
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
     DocumentIngestionResult,
+    cancel_processing_chunks,
     enqueue_document_ingestion_job,
     finalize_cancelled_jobs,
     ingest_document_pipeline,
@@ -1606,6 +1607,7 @@ class GraphService:
             await mark_jobs_cancelled(job_ids)
             await finalize_cancelled_jobs(job_ids)
             await purge_queued_job_messages(job_ids)
+            await cancel_processing_chunks(job_ids)
             await wait_for_chunk_drain(job_ids)
         for descendant in reversed(descendants):
             descendant_level = self._meta_collection_level(descendant.name)
