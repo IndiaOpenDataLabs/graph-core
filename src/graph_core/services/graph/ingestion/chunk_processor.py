@@ -722,9 +722,15 @@ async def _ingest_graph_chunk(
                 rel.target_name,
                 entity_by_name,
             )
+            assertion_text = f"{rel.source_name} {rel_type} {rel.target_name}"
+            assertion_fingerprint = hashlib.sha1(
+                assertion_text.encode("utf-8")
+            ).hexdigest()[:12]
             assertion_name = (
-                f"{rel.source_name} {rel_type} {rel.target_name}"
+                f"assertion:{chunk_hash[:12]}:{index}:"
+                f"{assertion_fingerprint}:{assertion_text}"
             )[:256]
+            assertion_display_name = assertion_text[:256]
             assertion_id = deterministic_uuid(
                 collection.id,
                 f"assertion:{chunk_hash}:{index}:{assertion_name}",
@@ -738,7 +744,7 @@ async def _ingest_graph_chunk(
                 f"mention:{chunk_hash}:{index}:target:{rel.target_name}",
             )
             assertion_description = (
-                f"{context_name}: {assertion_name}. Evidence: {rel.description}"
+                f"{context_name}: {assertion_text}. Evidence: {rel.description}"
             )
             source_mention_name = (
                 f"mention:{chunk_hash[:12]}:{index}:source:{rel.source_name}"
@@ -813,7 +819,7 @@ async def _ingest_graph_chunk(
             )
 
             for node_id, name in (
-                (assertion_id, assertion_name),
+                (assertion_id, assertion_display_name),
                 (source_mention_id, source_mention_name),
                 (target_mention_id, target_mention_name),
                 (source_concept_id, source_concept_name),
@@ -834,7 +840,7 @@ async def _ingest_graph_chunk(
                     context_id,
                     assertion_id,
                     context_name,
-                    assertion_name,
+                    assertion_display_name,
                     "HAS_ASSERTION",
                     assertion_description,
                     ["context", "assertion"],
@@ -843,20 +849,20 @@ async def _ingest_graph_chunk(
                 (
                     assertion_id,
                     source_mention_id,
-                    assertion_name,
+                    assertion_display_name,
                     source_mention_name,
                     "HAS_SUBJECT_MENTION",
-                    f"{assertion_name} has source mention {rel.source_name}.",
+                    f"{assertion_text} has source mention {rel.source_name}.",
                     ["assertion", "source", source_type.lower()],
                     1.0,
                 ),
                 (
                     assertion_id,
                     target_mention_id,
-                    assertion_name,
+                    assertion_display_name,
                     target_mention_name,
                     "HAS_OBJECT_MENTION",
-                    f"{assertion_name} has target mention {rel.target_name}.",
+                    f"{assertion_text} has target mention {rel.target_name}.",
                     ["assertion", "target", target_type.lower()],
                     1.0,
                 ),
