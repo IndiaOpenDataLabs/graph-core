@@ -2,6 +2,7 @@
 
 from openai import AsyncOpenAI
 
+from graph_core.config import settings
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.provider_semaphore import embedding_call_slot
 
@@ -17,7 +18,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         profile_id: str | None = None,
         max_concurrent_calls: int | None = None,
     ):
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=settings.openai_request_timeout_seconds,
+            max_retries=max(settings.openai_max_retries, 0),
+        )
         self._model = model
         self._dimensions = dimensions
         self._profile_id = profile_id

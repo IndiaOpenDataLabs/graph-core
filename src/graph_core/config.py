@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     provider_semaphore_acquire_timeout_seconds: float = 600
     ingest_chunk_time_limit_ms: int = 7200000
     ingest_chunk_max_age_ms: int = 28800000
+    openai_request_timeout_seconds: float = 1800
+    openai_max_retries: int = 0
+    llm_max_output_tokens: int = 8192
 
     # Encryption key for credential storage (32 bytes, base64 or hex encoded)
     credential_encryption_key: str = ""
