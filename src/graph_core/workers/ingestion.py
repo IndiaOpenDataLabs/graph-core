@@ -9,7 +9,7 @@ import graph_core.broker  # noqa: F401
 from graph_core.config import settings
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.ingestion.document_pipeline import (
-    dispatch_pending_chunks,
+    dispatch_pending_chunks_for_job_collection,
     increment_chunk_counter,
     is_job_cancelled,
 )
@@ -39,7 +39,7 @@ async def run_ingestion(job_id: str):
         await service.ingest_document_pipeline(job_uuid)
         if await is_job_cancelled(job_uuid):
             return
-        await dispatch_pending_chunks(job_uuid)
+        await dispatch_pending_chunks_for_job_collection(job_uuid)
         await service.append_job_event(job_uuid, "chunks_dispatched")
     except Exception as e:
         await service.append_job_event(job_uuid, "error", {"error": str(e)})
@@ -97,4 +97,4 @@ async def run_chunk(
                 "error": str(e),
             },
         )
-        await dispatch_pending_chunks(job_uuid, slots=1)
+        await dispatch_pending_chunks_for_job_collection(job_uuid, slots=1)

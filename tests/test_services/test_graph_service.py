@@ -1,15 +1,14 @@
 """GraphService — unit tests."""
 
 import uuid
-from unittest.mock import AsyncMock
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
 
 from graph_core.database import AsyncSessionLocal
-from graph_core.models.collection import Collection
 from graph_core.models.chunk import IngestionChunk
+from graph_core.models.collection import Collection
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job
 from graph_core.models.profile import Profile
@@ -21,6 +20,7 @@ from graph_core.services.graph import (
 from graph_core.services.graph.ingestion.document_pipeline import (
     cancel_processing_chunks,
     dispatch_pending_chunks,
+    dispatch_pending_chunks_for_job_collection,
     fan_out_chunks,
     process_single_chunk,
     reclaim_stale_processing_chunks,
@@ -720,6 +720,76 @@ async def test_dispatch_pending_chunks_stops_when_llm_capacity_is_unavailable(
         ).scalars().all()
 
     assert [row.status for row in rows] == ["processing", "pending", "pending"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pending_chunks_for_job_collection_uses_collection_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+    test_collection,
+):
+    async with AsyncSessionLocal() as session:
+        trigger_job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            payload={"text": "trigger"},
+        )
+        pending_job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            payload={"text": "pending"},
+        )
+        session.add_all([trigger_job, pending_job])
+        await session.commit()
+        await session.refresh(trigger_job)
+        await session.refresh(pending_job)
+
+        session.add(
+            IngestionChunk(
+                job_id=pending_job.id,
+                chunk_index=0,
+                text="pending chunk",
+                status="pending",
+            )
+        )
+        await session.commit()
+
+    import graph_core.services.graph.ingestion.document_pipeline as document_pipeline
+
+    monkeypatch.setattr(
+        document_pipeline,
+        "_resolve_chunk_dispatch_limit",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        document_pipeline,
+        "try_reserve_llm_call_slot",
+        AsyncMock(return_value="token-1"),
+    )
+
+    with patch("graph_core.workers.ingestion.run_chunk.send") as mock_send:
+        dispatched = await dispatch_pending_chunks_for_job_collection(trigger_job.id)
+
+    assert dispatched == 1
+    mock_send.assert_called_once_with(
+        str(pending_job.id),
+        0,
+        "default",
+        1,
+        "token-1",
+    )
+
+    async with AsyncSessionLocal() as session:
+        chunk = (
+            await session.execute(
+                select(IngestionChunk).where(IngestionChunk.job_id == pending_job.id)
+            )
+        ).scalar_one()
+
+    assert chunk.status == "processing"
 
 
 @pytest.mark.asyncio

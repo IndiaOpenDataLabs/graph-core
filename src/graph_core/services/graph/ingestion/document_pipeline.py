@@ -557,7 +557,7 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
             if llm_profile and llm_profile.max_concurrent_calls
             else settings.llm_max_concurrent_calls
         )
-        reserved_chunks: list[tuple[IngestionChunk, str | None]] = []
+        reserved_chunks: list[tuple[uuid.UUID, int, str | None]] = []
         for chunk in pending_chunks:
             token = await try_reserve_llm_call_slot(
                 scope=llm_scope,
@@ -565,12 +565,15 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
             )
             if token is None:
                 break
-            reserved_chunks.append((chunk, token))
+            reserved_chunks.append((chunk.job_id, chunk.chunk_index, token))
 
         if not reserved_chunks:
             return 0
 
-        for chunk, _ in reserved_chunks:
+        reserved_keys = {(job_id, chunk_index) for job_id, chunk_index, _ in reserved_chunks}
+        for chunk in pending_chunks:
+            if (chunk.job_id, chunk.chunk_index) not in reserved_keys:
+                continue
             chunk.status = "processing"  # type: ignore[assignment]
             started_at = datetime.now(UTC)
             chunk.processing_started_at = started_at
@@ -583,18 +586,17 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
     from graph_core.workers.ingestion import run_chunk
 
     try:
-        for chunk_index, token in (
-            (chunk.chunk_index, token) for chunk, token in reserved_chunks
-        ):
+        for chunk_job_id, chunk_index, token in reserved_chunks:
             run_chunk.send(  # type: ignore[attr-defined]
-                str(job_id),
+                str(chunk_job_id),
                 chunk_index,
                 llm_scope,
                 llm_limit,
                 token,
             )
     except Exception:
-        for _, token in reserved_chunks:
+        await _reset_reserved_chunks(reserved_chunks)
+        for _, _, token in reserved_chunks:
             await release_llm_call_slot(
                 scope=llm_scope,
                 token=token,
@@ -603,6 +605,169 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
         raise
 
     return len(reserved_chunks)
+
+
+async def dispatch_pending_chunks_for_job_collection(
+    job_id: uuid.UUID,
+    slots: int | None = None,
+) -> int:
+    """Dispatch pending chunks from the job's collection-wide backlog."""
+    if await is_job_cancelled(job_id):
+        return 0
+
+    async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_id)
+        if not job or not job.collection_id or job.status == "cancelled":
+            return 0
+        collection_id = job.collection_id
+
+    return await dispatch_pending_chunks_for_collection(collection_id, slots=slots)
+
+
+async def dispatch_pending_chunks_for_collection(
+    collection_id: uuid.UUID,
+    slots: int | None = None,
+) -> int:
+    """Reserve and enqueue pending chunks across all running jobs in a collection."""
+    await reclaim_stale_processing_chunks_for_collection(collection_id)
+    async with AsyncSessionLocal() as session:
+        collection = await session.get(Collection, collection_id)
+        if not collection:
+            return 0
+
+        embedding_profile = None
+        if collection.embedding_profile_id is not None:
+            embedding_profile = await session.get(
+                Profile,
+                collection.embedding_profile_id,
+            )
+
+        llm_profile = None
+        if collection.llm_profile_id is not None:
+            llm_profile = await session.get(Profile, collection.llm_profile_id)
+
+        dispatch_limit = _resolve_chunk_dispatch_limit(
+            collection,
+            embedding_profile,
+            llm_profile,
+        )
+
+        active_count = await session.scalar(
+            select(func.count())
+            .select_from(IngestionChunk)
+            .join(Job, Job.id == IngestionChunk.job_id)
+            .where(
+                Job.collection_id == collection_id,
+                Job.job_type == "ingest_document",
+                Job.status == "running",
+                IngestionChunk.status == "processing",
+            )
+        )
+        available = dispatch_limit - int(active_count or 0)
+        if slots is not None:
+            available = min(available, slots)
+        if available <= 0:
+            return 0
+
+        pending_chunks = (
+            await session.execute(
+                select(IngestionChunk)
+                .join(Job, Job.id == IngestionChunk.job_id)
+                .where(
+                    Job.collection_id == collection_id,
+                    Job.job_type == "ingest_document",
+                    Job.status == "running",
+                    IngestionChunk.status == "pending",
+                )
+                .order_by(Job.created_at, IngestionChunk.chunk_index)
+                .limit(available)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+
+        if not pending_chunks:
+            return 0
+
+        llm_profile_id = collection.llm_profile_id
+        llm_scope = str(llm_profile_id) if llm_profile_id is not None else "default"
+        llm_limit = (
+            llm_profile.max_concurrent_calls
+            if llm_profile and llm_profile.max_concurrent_calls
+            else settings.llm_max_concurrent_calls
+        )
+        reserved_chunks: list[tuple[uuid.UUID, int, str | None]] = []
+        for chunk in pending_chunks:
+            token = await try_reserve_llm_call_slot(
+                scope=llm_scope,
+                max_concurrent_calls=llm_limit,
+            )
+            if token is None:
+                break
+            reserved_chunks.append((chunk.job_id, chunk.chunk_index, token))
+
+        if not reserved_chunks:
+            return 0
+
+        reserved_keys = {(job_id, chunk_index) for job_id, chunk_index, _ in reserved_chunks}
+        for chunk in pending_chunks:
+            if (chunk.job_id, chunk.chunk_index) not in reserved_keys:
+                continue
+            chunk.status = "processing"  # type: ignore[assignment]
+            started_at = datetime.now(UTC)
+            chunk.processing_started_at = started_at
+            chunk.lease_expires_at = started_at + timedelta(
+                seconds=_chunk_processing_lease_seconds()
+            )
+
+        await session.commit()
+
+    from graph_core.workers.ingestion import run_chunk
+
+    try:
+        for chunk_job_id, chunk_index, token in reserved_chunks:
+            run_chunk.send(  # type: ignore[attr-defined]
+                str(chunk_job_id),
+                chunk_index,
+                llm_scope,
+                llm_limit,
+                token,
+            )
+    except Exception:
+        await _reset_reserved_chunks(reserved_chunks)
+        for _, _, token in reserved_chunks:
+            await release_llm_call_slot(
+                scope=llm_scope,
+                token=token,
+                max_concurrent_calls=llm_limit,
+            )
+        raise
+
+    return len(reserved_chunks)
+
+
+async def _reset_reserved_chunks(
+    reserved_chunks: list[tuple[uuid.UUID, int, str | None]],
+) -> None:
+    """Undo processing reservations if Dramatiq enqueue fails after DB commit."""
+    if not reserved_chunks:
+        return
+    async with AsyncSessionLocal() as session:
+        for job_id, chunk_index, _ in reserved_chunks:
+            chunk = (
+                await session.execute(
+                    select(IngestionChunk).where(
+                        IngestionChunk.job_id == job_id,
+                        IngestionChunk.chunk_index == chunk_index,
+                        IngestionChunk.status == "processing",
+                    )
+                )
+            ).scalar_one_or_none()
+            if chunk is None:
+                continue
+            chunk.status = "pending"  # type: ignore[assignment]
+            chunk.processing_started_at = None  # type: ignore[attr-defined]
+            chunk.lease_expires_at = None  # type: ignore[attr-defined]
+        await session.commit()
 
 
 # ── Single-chunk processing ──
@@ -710,7 +875,7 @@ async def process_single_chunk(
             "relationship_count": result.relationship_count,
         },
     )
-    await dispatch_pending_chunks(job_uuid, slots=1)
+    await dispatch_pending_chunks_for_collection(collection.id, slots=1)
 
 
 # ── Chunk status tracking ──
@@ -763,6 +928,40 @@ async def reclaim_stale_processing_chunks(job_id: uuid.UUID | None = None) -> in
             query = query.where(IngestionChunk.job_id == job_id)
 
         chunks = (await session.execute(query.with_for_update(skip_locked=True))).scalars().all()
+        if not chunks:
+            return 0
+
+        for chunk in chunks:
+            chunk.status = "pending"  # type: ignore[assignment]
+            chunk.error = None  # type: ignore[attr-defined]
+            chunk.processing_started_at = None  # type: ignore[attr-defined]
+            chunk.lease_expires_at = None  # type: ignore[attr-defined]
+            chunk.completed_at = None  # type: ignore[attr-defined]
+
+        await session.commit()
+        return len(chunks)
+
+
+async def reclaim_stale_processing_chunks_for_collection(
+    collection_id: uuid.UUID,
+) -> int:
+    """Move expired processing chunks in a collection back to pending."""
+    now = datetime.now(UTC)
+    async with AsyncSessionLocal() as session:
+        chunks = (
+            await session.execute(
+                select(IngestionChunk)
+                .join(Job, Job.id == IngestionChunk.job_id)
+                .where(
+                    Job.collection_id == collection_id,
+                    Job.status != "cancelled",
+                    IngestionChunk.status == "processing",
+                    IngestionChunk.lease_expires_at.isnot(None),
+                    IngestionChunk.lease_expires_at <= now,
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
         if not chunks:
             return 0
 
