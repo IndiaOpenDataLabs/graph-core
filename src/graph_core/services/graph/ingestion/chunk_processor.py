@@ -8,7 +8,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from graph_core.database import AsyncSessionLocal
@@ -19,21 +19,25 @@ from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
 from graph_core.models.graph_rag import (
+    EntityDescription,
     GraphEntity,
     GraphRelationship,
+    GraphRelationshipType,
     RawChunkExtraction,
+    RelationshipDescription,
 )
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.profile import Profile
-from graph_core.services.document_identity import normalize_document_path
-from graph_core.services.document_identity import document_id_for_chunk
-from graph_core.services.document_identity import document_id_for_path
+from graph_core.models.rel_types import normalize_rel_type, relationship_embedding_text
 from graph_core.services.crypto import CredentialCrypto
-from graph_core.services.entity_name_cache import EntityNameCache
-from graph_core.services.graph_rag.entity_resolver import (
-    IncrementalEntityResolver,
+from graph_core.services.document_identity import (
+    document_id_for_chunk,
+    document_id_for_path,
+    normalize_document_path,
 )
 from graph_core.services.graph_rag.extractor import (
+    ExtractedEntity,
+    ExtractedRelationship,
     ExtractionResult,
     LLMGraphExtractor,
 )
@@ -56,6 +60,7 @@ _sanitizer = TextSanitizer()
 _vector_store = VectorStore()
 _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
+_CUSTOM_GRAPH_CONTEXT_EXTRACTION_VERSION = "custom_context_v1"
 
 
 # ── Credential / provider resolution helpers ──
@@ -139,6 +144,337 @@ def deterministic_uuid(collection_id: uuid.UUID, name: str) -> uuid.UUID:
     return uuid.UUID(
         hashlib.md5(f"{collection_id}:{name}".encode()).hexdigest()
     )
+
+
+def _short_text(value: str, max_chars: int = 800) -> str:
+    normalized = " ".join((value or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _entity_type_for_mention(
+    name: str,
+    entity_by_name: dict[str, ExtractedEntity],
+) -> str:
+    entity = entity_by_name.get(name) or entity_by_name.get(name.strip().title())
+    return normalize_rel_type(entity.entity_type if entity else "CONCEPT")
+
+
+def _entity_description_for_mention(
+    name: str,
+    entity_by_name: dict[str, ExtractedEntity],
+) -> str:
+    entity = entity_by_name.get(name) or entity_by_name.get(name.strip().title())
+    return entity.description if entity else ""
+
+
+async def _graph_relationship_type_id(
+    session,
+    *,
+    collection_id: uuid.UUID,
+    rel_type: str,
+) -> tuple[uuid.UUID, str]:
+    canonical_type = normalize_rel_type(rel_type)
+    existing = await session.execute(
+        select(GraphRelationshipType).where(
+            GraphRelationshipType.collection_id == collection_id,
+            GraphRelationshipType.canonical_type == canonical_type,
+        )
+    )
+    row = existing.scalar_one_or_none()
+    if row:
+        return row.id, row.canonical_type
+
+    rel_type_id = deterministic_uuid(collection_id, f"rel_type:{canonical_type}")
+    await session.execute(
+        pg_insert(GraphRelationshipType)
+        .values(
+            id=rel_type_id,
+            collection_id=collection_id,
+            canonical_type=canonical_type,
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_graph_relationship_types_collection_canonical_type"
+        )
+    )
+    return rel_type_id, canonical_type
+
+
+async def _upsert_context_entity(
+    session,
+    *,
+    collection: Collection,
+    entity_id: uuid.UUID,
+    canonical_name: str,
+    primary_type: str,
+    description: str,
+    chunk_hash: str,
+    document_id: uuid.UUID | None,
+    document_path: str | None,
+    embedding_provider: EmbeddingProvider,
+) -> None:
+    await session.execute(
+        pg_insert(GraphEntity)
+        .values(
+            id=entity_id,
+            collection_id=collection.id,
+            canonical_name=canonical_name[:256],
+            primary_type=primary_type[:64],
+            description_count=1,
+        )
+        .on_conflict_do_update(
+            index_elements=[GraphEntity.id],
+            set_={
+                "canonical_name": canonical_name[:256],
+                "primary_type": primary_type[:64],
+                "description_count": 1,
+            },
+        )
+    )
+    description_id = deterministic_uuid(
+        collection.id,
+        f"desc:{entity_id}:{document_id or chunk_hash}",
+    )
+    await session.execute(
+        pg_insert(EntityDescription)
+        .values(
+            id=description_id,
+            entity_id=entity_id,
+            description=description,
+            weight=1,
+            source_chunk_hashes=[chunk_hash],
+            document_id=document_id,
+            document_path=normalize_document_path(document_path)
+            if document_path
+            else None,
+        )
+        .on_conflict_do_update(
+            index_elements=[EntityDescription.id],
+            set_={
+                "description": description,
+                "source_chunk_hashes": [chunk_hash],
+                "document_id": document_id,
+                "document_path": normalize_document_path(document_path)
+                if document_path
+                else None,
+            },
+        )
+    )
+    embedding = await embedding_provider.embed_query(
+        f"{canonical_name}: {description}"
+    )
+    await _graph_rag_vectors.upsert_entity_embedding(
+        entity_id=entity_id,
+        collection_id=collection.id,
+        name=canonical_name[:256],
+        description=description,
+        description_id=description_id,
+        embedding=embedding,
+        document_id=document_id,
+        document_path=document_path,
+        session=session,
+    )
+    await _graph_rag_vectors.upsert_entity_centroid(
+        entity_id=entity_id,
+        collection_id=collection.id,
+        canonical_name=canonical_name[:256],
+        primary_type=primary_type[:64],
+        description_count=1,
+        embedding=embedding,
+        session=session,
+    )
+
+
+async def _resolve_context_concept(
+    session,
+    *,
+    collection: Collection,
+    mention_name: str,
+    mention_type: str,
+    mention_description: str,
+    chunk_hash: str,
+    document_id: uuid.UUID | None,
+    document_path: str | None,
+    embedding_provider: EmbeddingProvider,
+) -> tuple[uuid.UUID, str]:
+    concept_type = normalize_rel_type(mention_type or "CONCEPT")
+    primary_type = f"CONCEPT_{concept_type}"[:64]
+    canonical_name = f"{concept_type}: {mention_name}"[:256]
+    description = (
+        f"Concept projection for {concept_type} mention {mention_name!r}. "
+        f"{mention_description}"
+    ).strip()
+    embedding = await embedding_provider.embed_query(
+        f"{canonical_name}: {description}"
+    )
+
+    exact = await session.execute(
+        select(GraphEntity).where(
+            GraphEntity.collection_id == collection.id,
+            GraphEntity.primary_type == primary_type,
+            func.lower(GraphEntity.canonical_name) == canonical_name.lower(),
+        )
+    )
+    existing = exact.scalar_one_or_none()
+    if existing:
+        return existing.id, existing.canonical_name
+
+    hits = await _graph_rag_vectors.search_entity_embeddings(
+        collection_id=collection.id,
+        query_embedding=embedding,
+        top_k=12,
+    )
+    candidate_ids: list[uuid.UUID] = []
+    score_by_id: dict[uuid.UUID, float] = {}
+    for hit in hits:
+        try:
+            entity_id = uuid.UUID(str(hit.metadata.get("entity_id") or ""))
+        except ValueError:
+            continue
+        candidate_ids.append(entity_id)
+        score_by_id[entity_id] = 1.0 - float(hit.distance)
+    if candidate_ids:
+        rows = await session.execute(
+            select(GraphEntity).where(
+                GraphEntity.collection_id == collection.id,
+                GraphEntity.id.in_(candidate_ids),
+                GraphEntity.primary_type == primary_type,
+            )
+        )
+        for candidate in rows.scalars().all():
+            if score_by_id.get(candidate.id, 0.0) >= 0.93:
+                return candidate.id, candidate.canonical_name
+
+    concept_id = deterministic_uuid(
+        collection.id,
+        f"concept:{concept_type}:{mention_name.lower()}",
+    )
+    await _upsert_context_entity(
+        session,
+        collection=collection,
+        entity_id=concept_id,
+        canonical_name=canonical_name,
+        primary_type=primary_type,
+        description=description,
+        chunk_hash=chunk_hash,
+        document_id=document_id,
+        document_path=document_path,
+        embedding_provider=embedding_provider,
+    )
+    return concept_id, canonical_name
+
+
+async def _upsert_context_relationship(
+    session,
+    *,
+    collection: Collection,
+    relationship_id: uuid.UUID,
+    source_id: uuid.UUID,
+    target_id: uuid.UUID,
+    source_name: str,
+    target_name: str,
+    rel_type: str,
+    description: str,
+    keywords: list[str],
+    weight: float,
+    chunk_hash: str,
+    document_id: uuid.UUID | None,
+    document_path: str | None,
+) -> dict[str, object]:
+    rel_type_id, canonical_type = await _graph_relationship_type_id(
+        session,
+        collection_id=collection.id,
+        rel_type=rel_type,
+    )
+    int_weight = max(1, int(float(weight or 1.0) * 10))
+    await session.execute(
+        pg_insert(GraphRelationship)
+        .values(
+            id=relationship_id,
+            source_entity_id=source_id,
+            target_entity_id=target_id,
+            weight=int_weight,
+            keywords=keywords,
+            relationship_type_id=rel_type_id,
+            rel_type=canonical_type,
+            collection_id=collection.id,
+        )
+        .on_conflict_do_update(
+            index_elements=[GraphRelationship.id],
+            set_={
+                "source_entity_id": source_id,
+                "target_entity_id": target_id,
+                "weight": int_weight,
+                "keywords": keywords,
+                "relationship_type_id": rel_type_id,
+                "rel_type": canonical_type,
+                "collection_id": collection.id,
+            },
+        )
+    )
+    description_id = deterministic_uuid(
+        collection.id,
+        f"rel_desc:{relationship_id}:{document_id or chunk_hash}",
+    )
+    await session.execute(
+        pg_insert(RelationshipDescription)
+        .values(
+            id=description_id,
+            relationship_id=relationship_id,
+            description=description,
+            keywords=keywords,
+            weight=1,
+            source_chunk_hashes=[chunk_hash],
+            document_id=document_id,
+            document_path=normalize_document_path(document_path)
+            if document_path
+            else None,
+        )
+        .on_conflict_do_update(
+            index_elements=[RelationshipDescription.id],
+            set_={
+                "description": description,
+                "keywords": keywords,
+                "source_chunk_hashes": [chunk_hash],
+                "document_id": document_id,
+                "document_path": normalize_document_path(document_path)
+                if document_path
+                else None,
+            },
+        )
+    )
+    return {
+        "source_id": str(source_id),
+        "target_id": str(target_id),
+        "id": str(relationship_id),
+        "weight": int_weight,
+        "keywords": keywords,
+        "rel_type": canonical_type,
+        "collection_id": str(collection.id),
+        "document_id": str(document_id) if document_id else None,
+        "document_path": document_path,
+        "_source_name": source_name[:256],
+        "_target_name": target_name[:256],
+        "_description": description,
+    }
+
+
+def _falkor_node(
+    *,
+    entity_id: uuid.UUID,
+    name: str,
+    collection: Collection,
+    document_id: uuid.UUID | None,
+    document_path: str | None,
+) -> dict[str, object]:
+    return {
+        "id": str(entity_id),
+        "name": name[:256],
+        "collection_id": str(collection.id),
+        "document_id": str(document_id) if document_id else None,
+        "document_path": document_path,
+    }
 
 
 def _enforce_namespace(collection: Collection, namespace_id: uuid.UUID) -> None:
@@ -290,7 +626,12 @@ async def _ingest_graph_chunk(
         llm_profile_id=collection.llm_profile_id,
     )
 
-    cached = await _get_raw_extraction(chunk_hash, collection.id, domain=domain)
+    cached = await _get_raw_extraction(
+        chunk_hash,
+        collection.id,
+        domain=domain,
+        cache_variant=_CUSTOM_GRAPH_CONTEXT_EXTRACTION_VERSION,
+    )
     if cached:
         extraction = cached
     else:
@@ -306,6 +647,7 @@ async def _ingest_graph_chunk(
             collection_id=collection.id,
             extraction=extraction,
             domain=domain,
+            cache_variant=_CUSTOM_GRAPH_CONTEXT_EXTRACTION_VERSION,
             document_id=document_id,
             document_path=document_path,
         )
@@ -326,171 +668,310 @@ async def _ingest_graph_chunk(
             chunk_hash=chunk_hash, entity_count=0, relationship_count=0,
         )
 
-    resolver = IncrementalEntityResolver(
-        embedding_provider=embedding_provider,
-        collection_id=collection.id,
-        namespace_id=collection.namespace_id,
-        domain=domain,
-        collection_name=collection.name,
+    context_seed = (
+        normalize_document_path(document_path)
+        if document_path
+        else str(document_id or chunk_hash)
     )
-    name_cache = EntityNameCache(str(collection.id))
-
-    resolved_entity_ids: dict[str, uuid.UUID] = {}
-    pending_cache: list[tuple[list[str], uuid.UUID]] = []
+    context_id = deterministic_uuid(
+        collection.id,
+        f"context:{context_seed}:{chunk_hash}",
+    )
+    context_name = f"context:{context_seed}:{chunk_hash[:12]}"[:256]
+    context_description = (
+        f"Source context for chunk {chunk_hash[:12]}"
+        f"{' from ' + context_seed if context_seed else ''}. "
+        f"Text excerpt: {_short_text(text, 1200)}"
+    )
+    entity_by_name = {entity.name: entity for entity in extraction.entities}
+    nodes_to_upsert: list[dict[str, object]] = []
+    edges_to_upsert: list[dict[str, object]] = []
 
     async with AsyncSessionLocal() as session:
-        for entity in extraction.entities:
-            cached_id = await name_cache.get(entity.name)
-            if cached_id:
-                resolved_entity_ids[entity.name] = cached_id
-                resolved_entity_ids[entity.name.strip().title()] = cached_id
-                continue
-
-            result = await resolver.resolve_entity(
-                session=session,
-                name=entity.name,
-                entity_type=entity.entity_type,
-                description=entity.description,
-                source_chunk_hash=chunk_hash,
+        await _upsert_context_entity(
+            session,
+            collection=collection,
+            entity_id=context_id,
+            canonical_name=context_name,
+            primary_type="CONTEXT",
+            description=context_description,
+            chunk_hash=chunk_hash,
+            document_id=document_id,
+            document_path=document_path,
+            embedding_provider=embedding_provider,
+        )
+        nodes_to_upsert.append(
+            _falkor_node(
+                entity_id=context_id,
+                name=context_name,
+                collection=collection,
                 document_id=document_id,
                 document_path=document_path,
             )
-            resolved_entity_ids[entity.name] = result.entity_id
-            resolved_entity_ids[entity.name.strip().title()] = result.entity_id
+        )
 
-            if result.is_new:
-                pending_cache.append(
+        for index, rel in enumerate(extraction.relationships):
+            rel_type = normalize_rel_type(rel.rel_type)
+            source_type = _entity_type_for_mention(rel.source_name, entity_by_name)
+            target_type = _entity_type_for_mention(rel.target_name, entity_by_name)
+            source_description = _entity_description_for_mention(
+                rel.source_name,
+                entity_by_name,
+            )
+            target_description = _entity_description_for_mention(
+                rel.target_name,
+                entity_by_name,
+            )
+            assertion_name = (
+                f"{rel.source_name} {rel_type} {rel.target_name}"
+            )[:256]
+            assertion_id = deterministic_uuid(
+                collection.id,
+                f"assertion:{chunk_hash}:{index}:{assertion_name}",
+            )
+            source_mention_id = deterministic_uuid(
+                collection.id,
+                f"mention:{chunk_hash}:{index}:source:{rel.source_name}",
+            )
+            target_mention_id = deterministic_uuid(
+                collection.id,
+                f"mention:{chunk_hash}:{index}:target:{rel.target_name}",
+            )
+            assertion_description = (
+                f"{context_name}: {assertion_name}. Evidence: {rel.description}"
+            )
+            source_mention_name = (
+                f"mention:{chunk_hash[:12]}:{index}:source:{rel.source_name}"
+            )[:256]
+            target_mention_name = (
+                f"mention:{chunk_hash[:12]}:{index}:target:{rel.target_name}"
+            )[:256]
+
+            await _upsert_context_entity(
+                session,
+                collection=collection,
+                entity_id=assertion_id,
+                canonical_name=assertion_name,
+                primary_type="ASSERTION",
+                description=assertion_description,
+                chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
+                embedding_provider=embedding_provider,
+            )
+            await _upsert_context_entity(
+                session,
+                collection=collection,
+                entity_id=source_mention_id,
+                canonical_name=source_mention_name,
+                primary_type=f"MENTION_{source_type}"[:64],
+                description=(
+                    f"Context-local source mention {rel.source_name!r} "
+                    f"of type {source_type}. {source_description}"
+                ),
+                chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
+                embedding_provider=embedding_provider,
+            )
+            await _upsert_context_entity(
+                session,
+                collection=collection,
+                entity_id=target_mention_id,
+                canonical_name=target_mention_name,
+                primary_type=f"MENTION_{target_type}"[:64],
+                description=(
+                    f"Context-local target mention {rel.target_name!r} "
+                    f"of type {target_type}. {target_description}"
+                ),
+                chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
+                embedding_provider=embedding_provider,
+            )
+            source_concept_id, source_concept_name = await _resolve_context_concept(
+                session,
+                collection=collection,
+                mention_name=rel.source_name,
+                mention_type=source_type,
+                mention_description=source_description,
+                chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
+                embedding_provider=embedding_provider,
+            )
+            target_concept_id, target_concept_name = await _resolve_context_concept(
+                session,
+                collection=collection,
+                mention_name=rel.target_name,
+                mention_type=target_type,
+                mention_description=target_description,
+                chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
+                embedding_provider=embedding_provider,
+            )
+
+            for node_id, name in (
+                (assertion_id, assertion_name),
+                (source_mention_id, source_mention_name),
+                (target_mention_id, target_mention_name),
+                (source_concept_id, source_concept_name),
+                (target_concept_id, target_concept_name),
+            ):
+                nodes_to_upsert.append(
+                    _falkor_node(
+                        entity_id=node_id,
+                        name=name,
+                        collection=collection,
+                        document_id=document_id,
+                        document_path=document_path,
+                    )
+                )
+
+            relationship_specs = [
+                (
+                    context_id,
+                    assertion_id,
+                    context_name,
+                    assertion_name,
+                    "HAS_ASSERTION",
+                    assertion_description,
+                    ["context", "assertion"],
+                    1.0,
+                ),
+                (
+                    assertion_id,
+                    source_mention_id,
+                    assertion_name,
+                    source_mention_name,
+                    "HAS_SUBJECT_MENTION",
+                    f"{assertion_name} has source mention {rel.source_name}.",
+                    ["assertion", "source", source_type.lower()],
+                    1.0,
+                ),
+                (
+                    assertion_id,
+                    target_mention_id,
+                    assertion_name,
+                    target_mention_name,
+                    "HAS_OBJECT_MENTION",
+                    f"{assertion_name} has target mention {rel.target_name}.",
+                    ["assertion", "target", target_type.lower()],
+                    1.0,
+                ),
+                (
+                    source_mention_id,
+                    source_concept_id,
+                    source_mention_name,
+                    source_concept_name,
+                    "DENOTES",
                     (
-                        [
-                            entity.name,
-                            entity.name.strip().title(),
-                            result.canonical_name,
-                        ],
-                        result.entity_id,
+                        f"Source mention {rel.source_name!r} denotes "
+                        f"{source_concept_name}."
+                    ),
+                    ["mention", "concept", source_type.lower()],
+                    1.0,
+                ),
+                (
+                    target_mention_id,
+                    target_concept_id,
+                    target_mention_name,
+                    target_concept_name,
+                    "DENOTES",
+                    (
+                        f"Target mention {rel.target_name!r} denotes "
+                        f"{target_concept_name}."
+                    ),
+                    ["mention", "concept", target_type.lower()],
+                    1.0,
+                ),
+                (
+                    source_mention_id,
+                    target_mention_id,
+                    source_mention_name,
+                    target_mention_name,
+                    rel_type,
+                    assertion_description,
+                    rel.keywords,
+                    rel.weight,
+                ),
+                (
+                    context_id,
+                    target_mention_id,
+                    context_name,
+                    target_mention_name,
+                    rel_type,
+                    assertion_description,
+                    rel.keywords,
+                    rel.weight,
+                ),
+            ]
+
+            for spec_index, spec in enumerate(relationship_specs):
+                (
+                    source_id,
+                    target_id,
+                    source_name,
+                    target_name,
+                    spec_rel_type,
+                    description,
+                    keywords,
+                    weight,
+                ) = spec
+                relationship_id = deterministic_uuid(
+                    collection.id,
+                    (
+                        f"edge:{chunk_hash}:{index}:{spec_index}:"
+                        f"{source_id}:{spec_rel_type}:{target_id}"
+                    ),
+                )
+                edges_to_upsert.append(
+                    await _upsert_context_relationship(
+                        session,
+                        collection=collection,
+                        relationship_id=relationship_id,
+                        source_id=source_id,
+                        target_id=target_id,
+                        source_name=source_name,
+                        target_name=target_name,
+                        rel_type=spec_rel_type,
+                        description=description,
+                        keywords=list(keywords),
+                        weight=float(weight),
+                        chunk_hash=chunk_hash,
+                        document_id=document_id,
+                        document_path=document_path,
                     )
                 )
 
         await session.commit()
-        for names, entity_id in pending_cache:
-            await name_cache.set_many(names, entity_id)
 
-        canonical_name_by_id: dict[uuid.UUID, str] = {}
-        if resolved_entity_ids:
-            entity_ids = list(dict.fromkeys(resolved_entity_ids.values()))
-            entity_rows = await session.execute(
-                select(GraphEntity).where(GraphEntity.id.in_(entity_ids))
+    for edge in edges_to_upsert:
+        rel_embedding = await embedding_provider.embed_query(
+            relationship_embedding_text(
+                source_name=str(edge.get("_source_name") or ""),
+                target_name=str(edge.get("_target_name") or ""),
+                rel_type=str(edge.get("rel_type") or "RELATES_TO"),
+                description=str(edge.get("_description") or ""),
+                keywords=list(edge.get("keywords") or []),
             )
-            canonical_name_by_id = {
-                entity_row.id: entity_row.canonical_name
-                for entity_row in entity_rows.scalars().all()
-            }
-
-        nodes_to_upsert = []
-        edges_to_upsert = []
-
-        for rel in extraction.relationships:
-            source_id = (
-                resolved_entity_ids.get(rel.source_name)
-                or resolved_entity_ids.get(rel.source_name.strip().title())
-                or await name_cache.get(rel.source_name)
-            )
-            target_id = (
-                resolved_entity_ids.get(rel.target_name)
-                or resolved_entity_ids.get(rel.target_name.strip().title())
-                or await name_cache.get(rel.target_name)
-            )
-
-            for is_source, name in [
-                (True, rel.source_name),
-                (False, rel.target_name),
-            ]:
-                if (source_id if is_source else target_id) is None:
-                    synthetic = await resolver.resolve_entity(
-                        session=session,
-                        name=name,
-                        entity_type="",
-                        description="",
-                        source_chunk_hash=chunk_hash,
-                        document_id=document_id,
-                        document_path=document_path,
-                    )
-                    await session.commit()
-                    await name_cache.set_many(
-                        [name, name.strip().title(), synthetic.canonical_name],
-                        synthetic.entity_id,
-                    )
-                    resolved_entity_ids[name] = synthetic.entity_id
-                    resolved_entity_ids[name.strip().title()] = synthetic.entity_id
-                    canonical_name_by_id[synthetic.entity_id] = synthetic.canonical_name
-                    if is_source:
-                        source_id = synthetic.entity_id
-                    else:
-                        target_id = synthetic.entity_id
-
-            if not source_id or not target_id:
-                continue
-
-            rel_result = await resolver.resolve_relationship(
-                session=session,
-                source_entity_id=source_id,
-                target_entity_id=target_id,
-                description=rel.description,
-                keywords=rel.keywords,
-                weight=rel.weight,
-                source_chunk_hash=chunk_hash,
-                rel_type=rel.rel_type,
-                document_id=document_id,
-                document_path=document_path,
-            )
-            persisted_rel = await session.get(
-                GraphRelationship,
-                rel_result.relationship_id,
-            )
-            await session.commit()
-
-            source_name = canonical_name_by_id.get(
-                source_id, rel.source_name.strip().title()
-            )
-            target_name = canonical_name_by_id.get(
-                target_id, rel.target_name.strip().title()
-            )
-            nodes_to_upsert.append({
-                "id": str(source_id),
-                "name": source_name,
-                "collection_id": str(collection.id),
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-            })
-            nodes_to_upsert.append({
-                "id": str(target_id),
-                "name": target_name,
-                "collection_id": str(collection.id),
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-            })
-            edges_to_upsert.append({
-                "source_id": str(source_id),
-                "target_id": str(target_id),
-                "id": str(rel_result.relationship_id),
-                "weight": int(
-                    persisted_rel.weight if persisted_rel else int(rel.weight * 10)
-                ),
-                "keywords": (
-                    persisted_rel.keywords if persisted_rel else rel.keywords
-                ),
-                "rel_type": (
-                    persisted_rel.rel_type if persisted_rel else rel.rel_type
-                ),
-                "collection_id": str(collection.id),
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-            })
-
-    unique_nodes = {n["id"]: n for n in nodes_to_upsert}.values()
+        )
+        await _graph_rag_vectors.upsert_relationship_embedding(
+            relationship_id=uuid.UUID(str(edge["id"])),
+            collection_id=collection.id,
+            source_name=str(edge.get("_source_name") or "")[:256],
+            target_name=str(edge.get("_target_name") or "")[:256],
+            description=str(edge.get("_description") or ""),
+            embedding=rel_embedding,
+            document_id=document_id,
+            document_path=document_path,
+        )
 
     graph_storage = get_graph_storage(collection)
+    unique_nodes = list({str(n["id"]): n for n in nodes_to_upsert}.values())
     if unique_nodes:
-        await graph_storage.upsert_nodes(list(unique_nodes))
+        await graph_storage.upsert_nodes(unique_nodes)
     if edges_to_upsert:
         await graph_storage.upsert_edges(edges_to_upsert)
 
@@ -706,11 +1187,24 @@ async def _ingest_lightrag_chunk(
 # ── Raw extraction cache ──
 
 
+def _raw_extraction_model_key(
+    domain: str | None,
+    cache_variant: str | None = None,
+) -> str | None:
+    domain_key = f"domain:{domain}" if domain else None
+    if not cache_variant:
+        return domain_key
+    if domain_key:
+        return f"{cache_variant}:{domain_key}"
+    return cache_variant
+
+
 async def _save_raw_extraction(
     chunk_hash: str,
     collection_id: uuid.UUID,
     extraction: ExtractionResult,
     domain: str | None = None,
+    cache_variant: str | None = None,
     document_id: uuid.UUID | None = None,
     document_path: str | None = None,
 ) -> None:
@@ -720,7 +1214,9 @@ async def _save_raw_extraction(
             chunk_content_hash=chunk_hash,
             collection_id=collection_id,
             document_id=document_id,
-            document_path=normalize_document_path(document_path) if document_path else None,
+            document_path=(
+                normalize_document_path(document_path) if document_path else None
+            ),
             entities_json=[
                 {
                     "name": e.name,
@@ -740,7 +1236,7 @@ async def _save_raw_extraction(
                 }
                 for r in extraction.relationships
             ],
-            extraction_model=(f"domain:{domain}" if domain else None),
+            extraction_model=_raw_extraction_model_key(domain, cache_variant),
         )
         session.add(record)
         try:
@@ -750,12 +1246,14 @@ async def _save_raw_extraction(
 
 
 async def _get_raw_extraction(
-    chunk_hash: str, collection_id: uuid.UUID, domain: str | None = None
+    chunk_hash: str,
+    collection_id: uuid.UUID,
+    domain: str | None = None,
+    cache_variant: str | None = None,
 ) -> ExtractionResult | None:
     """Retrieve a cached extraction by chunk hash, or None if not found."""
     from graph_core.services.graph_rag.extractor import (
         ExtractedEntity,
-        ExtractedRelationship,
     )
 
     async with AsyncSessionLocal() as session:
@@ -764,7 +1262,7 @@ async def _get_raw_extraction(
                 RawChunkExtraction.chunk_content_hash == chunk_hash,
                 RawChunkExtraction.collection_id == collection_id,
                 RawChunkExtraction.extraction_model
-                == (f"domain:{domain}" if domain else None),
+                == _raw_extraction_model_key(domain, cache_variant),
             )
         )
         record = result.scalar_one_or_none()
@@ -810,7 +1308,9 @@ async def _write_ledger(
             collection_id=collection.id,
             chunk_hash=chunk_hash,
             document_id=document_id,
-            document_path=normalize_document_path(document_path) if document_path else None,
+            document_path=(
+                normalize_document_path(document_path) if document_path else None
+            ),
             strategy=collection.strategy,
             entity_count=result.entity_count,
             relationship_count=result.relationship_count,

@@ -12,10 +12,10 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Any
 
-from sqlalchemy import distinct, func, or_, select
+from sqlalchemy import distinct, func, or_, select, text
 
 from graph_core.config import settings
-from graph_core.database import AsyncSessionLocal
+from graph_core.database import AsyncSessionLocal, _uuid_for_sql
 from graph_core.embedding import get_embedding_provider
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
@@ -415,7 +415,7 @@ class GraphQueryArtifacts:
 class DocumentRoutingDecision:
     use_all_documents: bool
     document_ids: list[uuid.UUID]
-    
+
 
 @dataclass
 class DocumentRoutingCandidate:
@@ -423,6 +423,26 @@ class DocumentRoutingCandidate:
     document_path: str
     best_score: float
     matched_entities: list[str]
+
+
+@dataclass
+class ContextEvidenceCandidate:
+    context_id: uuid.UUID
+    name: str
+    document_path: str
+    description: str
+    score: float
+    reasons: list[str]
+
+
+@dataclass
+class ContextAssertionEvidence:
+    context_id: uuid.UUID
+    context_name: str
+    document_path: str
+    assertion_id: uuid.UUID
+    assertion: str
+    evidence: str
 
 
 def _format_retrieval_query(instruction: str, query: str) -> str:
@@ -1875,6 +1895,495 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
     )
 
 
+def _vector_hit_score(hit) -> float:
+    return max(0.0, 1.0 - float(hit.distance))
+
+
+def _uuid_from_value(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _collection_has_context_layer(collection: Collection) -> bool:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(GraphEntity.id)
+            .where(
+                GraphEntity.collection_id == collection.id,
+                GraphEntity.primary_type == "CONTEXT",
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def _contexts_for_document_paths(
+    *,
+    collection_id: uuid.UUID,
+    document_paths: dict[str, float],
+    document_ids: list[uuid.UUID] | None = None,
+) -> dict[uuid.UUID, ContextEvidenceCandidate]:
+    if not document_paths:
+        return {}
+    params: dict[str, Any] = {"cid": _uuid_for_sql(collection_id)}
+    placeholders: list[str] = []
+    for index, path in enumerate(document_paths):
+        key = f"path_{index}"
+        params[key] = path
+        placeholders.append(f":{key}")
+    doc_filter = ""
+    if document_ids:
+        doc_placeholders: list[str] = []
+        for index, document_id in enumerate(document_ids):
+            key = f"document_id_{index}"
+            params[key] = _uuid_for_sql(document_id)
+            doc_placeholders.append(f":{key}")
+        doc_filter = f" AND ed.document_id IN ({', '.join(doc_placeholders)})"
+
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(
+            text(
+                f"""
+                SELECT e.id, e.canonical_name, ed.document_path, ed.description
+                FROM graph_entities e
+                JOIN entity_descriptions ed ON ed.entity_id = e.id
+                WHERE e.collection_id = :cid
+                  AND e.primary_type = 'CONTEXT'
+                  AND ed.document_path IN ({", ".join(placeholders)})
+                  {doc_filter}
+                """
+            ),
+            params,
+        )
+
+    candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
+    for row in rows:
+        context_id = uuid.UUID(str(row[0]))
+        document_path = str(row[2] or "")
+        candidates[context_id] = ContextEvidenceCandidate(
+            context_id=context_id,
+            name=str(row[1]),
+            document_path=document_path,
+            description=str(row[3] or ""),
+            score=document_paths.get(document_path, 0.0) * 0.85,
+            reasons=[f"same document as vector hit ({document_path})"],
+        )
+    return candidates
+
+
+async def _contexts_for_graph_hits(
+    *,
+    collection_id: uuid.UUID,
+    entity_scores: dict[uuid.UUID, float],
+    relationship_scores: dict[uuid.UUID, float],
+    document_ids: list[uuid.UUID] | None = None,
+) -> dict[uuid.UUID, ContextEvidenceCandidate]:
+    if not entity_scores and not relationship_scores:
+        return {}
+
+    params: dict[str, Any] = {"cid": _uuid_for_sql(collection_id)}
+    entity_placeholders: list[str] = []
+    relationship_placeholders: list[str] = []
+    for index, entity_id in enumerate(entity_scores):
+        key = f"entity_{index}"
+        params[key] = _uuid_for_sql(entity_id)
+        entity_placeholders.append(f":{key}")
+    for index, relationship_id in enumerate(relationship_scores):
+        key = f"relationship_{index}"
+        params[key] = _uuid_for_sql(relationship_id)
+        relationship_placeholders.append(f":{key}")
+    entity_clause = ", ".join(entity_placeholders) or "NULL"
+    relationship_clause = ", ".join(relationship_placeholders) or "NULL"
+
+    doc_filter = ""
+    if document_ids:
+        doc_placeholders: list[str] = []
+        for index, document_id in enumerate(document_ids):
+            key = f"context_document_id_{index}"
+            params[key] = _uuid_for_sql(document_id)
+            doc_placeholders.append(f":{key}")
+        doc_filter = f" AND ed.document_id IN ({', '.join(doc_placeholders)})"
+
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(
+            text(
+                f"""
+                WITH candidate_contexts AS (
+                    SELECT e.id AS context_id, e.id AS matched_entity_id,
+                           NULL::uuid AS matched_relationship_id,
+                           'direct context entity hit'::text AS reason
+                    FROM graph_entities e
+                    WHERE e.collection_id = :cid
+                      AND e.primary_type = 'CONTEXT'
+                      AND e.id IN ({entity_clause})
+
+                    UNION ALL
+
+                    SELECT ctx.id AS context_id,
+                           owns.target_entity_id AS matched_entity_id,
+                           NULL::uuid AS matched_relationship_id,
+                           'matched assertion owned by context'::text AS reason
+                    FROM graph_relationships owns
+                    JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
+                    WHERE owns.collection_id = :cid
+                      AND owns.rel_type = 'HAS_ASSERTION'
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND owns.target_entity_id IN ({entity_clause})
+
+                    UNION ALL
+
+                    SELECT ctx.id AS context_id,
+                           edge.target_entity_id AS matched_entity_id,
+                           NULL::uuid AS matched_relationship_id,
+                           'matched node attached to context'::text AS reason
+                    FROM graph_relationships edge
+                    JOIN graph_entities ctx ON ctx.id = edge.source_entity_id
+                    WHERE edge.collection_id = :cid
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND edge.target_entity_id IN ({entity_clause})
+
+                    UNION ALL
+
+                    SELECT ctx.id AS context_id,
+                           CASE
+                             WHEN ar.source_entity_id IN ({entity_clause})
+                               THEN ar.source_entity_id
+                             ELSE ar.target_entity_id
+                           END AS matched_entity_id,
+                           NULL::uuid AS matched_relationship_id,
+                           'matched node connected to context assertion'::text
+                           AS reason
+                    FROM graph_relationships owns
+                    JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
+                    JOIN graph_relationships ar
+                      ON ar.source_entity_id = owns.target_entity_id
+                      OR ar.target_entity_id = owns.target_entity_id
+                    WHERE owns.collection_id = :cid
+                      AND owns.rel_type = 'HAS_ASSERTION'
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND (ar.source_entity_id IN ({entity_clause})
+                           OR ar.target_entity_id IN ({entity_clause}))
+
+                    UNION ALL
+
+                    SELECT ctx.id AS context_id, NULL::uuid AS matched_entity_id,
+                           edge.id AS matched_relationship_id,
+                           'matched relationship attached to context'::text
+                           AS reason
+                    FROM graph_relationships edge
+                    JOIN graph_entities ctx
+                      ON ctx.id = edge.source_entity_id
+                      OR ctx.id = edge.target_entity_id
+                    WHERE edge.collection_id = :cid
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND edge.id IN ({relationship_clause})
+
+                    UNION ALL
+
+                    SELECT ctx.id AS context_id, NULL::uuid AS matched_entity_id,
+                           edge.id AS matched_relationship_id,
+                           'matched relationship attached to owned assertion'::text
+                           AS reason
+                    FROM graph_relationships owns
+                    JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
+                    JOIN graph_relationships edge
+                      ON edge.source_entity_id = owns.target_entity_id
+                      OR edge.target_entity_id = owns.target_entity_id
+                    WHERE owns.collection_id = :cid
+                      AND owns.rel_type = 'HAS_ASSERTION'
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND edge.id IN ({relationship_clause})
+                )
+                SELECT c.id, c.canonical_name, ed.document_path, ed.description,
+                       cc.matched_entity_id, cc.matched_relationship_id,
+                       cc.reason
+                FROM candidate_contexts cc
+                JOIN graph_entities c ON c.id = cc.context_id
+                JOIN entity_descriptions ed ON ed.entity_id = c.id
+                WHERE c.collection_id = :cid
+                  {doc_filter}
+                """
+            ),
+            params,
+        )
+
+    candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
+    for row in rows:
+        context_id = uuid.UUID(str(row[0]))
+        entity_id = _uuid_from_value(row[4])
+        relationship_id = _uuid_from_value(row[5])
+        score = 0.0
+        if entity_id is not None:
+            score = max(score, entity_scores.get(entity_id, 0.0))
+        if relationship_id is not None:
+            score = max(score, relationship_scores.get(relationship_id, 0.0))
+        if score <= 0:
+            continue
+        candidate = candidates.get(context_id)
+        if candidate is None:
+            candidate = ContextEvidenceCandidate(
+                context_id=context_id,
+                name=str(row[1]),
+                document_path=str(row[2] or ""),
+                description=str(row[3] or ""),
+                score=0.0,
+                reasons=[],
+            )
+            candidates[context_id] = candidate
+        candidate.score += score
+        reason = str(row[6] or "")
+        if reason and reason not in candidate.reasons:
+            candidate.reasons.append(reason)
+    return candidates
+
+
+async def _select_context_evidence_candidates(
+    *,
+    collection: Collection,
+    entity_query_embedding: list[float],
+    relationship_query_embedding: list[float],
+    document_ids: list[uuid.UUID] | None = None,
+    top_k: int = 40,
+    max_contexts: int = 8,
+) -> list[ContextEvidenceCandidate]:
+    entity_hits = await _graph_rag_vectors.search_entity_embeddings(
+        collection_id=collection.id,
+        query_embedding=entity_query_embedding,
+        top_k=top_k,
+        document_ids=document_ids,
+    )
+    relationship_hits = await _graph_rag_vectors.search_relationship_embeddings(
+        collection_id=collection.id,
+        query_embedding=relationship_query_embedding,
+        top_k=top_k,
+        document_ids=document_ids,
+    )
+
+    entity_scores: dict[uuid.UUID, float] = {}
+    relationship_scores: dict[uuid.UUID, float] = {}
+    document_path_scores: dict[str, float] = {}
+    for hit in entity_hits:
+        score = _vector_hit_score(hit)
+        entity_id = _uuid_from_value(hit.metadata.get("entity_id"))
+        if entity_id is not None:
+            entity_scores[entity_id] = max(entity_scores.get(entity_id, 0.0), score)
+        document_path = str(hit.metadata.get("document_path") or "")
+        if document_path:
+            document_path_scores[document_path] = max(
+                document_path_scores.get(document_path, 0.0),
+                score,
+            )
+    for hit in relationship_hits:
+        score = _vector_hit_score(hit)
+        relationship_id = _uuid_from_value(hit.metadata.get("relationship_id"))
+        if relationship_id is not None:
+            relationship_scores[relationship_id] = max(
+                relationship_scores.get(relationship_id, 0.0),
+                score,
+            )
+        document_path = str(hit.metadata.get("document_path") or "")
+        if document_path:
+            document_path_scores[document_path] = max(
+                document_path_scores.get(document_path, 0.0),
+                score,
+            )
+
+    graph_candidates = await _contexts_for_graph_hits(
+        collection_id=collection.id,
+        entity_scores=entity_scores,
+        relationship_scores=relationship_scores,
+        document_ids=document_ids,
+    )
+    document_candidates = await _contexts_for_document_paths(
+        collection_id=collection.id,
+        document_paths=document_path_scores,
+        document_ids=document_ids,
+    )
+    merged = dict(graph_candidates)
+    for context_id, doc_candidate in document_candidates.items():
+        candidate = merged.get(context_id)
+        if candidate is None:
+            merged[context_id] = doc_candidate
+            continue
+        candidate.score += doc_candidate.score
+        for reason in doc_candidate.reasons:
+            if reason not in candidate.reasons:
+                candidate.reasons.append(reason)
+    return sorted(merged.values(), key=lambda item: item.score, reverse=True)[
+        :max_contexts
+    ]
+
+
+async def _load_context_assertions(
+    *,
+    collection_id: uuid.UUID,
+    context_ids: list[uuid.UUID],
+    max_assertions_per_context: int = 40,
+) -> list[ContextAssertionEvidence]:
+    if not context_ids:
+        return []
+    params: dict[str, Any] = {
+        "cid": _uuid_for_sql(collection_id),
+        "limit_per_context": max_assertions_per_context,
+    }
+    placeholders: list[str] = []
+    for index, context_id in enumerate(context_ids):
+        key = f"context_{index}"
+        params[key] = _uuid_for_sql(context_id)
+        placeholders.append(f":{key}")
+
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(
+            text(
+                f"""
+                WITH owned_assertions AS (
+                    SELECT
+                        ctx.id AS context_id,
+                        ctx.canonical_name AS context_name,
+                        ctx_ed.document_path AS context_document_path,
+                        assertion.id AS assertion_id,
+                        assertion.canonical_name AS assertion_name,
+                        assertion_ed.description AS evidence,
+                        row_number() OVER (
+                            PARTITION BY ctx.id
+                            ORDER BY assertion.canonical_name
+                        ) AS rn
+                    FROM graph_relationships owns
+                    JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
+                    JOIN entity_descriptions ctx_ed ON ctx_ed.entity_id = ctx.id
+                    JOIN graph_entities assertion
+                      ON assertion.id = owns.target_entity_id
+                    JOIN entity_descriptions assertion_ed
+                      ON assertion_ed.entity_id = assertion.id
+                    WHERE owns.collection_id = :cid
+                      AND owns.rel_type = 'HAS_ASSERTION'
+                      AND ctx.id IN ({", ".join(placeholders)})
+                )
+                SELECT context_id, context_name, context_document_path,
+                       assertion_id, assertion_name, evidence
+                FROM owned_assertions
+                WHERE rn <= :limit_per_context
+                ORDER BY context_document_path, context_name, assertion_name
+                """
+            ),
+            params,
+        )
+    return [
+        ContextAssertionEvidence(
+            context_id=uuid.UUID(str(row[0])),
+            context_name=str(row[1]),
+            document_path=str(row[2] or ""),
+            assertion_id=uuid.UUID(str(row[3])),
+            assertion=str(row[4]),
+            evidence=str(row[5] or ""),
+        )
+        for row in rows
+    ]
+
+
+def _build_context_evidence_text(
+    contexts: list[ContextEvidenceCandidate],
+    assertions: list[ContextAssertionEvidence],
+) -> tuple[str, list[str], list[str], str]:
+    assertions_by_context: dict[uuid.UUID, list[ContextAssertionEvidence]] = {}
+    for assertion in assertions:
+        assertions_by_context.setdefault(assertion.context_id, []).append(assertion)
+
+    lines = ["Context:", "Context-Scoped Evidence:"]
+    entities_used: list[str] = []
+    relationships_used: list[str] = []
+    rel_lines: list[str] = []
+    for index, context in enumerate(contexts, start=1):
+        entities_used.append(context.name)
+        lines.extend([
+            f"Context {index}: {context.name}",
+            f"Source: {context.document_path or '(unknown)'}",
+            f"Routing score: {context.score:.4f}",
+            f"Routing reasons: {', '.join(context.reasons) or '(none)'}",
+            f"Context description: {context.description}",
+            "Assertions:",
+        ])
+        owned_assertions = assertions_by_context.get(context.context_id, [])
+        if not owned_assertions:
+            lines.append("- (none)")
+            continue
+        for assertion in owned_assertions:
+            evidence = " ".join(assertion.evidence.split())
+            line = f"- {assertion.assertion}\n  Evidence: {evidence}"
+            lines.append(line)
+            rel_lines.append(line)
+            relationships_used.append(assertion.assertion)
+    rel_context = "\n".join(rel_lines)
+    return (
+        "\n".join(lines),
+        list(dict.fromkeys(entities_used)),
+        list(dict.fromkeys(relationships_used)),
+        rel_context,
+    )
+
+
+async def _context_mix_artifacts(
+    question: str,
+    collection: Collection,
+    entity_query_embedding: list[float],
+    relationship_query_embedding: list[float],
+    *,
+    document_ids: list[uuid.UUID] | None = None,
+) -> GraphQueryArtifacts | None:
+    if not await _collection_has_context_layer(collection):
+        return None
+    contexts = await _select_context_evidence_candidates(
+        collection=collection,
+        entity_query_embedding=entity_query_embedding,
+        relationship_query_embedding=relationship_query_embedding,
+        document_ids=document_ids,
+    )
+    if not contexts:
+        return None
+    assertions = await _load_context_assertions(
+        collection_id=collection.id,
+        context_ids=[context.context_id for context in contexts],
+    )
+    context, entities_used, relationships_used, rel_context = (
+        _build_context_evidence_text(contexts, assertions)
+    )
+    discovered_entity_ids = {str(context.context_id) for context in contexts}
+    discovered_entity_ids.update(
+        str(assertion.assertion_id) for assertion in assertions
+    )
+    state = GraphQueryState(
+        discovered_entity_ids=discovered_entity_ids,
+        entity_relevance={
+            str(context.context_id): context.score for context in contexts
+        },
+        traversed_rel_ids=[],
+        rel_score_cache={},
+        rel_combined_score_cache={},
+    )
+    route_profile = DerivedRouteProfile(
+        primary_route="context",
+        route_scores={"context": 1.0},
+        rel_type_scores={},
+    )
+    logger.info(
+        "graph_rag context_mix collection=%s question=%r contexts=%s assertions=%d",
+        collection.name,
+        question,
+        [(context.name, round(context.score, 6)) for context in contexts],
+        len(assertions),
+    )
+    return GraphQueryArtifacts(
+        context=context,
+        entities_used=entities_used,
+        relationships_used=relationships_used,
+        rel_context=rel_context,
+        route_profile=route_profile,
+        state=state,
+    )
+
+
 def _fallback_mix_interpretation(
     candidates: list[tuple[str, str, float]],
 ) -> MixInterpretation:
@@ -2645,6 +3154,11 @@ async def _answer_from_context(
                 "question, acknowledge it briefly without making it the focus."
                 "\n\nTreat the context as a graph-backed record of stored entities, descriptions, aliases, "
                 "and relationships. Use that evidence to ground your answer."
+                "\n\nIf a Context-Scoped Evidence section is present, each "
+                "context is a source-local evidence scope and each assertion "
+                "is true only inside that source context. Compare or group "
+                "across contexts only after preserving which source each "
+                "assertion came from."
                 "\n\nIf an Internal Higher-Level Context section is present, it contains progressively broader, "
                 "more synthesized concepts built from lower levels. Use it only for internal navigation: it may "
                 "help you identify which lower-level or base-level entities matter. Do not quote, name, "
@@ -2723,13 +3237,23 @@ async def _build_graph_query_artifacts(
         effective_mode,
         _REL_ENDPOINT_ENTITY_SCORE_MIN,
     )
+    relationship_query_embedding = await _embed_relationship_query(
+        embedding_provider,
+        question,
+        rel_type=None,
+    )
+    if effective_mode == "mix":
+        context_artifacts = await _context_mix_artifacts(
+            question,
+            collection,
+            entity_query_embedding,
+            relationship_query_embedding,
+            document_ids=document_ids,
+        )
+        if context_artifacts is not None:
+            return context_artifacts
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
-        relationship_query_embedding = await _embed_relationship_query(
-            embedding_provider,
-            question,
-            rel_type=None,
-        )
         kwargs = {
             "rel_types": None,
             "dimension_weight": 1.0,

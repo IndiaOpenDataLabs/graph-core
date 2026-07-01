@@ -56,6 +56,7 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
             "additionalProperties": False,
             "properties": {
                 "name": {"type": "string"},
+                "type": {"type": "string"},
                 "description": {"type": "string"},
             },
             "required": ["name", "description"],
@@ -65,6 +66,7 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
             "additionalProperties": False,
             "properties": {
                 "name": {"type": "string"},
+                "type": {"type": "string"},
                 "description": {"type": "string"},
             },
             "required": ["name", "description"],
@@ -174,24 +176,34 @@ relationships from input text.
 
 ---Instructions---
 1. Relationship extraction:
-   - Identify direct relationships between concrete entities or concepts
-     that are explicitly supported by the text.
+   - Treat the input text as one source context/chunk. Extract claims that
+     are true inside this context, not global facts detached from the source.
+   - Identify direct relationships between concrete mentions, entities, or
+     concepts that are explicitly supported by the text.
    - For N-ary relationships, decompose them into binary pairs.
    - For each relationship, extract: source, target, description, keywords,
      weight, rel_type.
    - Relationship descriptions must explain the nature of the connection,
-     the context in which it holds, and why it matters.
+     the context in which it holds, and why it matters. Include the local
+     evidence phrase or sentence when possible.
    - Treat relationships as undirected unless the text clearly indicates
      direction.
    - Avoid duplicate relationships.
+   - Do not merge two things just because their surface names are similar.
+     If a name appears in this chunk, extract the local mention from this
+     chunk. Concept merging is handled later by the graph layer.
 
 2. Output requirements:
    - Return structured JSON with one object: "relationships".
    - Each relationship item must use endpoint objects for source and target:
-       source: {{name (string), description (string)}}
-       target: {{name (string), description (string)}}
+       source: {{name (string), type (string), description (string)}}
+       target: {{name (string), type (string), description (string)}}
+   - Endpoint objects are source-local mentions. Use generic, domain-neutral
+     type labels such as PERSON, ORG, ROLE, SKILL, METHOD, FUNCTION, MODULE,
+     PLACE, REQUIREMENT, CLAIM, EVENT, CONCEPT, DOCUMENT, SECTION, or the
+     closest useful type for the text. Do not use a domain-specific schema.
    - Keep source and target descriptions separate from the relationship
-     description. The endpoint descriptions are entity descriptions.
+     description. Endpoint descriptions describe the mention in this context.
    - Each relationship must also have top-level:
        description (string),
        keywords    (array of strings),
@@ -233,6 +245,9 @@ entities and relationships from source code.
 
 ---Instructions---
 1. Relationship extraction:
+   - Treat the source code chunk as one source context. Extract local code
+     mentions and relationships inside this chunk; do not collapse them into
+     global concepts during extraction.
    - Identify direct code relationships between concrete code objects.
    - Use the fixed taxonomy below and keep the output structured by
      category and rel_type.
@@ -249,10 +264,13 @@ entities and relationships from source code.
    - Return structured JSON with one object: "relationships".
    - Each relationship item must use endpoint objects for source and
      target:
-       source: {{name (string), description (string)}}
-       target: {{name (string), description (string)}}
+       source: {{name (string), type (string), description (string)}}
+       target: {{name (string), type (string), description (string)}}
+   - Endpoint objects are source-local mentions. For code, useful endpoint
+     types include FUNCTION, METHOD, CLASS, MODULE, VARIABLE, PARAMETER,
+     API, FILE, CONFIG, TABLE, EVENT, CONCEPT, or CODE_OBJECT.
    - Keep source and target descriptions separate from the relationship
-     description. The endpoint descriptions are entity descriptions.
+     description. Endpoint descriptions describe the mention in this chunk.
    - "relationships" must contain every category and every rel_type in
      the fixed taxonomy below.
    - Each rel_type field is an array of relationship objects with:
@@ -287,6 +305,9 @@ extraction so the graph fully captures the logic of the source code.
    corrections attach to the same (source, target, rel_type) edges.
 6. Keep additions grounded in the code's actual execution flow, state
    changes, control flow, and API boundaries.
+6a. Keep endpoint names as local code mentions from this chunk. Do not merge
+    two mentions simply because they have similar names; concept resolution
+    happens later.
 7. Prefer semantically central code symbols, concepts, and operations.
    Do not add edges for ephemeral locals, loop counters, temporary
    accumulators, or helper builtins unless they are essential to the logic.
@@ -388,31 +409,34 @@ def _normalize_code_entity_name(name: str) -> str:
     return normalized
 
 
-def _parse_relationship_endpoint(value: Any) -> tuple[str, str] | None:
+def _parse_relationship_endpoint(value: Any) -> tuple[str, str, str] | None:
     if isinstance(value, str):
         name = value.strip()
-        return (name, "") if name else None
+        return (name, "", "UNKNOWN") if name else None
     if not isinstance(value, dict):
         return None
     name = value.get("name", "")
     description = value.get("description", "")
+    entity_type = value.get("type", "UNKNOWN")
     if not isinstance(name, str) or not isinstance(description, str):
         return None
+    if not isinstance(entity_type, str):
+        entity_type = "UNKNOWN"
     normalized_name = " ".join(name.strip().split())
     if not normalized_name:
         return None
-    return normalized_name, description.strip()
+    return normalized_name, description.strip(), normalize_rel_type(entity_type)
 
 
-def _parse_code_endpoint(value: Any) -> tuple[str, str] | None:
+def _parse_code_endpoint(value: Any) -> tuple[str, str, str] | None:
     parsed = _parse_relationship_endpoint(value)
     if parsed is None:
         return None
-    name, description = parsed
+    name, description, entity_type = parsed
     normalized_name = _normalize_code_entity_name(name)
     if not normalized_name:
         return None
-    return normalized_name, description
+    return normalized_name, description, entity_type or "CODE_OBJECT"
 
 
 def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
@@ -420,6 +444,7 @@ def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
         return []
 
     entity_descriptions: dict[str, str] = {}
+    entity_types: dict[str, str] = {}
     entity_order: list[str] = []
 
     for category_name, rel_types in CODE_REL_TYPE_TAXONOMY:
@@ -439,18 +464,22 @@ def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
                     parsed = _parse_code_endpoint(item.get(endpoint_key))
                     if parsed is None:
                         continue
-                    name, description = parsed
+                    name, description, entity_type = parsed
                     if name not in entity_descriptions:
                         entity_order.append(name)
                         entity_descriptions[name] = description
+                        entity_types[name] = entity_type or "CODE_OBJECT"
                         continue
-                    if description and len(description) > len(entity_descriptions[name]):
+                    if (
+                        description
+                        and len(description) > len(entity_descriptions[name])
+                    ):
                         entity_descriptions[name] = description
 
     return [
         ExtractedEntity(
             name=name,
-            entity_type="CODE_OBJECT",
+            entity_type=entity_types.get(name) or "CODE_OBJECT",
             description=entity_descriptions.get(name, ""),
         )
         for name in entity_order
@@ -462,6 +491,7 @@ def _collect_generic_entities(relationships: Any) -> list[ExtractedEntity]:
         return []
 
     entity_descriptions: dict[str, str] = {}
+    entity_types: dict[str, str] = {}
     entity_order: list[str] = []
     for rel in relationships:
         if not isinstance(rel, dict):
@@ -470,10 +500,11 @@ def _collect_generic_entities(relationships: Any) -> list[ExtractedEntity]:
             parsed = _parse_relationship_endpoint(rel.get(endpoint_key))
             if parsed is None:
                 continue
-            name, description = parsed
+            name, description, entity_type = parsed
             if name not in entity_descriptions:
                 entity_order.append(name)
                 entity_descriptions[name] = description
+                entity_types[name] = entity_type or "UNKNOWN"
                 continue
             if description and len(description) > len(entity_descriptions[name]):
                 entity_descriptions[name] = description
@@ -481,7 +512,7 @@ def _collect_generic_entities(relationships: Any) -> list[ExtractedEntity]:
     return [
         ExtractedEntity(
             name=name,
-            entity_type="UNKNOWN",
+            entity_type=entity_types.get(name) or "UNKNOWN",
             description=entity_descriptions.get(name, ""),
         )
         for name in entity_order
@@ -506,6 +537,9 @@ to recreate that logic, and emit only those additions or corrections.
      rel_type to match the required structure or the passage's meaning
 3. Keep naming consistent with the previously extracted endpoints so that
    corrections attach to the same (source, target, rel_type) edges.
+3a. Preserve source-local mention identity. Do not introduce global canonical
+    entities or merge across sources during gleaning; the graph layer will
+    project mentions to concepts later.
 4. Relationship descriptions must still explain the nature, context,
    and significance of the connection. Make them rich enough to
    understand the behavior without looking at the text again.
@@ -619,7 +653,8 @@ class LLMGraphExtractor:
                     )
                     continue
                 logger.info(
-                    "LLM emitted new rel_type=%r outside active %s vocab; accepting normalized type %s",
+                    "LLM emitted new rel_type=%r outside active %s vocab; "
+                    "accepting normalized type %s",
                     raw_name,
                     domain,
                     name,
@@ -834,8 +869,8 @@ Only output the structured relationships object.
             target_endpoint = _parse_relationship_endpoint(rel.get("target"))
             if not (source_endpoint and target_endpoint):
                 continue
-            source, _source_description = source_endpoint
-            target, _target_description = target_endpoint
+            source, _source_description, _source_type = source_endpoint
+            target, _target_description, _target_type = target_endpoint
             rel_description = rel.get("description", "")
             rel_keywords = cls._parse_relationship_keywords(
                 rel.get("keywords", []),
@@ -902,8 +937,8 @@ Only output the structured relationships object.
                     target_endpoint = _parse_code_endpoint(item.get("target"))
                     if not (source_endpoint and target_endpoint):
                         continue
-                    source, _source_description = source_endpoint
-                    target, _target_description = target_endpoint
+                    source, _source_description, _source_type = source_endpoint
+                    target, _target_description, _target_type = target_endpoint
                     description = item.get("description", "")
                     if not isinstance(description, str):
                         description = ""
