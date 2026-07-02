@@ -113,9 +113,10 @@ services:
       - ./scripts/falkordb/users.acl:/var/lib/falkordb/data/users.acl
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -p 6382 ping | grep PONG"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 60
+      start_period: 10m
 
   falkordb-proxy:
     build: .
