@@ -2735,6 +2735,7 @@ async def _select_context_evidence_candidates(
     document_ids: list[uuid.UUID] | None = None,
     plan: GraphQueryPlan | None = None,
     frame_plan: GraphQueryFramePlan | None = None,
+    frame_candidates: list[ContextEvidenceCandidate] | None = None,
     top_k: int = 40,
     max_contexts: int = 8,
 ) -> list[ContextEvidenceCandidate]:
@@ -2804,11 +2805,12 @@ async def _select_context_evidence_candidates(
 
     frame_constrained = False
     if frame_plan is not None and frame_plan.focus_terms:
-        frame_candidates = await _contexts_for_frame_precision(
-            collection_id=collection.id,
-            frame_plan=frame_plan,
-            document_ids=document_ids,
-        )
+        if frame_candidates is None:
+            frame_candidates = await _contexts_for_frame_precision(
+                collection_id=collection.id,
+                frame_plan=frame_plan,
+                document_ids=document_ids,
+            )
         if frame_candidates:
             frame_constrained = True
             precision_merged = {
@@ -2847,6 +2849,24 @@ async def _select_context_evidence_candidates(
     return sorted(merged.values(), key=lambda item: item.score, reverse=True)[
         :max_contexts
     ]
+
+
+def _merge_context_candidates(
+    primary_contexts: list[ContextEvidenceCandidate],
+    secondary_contexts: list[ContextEvidenceCandidate],
+    *,
+    max_contexts: int,
+) -> list[ContextEvidenceCandidate]:
+    merged: list[ContextEvidenceCandidate] = []
+    seen: set[uuid.UUID] = set()
+    for context in [*primary_contexts, *secondary_contexts]:
+        if context.context_id in seen:
+            continue
+        merged.append(context)
+        seen.add(context.context_id)
+        if len(merged) >= max_contexts:
+            break
+    return merged
 
 
 async def _load_context_assertions(
@@ -3017,30 +3037,65 @@ def _build_context_evidence_text(
             f"Requested fields: {requested}",
         ]
     else:
-        lines = ["Context:", "Context-Scoped Evidence:"]
+        lines = [
+            "Context:",
+            "Context-Scoped Evidence:",
+            "Question-frame evidence should be treated as the primary evidence "
+            "for the question's requested subject, fields, or scope. Selected "
+            "retrieved evidence is additional context that may qualify, contrast, "
+            "or fill gaps, but should not override more direct source-local "
+            "evidence.",
+        ]
     entities_used: list[str] = []
     relationships_used: list[str] = []
     rel_lines: list[str] = []
-    for index, context in enumerate(contexts, start=1):
-        entities_used.append(context.name)
-        lines.extend([
-            f"Context {index}: {context.name}",
-            f"Source: {context.document_path or '(unknown)'}",
-            f"Routing score: {context.score:.4f}",
-            f"Routing reasons: {', '.join(context.reasons) or '(none)'}",
-            f"Context description: {context.description}",
-            "Assertions:",
-        ])
-        owned_assertions = assertions_by_context.get(context.context_id, [])
-        if not owned_assertions:
-            lines.append("- (none)")
+
+    if coverage:
+        context_sections = [("Evidence", contexts)]
+    else:
+        frame_contexts = [
+            context
+            for context in contexts
+            if any("focus frame" in reason for reason in context.reasons)
+        ]
+        frame_context_ids = {context.context_id for context in frame_contexts}
+        retrieved_contexts = [
+            context for context in contexts if context.context_id not in frame_context_ids
+        ]
+        context_sections = [
+            ("Question-frame evidence", frame_contexts),
+            ("Selected retrieved evidence", retrieved_contexts),
+        ]
+
+    context_index = 1
+    for section_title, section_contexts in context_sections:
+        if not section_contexts:
             continue
-        for assertion in owned_assertions:
-            evidence = " ".join(assertion.evidence.split())
-            line = f"- {assertion.assertion}\n  Evidence: {evidence}"
-            lines.append(line)
-            rel_lines.append(line)
-            relationships_used.append(assertion.assertion)
+        if not coverage:
+            lines.append(section_title + ":")
+        for context in section_contexts:
+            entities_used.append(context.name)
+            lines.extend([
+                f"Context {context_index}: {context.name}",
+                f"Source: {context.document_path or '(unknown)'}",
+                f"Routing score: {context.score:.4f}",
+                f"Routing reasons: {', '.join(context.reasons) or '(none)'}",
+                f"Context description: {context.description}",
+                "Assertions:",
+            ])
+            owned_assertions = assertions_by_context.get(context.context_id, [])
+            if not owned_assertions:
+                lines.append("- (none)")
+                context_index += 1
+                continue
+            for assertion in owned_assertions:
+                evidence = " ".join(assertion.evidence.split())
+                line = f"- {assertion.assertion}\n  Evidence: {evidence}"
+                lines.append(line)
+                rel_lines.append(line)
+                relationships_used.append(assertion.assertion)
+            context_index += 1
+
     rel_context = "\n".join(rel_lines)
     return (
         "\n".join(lines),
@@ -3077,6 +3132,15 @@ async def _context_mix_artifacts(
             llm_profile_id,
             plan,
         )
+        frame_contexts = (
+            await _contexts_for_frame_precision(
+                collection_id=collection.id,
+                frame_plan=frame_plan,
+                document_ids=document_ids,
+            )
+            if frame_plan.focus_terms
+            else []
+        )
         contexts = await _select_context_evidence_candidates(
             collection=collection,
             entity_query_embedding=entity_query_embedding,
@@ -3084,7 +3148,13 @@ async def _context_mix_artifacts(
             document_ids=document_ids,
             plan=plan,
             frame_plan=frame_plan,
+            frame_candidates=frame_contexts,
             top_k=_CONTEXT_MIX_TOP_K,
+            max_contexts=_CONTEXT_MIX_MAX_CONTEXTS,
+        )
+        contexts = _merge_context_candidates(
+            frame_contexts,
+            contexts,
             max_contexts=_CONTEXT_MIX_MAX_CONTEXTS,
         )
         max_assertions_per_context = 40
@@ -3915,6 +3985,19 @@ async def _answer_from_context(
                 "is true only inside that source context. Compare or group "
                 "across contexts only after preserving which source each "
                 "assertion came from."
+                "\n\nThe context may contain both central evidence and nearby "
+                "distractors. Prefer assertions and source descriptions that "
+                "directly answer the question's subject, action, comparison, "
+                "or requested field. Use routing scores and routing reasons "
+                "only as relevance hints, not as facts. Use lower-scoring or "
+                "merely related contexts only to qualify, contrast, or explain "
+                "absence of support. If evidence appears to conflict, prefer "
+                "the more direct source-local assertion over a broader or more "
+                "generic related assertion. Do not infer that two items "
+                "participate in the same process, argument, event, role, or "
+                "mechanism merely because both are retrieved or mentioned in "
+                "the question; state the connection only when the evidence "
+                "shows it."
                 "\n\nIf a Collection Coverage Evidence section is present, the "
                 "question is collection-wide. Use every listed source scope "
                 "that contains relevant requested fields; do not answer from "
