@@ -410,6 +410,13 @@ class GraphQueryPlan:
 
 
 @dataclass
+class GraphQueryFramePlan:
+    focus_terms: list[str]
+    competing_terms: list[str]
+    relation_hints: list[str]
+
+
+@dataclass
 class DerivedRouteProfile:
     primary_route: str
     route_scores: dict[str, float]
@@ -1940,6 +1947,32 @@ def _normalise_plan_list(value: Any, *, max_items: int = 12) -> list[str]:
     return items
 
 
+def _expand_frame_terms(terms: list[str], *, max_items: int = 16) -> list[str]:
+    expanded = list(terms)
+    token_counts: dict[str, int] = {}
+    for term in terms:
+        tokens = {
+            "".join(ch for ch in raw_token.casefold() if ch.isalnum())
+            for raw_token in term.split()
+        }
+        for token in tokens:
+            if len(token) >= 4:
+                token_counts[token] = token_counts.get(token, 0) + 1
+
+    seen = {term.casefold() for term in expanded}
+    for token, count in sorted(
+        token_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        if count < 2 or token in seen:
+            continue
+        expanded.append(token)
+        seen.add(token)
+        if len(expanded) >= max_items:
+            break
+    return expanded[:max_items]
+
+
 def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
     lowered = f" {question.casefold()} "
     operation = "describe"
@@ -1973,6 +2006,20 @@ def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
         anchors=[],
         requested_fields=[],
         output_shape=output_shape,
+    )
+
+
+def _fallback_graph_query_frame_plan(
+    question: str,
+    plan: GraphQueryPlan | None = None,
+) -> GraphQueryFramePlan:
+    terms = list(plan.requested_fields) if plan else []
+    if not terms:
+        terms = [_diagnostic_entity_text(question)]
+    return GraphQueryFramePlan(
+        focus_terms=_expand_frame_terms(terms),
+        competing_terms=[],
+        relation_hints=[],
     )
 
 
@@ -2079,6 +2126,78 @@ async def _plan_graph_query(
         plan.output_shape,
     )
     return plan
+
+
+async def _plan_graph_query_frame(
+    question: str,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
+    plan: GraphQueryPlan | None = None,
+) -> GraphQueryFramePlan:
+    fallback = _fallback_graph_query_frame_plan(question, plan)
+    llm_provider = await _resolve_llm_provider(
+        namespace_id=namespace_id,
+        llm_profile_id=llm_profile_id,
+    )
+    if isinstance(llm_provider, LocalEchoLLMProvider):
+        return fallback
+
+    schema = {
+        "title": "GraphQueryFramePlan",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "focus_terms": {"type": "array", "items": {"type": "string"}},
+            "competing_terms": {"type": "array", "items": {"type": "string"}},
+            "relation_hints": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["focus_terms", "competing_terms", "relation_hints"],
+    }
+    prompt = (
+        "Identify the graph retrieval frame for this question without assuming "
+        "any domain schema. A frame is the topic, process, source scope, or "
+        "conceptual region the answer should stay inside; it is not a named "
+        "entity anchor.\n\n"
+        "Return:\n"
+        "- focus_terms: literal terms and close variants that define the target "
+        "context. Use the user's wording where possible.\n"
+        "- competing_terms: nearby frames likely to be confused with the focus "
+        "and should be demoted when evidence is mostly about them.\n"
+        "- relation_hints: generic action/edge words that describe how evidence "
+        "inside the frame connects, without inventing a domain schema.\n\n"
+        "Do not include output-control words unless they are domain terms. "
+        "Do not include named anchors from the question as focus terms.\n\n"
+        f"Question: {question}\n"
+        f"Query plan requested_fields: {plan.requested_fields if plan else []}\n"
+        f"Query plan anchors: {plan.anchors if plan else []}"
+    )
+    try:
+        extracted = await llm_provider.structured_extract(prompt, schema)
+    except Exception:
+        logger.exception("graph_rag frame_plan_failed")
+        return fallback
+
+    focus_terms = _normalise_plan_list(extracted.get("focus_terms"), max_items=10)
+    competing_terms = _normalise_plan_list(
+        extracted.get("competing_terms"),
+        max_items=12,
+    )
+    relation_hints = _normalise_plan_list(
+        extracted.get("relation_hints"),
+        max_items=12,
+    )
+    frame_plan = GraphQueryFramePlan(
+        focus_terms=_expand_frame_terms(focus_terms or fallback.focus_terms),
+        competing_terms=competing_terms,
+        relation_hints=relation_hints,
+    )
+    logger.info(
+        "graph_rag frame_plan focus=%s competing=%s relations=%s",
+        frame_plan.focus_terms,
+        frame_plan.competing_terms,
+        frame_plan.relation_hints,
+    )
+    return frame_plan
 
 
 async def _collection_has_context_layer(collection: Collection) -> bool:
@@ -2439,6 +2558,175 @@ async def _contexts_for_anchor_literals(
     return sorted(candidates.values(), key=lambda item: item.score, reverse=True)
 
 
+async def _contexts_for_frame_precision(
+    *,
+    collection_id: uuid.UUID,
+    frame_plan: GraphQueryFramePlan,
+    document_ids: list[uuid.UUID] | None = None,
+) -> list[ContextEvidenceCandidate]:
+    if not frame_plan.focus_terms:
+        return []
+
+    def _clauses(
+        *,
+        params: dict[str, Any],
+        prefix: str,
+        terms: list[str],
+        expressions: list[str],
+    ) -> str:
+        clauses: list[str] = []
+        for index, term in enumerate(terms):
+            key = f"{prefix}_{index}"
+            params[key] = f"%{term}%"
+            expression_clauses = [
+                f"{expression} ILIKE :{key}" for expression in expressions
+            ]
+            clauses.append("(" + " OR ".join(expression_clauses) + ")")
+        return " OR ".join(clauses) or "FALSE"
+
+    async def _bounded_matches(
+        *,
+        terms: list[str],
+        prefix: str,
+        context_score: float,
+        assertion_score: float,
+        reason: str,
+    ) -> dict[uuid.UUID, ContextEvidenceCandidate]:
+        if not terms:
+            return {}
+
+        params: dict[str, Any] = {
+            "cid": _uuid_for_sql(collection_id),
+            "context_limit": 100,
+            "assertion_limit": 160,
+        }
+        context_clause = _clauses(
+            params=params,
+            prefix=f"{prefix}_ctx",
+            terms=terms,
+            expressions=[
+                "ctx.canonical_name",
+                "ctx_ed.description",
+                "ctx_ed.document_path",
+            ],
+        )
+        assertion_clause = _clauses(
+            params=params,
+            prefix=f"{prefix}_assertion",
+            terms=terms,
+            expressions=["assertion.canonical_name", "assertion_ed.description"],
+        )
+        doc_filter = ""
+        if document_ids:
+            doc_placeholders: list[str] = []
+            for index, document_id in enumerate(document_ids):
+                key = f"{prefix}_document_id_{index}"
+                params[key] = _uuid_for_sql(document_id)
+                doc_placeholders.append(f":{key}")
+            doc_filter = f" AND ctx_ed.document_id IN ({', '.join(doc_placeholders)})"
+
+        async with AsyncSessionLocal() as session:
+            direct_rows = await session.execute(
+                text(
+                    f"""
+                    SELECT ctx.id, ctx.canonical_name, ctx_ed.document_path,
+                           ctx_ed.description
+                    FROM graph_entities ctx
+                    JOIN entity_descriptions ctx_ed ON ctx_ed.entity_id = ctx.id
+                    WHERE ctx.collection_id = :cid
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND ({context_clause})
+                      {doc_filter}
+                    ORDER BY ctx_ed.document_path, ctx.canonical_name
+                    LIMIT :context_limit
+                    """
+                ),
+                params,
+            )
+            assertion_rows = await session.execute(
+                text(
+                    f"""
+                    SELECT ctx.id, count(*) AS assertion_matches
+                    FROM graph_relationships owns
+                    JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
+                    JOIN entity_descriptions ctx_ed ON ctx_ed.entity_id = ctx.id
+                    JOIN graph_entities assertion
+                      ON assertion.id = owns.target_entity_id
+                    JOIN entity_descriptions assertion_ed
+                      ON assertion_ed.entity_id = assertion.id
+                    WHERE owns.collection_id = :cid
+                      AND owns.rel_type = 'HAS_ASSERTION'
+                      AND ctx.primary_type = 'CONTEXT'
+                      AND assertion.primary_type = 'ASSERTION'
+                      AND ({assertion_clause})
+                      {doc_filter}
+                    GROUP BY ctx.id
+                    ORDER BY assertion_matches DESC
+                    LIMIT :assertion_limit
+                    """
+                ),
+                params,
+            )
+
+        candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
+        for row in direct_rows:
+            context_id = uuid.UUID(str(row[0]))
+            candidates[context_id] = ContextEvidenceCandidate(
+                context_id=context_id,
+                name=str(row[1]),
+                document_path=str(row[2] or ""),
+                description=str(row[3] or ""),
+                score=context_score,
+                reasons=[f"{reason} context match"],
+            )
+
+        for row in assertion_rows:
+            context_id = uuid.UUID(str(row[0]))
+            candidate = candidates.get(context_id)
+            if candidate is None:
+                continue
+            candidate.score += assertion_score * float(row[1] or 1.0)
+            assertion_reason = f"{reason} owned assertion match"
+            if assertion_reason not in candidate.reasons:
+                candidate.reasons.append(assertion_reason)
+        return candidates
+
+    focus_candidates = await _bounded_matches(
+        terms=frame_plan.focus_terms,
+        prefix="focus",
+        context_score=10.0,
+        assertion_score=6.0,
+        reason="focus frame",
+    )
+    competing_candidates = await _bounded_matches(
+        terms=frame_plan.competing_terms,
+        prefix="competing",
+        context_score=7.0,
+        assertion_score=4.0,
+        reason="competing frame",
+    )
+
+    for context_id, competing in competing_candidates.items():
+        candidate = focus_candidates.get(context_id)
+        if candidate is None:
+            continue
+        candidate.score -= competing.score
+        for reason in competing.reasons:
+            demotion_reason = f"demoted by {reason}"
+            if demotion_reason not in candidate.reasons:
+                candidate.reasons.append(demotion_reason)
+
+    return [
+        candidate
+        for candidate in sorted(
+            focus_candidates.values(),
+            key=lambda item: item.score,
+            reverse=True,
+        )
+        if candidate.score > 0
+    ]
+
+
 async def _select_context_evidence_candidates(
     *,
     collection: Collection,
@@ -2446,6 +2734,7 @@ async def _select_context_evidence_candidates(
     relationship_query_embedding: list[float],
     document_ids: list[uuid.UUID] | None = None,
     plan: GraphQueryPlan | None = None,
+    frame_plan: GraphQueryFramePlan | None = None,
     top_k: int = 40,
     max_contexts: int = 8,
 ) -> list[ContextEvidenceCandidate]:
@@ -2513,6 +2802,28 @@ async def _select_context_evidence_candidates(
             if reason not in candidate.reasons:
                 candidate.reasons.append(reason)
 
+    frame_constrained = False
+    if frame_plan is not None and frame_plan.focus_terms:
+        frame_candidates = await _contexts_for_frame_precision(
+            collection_id=collection.id,
+            frame_plan=frame_plan,
+            document_ids=document_ids,
+        )
+        if frame_candidates:
+            frame_constrained = True
+            precision_merged = {
+                candidate.context_id: candidate for candidate in frame_candidates
+            }
+            for context_id, vector_candidate in merged.items():
+                candidate = precision_merged.get(context_id)
+                if candidate is None:
+                    continue
+                candidate.score += vector_candidate.score
+                for reason in vector_candidate.reasons:
+                    if reason not in candidate.reasons:
+                        candidate.reasons.append(reason)
+            merged = precision_merged
+
     if plan is not None and plan.scope == "anchored" and plan.anchors:
         anchor_candidates = await _contexts_for_anchor_literals(
             collection_id=collection.id,
@@ -2522,13 +2833,16 @@ async def _select_context_evidence_candidates(
         for anchor_candidate in anchor_candidates:
             candidate = merged.get(anchor_candidate.context_id)
             if candidate is None:
+                if frame_constrained:
+                    continue
                 merged[anchor_candidate.context_id] = anchor_candidate
                 continue
             candidate.score += anchor_candidate.score
             for reason in anchor_candidate.reasons:
                 if reason not in candidate.reasons:
                     candidate.reasons.append(reason)
-        max_contexts = max(max_contexts, len(plan.anchors) * 3)
+        if not frame_constrained:
+            max_contexts = max(max_contexts, len(plan.anchors) * 3)
 
     return sorted(merged.values(), key=lambda item: item.score, reverse=True)[
         :max_contexts
@@ -2739,11 +3053,13 @@ def _build_context_evidence_text(
 async def _context_mix_artifacts(
     question: str,
     collection: Collection,
+    namespace_id: uuid.UUID,
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
     *,
     document_ids: list[uuid.UUID] | None = None,
     plan: GraphQueryPlan | None = None,
+    llm_profile_id: uuid.UUID | None = None,
 ) -> GraphQueryArtifacts | None:
     if not await _collection_has_context_layer(collection):
         return None
@@ -2755,12 +3071,19 @@ async def _context_mix_artifacts(
         max_assertions_per_context = _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT
         coverage = True
     else:
+        frame_plan = await _plan_graph_query_frame(
+            question,
+            namespace_id,
+            llm_profile_id,
+            plan,
+        )
         contexts = await _select_context_evidence_candidates(
             collection=collection,
             entity_query_embedding=entity_query_embedding,
             relationship_query_embedding=relationship_query_embedding,
             document_ids=document_ids,
             plan=plan,
+            frame_plan=frame_plan,
             top_k=_CONTEXT_MIX_TOP_K,
             max_contexts=_CONTEXT_MIX_MAX_CONTEXTS,
         )
@@ -3686,10 +4009,12 @@ async def _build_graph_query_artifacts(
         context_artifacts = await _context_mix_artifacts(
             question,
             collection,
+            namespace_id,
             entity_query_embedding,
             relationship_query_embedding,
             document_ids=document_ids,
             plan=query_plan,
+            llm_profile_id=llm_profile_id,
         )
         if context_artifacts is not None:
             return context_artifacts
