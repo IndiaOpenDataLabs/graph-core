@@ -102,7 +102,7 @@ services:
       retries: 10
 
   falkordb:
-    image: falkordb/falkordb:latest
+    image: falkordb/falkordb:v4.18.11-arm64v8
     ports:
       - "6379:6379"
       - "3001:3000"
