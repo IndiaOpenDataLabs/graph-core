@@ -601,7 +601,6 @@ async def test_get_job_uses_chunk_rows_for_progress(service, test_collection):
     assert result["recorded_progress_percent"] == 101
     assert result["chunks_completed"] == 2
     assert result["chunks_total"] == 3
-    assert result["chunks_remaining"] == 1
 
 
 @pytest.mark.asyncio

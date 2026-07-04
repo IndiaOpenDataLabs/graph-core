@@ -1881,12 +1881,10 @@ class GraphService:
             progress_percent = job.progress_percent
             chunks_total = job.chunks_total
             chunks_completed = job.chunks_completed
-            chunks_remaining = None
             if chunk_summary is not None:
                 progress_percent = chunk_summary["progress_percent"]
                 chunks_total = chunk_summary["chunks_total"]
                 chunks_completed = chunk_summary["chunks_completed"]
-                chunks_remaining = chunk_summary["chunks_remaining"]
             return {
                 "id": str(job.id),
                 "type": job.job_type,
@@ -1903,7 +1901,6 @@ class GraphService:
                 ),
                 "chunks_total": chunks_total,
                 "chunks_completed": chunks_completed,
-                "chunks_remaining": chunks_remaining,
                 "payload": job.payload,
             }
 
@@ -2090,11 +2087,6 @@ class GraphService:
                         if chunk_summaries.get(job.id) is not None
                         else job.chunks_completed
                     ),
-                    "chunks_remaining": (
-                        chunk_summaries[job.id]["chunks_remaining"]
-                        if chunk_summaries.get(job.id) is not None
-                        else None
-                    ),
                     "collection_id": (
                         str(job.collection_id) if job.collection_id else None
                     ),
@@ -2150,7 +2142,6 @@ class GraphService:
         return {
             "chunks_total": total,
             "chunks_completed": completed,
-            "chunks_remaining": max(total - completed, 0),
             "progress_percent": progress_percent,
         }
 
