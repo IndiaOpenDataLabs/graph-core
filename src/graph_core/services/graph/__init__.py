@@ -24,6 +24,7 @@ from graph_core.models.graph_rag import GraphEntity, GraphRelationship
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
+from graph_core.provider_semaphore import provider_job_context
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.document_identity import (
     document_id_for_path,
@@ -49,6 +50,7 @@ from graph_core.services.graph.ingestion.document_pipeline import (
     enqueue_document_ingestion_job,
     finalize_cancelled_jobs,
     ingest_document_pipeline,
+    is_job_cancelled,
     mark_jobs_cancelled,
     process_single_chunk,
     purge_queued_job_messages,
@@ -94,6 +96,11 @@ from graph_core.storage.vector_tables import (
     create_all_tables,
     drop_all_tables,
 )
+
+
+class EnhanceJobCancelled(Exception):
+    """Raised when an enhance job is cancelled cooperatively."""
+
 
 _crypto = CredentialCrypto()
 
@@ -2014,15 +2021,22 @@ class GraphService:
             if collection_id is None:
                 raise ValueError(f"Job {job_id} is missing collection_id")
             levels = int(payload.get("levels") or 1)
+            if job.status == "cancelled" or await is_job_cancelled(job_id):
+                await self.update_job_status(job_id, "cancelled")
+                await self.append_job_event(job_id, "cancelled")
+                return
 
         await self.update_job_status(job_id, "running")
         await self.append_job_event(job_id, "started")
         try:
-            result = await self.build_collection_understanding(
-                collection_id,
-                namespace_id,
-                levels=levels,
-            )
+            async with provider_job_context(job_id):
+                result = await self.build_collection_understanding(
+                    collection_id,
+                    namespace_id,
+                    levels=levels,
+                    job_id=job_id,
+                )
+            await self._raise_if_enhance_cancelled(job_id)
             summary = {
                 "requested_levels": result.get("requested_levels", levels),
                 "generated_levels": result.get("generated_levels", []),
@@ -2037,6 +2051,10 @@ class GraphService:
             )
             await self.update_job_status(job_id, "completed", progress_percent=100)
             await self.append_job_event(job_id, "completed", summary)
+        except EnhanceJobCancelled:
+            await self.update_job_status(job_id, "cancelled")
+            await self.append_job_event(job_id, "cancelled")
+            return
         except Exception as e:
             await self.update_job_status(job_id, "failed", error=str(e))
             await self.append_job_event(job_id, "error", {"error": str(e)})
@@ -2599,9 +2617,11 @@ class GraphService:
         namespace_id: uuid.UUID,
         *,
         levels: int = 1,
+        job_id: uuid.UUID | None = None,
     ) -> dict[str, Any]:
         if levels < 1:
             raise ValueError("Enhance levels must be 1 or greater")
+        await self._raise_if_enhance_cancelled(job_id)
         source_collection = await self.get_collection(collection_id)
         self._enforce_namespace(source_collection, namespace_id)
         source_level = self._meta_collection_level(source_collection.name)
@@ -2609,7 +2629,9 @@ class GraphService:
         final_analysis: dict[str, Any] | None = None
 
         for target_level in range(source_level + 1, source_level + levels + 1):
+            await self._raise_if_enhance_cancelled(job_id)
             analysis = await analyze_collection_graph(source_collection.id)
+            await self._raise_if_enhance_cancelled(job_id)
             llm_provider = await self._resolve_collection_llm_provider(
                 source_collection, None
             )
@@ -2626,6 +2648,7 @@ class GraphService:
                 concept: dict[str, Any],
             ) -> None:
                 nonlocal meta_collection, embedding_provider, graph_storage
+                await self._raise_if_enhance_cancelled(job_id)
                 if meta_collection is None:
                     meta_collection = await self._prepare_meta_collection(
                         source_collection,
@@ -2648,9 +2671,11 @@ class GraphService:
                     graph_storage=graph_storage,
                     node_id_map=node_id_map,
                 )
+                await self._raise_if_enhance_cancelled(job_id)
 
             async def on_meta_edge(edge: dict[str, Any]) -> None:
                 nonlocal meta_collection, embedding_provider, graph_storage
+                await self._raise_if_enhance_cancelled(job_id)
                 if meta_collection is None:
                     meta_collection = await self._prepare_meta_collection(
                         source_collection,
@@ -2672,6 +2697,7 @@ class GraphService:
                     embedding_provider=embedding_provider,
                     graph_storage=graph_storage,
                 )
+                await self._raise_if_enhance_cancelled(job_id)
 
             understanding = await build_collection_understanding(
                 analysis,
@@ -2680,6 +2706,7 @@ class GraphService:
                 on_region_concept=on_region_concept,
                 on_meta_edge=on_meta_edge,
             )
+            await self._raise_if_enhance_cancelled(job_id)
             candidate_region_count = int(
                 understanding.get("candidate_region_count") or 0
             )
@@ -2726,6 +2753,16 @@ class GraphService:
             "derived_graph": final_level,
         }
 
+    async def _raise_if_enhance_cancelled(self, job_id: uuid.UUID | None) -> None:
+        if job_id is None:
+            return
+        if await is_job_cancelled(job_id):
+            raise EnhanceJobCancelled()
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if job and job.status == "cancelled":
+                raise EnhanceJobCancelled()
+
     async def update_job_status(
         self,
         job_id: uuid.UUID,
@@ -2771,6 +2808,7 @@ class GraphService:
 
 __all__ = [
     "GraphService",
+    "EnhanceJobCancelled",
     "ChunkIngestionResult",
     "DocumentIngestionResult",
     "QueryResult",

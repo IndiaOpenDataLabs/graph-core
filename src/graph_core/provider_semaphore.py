@@ -7,7 +7,7 @@ import contextvars
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
@@ -39,6 +39,19 @@ return 1
 """
 
 
+_current_job_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "provider_semaphore_job_id",
+    default=None,
+)
+
+
+def _make_token(owner_job_id: str | None = None) -> str:
+    token = str(uuid.uuid4())
+    if not owner_job_id:
+        return token
+    return f"job:{owner_job_id}:{token}"
+
+
 class _RedisSemaphore:
     def __init__(self, key_prefix: str) -> None:
         self._key_prefix = key_prefix
@@ -46,10 +59,15 @@ class _RedisSemaphore:
         self._poll_seconds = max(settings.provider_semaphore_poll_interval_ms, 1) / 1000
         self._redis = aioredis.from_url(settings.redis_semaphore_url)
 
-    async def acquire(self, scope: str, limit: int) -> str | None:
+    async def acquire(
+        self,
+        scope: str,
+        limit: int,
+        owner_job_id: str | None = None,
+    ) -> str | None:
         if limit <= 0:
             return None
-        token = str(uuid.uuid4())
+        token = _make_token(owner_job_id)
         key = f"{self._key_prefix}:{scope}"
         timeout = max(settings.provider_semaphore_acquire_timeout_seconds, 1)
         deadline = time.monotonic() + timeout
@@ -75,10 +93,15 @@ class _RedisSemaphore:
             wait = min(self._poll_seconds, remaining)
             await asyncio.sleep(wait)
 
-    async def try_acquire(self, scope: str, limit: int) -> str | None:
+    async def try_acquire(
+        self,
+        scope: str,
+        limit: int,
+        owner_job_id: str | None = None,
+    ) -> str | None:
         if limit <= 0:
             return None
-        token = str(uuid.uuid4())
+        token = _make_token(owner_job_id)
         key = f"{self._key_prefix}:{scope}"
         now_ms = int(time.time() * 1000)
         acquired = await self._redis.eval(
@@ -103,6 +126,22 @@ class _RedisSemaphore:
         except Exception:
             logger.exception("Failed to release provider semaphore %s", key)
 
+    async def release_owned(self, job_ids: Iterable[uuid.UUID | str]) -> int:
+        owners = {f"job:{job_id}:" for job_id in job_ids if str(job_id)}
+        if not owners:
+            return 0
+        removed = 0
+        async for key in self._redis.scan_iter(match=f"{self._key_prefix}:*"):
+            members = await self._redis.zrange(key, 0, -1)
+            owned_members: list[bytes | str] = []
+            for member in members:
+                text = member.decode() if isinstance(member, bytes) else str(member)
+                if any(text.startswith(owner) for owner in owners):
+                    owned_members.append(member)
+            if owned_members:
+                removed += int(await self._redis.zrem(key, *owned_members))
+        return removed
+
 
 async def _release_slot(
     semaphore: _RedisSemaphore,
@@ -124,9 +163,19 @@ def _reservation_key(scope: str | None, limit: int) -> tuple[str, int]:
     return (scope or "default", limit)
 
 
+@asynccontextmanager
+async def provider_job_context(job_id: uuid.UUID | str) -> AsyncIterator[None]:
+    token = _current_job_id.set(str(job_id))
+    try:
+        yield
+    finally:
+        _current_job_id.reset(token)
+
+
 async def reserve_llm_call_slot(
     scope: str | None = None,
     max_concurrent_calls: int | None = None,
+    owner_job_id: uuid.UUID | str | None = None,
 ) -> str | None:
     limit = (
         max_concurrent_calls
@@ -134,12 +183,14 @@ async def reserve_llm_call_slot(
         else settings.llm_max_concurrent_calls
     )
     semaphore_scope = scope or "default"
-    return await _llm_semaphore.acquire(semaphore_scope, limit)
+    owner = str(owner_job_id) if owner_job_id is not None else _current_job_id.get()
+    return await _llm_semaphore.acquire(semaphore_scope, limit, owner_job_id=owner)
 
 
 async def try_reserve_llm_call_slot(
     scope: str | None = None,
     max_concurrent_calls: int | None = None,
+    owner_job_id: uuid.UUID | str | None = None,
 ) -> str | None:
     """Attempt to reserve a slot once without waiting for capacity."""
     limit = (
@@ -148,7 +199,12 @@ async def try_reserve_llm_call_slot(
         else settings.llm_max_concurrent_calls
     )
     semaphore_scope = scope or "default"
-    return await _llm_semaphore.try_acquire(semaphore_scope, limit)
+    owner = str(owner_job_id) if owner_job_id is not None else _current_job_id.get()
+    return await _llm_semaphore.try_acquire(
+        semaphore_scope,
+        limit,
+        owner_job_id=owner,
+    )
 
 
 async def release_llm_call_slot(
@@ -204,7 +260,11 @@ async def llm_call_slot(
     if _active_llm_reservation.get() == reservation:
         yield
         return
-    token = await _llm_semaphore.acquire(semaphore_scope, limit)
+    token = await _llm_semaphore.acquire(
+        semaphore_scope,
+        limit,
+        owner_job_id=_current_job_id.get(),
+    )
     reservation_token = _active_llm_reservation.set(reservation)
     try:
         yield
@@ -224,8 +284,23 @@ async def embedding_call_slot(
         else settings.embedding_max_concurrent_calls
     )
     semaphore_scope = scope or "default"
-    token = await _embedding_semaphore.acquire(semaphore_scope, limit)
+    token = await _embedding_semaphore.acquire(
+        semaphore_scope,
+        limit,
+        owner_job_id=_current_job_id.get(),
+    )
     try:
         yield
     finally:
         await _release_slot(_embedding_semaphore, semaphore_scope, token, limit)
+
+
+async def release_provider_slots_for_jobs(
+    job_ids: Iterable[uuid.UUID | str],
+) -> int:
+    job_id_values = [str(job_id) for job_id in job_ids if str(job_id)]
+    if not job_id_values:
+        return 0
+    llm_removed = await _llm_semaphore.release_owned(job_id_values)
+    embedding_removed = await _embedding_semaphore.release_owned(job_id_values)
+    return llm_removed + embedding_removed

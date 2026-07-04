@@ -10,12 +10,27 @@ class _FakeSemaphore:
         self.acquire_count = 0
         self.release_started = asyncio.Event()
         self.released = asyncio.Event()
+        self.owner_job_ids: list[str | None] = []
 
-    async def acquire(self, scope: str, limit: int) -> str | None:
+    async def acquire(
+        self,
+        scope: str,
+        limit: int,
+        owner_job_id: str | None = None,
+    ) -> str | None:
         assert scope == "scope"
         assert limit == 1
         self.acquire_count += 1
+        self.owner_job_ids.append(owner_job_id)
         return "token"
+
+    async def try_acquire(
+        self,
+        scope: str,
+        limit: int,
+        owner_job_id: str | None = None,
+    ) -> str | None:
+        return await self.acquire(scope, limit, owner_job_id=owner_job_id)
 
     async def release(self, scope: str, token: str | None, limit: int) -> None:
         assert scope == "scope"
@@ -88,3 +103,45 @@ async def test_llm_call_slot_reuses_adopted_reservation(
         max_concurrent_calls=1,
     )
     assert fake.acquire_count == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_job_context_tags_direct_provider_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_llm = _FakeSemaphore()
+    fake_embedding = _FakeSemaphore()
+    monkeypatch.setattr(provider_semaphore, "_llm_semaphore", fake_llm)
+    monkeypatch.setattr(provider_semaphore, "_embedding_semaphore", fake_embedding)
+
+    async with provider_semaphore.provider_job_context("job-123"):
+        async with provider_semaphore.llm_call_slot(
+            scope="scope",
+            max_concurrent_calls=1,
+        ):
+            pass
+        async with provider_semaphore.embedding_call_slot(
+            scope="scope",
+            max_concurrent_calls=1,
+        ):
+            pass
+
+    assert fake_llm.owner_job_ids == ["job-123"]
+    assert fake_embedding.owner_job_ids == ["job-123"]
+
+
+@pytest.mark.asyncio
+async def test_try_reserve_llm_call_slot_uses_explicit_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeSemaphore()
+    monkeypatch.setattr(provider_semaphore, "_llm_semaphore", fake)
+
+    token = await provider_semaphore.try_reserve_llm_call_slot(
+        scope="scope",
+        max_concurrent_calls=1,
+        owner_job_id="job-456",
+    )
+
+    assert token == "token"
+    assert fake.owner_job_ids == ["job-456"]

@@ -31,6 +31,7 @@ from graph_core.models.profile import Profile
 from graph_core.provider_semaphore import (
     adopt_llm_call_slot,
     release_llm_call_slot,
+    release_provider_slots_for_jobs,
     try_reserve_llm_call_slot,
 )
 from graph_core.services.chunking import DocumentChunker
@@ -120,6 +121,7 @@ async def mark_jobs_cancelled(job_ids: Iterable[uuid.UUID | str]) -> int:
     try:
         added = await redis.sadd(_CANCELLED_JOBS_KEY, *job_id_strings)
         await redis.expire(_CANCELLED_JOBS_KEY, _CANCELLED_JOBS_TTL)
+        await release_provider_slots_for_jobs(job_id_strings)
         return int(added)
     finally:
         await redis.aclose()
@@ -562,6 +564,7 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
             token = await try_reserve_llm_call_slot(
                 scope=llm_scope,
                 max_concurrent_calls=llm_limit,
+                owner_job_id=chunk.job_id,
             )
             if token is None:
                 break
@@ -700,6 +703,7 @@ async def dispatch_pending_chunks_for_collection(
             token = await try_reserve_llm_call_slot(
                 scope=llm_scope,
                 max_concurrent_calls=llm_limit,
+                owner_job_id=chunk.job_id,
             )
             if token is None:
                 break

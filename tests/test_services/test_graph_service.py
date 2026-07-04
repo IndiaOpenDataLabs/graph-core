@@ -15,6 +15,7 @@ from graph_core.models.profile import Profile
 from graph_core.services.graph import (
     ChunkIngestionResult,
     DocumentIngestionResult,
+    EnhanceJobCancelled,
     GraphService,
 )
 from graph_core.services.graph.ingestion.document_pipeline import (
@@ -552,6 +553,67 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
     assert len(result["generated_levels"]) == 1
     assert result["generated_levels"][0]["level"] == 1
     assert result["generated_levels"][0]["node_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_enhance_checks_cancellation_inside_generation_loop(test_namespace):
+    service = GraphService()
+    job_id = uuid.uuid4()
+    base_collection = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_namespace.id,
+        name="base",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
+    service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_enhance_region_batch_size = AsyncMock(return_value=1)  # type: ignore[method-assign]
+
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=job_id,
+                namespace_id=test_namespace.id,
+                collection_id=base_collection.id,
+                job_type="enhance",
+                status="running",
+            )
+        )
+        await session.commit()
+
+    async def _cancel_after_analysis(*args, **kwargs):
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            assert job is not None
+            job.status = "cancelled"
+            await session.commit()
+        return {"totals": {}, "role_groups": []}
+
+    analytics_builder = AsyncMock(
+        return_value={
+            "nodes": [],
+            "edges": [],
+            "chunks": [],
+            "candidate_region_count": 0,
+        }
+    )
+    with patch(
+        "graph_core.services.graph.analyze_collection_graph",
+        AsyncMock(side_effect=_cancel_after_analysis),
+    ), patch(
+        "graph_core.services.graph.build_collection_understanding",
+        analytics_builder,
+    ):
+        with pytest.raises(EnhanceJobCancelled):
+            await service.build_collection_understanding(
+                base_collection.id,
+                test_namespace.id,
+                levels=1,
+                job_id=job_id,
+            )
+
+    analytics_builder.assert_not_awaited()
 
 
 @pytest.mark.asyncio
