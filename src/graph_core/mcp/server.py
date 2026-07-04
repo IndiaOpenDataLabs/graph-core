@@ -720,9 +720,10 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
         if job.get("error"):
             lines.append(f"  error: {job['error']}")
         if job.get("chunks_total"):
-            lines.append(
-                f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
-            )
+            chunks = f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
+            if job.get("chunks_remaining") is not None:
+                chunks += f" | remaining: {job['chunks_remaining']}"
+            lines.append(chunks)
         payload = job.get("payload") or {}
         result = payload.get("result") if isinstance(payload, dict) else None
         if isinstance(result, dict):
@@ -825,6 +826,8 @@ async def list_jobs(
                     f" | chunks {job.get('chunks_completed', 0)}/"
                     f"{job['chunks_total']}"
                 )
+                if job.get("chunks_remaining") is not None:
+                    chunks += f" | remaining {job['chunks_remaining']}"
             lines.append(
                 f"  - {job['id']} | {job.get('type', 'N/A')} | "
                 f"{job.get('status', 'unknown')} | "

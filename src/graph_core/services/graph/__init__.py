@@ -17,17 +17,18 @@ from graph_core.database import AsyncSessionLocal
 from graph_core.embedding import get_embedding_provider
 from graph_core.llm import get_llm_provider
 from graph_core.models.chat import ChatMessage, ChatSession
+from graph_core.models.chunk import IngestionChunk
 from graph_core.models.collection import Collection
 from graph_core.models.credential import Credential
 from graph_core.models.graph_rag import GraphEntity, GraphRelationship
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
 from graph_core.models.profile import Profile
+from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.document_identity import (
     document_id_for_path,
     normalize_document_path,
 )
-from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
     build_collection_understanding,
@@ -48,7 +49,6 @@ from graph_core.services.graph.ingestion.document_pipeline import (
     enqueue_document_ingestion_job,
     finalize_cancelled_jobs,
     ingest_document_pipeline,
-    is_job_cancelled,
     mark_jobs_cancelled,
     process_single_chunk,
     purge_queued_job_messages,
@@ -1877,21 +1877,33 @@ class GraphService:
             job = await session.get(Job, job_id)
             if not job:
                 raise ValueError(f"Job {job_id} not found")
+            chunk_summary = await self._job_chunk_summary(session, job)
+            progress_percent = job.progress_percent
+            chunks_total = job.chunks_total
+            chunks_completed = job.chunks_completed
+            chunks_remaining = None
+            if chunk_summary is not None:
+                progress_percent = chunk_summary["progress_percent"]
+                chunks_total = chunk_summary["chunks_total"]
+                chunks_completed = chunk_summary["chunks_completed"]
+                chunks_remaining = chunk_summary["chunks_remaining"]
             return {
                 "id": str(job.id),
                 "type": job.job_type,
                 "status": job.status,
                 "document_id": str(job.document_id) if getattr(job, "document_id", None) else None,
                 "document_path": getattr(job, "document_path", None),
-                "progress_percent": job.progress_percent,
+                "progress_percent": progress_percent,
+                "recorded_progress_percent": job.progress_percent,
                 "error": job.error,
                 "created_at": job.created_at.isoformat() if job.created_at else None,
                 "started_at": job.started_at.isoformat() if job.started_at else None,
                 "completed_at": (
                     job.completed_at.isoformat() if job.completed_at else None
                 ),
-                "chunks_total": job.chunks_total,
-                "chunks_completed": job.chunks_completed,
+                "chunks_total": chunks_total,
+                "chunks_completed": chunks_completed,
+                "chunks_remaining": chunks_remaining,
                 "payload": job.payload,
             }
 
@@ -2051,6 +2063,10 @@ class GraphService:
                 query = query.where(Job.collection_id == collection_id)
             result = await session.execute(query)
             jobs = list(result.scalars().all())
+            chunk_summaries = {
+                job.id: await self._job_chunk_summary(session, job)
+                for job in jobs
+            }
             return [
                 {
                     "id": str(job.id),
@@ -2058,9 +2074,27 @@ class GraphService:
                     "status": job.status,
                     "document_id": str(job.document_id) if getattr(job, "document_id", None) else None,
                     "document_path": getattr(job, "document_path", None),
-                    "progress_percent": job.progress_percent,
-                    "chunks_total": job.chunks_total,
-                    "chunks_completed": job.chunks_completed,
+                    "progress_percent": (
+                        chunk_summaries[job.id]["progress_percent"]
+                        if chunk_summaries.get(job.id) is not None
+                        else job.progress_percent
+                    ),
+                    "recorded_progress_percent": job.progress_percent,
+                    "chunks_total": (
+                        chunk_summaries[job.id]["chunks_total"]
+                        if chunk_summaries.get(job.id) is not None
+                        else job.chunks_total
+                    ),
+                    "chunks_completed": (
+                        chunk_summaries[job.id]["chunks_completed"]
+                        if chunk_summaries.get(job.id) is not None
+                        else job.chunks_completed
+                    ),
+                    "chunks_remaining": (
+                        chunk_summaries[job.id]["chunks_remaining"]
+                        if chunk_summaries.get(job.id) is not None
+                        else None
+                    ),
                     "collection_id": (
                         str(job.collection_id) if job.collection_id else None
                     ),
@@ -2083,6 +2117,42 @@ class GraphService:
         return await analyze_collection_graph(
             collection_id,
         )
+
+    async def _job_chunk_summary(
+        self,
+        session,
+        job: Job,
+    ) -> dict[str, int] | None:
+        if job.job_type != "ingest_document":
+            return None
+
+        result = await session.execute(
+            select(
+                IngestionChunk.status,
+                func.count(),
+            )
+            .where(IngestionChunk.job_id == job.id)
+            .group_by(IngestionChunk.status)
+        )
+        status_counts = {
+            str(status): int(count)
+            for status, count in result.all()
+        }
+        total = int(job.chunks_total or 0)
+        row_total = sum(status_counts.values())
+        if total <= 0:
+            total = row_total
+        if total <= 0:
+            return None
+
+        completed = int(status_counts.get("completed", 0))
+        progress_percent = min(100, int((completed / total) * 100)) if total else 0
+        return {
+            "chunks_total": total,
+            "chunks_completed": completed,
+            "chunks_remaining": max(total - completed, 0),
+            "progress_percent": progress_percent,
+        }
 
     async def _materialize_meta_collection(
         self,

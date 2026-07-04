@@ -91,7 +91,7 @@ def extract_job_id(text: str) -> str:
 def parse_jobs(text: str) -> list[dict]:
     items = []
     for match in re.finditer(
-        r"^  - ([^|]+)\| ([^|]+)\| ([^|]+)\| ([^%\n]+)%(?: \| chunks (\d+)/(\d+))?$",
+        r"^  - ([^|]+)\| ([^|]+)\| ([^|]+)\| ([^%\n]+)%(?: \| chunks (\d+)/(\d+))?(?: \| remaining (\d+))?$",
         text,
         re.MULTILINE,
     ):
@@ -102,6 +102,7 @@ def parse_jobs(text: str) -> list[dict]:
             "progress_percent": int(match.group(4).strip()),
             "chunks_completed": int(match.group(5)) if match.group(5) else None,
             "chunks_total": int(match.group(6)) if match.group(6) else None,
+            "chunks_remaining": int(match.group(7)) if match.group(7) else None,
         })
     return items
 

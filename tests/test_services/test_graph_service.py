@@ -555,12 +555,53 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
 
 
 @pytest.mark.asyncio
-async def test_update_and_get_job(service):
-    job_id = uuid.uuid4()
-    # Create a job directly for testing
-    await service.update_job_status(job_id, "running", progress_percent=50)
-    # Note: job doesn't exist yet, update is a no-op in current impl
-    # This tests the update path without crash
+async def test_get_job_uses_chunk_rows_for_progress(service, test_collection):
+    async with AsyncSessionLocal() as session:
+        job = Job(
+            namespace_id=test_collection.namespace_id,
+            collection_id=test_collection.id,
+            job_type="ingest_document",
+            status="running",
+            progress_percent=101,
+            chunks_total=3,
+            chunks_completed=4,
+            payload={"text": "ignored"},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+
+        session.add_all(
+            [
+                IngestionChunk(
+                    job_id=job.id,
+                    chunk_index=0,
+                    text="chunk 0",
+                    status="completed",
+                ),
+                IngestionChunk(
+                    job_id=job.id,
+                    chunk_index=1,
+                    text="chunk 1",
+                    status="completed",
+                ),
+                IngestionChunk(
+                    job_id=job.id,
+                    chunk_index=2,
+                    text="chunk 2",
+                    status="pending",
+                ),
+            ]
+        )
+        await session.commit()
+
+    result = await service.get_job(job.id)
+
+    assert result["progress_percent"] == 66
+    assert result["recorded_progress_percent"] == 101
+    assert result["chunks_completed"] == 2
+    assert result["chunks_total"] == 3
+    assert result["chunks_remaining"] == 1
 
 
 @pytest.mark.asyncio
