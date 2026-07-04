@@ -474,6 +474,7 @@ async def test_enhance_stops_when_no_candidate_regions(test_namespace):
 @pytest.mark.asyncio
 async def test_enhance_stops_after_single_concept_level(test_namespace):
     service = GraphService()
+    job_id = uuid.uuid4()
     base_collection = Collection(
         id=uuid.uuid4(),
         namespace_id=test_namespace.id,
@@ -500,7 +501,22 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
     service._materialize_meta_edges = AsyncMock()  # type: ignore[method-assign]
     service._graph_name = lambda collection: f"graph_{collection.name}"  # type: ignore[method-assign]
 
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=job_id,
+                namespace_id=test_namespace.id,
+                collection_id=base_collection.id,
+                job_type="enhance",
+                status="running",
+            )
+        )
+        await session.commit()
+
     async def _fake_build_collection_understanding(*args, **kwargs):
+        on_progress = kwargs.get("on_progress")
+        if on_progress is not None:
+            await on_progress(1, 0)
         on_region_concept = kwargs.get("on_region_concept")
         if on_region_concept is not None:
             await on_region_concept(
@@ -515,6 +531,8 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
                     "evidence_region_ids": ["role_group_1"],
                 },
             )
+        if on_progress is not None:
+            await on_progress(1, 1)
         on_meta_edge = kwargs.get("on_meta_edge")
         meta_edge = {
             "source_id": "concept-1",
@@ -545,6 +563,7 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
             base_collection.id,
             test_namespace.id,
             levels=100,
+            job_id=job_id,
         )
 
     service._prepare_meta_collection.assert_awaited_once()
@@ -553,6 +572,11 @@ async def test_enhance_stops_after_single_concept_level(test_namespace):
     assert len(result["generated_levels"]) == 1
     assert result["generated_levels"][0]["level"] == 1
     assert result["generated_levels"][0]["node_count"] == 1
+    job = await service.get_job(job_id)
+    assert job["progress_label"] == "meta_entities"
+    assert job["progress_total"] == 1
+    assert job["progress_completed"] == 1
+    assert job["progress_percent"] == 100
 
 
 @pytest.mark.asyncio

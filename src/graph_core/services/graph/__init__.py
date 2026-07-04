@@ -1892,6 +1892,7 @@ class GraphService:
                 progress_percent = chunk_summary["progress_percent"]
                 chunks_total = chunk_summary["chunks_total"]
                 chunks_completed = chunk_summary["chunks_completed"]
+            progress_label = self._job_progress_label(job)
             return {
                 "id": str(job.id),
                 "type": job.job_type,
@@ -1908,6 +1909,9 @@ class GraphService:
                 ),
                 "chunks_total": chunks_total,
                 "chunks_completed": chunks_completed,
+                "progress_label": progress_label,
+                "progress_total": chunks_total,
+                "progress_completed": chunks_completed,
                 "payload": job.payload,
             }
 
@@ -2101,6 +2105,17 @@ class GraphService:
                         else job.chunks_total
                     ),
                     "chunks_completed": (
+                        chunk_summaries[job.id]["chunks_completed"]
+                        if chunk_summaries.get(job.id) is not None
+                        else job.chunks_completed
+                    ),
+                    "progress_label": self._job_progress_label(job),
+                    "progress_total": (
+                        chunk_summaries[job.id]["chunks_total"]
+                        if chunk_summaries.get(job.id) is not None
+                        else job.chunks_total
+                    ),
+                    "progress_completed": (
                         chunk_summaries[job.id]["chunks_completed"]
                         if chunk_summaries.get(job.id) is not None
                         else job.chunks_completed
@@ -2699,12 +2714,23 @@ class GraphService:
                 )
                 await self._raise_if_enhance_cancelled(job_id)
 
+            async def on_progress(total: int, completed: int) -> None:
+                if job_id is None:
+                    return
+                await self.update_job_progress(
+                    job_id,
+                    total=total,
+                    completed=completed,
+                )
+                await self._raise_if_enhance_cancelled(job_id)
+
             understanding = await build_collection_understanding(
                 analysis,
                 llm_provider=llm_provider,
                 region_batch_size=region_batch_size,
                 on_region_concept=on_region_concept,
                 on_meta_edge=on_meta_edge,
+                on_progress=on_progress,
             )
             await self._raise_if_enhance_cancelled(job_id)
             candidate_region_count = int(
@@ -2784,6 +2810,32 @@ class GraphService:
             if status in ("completed", "failed", "cancelled"):
                 job.completed_at = datetime.now(UTC)
             await session.commit()
+
+    async def update_job_progress(
+        self,
+        job_id: uuid.UUID,
+        *,
+        total: int,
+        completed: int,
+    ) -> None:
+        total = max(int(total), 0)
+        completed = min(max(int(completed), 0), total) if total else 0
+        progress_percent = min(100, int((completed / total) * 100)) if total else 0
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                return
+            job.chunks_total = total
+            job.chunks_completed = completed
+            job.progress_percent = progress_percent
+            await session.commit()
+
+    def _job_progress_label(self, job: Job) -> str:
+        if job.job_type == "enhance":
+            return "meta_entities"
+        if job.job_type == "ingest_document":
+            return "chunks"
+        return "steps"
 
     async def append_job_event(
         self, job_id: uuid.UUID, event_type: str, payload: dict | None = None

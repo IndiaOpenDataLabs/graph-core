@@ -1634,6 +1634,7 @@ async def build_collection_understanding(
     on_region_concept: Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
     | None = None,
     on_meta_edge: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     collection = analysis["collection"]
     max_deterministic_link_pairs = 64
@@ -1861,6 +1862,9 @@ async def build_collection_understanding(
             }
         )
 
+    if on_progress is not None:
+        await on_progress(len(candidate_regions), 0)
+
     induced_concepts = list(fallback_concepts)
     streamed_regions = False
     if llm_provider and not isinstance(llm_provider, LocalEchoLLMProvider) and candidate_regions:
@@ -1996,6 +2000,7 @@ async def build_collection_understanding(
 
         induced_concepts: list[dict[str, Any] | None] = [None] * len(candidate_regions)
         batch_size = max(1, int(region_batch_size))
+        completed_regions = 0
 
         async def induce_region_concept_at(
             index: int,
@@ -2031,17 +2036,28 @@ async def build_collection_understanding(
                             induce_region_concept_at(next_index, next_region)
                         )
                     )
-                    next_index += 1
+                next_index += 1
                 if on_region_concept is not None:
                     await on_region_concept(region, concept)
+                completed_regions += 1
+                if on_progress is not None:
+                    await on_progress(len(candidate_regions), completed_regions)
         streamed_regions = True
     region_concepts: list[dict[str, Any]] = [
         {"region": region, "concept": concept}
         for region, concept in zip(candidate_regions, induced_concepts, strict=False)
     ]
-    if on_region_concept is not None and not streamed_regions:
+    if not streamed_regions:
+        completed_regions = 0
         for region_entry in region_concepts:
-            await on_region_concept(region_entry["region"], region_entry["concept"])
+            if on_region_concept is not None:
+                await on_region_concept(
+                    region_entry["region"],
+                    region_entry["concept"],
+                )
+            completed_regions += 1
+            if on_progress is not None:
+                await on_progress(len(candidate_regions), completed_regions)
     region_lookup = {region["region_id"]: region for region in candidate_regions}
     concept_id_by_label: dict[str, str] = {}
     concept_source_ids: dict[str, list[str]] = {}

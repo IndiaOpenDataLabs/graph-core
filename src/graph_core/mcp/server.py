@@ -719,9 +719,15 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
         ]
         if job.get("error"):
             lines.append(f"  error: {job['error']}")
-        if job.get("chunks_total"):
+        progress_total = job.get("progress_total") or job.get("chunks_total")
+        progress_completed = job.get(
+            "progress_completed",
+            job.get("chunks_completed", 0),
+        )
+        progress_label = job.get("progress_label") or "chunks"
+        if progress_total:
             lines.append(
-                f"  chunks: {job.get('chunks_completed', 0)}/{job['chunks_total']}"
+                f"  {progress_label}: {progress_completed}/{progress_total}"
             )
         payload = job.get("payload") or {}
         result = payload.get("result") if isinstance(payload, dict) else None
@@ -745,6 +751,9 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
                 "error": job.get("error"),
                 "chunks_total": job.get("chunks_total"),
                 "chunks_completed": job.get("chunks_completed"),
+                "progress_label": job.get("progress_label"),
+                "progress_total": job.get("progress_total"),
+                "progress_completed": job.get("progress_completed"),
                 "payload": job.get("payload"),
             }
         },
@@ -819,16 +828,19 @@ async def list_jobs(
         lines = ["Jobs:"]
         items: list[dict[str, object]] = []
         for job in jobs:
-            chunks = ""
-            if job.get("chunks_total"):
-                chunks = (
-                    f" | chunks {job.get('chunks_completed', 0)}/"
-                    f"{job['chunks_total']}"
-                )
+            progress = ""
+            progress_total = job.get("progress_total") or job.get("chunks_total")
+            progress_completed = job.get(
+                "progress_completed",
+                job.get("chunks_completed", 0),
+            )
+            progress_label = job.get("progress_label") or "chunks"
+            if progress_total:
+                progress = f" | {progress_label} {progress_completed}/{progress_total}"
             lines.append(
                 f"  - {job['id']} | {job.get('type', 'N/A')} | "
                 f"{job.get('status', 'unknown')} | "
-                f"{job.get('progress_percent', 0)}%{chunks}"
+                f"{job.get('progress_percent', 0)}%{progress}"
             )
             items.append(
                 {
@@ -838,6 +850,9 @@ async def list_jobs(
                     "progress_percent": job.get("progress_percent", 0),
                     "chunks_total": job.get("chunks_total"),
                     "chunks_completed": job.get("chunks_completed"),
+                    "progress_label": job.get("progress_label"),
+                    "progress_total": job.get("progress_total"),
+                    "progress_completed": job.get("progress_completed"),
                     "payload": job.get("payload"),
                 }
             )

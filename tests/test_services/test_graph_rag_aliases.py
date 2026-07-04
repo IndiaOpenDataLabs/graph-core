@@ -1442,9 +1442,22 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
         "entity_aliases_by_id": {},
     }
 
-    understanding = await build_collection_understanding(analysis)
+    progress_updates: list[tuple[int, int]] = []
+
+    async def _on_progress(total: int, completed: int) -> None:
+        progress_updates.append((total, completed))
+
+    understanding = await build_collection_understanding(
+        analysis,
+        on_progress=_on_progress,
+    )
 
     assert understanding["candidate_region_count"] > 0
+    assert progress_updates[0] == (understanding["candidate_region_count"], 0)
+    assert progress_updates[-1] == (
+        understanding["candidate_region_count"],
+        understanding["candidate_region_count"],
+    )
     region_kinds = {
         entry["region"]["kind"]
         for entry in understanding["regions"]
