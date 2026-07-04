@@ -12,6 +12,7 @@ from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
     GraphRelationshipType,
+    RelationshipDescription,
     RelationshipTypeAlias,
 )
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
@@ -1108,6 +1109,13 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
         "CALLS",
         weight=7,
     )
+    semantic_description = RelationshipDescription(
+        id=uuid.uuid4(),
+        relationship_id=semantic_relationship.id,
+        description="Krishna guides Arjuna through moral doubt on the battlefield.",
+        keywords=["guidance", "dharma"],
+        weight=1,
+    )
     db_session.add_all(
         [
             context,
@@ -1123,6 +1131,7 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
             relationship(source_mention, source_concept, "DENOTES"),
             relationship(target_mention, target_concept, "DENOTES"),
             semantic_relationship,
+            semantic_description,
             relationship(context, target_mention, "CALLS", weight=7),
         ]
     )
@@ -1147,8 +1156,12 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
             "target_name": "PERSON: Arjuna",
             "rel_type": "CALLS",
             "weight": 7,
+            "description": "Krishna guides Arjuna through moral doubt on the battlefield.",
         }
     ]
+    assert analysis["assertion_records"][0]["description"] == (
+        "Krishna guides Arjuna through moral doubt on the battlefield."
+    )
 
 
 @pytest.mark.asyncio
@@ -1369,6 +1382,48 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
                 "assertion_name": "Krishna is a Yadava prince",
                 "context_name": "royal identity",
             },
+            {
+                "id": str(uuid.uuid4()),
+                "source_concept_id": vata_id,
+                "source_concept_name": "DOSHA: Vata",
+                "source_concept_type": "CONCEPT_DOSHA",
+                "target_concept_id": dosha_id,
+                "target_concept_name": "CATEGORY: Dosha",
+                "target_concept_type": "CONCEPT_CATEGORY",
+                "rel_type": "IS_A",
+                "weight": 5,
+                "assertion_name": "Vata is a dosha",
+                "context_name": "ayurvedic classification",
+                "description": "Vata is one of the three doshas.",
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_concept_id": pitta_id,
+                "source_concept_name": "DOSHA: Pitta",
+                "source_concept_type": "CONCEPT_DOSHA",
+                "target_concept_id": dosha_id,
+                "target_concept_name": "CATEGORY: Dosha",
+                "target_concept_type": "CONCEPT_CATEGORY",
+                "rel_type": "IS_A",
+                "weight": 5,
+                "assertion_name": "Pitta is a dosha",
+                "context_name": "ayurvedic classification",
+                "description": "Pitta is one of the three doshas.",
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_concept_id": kapha_id,
+                "source_concept_name": "DOSHA: Kapha",
+                "source_concept_type": "CONCEPT_DOSHA",
+                "target_concept_id": dosha_id,
+                "target_concept_name": "CATEGORY: Dosha",
+                "target_concept_type": "CONCEPT_CATEGORY",
+                "rel_type": "IS_A",
+                "weight": 5,
+                "assertion_name": "Kapha is a dosha",
+                "context_name": "ayurvedic classification",
+                "description": "Kapha is one of the three doshas.",
+            },
         ],
         "role_groups": [
             {
@@ -1395,6 +1450,7 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
         for entry in understanding["regions"]
     }
     assert "referent_facet" in region_kinds
+    assert "shared_class" in region_kinds
     assert "role_clique" in region_kinds
     assert any(
         "PERSON: Krishna as source" in entry["region"]["title"]
@@ -1403,6 +1459,15 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
     assert any(
         "DOSHA: Vata, DOSHA: Pitta, DOSHA: Kapha" in entry["region"]["title"]
         for entry in understanding["regions"]
+    )
+    shared_class_region = next(
+        entry["region"]
+        for entry in understanding["regions"]
+        if entry["region"]["kind"] == "shared_class"
+    )
+    assert shared_class_region["anchor"] == "CATEGORY: Dosha"
+    assert "Vata is one of the three doshas." in (
+        shared_class_region["representative_edges"][0]["description"]
     )
 
 

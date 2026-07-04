@@ -31,6 +31,7 @@ from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
     GraphRelationshipType,
+    RelationshipDescription,
 )
 from graph_core.models.rel_types import rel_types_for_domain
 
@@ -51,6 +52,7 @@ class RelationshipRecord:
     target_name: str
     rel_type: str
     weight: int
+    description: str = ""
 
 
 @dataclass(slots=True)
@@ -68,6 +70,7 @@ class AssertionRecord:
     target_role: str
     source_mention_id: uuid.UUID
     target_mention_id: uuid.UUID
+    description: str = ""
     assertion_id: uuid.UUID | None = None
     assertion_name: str = ""
     context_id: uuid.UUID | None = None
@@ -374,6 +377,7 @@ def _project_context_scaffold_graph(
                 target_name=target_node.name,
                 rel_type=rel_type,
                 weight=rel.weight,
+                description=rel.description,
             )
         )
         assertion_id = (
@@ -402,6 +406,7 @@ def _project_context_scaffold_graph(
                 target_role="target",
                 source_mention_id=rel.source_id,
                 target_mention_id=rel.target_id,
+                description=rel.description,
                 assertion_id=assertion_id,
                 assertion_name=assertion_node.name if assertion_node else "",
                 context_id=context_id,
@@ -604,6 +609,7 @@ def _build_role_similarity_groups(
                 "weight": float(rel.weight or 0.0),
                 "direction": "out",
                 "relationship_id": str(rel.id),
+                "description": rel.description,
             }
         )
         relationship_records_by_node[target_id].append(
@@ -616,6 +622,7 @@ def _build_role_similarity_groups(
                 "weight": float(rel.weight or 0.0),
                 "direction": "in",
                 "relationship_id": str(rel.id),
+                "description": rel.description,
             }
         )
 
@@ -782,6 +789,7 @@ def _build_dynamic_anchor_regions(
                     "weight": weight,
                     "direction": direction,
                     "relationship_id": str(rel.id),
+                    "description": rel.description,
                 }
             )
 
@@ -1081,6 +1089,7 @@ def _build_facet_candidate_regions(
                     "assertion_id": assertion_id,
                     "assertion_name": str(record.get("assertion_name") or ""),
                     "context_name": str(record.get("context_name") or ""),
+                    "description": str(record.get("description") or ""),
                 }
             )
         role = str(bucket["role"])
@@ -1122,6 +1131,117 @@ def _build_facet_candidate_regions(
                     "rel_type_counts": dict(bucket["rel_counter"].most_common()),
                     "assertion_ids": sorted(set(assertion_ids)),
                     "context_names": sorted(bucket["context_names"])[:8],
+                },
+            }
+        )
+        if len(regions) >= max_regions:
+            break
+    return regions
+
+
+def _build_shared_class_candidate_regions(
+    assertion_records: list[dict[str, Any]],
+    *,
+    min_members: int = 2,
+    max_regions: int = 80,
+) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in assertion_records:
+        source_id = str(record.get("source_concept_id") or "").strip()
+        target_id = str(record.get("target_concept_id") or "").strip()
+        source_name = str(record.get("source_concept_name") or source_id).strip()
+        target_name = str(record.get("target_concept_name") or target_id).strip()
+        if not source_id or not target_id or source_id == target_id:
+            continue
+        rel_type = str(record.get("rel_type") or "RELATES_TO").upper()
+        key = (rel_type, target_id)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "rel_type": rel_type,
+                "target_id": target_id,
+                "target_name": target_name,
+                "target_type": str(record.get("target_concept_type") or ""),
+                "members": {},
+                "assertions": [],
+                "score": 0.0,
+            },
+        )
+        bucket["members"][source_id] = {
+            "id": source_id,
+            "name": source_name,
+            "type": str(record.get("source_concept_type") or ""),
+        }
+        bucket["assertions"].append(record)
+        bucket["score"] += float(record.get("weight") or 0.0) + 1.0
+
+    ranked = sorted(
+        buckets.values(),
+        key=lambda bucket: (
+            -len(bucket["members"]),
+            -float(bucket["score"]),
+            str(bucket["rel_type"]),
+            str(bucket["target_name"]),
+        ),
+    )
+    regions: list[dict[str, Any]] = []
+    for bucket in ranked:
+        members = list(bucket["members"].values())
+        if len(members) < min_members:
+            continue
+        member_names = sorted(str(member["name"]) for member in members)
+        member_ids = sorted(str(member["id"]) for member in members)
+        representative_edges = []
+        assertion_ids = []
+        for record in bucket["assertions"]:
+            assertion_id = str(record.get("assertion_id") or "").strip()
+            if assertion_id:
+                assertion_ids.append(assertion_id)
+            representative_edges.append(
+                {
+                    "source_id": str(record.get("source_concept_id") or ""),
+                    "source_name": str(record.get("source_concept_name") or ""),
+                    "target_id": str(record.get("target_concept_id") or ""),
+                    "target_name": str(record.get("target_concept_name") or ""),
+                    "rel_type": str(record.get("rel_type") or "RELATES_TO").upper(),
+                    "weight": float(record.get("weight") or 0.0),
+                    "relationship_id": str(record.get("id") or ""),
+                    "assertion_id": assertion_id,
+                    "assertion_name": str(record.get("assertion_name") or ""),
+                    "context_name": str(record.get("context_name") or ""),
+                    "description": str(record.get("description") or ""),
+                }
+            )
+        rel_type = str(bucket["rel_type"])
+        target_name = str(bucket["target_name"])
+        title = f"{', '.join(member_names[:8])} as {target_name} members"
+        regions.append(
+            {
+                "region_id": (
+                    f"shared_class_{len(regions) + 1}_"
+                    f"{hashlib.md5(title.encode('utf-8')).hexdigest()[:10]}"
+                ),
+                "kind": "shared_class",
+                "title": title,
+                "description": (
+                    f"{len(member_names)} entities share {rel_type} assertions "
+                    f"to {target_name}: {', '.join(member_names[:12])}."
+                ),
+                "source_ids": sorted({*member_ids, str(bucket["target_id"])}),
+                "entity_names": [*member_names, target_name],
+                "rel_types": [rel_type],
+                "representative_edges": representative_edges[:24],
+                "pair_metrics": [],
+                "anchor": target_name,
+                "anchor_id": str(bucket["target_id"]),
+                "shared_class_profile": {
+                    "class_id": str(bucket["target_id"]),
+                    "class_name": target_name,
+                    "class_type": str(bucket["target_type"]),
+                    "member_ids": member_ids,
+                    "member_names": member_names,
+                    "rel_type": rel_type,
+                    "assertion_ids": sorted(set(assertion_ids)),
                 },
             }
         )
@@ -1348,6 +1468,19 @@ async def _load_graph_records(
                 )
             )
         ).all()
+        description_rows = (
+            await session.execute(
+                select(
+                    RelationshipDescription.relationship_id,
+                    RelationshipDescription.description,
+                )
+                .join(
+                    GraphRelationship,
+                    GraphRelationship.id == RelationshipDescription.relationship_id,
+                )
+                .where(GraphRelationship.collection_id == collection_id)
+            )
+        ).all()
 
     aliases_by_entity_id: dict[str, list[str]] = defaultdict(list)
     for entity_id, alias_name in alias_rows:
@@ -1355,6 +1488,14 @@ async def _load_graph_records(
         if not alias:
             continue
         aliases_by_entity_id[str(entity_id)].append(alias)
+    description_by_relationship_id: dict[uuid.UUID, str] = {}
+    for relationship_id, description in description_rows:
+        text = str(description or "").strip()
+        if not text:
+            continue
+        current = description_by_relationship_id.get(relationship_id, "")
+        if len(text) > len(current):
+            description_by_relationship_id[relationship_id] = text
 
     loaded_nodes = [
         NodeRecord(id=node_id, name=name, primary_type=str(primary_type or ""))
@@ -1370,6 +1511,7 @@ async def _load_graph_records(
             target_name=target_name,
             rel_type=rel_type,
             weight=int(weight or 0),
+            description=description_by_relationship_id.get(rel_id, ""),
         )
         for (
             rel_id,
@@ -1447,6 +1589,7 @@ async def analyze_collection_graph(
             "target_name": rel.target_name,
             "rel_type": rel.rel_type,
             "weight": rel.weight,
+            "description": rel.description,
         }
         for rel in relationships
     ]
@@ -1469,6 +1612,7 @@ async def analyze_collection_graph(
             "assertion_name": record.assertion_name,
             "context_id": str(record.context_id) if record.context_id else None,
             "context_name": record.context_name,
+            "description": record.description,
         }
         for record in assertion_records
     ]
@@ -1609,6 +1753,9 @@ async def build_collection_understanding(
     role_profiles: list[dict[str, Any]] = []
     if assertion_records:
         candidate_regions.extend(_build_facet_candidate_regions(assertion_records))
+        candidate_regions.extend(
+            _build_shared_class_candidate_regions(assertion_records)
+        )
 
     analysis_nodes = [
         NodeRecord(
@@ -1628,6 +1775,7 @@ async def build_collection_understanding(
             target_name=str(rel["target_name"]),
             rel_type=str(rel.get("rel_type") or "RELATES_TO"),
             weight=int(rel.get("weight") or 0),
+            description=str(rel.get("description") or ""),
         )
         for rel in relationship_records
         if str(rel.get("id") or "").strip()
@@ -1720,7 +1868,20 @@ async def build_collection_understanding(
             "type": "object",
             "properties": {
                 "label": {"type": "string"},
-                "concept_type": {"type": "string", "enum": ["theme", "process", "role", "pattern", "tension", "flow", "facet", "concept"]},
+                "concept_type": {
+                    "type": "string",
+                    "enum": [
+                        "referent_facet",
+                        "shared_class",
+                        "relation_pattern",
+                        "process_flow",
+                        "tension",
+                        "composite_identity",
+                        "theme",
+                        "role",
+                        "concept",
+                    ],
+                },
                 "description": {"type": "string"},
                 "aliases": {
                     "type": "array",
@@ -1756,7 +1917,9 @@ async def build_collection_understanding(
                         f"{edge['source_name']} -[{rel_type}]-> "
                         f"{edge['target_name']} "
                         f"(weight={edge.get('weight', 0)}, "
-                        f"count={edge.get('relationship_count', 1)})"
+                        f"count={edge.get('relationship_count', 1)}"
+                        f"; assertion={edge.get('assertion_name') or 'n/a'}"
+                        f"; evidence={edge.get('description') or 'n/a'})"
                     )
                     for edge in region.get("representative_edges", [])[:5]
                 )
@@ -1776,8 +1939,13 @@ async def build_collection_understanding(
             code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
             prompt = (
                 "You are inducing one reusable semantic concept from a candidate region in a knowledge graph.\n"
-                "The candidate may be a referent facet, dynamic anchor neighborhood, or role-similarity clique.\n"
-                "For referent facets, name the specific context-supported role, identity, capacity, or aspect of the anchor entity.\n"
+                "The candidate may be a referent facet, shared class, dynamic anchor neighborhood, or role-similarity clique.\n"
+                "Use concept_type=referent_facet for a specific context-supported role, identity, capacity, or aspect of one anchor entity.\n"
+                "Use concept_type=shared_class for sibling entities that instantiate the same category, type, or class.\n"
+                "Use concept_type=relation_pattern for a repeated relationship shape across different entities.\n"
+                "Use concept_type=process_flow for ordered mechanisms, workflows, or causal sequences.\n"
+                "Use concept_type=tension for opposing forces, constraints, tradeoffs, or contradictions.\n"
+                "Use concept_type=composite_identity for a stable entity identity made from multiple facets.\n"
                 "If a dynamic role label is present, center the concept on that functional role and its local evidence.\n"
                 "Do not return a mechanical label like cluster, graph region, connector, bridge, or clique.\n"
                 "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n"
