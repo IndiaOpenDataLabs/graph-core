@@ -1608,7 +1608,7 @@ async def build_collection_understanding(
     candidate_regions: list[dict[str, Any]] = []
     role_profiles: list[dict[str, Any]] = []
     if assertion_records:
-        candidate_regions = _build_facet_candidate_regions(assertion_records)
+        candidate_regions.extend(_build_facet_candidate_regions(assertion_records))
 
     analysis_nodes = [
         NodeRecord(
@@ -1632,14 +1632,15 @@ async def build_collection_understanding(
         for rel in relationship_records
         if str(rel.get("id") or "").strip()
     ]
-    if not candidate_regions and analysis_nodes and analysis_relationships:
-        candidate_regions, role_profiles = _build_dynamic_anchor_regions(
+    if analysis_nodes and analysis_relationships:
+        dynamic_regions, role_profiles = _build_dynamic_anchor_regions(
             analysis_nodes,
             analysis_relationships,
             role_count=100,
             min_bucket_size=5,
             anchors_per_role=1,
         )
+        candidate_regions.extend(dynamic_regions)
         role_refinements = await _refine_dynamic_role_profiles(
             str(collection["name"]),
             role_profiles,
@@ -1670,34 +1671,33 @@ async def build_collection_understanding(
                     f"{role.get('description') or ''}"
                 ).strip()
 
-    if not candidate_regions:
-        role_groups = list(analysis.get("role_groups") or [])
-        for idx, group in enumerate(role_groups, start=1):
-            if int(group.get("size", 0)) < 2:
-                continue
-            representative_edges = group.get("representative_edges", [])
-            entity_names = list(group.get("node_names", []))[:24]
-            rel_types = list(group.get("top_rel_types", []))
-            pair_metrics = list(group.get("pair_metrics", []))
-            candidate_regions.append(
-                {
-                    "region_id": f"role_group_{idx}",
-                    "kind": "role_clique",
-                    "title": f"Role clique of size {group['size']}: {', '.join(entity_names[:6])}",
-                    "description": (
-                        f"Role-similarity clique of size {group['size']} with average cosine "
-                        f"{group['avg_cosine']} and average jaccard {group['avg_jaccard']}; "
-                        f"total neighborhood overlap {group['total_overlap']}. "
-                        f"Members: {', '.join(entity_names) or 'none'}. "
-                        f"Dominant relation types: {', '.join(rel_types) or 'none'}."
-                    ),
-                    "source_ids": list(group.get("node_ids", [])),
-                    "entity_names": entity_names,
-                    "rel_types": rel_types,
-                    "representative_edges": representative_edges,
-                    "pair_metrics": pair_metrics,
-                }
-            )
+    role_groups = list(analysis.get("role_groups") or [])
+    for idx, group in enumerate(role_groups, start=1):
+        if int(group.get("size", 0)) < 2:
+            continue
+        representative_edges = group.get("representative_edges", [])
+        entity_names = list(group.get("node_names", []))[:24]
+        rel_types = list(group.get("top_rel_types", []))
+        pair_metrics = list(group.get("pair_metrics", []))
+        candidate_regions.append(
+            {
+                "region_id": f"role_group_{idx}",
+                "kind": "role_clique",
+                "title": f"Role clique of size {group['size']}: {', '.join(entity_names[:6])}",
+                "description": (
+                    f"Role-similarity clique of size {group['size']} with average cosine "
+                    f"{group['avg_cosine']} and average jaccard {group['avg_jaccard']}; "
+                    f"total neighborhood overlap {group['total_overlap']}. "
+                    f"Members: {', '.join(entity_names) or 'none'}. "
+                    f"Dominant relation types: {', '.join(rel_types) or 'none'}."
+                ),
+                "source_ids": list(group.get("node_ids", [])),
+                "entity_names": entity_names,
+                "rel_types": rel_types,
+                "representative_edges": representative_edges,
+                "pair_metrics": pair_metrics,
+            }
+        )
 
     fallback_concepts = []
     for region in candidate_regions:

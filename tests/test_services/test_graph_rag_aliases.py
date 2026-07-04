@@ -1213,13 +1213,17 @@ async def test_build_collection_understanding_tolerates_missing_relationship_cou
 
 
 @pytest.mark.asyncio
-async def test_build_collection_understanding_prefers_assertion_facets():
+async def test_build_collection_understanding_combines_assertion_facets_and_role_regions():
     collection_id = str(uuid.uuid4())
     namespace_id = str(uuid.uuid4())
     krishna_id = str(uuid.uuid4())
     arjuna_id = str(uuid.uuid4())
     god_id = str(uuid.uuid4())
     prince_id = str(uuid.uuid4())
+    vata_id = str(uuid.uuid4())
+    pitta_id = str(uuid.uuid4())
+    kapha_id = str(uuid.uuid4())
+    dosha_id = str(uuid.uuid4())
     analysis = {
         "collection": {
             "id": collection_id,
@@ -1248,6 +1252,26 @@ async def test_build_collection_understanding_prefers_assertion_facets():
                 "name": "ROLE: Prince",
                 "primary_type": "CONCEPT_ROLE",
             },
+            {
+                "id": vata_id,
+                "name": "DOSHA: Vata",
+                "primary_type": "CONCEPT_DOSHA",
+            },
+            {
+                "id": pitta_id,
+                "name": "DOSHA: Pitta",
+                "primary_type": "CONCEPT_DOSHA",
+            },
+            {
+                "id": kapha_id,
+                "name": "DOSHA: Kapha",
+                "primary_type": "CONCEPT_DOSHA",
+            },
+            {
+                "id": dosha_id,
+                "name": "CATEGORY: Dosha",
+                "primary_type": "CONCEPT_CATEGORY",
+            },
         ],
         "relationship_records": [
             {
@@ -1274,6 +1298,33 @@ async def test_build_collection_understanding_prefers_assertion_facets():
                 "source_name": "PERSON: Krishna",
                 "target_id": prince_id,
                 "target_name": "ROLE: Prince",
+                "rel_type": "IS_A",
+                "weight": 5,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": vata_id,
+                "source_name": "DOSHA: Vata",
+                "target_id": dosha_id,
+                "target_name": "CATEGORY: Dosha",
+                "rel_type": "IS_A",
+                "weight": 5,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": pitta_id,
+                "source_name": "DOSHA: Pitta",
+                "target_id": dosha_id,
+                "target_name": "CATEGORY: Dosha",
+                "rel_type": "IS_A",
+                "weight": 5,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": kapha_id,
+                "source_name": "DOSHA: Kapha",
+                "target_id": dosha_id,
+                "target_name": "CATEGORY: Dosha",
                 "rel_type": "IS_A",
                 "weight": 5,
             },
@@ -1322,14 +1373,14 @@ async def test_build_collection_understanding_prefers_assertion_facets():
         "role_groups": [
             {
                 "group_id": "role:0",
-                "size": 2,
-                "node_ids": [krishna_id, arjuna_id],
-                "node_names": ["PERSON: Krishna", "PERSON: Arjuna"],
-                "avg_cosine": 0.5,
-                "avg_jaccard": 0.5,
-                "total_overlap": 1,
+                "size": 3,
+                "node_ids": [vata_id, pitta_id, kapha_id],
+                "node_names": ["DOSHA: Vata", "DOSHA: Pitta", "DOSHA: Kapha"],
+                "avg_cosine": 1.0,
+                "avg_jaccard": 1.0,
+                "total_overlap": 3,
                 "pair_metrics": [],
-                "top_rel_types": ["GUIDES"],
+                "top_rel_types": ["IS_A"],
                 "representative_edges": [],
             }
         ],
@@ -1339,12 +1390,18 @@ async def test_build_collection_understanding_prefers_assertion_facets():
     understanding = await build_collection_understanding(analysis)
 
     assert understanding["candidate_region_count"] > 0
-    assert {
+    region_kinds = {
         entry["region"]["kind"]
         for entry in understanding["regions"]
-    } == {"referent_facet"}
+    }
+    assert "referent_facet" in region_kinds
+    assert "role_clique" in region_kinds
     assert any(
         "PERSON: Krishna as source" in entry["region"]["title"]
+        for entry in understanding["regions"]
+    )
+    assert any(
+        "DOSHA: Vata, DOSHA: Pitta, DOSHA: Kapha" in entry["region"]["title"]
         for entry in understanding["regions"]
     )
 
