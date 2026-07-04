@@ -7,21 +7,21 @@ from sqlalchemy import select
 
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
+from graph_core.models.domain_config import CODE_REL_TYPE_TAXONOMY, get_domain_config
 from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
     GraphRelationshipType,
     RelationshipTypeAlias,
 )
-from graph_core.models.domain_config import CODE_REL_TYPE_TAXONOMY, get_domain_config
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.analytics import (
-    analyze_collection_graph,
-    build_collection_understanding,
     NodeRecord,
     RelationshipRecord,
     _build_role_similarity_groups,
+    analyze_collection_graph,
+    build_collection_understanding,
 )
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import (
@@ -1025,6 +1025,130 @@ async def test_analyze_collection_graph_uses_canonical_relationship_types(
     analysis = await analyze_collection_graph(test_graph_rag_collection.id)
 
     assert analysis["relationship_records"][0]["rel_type"] == "CALLS"
+
+
+@pytest.mark.asyncio
+async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
+    db_session,
+    test_graph_rag_collection,
+):
+    collection_id = test_graph_rag_collection.id
+    context = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="context:doc:chunk",
+        primary_type="CONTEXT",
+        description_count=0,
+    )
+    assertion = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="assertion:Krishna CALLS Arjuna",
+        primary_type="ASSERTION",
+        description_count=0,
+    )
+    source_mention = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="mention:source:Krishna",
+        primary_type="MENTION_PERSON",
+        description_count=0,
+    )
+    target_mention = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="mention:target:Arjuna",
+        primary_type="MENTION_PERSON",
+        description_count=0,
+    )
+    source_concept = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="PERSON: Krishna",
+        primary_type="CONCEPT_PERSON",
+        description_count=0,
+    )
+    target_concept = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="PERSON: Arjuna",
+        primary_type="CONCEPT_PERSON",
+        description_count=0,
+    )
+    rel_types = {
+        rel_type: GraphRelationshipType(
+            id=uuid.uuid4(),
+            collection_id=collection_id,
+            canonical_type=rel_type,
+        )
+        for rel_type in (
+            "HAS_ASSERTION",
+            "HAS_SUBJECT_MENTION",
+            "HAS_OBJECT_MENTION",
+            "DENOTES",
+            "CALLS",
+        )
+    }
+
+    def relationship(source, target, rel_type: str, weight: int = 1):
+        return GraphRelationship(
+            id=uuid.uuid4(),
+            collection_id=collection_id,
+            source_entity_id=source.id,
+            target_entity_id=target.id,
+            relationship_type_id=rel_types[rel_type].id,
+            rel_type=rel_type,
+            weight=weight,
+            keywords=[],
+        )
+
+    semantic_relationship = relationship(
+        source_mention,
+        target_mention,
+        "CALLS",
+        weight=7,
+    )
+    db_session.add_all(
+        [
+            context,
+            assertion,
+            source_mention,
+            target_mention,
+            source_concept,
+            target_concept,
+            *rel_types.values(),
+            relationship(context, assertion, "HAS_ASSERTION"),
+            relationship(assertion, source_mention, "HAS_SUBJECT_MENTION"),
+            relationship(assertion, target_mention, "HAS_OBJECT_MENTION"),
+            relationship(source_mention, source_concept, "DENOTES"),
+            relationship(target_mention, target_concept, "DENOTES"),
+            semantic_relationship,
+            relationship(context, target_mention, "CALLS", weight=7),
+        ]
+    )
+    await db_session.commit()
+
+    analysis = await analyze_collection_graph(collection_id)
+
+    assert {
+        node["primary_type"]
+        for node in analysis["node_records"]
+    } == {"CONCEPT_PERSON"}
+    assert {
+        node["name"]
+        for node in analysis["node_records"]
+    } == {"PERSON: Krishna", "PERSON: Arjuna"}
+    assert analysis["relationship_records"] == [
+        {
+            "id": str(semantic_relationship.id),
+            "source_id": str(source_concept.id),
+            "source_name": "PERSON: Krishna",
+            "target_id": str(target_concept.id),
+            "target_name": "PERSON: Arjuna",
+            "rel_type": "CALLS",
+            "weight": 7,
+        }
+    ]
 
 
 @pytest.mark.asyncio

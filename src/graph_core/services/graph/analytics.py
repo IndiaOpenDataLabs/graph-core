@@ -12,8 +12,8 @@ import json
 import math
 import re
 import uuid
-from collections.abc import Awaitable, Callable
 from collections import Counter, defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
@@ -60,6 +60,13 @@ _NON_CODE_REL_TYPES = {
     for value in rel_types_for_domain(domain)
 }
 _CODE_ONLY_REL_TYPES = _CODE_REL_TYPES - _NON_CODE_REL_TYPES
+_CONTEXT_SCAFFOLD_NODE_TYPES = {"CONTEXT", "ASSERTION"}
+_CONTEXT_SCAFFOLD_REL_TYPES = {
+    "HAS_ASSERTION",
+    "HAS_SUBJECT_MENTION",
+    "HAS_OBJECT_MENTION",
+    "DENOTES",
+}
 
 
 # Enhancement defaults favor broader, burner-like recall.
@@ -252,6 +259,89 @@ def _direction_role(out_count: int, in_count: int) -> str:
     if in_count >= out_count * 2:
         return "sink"
     return "bridge"
+
+
+def _is_context_concept_type(primary_type: str) -> bool:
+    return primary_type.upper().startswith("CONCEPT_")
+
+
+def _is_context_mention_type(primary_type: str) -> bool:
+    return primary_type.upper().startswith("MENTION_")
+
+
+def _has_context_scaffold(nodes: list[NodeRecord]) -> bool:
+    primary_types = {node.primary_type.upper() for node in nodes}
+    return bool(primary_types & _CONTEXT_SCAFFOLD_NODE_TYPES) or any(
+        _is_context_mention_type(primary_type)
+        or _is_context_concept_type(primary_type)
+        for primary_type in primary_types
+    )
+
+
+def _project_context_scaffold_graph(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+) -> tuple[list[NodeRecord], list[RelationshipRecord]]:
+    """Return the semantic concept graph from context/assertion/mention scaffolding."""
+    node_by_id = {node.id: node for node in nodes}
+    concept_ids = {
+        node.id
+        for node in nodes
+        if _is_context_concept_type(node.primary_type)
+    }
+    mention_ids = {
+        node.id
+        for node in nodes
+        if _is_context_mention_type(node.primary_type)
+    }
+    if not concept_ids or not mention_ids:
+        return nodes, relationships
+
+    concept_id_by_mention_id: dict[uuid.UUID, uuid.UUID] = {}
+    for rel in relationships:
+        rel_type = str(rel.rel_type or "").upper()
+        if (
+            rel_type == "DENOTES"
+            and rel.source_id in mention_ids
+            and rel.target_id in concept_ids
+        ):
+            concept_id_by_mention_id[rel.source_id] = rel.target_id
+
+    projected_relationships: list[RelationshipRecord] = []
+    for rel in relationships:
+        rel_type = str(rel.rel_type or "RELATES_TO").upper()
+        if rel_type in _CONTEXT_SCAFFOLD_REL_TYPES:
+            continue
+        if rel.source_id not in mention_ids or rel.target_id not in mention_ids:
+            continue
+        source_concept_id = concept_id_by_mention_id.get(rel.source_id)
+        target_concept_id = concept_id_by_mention_id.get(rel.target_id)
+        if (
+            source_concept_id is None
+            or target_concept_id is None
+            or source_concept_id == target_concept_id
+        ):
+            continue
+        source_node = node_by_id.get(source_concept_id)
+        target_node = node_by_id.get(target_concept_id)
+        if source_node is None or target_node is None:
+            continue
+        projected_relationships.append(
+            RelationshipRecord(
+                id=rel.id,
+                source_id=source_concept_id,
+                source_name=source_node.name,
+                target_id=target_concept_id,
+                target_name=target_node.name,
+                rel_type=rel_type,
+                weight=rel.weight,
+            )
+        )
+
+    return (
+        [node for node in nodes if node.id in concept_ids],
+        projected_relationships,
+    )
 
 
 def _dynamic_role_label(
@@ -1008,37 +1098,46 @@ async def _load_graph_records(
             continue
         aliases_by_entity_id[str(entity_id)].append(alias)
 
+    loaded_nodes = [
+        NodeRecord(id=node_id, name=name, primary_type=str(primary_type or ""))
+        for node_id, name, primary_type in nodes
+        if node_id in non_ref_entity_ids
+    ]
+    loaded_relationships = [
+        RelationshipRecord(
+            id=rel_id,
+            source_id=source_id,
+            source_name=source_name,
+            target_id=target_id,
+            target_name=target_name,
+            rel_type=rel_type,
+            weight=int(weight or 0),
+        )
+        for (
+            rel_id,
+            source_id,
+            source_name,
+            target_id,
+            target_name,
+            rel_type,
+            weight,
+        ) in relationships
+        if source_id in non_ref_entity_ids and target_id in non_ref_entity_ids
+    ]
+    if _has_context_scaffold(loaded_nodes):
+        loaded_nodes, loaded_relationships = _project_context_scaffold_graph(
+            loaded_nodes,
+            loaded_relationships,
+        )
+    loaded_node_ids = {str(node.id) for node in loaded_nodes}
     return (
         collection,
-        [
-            NodeRecord(id=node_id, name=name, primary_type=str(primary_type or ""))
-            for node_id, name, primary_type in nodes
-            if node_id in non_ref_entity_ids
-        ],
-        [
-            RelationshipRecord(
-                id=rel_id,
-                source_id=source_id,
-                source_name=source_name,
-                target_id=target_id,
-                target_name=target_name,
-                rel_type=rel_type,
-                weight=int(weight or 0),
-            )
-            for (
-                rel_id,
-                source_id,
-                source_name,
-                target_id,
-                target_name,
-                rel_type,
-                weight,
-            ) in relationships
-            if source_id in non_ref_entity_ids and target_id in non_ref_entity_ids
-        ],
+        loaded_nodes,
+        loaded_relationships,
         {
             entity_id: sorted({alias for alias in aliases})
             for entity_id, aliases in aliases_by_entity_id.items()
+            if entity_id in loaded_node_ids
         },
     )
 
