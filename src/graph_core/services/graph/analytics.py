@@ -1250,6 +1250,92 @@ def _build_shared_class_candidate_regions(
     return regions
 
 
+def _region_evidence_keys(region: dict[str, Any]) -> tuple[set[str], set[str]]:
+    assertion_ids: set[str] = set()
+    context_names: set[str] = set()
+    profile = region.get("facet_profile") or region.get("shared_class_profile") or {}
+    if isinstance(profile, dict):
+        assertion_ids.update(
+            str(value).strip()
+            for value in profile.get("assertion_ids", [])
+            if str(value).strip()
+        )
+        context_names.update(
+            str(value).strip()
+            for value in profile.get("context_names", [])
+            if str(value).strip()
+        )
+    for edge in region.get("representative_edges", []):
+        if not isinstance(edge, dict):
+            continue
+        assertion_id = str(
+            edge.get("assertion_id") or edge.get("relationship_id") or ""
+        ).strip()
+        if assertion_id:
+            assertion_ids.add(assertion_id)
+        context_name = str(edge.get("context_name") or "").strip()
+        if context_name:
+            context_names.add(context_name)
+    return assertion_ids, context_names
+
+
+def _meta_relation_type_for_evidence(rel_types: list[str]) -> str:
+    normalized = {str(rel_type).strip().upper() for rel_type in rel_types if rel_type}
+    if not normalized:
+        return "CONNECTS_TO"
+    if normalized & {
+        "IS_A",
+        "INSTANCE_OF",
+        "TYPE_OF",
+        "SUBCLASS_OF",
+        "INHERITS_FROM",
+        "IMPLEMENTS",
+        "EXTENDS",
+    }:
+        return "SPECIALIZES"
+    if normalized & {
+        "PART_OF",
+        "HAS_PART",
+        "CONTAINS",
+        "BELONGS_TO",
+        "INCLUDES",
+        "COMPOSED_OF",
+    }:
+        return "PART_OF"
+    if normalized & {
+        "CAUSES",
+        "ENABLES",
+        "TRIGGERS",
+        "PRODUCES",
+        "GENERATES",
+        "CREATES",
+        "LEADS_TO",
+        "RESULTS_IN",
+    }:
+        return "ENABLES"
+    if normalized & {
+        "GUIDES",
+        "INFORMS",
+        "EXPLAINS",
+        "DESCRIBES",
+        "TEACHES",
+        "SUPPORTS",
+        "EVIDENCES",
+    }:
+        return "INFORMS"
+    if normalized & {
+        "CALLS",
+        "USES",
+        "DEPENDS_ON",
+        "REQUIRES",
+        "IMPORTS",
+        "READS",
+        "WRITES",
+    }:
+        return "DEPENDS_ON"
+    return "CONNECTS_TO"
+
+
 async def _refine_dynamic_role_profiles(
     collection_name: str,
     role_profiles: list[dict[str, Any]],
@@ -2279,10 +2365,11 @@ async def build_collection_understanding(
             | set(str(value) for value in bucket["source_ids"])
             | path_source_ids
         )
+        meta_rel_type = _meta_relation_type_for_evidence(top_rel_types)
         created_edge = add_edge(
             source_concept_id,
             target_concept_id,
-            rel_type="CONNECTS_TO",
+            rel_type=meta_rel_type,
             description=_format_connects_to_description(
                 source_label=source_label,
                 source_desc=source_desc,
@@ -2305,6 +2392,88 @@ async def build_collection_understanding(
             [edge for edge in edges if "__EVIDENCED_BY__" not in edge["id"]]
         ) >= max_deterministic_meta_edges:
             break
+
+    evidence_buckets: dict[tuple[str, str], set[str]] = defaultdict(set)
+    concept_evidence: dict[str, tuple[set[str], set[str]]] = {}
+    for concept_id, region_ids in concept_region_ids_by_id.items():
+        assertion_ids: set[str] = set()
+        context_names: set[str] = set()
+        for region_id in region_ids:
+            region = region_lookup.get(region_id)
+            if not region:
+                continue
+            region_assertions, region_contexts = _region_evidence_keys(region)
+            assertion_ids.update(region_assertions)
+            context_names.update(region_contexts)
+        concept_evidence[concept_id] = (assertion_ids, context_names)
+        for assertion_id in assertion_ids:
+            evidence_buckets[("assertion", assertion_id)].add(concept_id)
+        for context_name in context_names:
+            evidence_buckets[("context", context_name)].add(concept_id)
+
+    co_occurrence_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    for (evidence_kind, evidence_key), concept_ids in evidence_buckets.items():
+        ordered_ids = sorted(concept_ids)
+        for index, source_concept_id in enumerate(ordered_ids):
+            for target_concept_id in ordered_ids[index + 1 :]:
+                pair_key = (source_concept_id, target_concept_id)
+                bucket = co_occurrence_pairs.setdefault(
+                    pair_key,
+                    {
+                        "source_id": source_concept_id,
+                        "target_id": target_concept_id,
+                        "assertions": set(),
+                        "contexts": set(),
+                    },
+                )
+                if evidence_kind == "assertion":
+                    bucket["assertions"].add(evidence_key)
+                else:
+                    bucket["contexts"].add(evidence_key)
+
+    ranked_co_occurrences = sorted(
+        co_occurrence_pairs.values(),
+        key=lambda item: (
+            len(item["assertions"]) + len(item["contexts"]),
+            len(item["assertions"]),
+            item["source_id"],
+            item["target_id"],
+        ),
+        reverse=True,
+    )
+    for bucket in ranked_co_occurrences:
+        if len(
+            [edge for edge in edges if "__EVIDENCED_BY__" not in edge["id"]]
+        ) >= max_deterministic_meta_edges:
+            break
+        source_concept_id = str(bucket["source_id"])
+        target_concept_id = str(bucket["target_id"])
+        source_label = concept_labels_by_id.get(source_concept_id, source_concept_id)
+        target_label = concept_labels_by_id.get(target_concept_id, target_concept_id)
+        shared_assertions = sorted(bucket["assertions"])
+        shared_contexts = sorted(bucket["contexts"])
+        if not shared_assertions and not shared_contexts:
+            continue
+        edge_source_ids = sorted(
+            set(concept_source_ids.get(source_concept_id, []))
+            | set(concept_source_ids.get(target_concept_id, []))
+        )
+        context_text = ", ".join(shared_contexts[:4]) or "none"
+        assertion_text = ", ".join(shared_assertions[:4]) or "none"
+        created_edge = add_edge(
+            source_concept_id,
+            target_concept_id,
+            rel_type="CO_OCCURS_WITH",
+            description=(
+                f"{source_label} and {target_label} are grounded in shared "
+                f"context/assertion evidence. Contexts: {context_text}. "
+                f"Assertions: {assertion_text}."
+            ),
+            source_ids=edge_source_ids,
+            keywords=["CO_OCCURS_WITH", *shared_contexts[:3]],
+        )
+        if created_edge is not None and on_meta_edge is not None:
+            await on_meta_edge(created_edge)
 
     return {
         "nodes": nodes,

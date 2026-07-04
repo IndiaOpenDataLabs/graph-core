@@ -1482,6 +1482,14 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
     assert "Vata is one of the three doshas." in (
         shared_class_region["representative_edges"][0]["description"]
     )
+    rel_types = {edge["rel_type"] for edge in understanding["edges"]}
+    assert "SPECIALIZES" in rel_types
+    assert "CO_OCCURS_WITH" in rel_types
+    assert any(
+        "ayurvedic classification" in edge["description"]
+        for edge in understanding["edges"]
+        if edge["rel_type"] == "CO_OCCURS_WITH"
+    )
 
 
 def test_role_similarity_groups_ignore_rel_type_in_neighborhood_signature():
