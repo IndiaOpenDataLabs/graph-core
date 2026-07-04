@@ -53,6 +53,27 @@ class RelationshipRecord:
     weight: int
 
 
+@dataclass(slots=True)
+class AssertionRecord:
+    id: uuid.UUID
+    source_concept_id: uuid.UUID
+    source_concept_name: str
+    source_concept_type: str
+    target_concept_id: uuid.UUID
+    target_concept_name: str
+    target_concept_type: str
+    rel_type: str
+    weight: int
+    source_role: str
+    target_role: str
+    source_mention_id: uuid.UUID
+    target_mention_id: uuid.UUID
+    assertion_id: uuid.UUID | None = None
+    assertion_name: str = ""
+    context_id: uuid.UUID | None = None
+    context_name: str = ""
+
+
 _CODE_REL_TYPES = {value.upper() for value in rel_types_for_domain("code")}
 _NON_CODE_REL_TYPES = {
     value.upper()
@@ -281,7 +302,7 @@ def _has_context_scaffold(nodes: list[NodeRecord]) -> bool:
 def _project_context_scaffold_graph(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
-) -> tuple[list[NodeRecord], list[RelationshipRecord]]:
+) -> tuple[list[NodeRecord], list[RelationshipRecord], list[AssertionRecord]]:
     """Return the semantic concept graph from context/assertion/mention scaffolding."""
     node_by_id = {node.id: node for node in nodes}
     concept_ids = {
@@ -295,9 +316,11 @@ def _project_context_scaffold_graph(
         if _is_context_mention_type(node.primary_type)
     }
     if not concept_ids or not mention_ids:
-        return nodes, relationships
+        return nodes, relationships, []
 
     concept_id_by_mention_id: dict[uuid.UUID, uuid.UUID] = {}
+    assertion_id_by_mention_id: dict[uuid.UUID, uuid.UUID] = {}
+    context_id_by_assertion_id: dict[uuid.UUID, uuid.UUID] = {}
     for rel in relationships:
         rel_type = str(rel.rel_type or "").upper()
         if (
@@ -306,8 +329,24 @@ def _project_context_scaffold_graph(
             and rel.target_id in concept_ids
         ):
             concept_id_by_mention_id[rel.source_id] = rel.target_id
+        elif (
+            rel_type in {"HAS_SUBJECT_MENTION", "HAS_OBJECT_MENTION"}
+            and node_by_id.get(rel.source_id) is not None
+            and node_by_id[rel.source_id].primary_type.upper() == "ASSERTION"
+            and rel.target_id in mention_ids
+        ):
+            assertion_id_by_mention_id[rel.target_id] = rel.source_id
+        elif (
+            rel_type == "HAS_ASSERTION"
+            and node_by_id.get(rel.source_id) is not None
+            and node_by_id[rel.source_id].primary_type.upper() == "CONTEXT"
+            and node_by_id.get(rel.target_id) is not None
+            and node_by_id[rel.target_id].primary_type.upper() == "ASSERTION"
+        ):
+            context_id_by_assertion_id[rel.target_id] = rel.source_id
 
     projected_relationships: list[RelationshipRecord] = []
+    assertion_records: list[AssertionRecord] = []
     for rel in relationships:
         rel_type = str(rel.rel_type or "RELATES_TO").upper()
         if rel_type in _CONTEXT_SCAFFOLD_REL_TYPES:
@@ -337,10 +376,43 @@ def _project_context_scaffold_graph(
                 weight=rel.weight,
             )
         )
+        assertion_id = (
+            assertion_id_by_mention_id.get(rel.source_id)
+            or assertion_id_by_mention_id.get(rel.target_id)
+        )
+        assertion_node = node_by_id.get(assertion_id) if assertion_id else None
+        context_id = (
+            context_id_by_assertion_id.get(assertion_id)
+            if assertion_id is not None
+            else None
+        )
+        context_node = node_by_id.get(context_id) if context_id else None
+        assertion_records.append(
+            AssertionRecord(
+                id=rel.id,
+                source_concept_id=source_concept_id,
+                source_concept_name=source_node.name,
+                source_concept_type=source_node.primary_type,
+                target_concept_id=target_concept_id,
+                target_concept_name=target_node.name,
+                target_concept_type=target_node.primary_type,
+                rel_type=rel_type,
+                weight=rel.weight,
+                source_role="source",
+                target_role="target",
+                source_mention_id=rel.source_id,
+                target_mention_id=rel.target_id,
+                assertion_id=assertion_id,
+                assertion_name=assertion_node.name if assertion_node else "",
+                context_id=context_id,
+                context_name=context_node.name if context_node else "",
+            )
+        )
 
     return (
         [node for node in nodes if node.id in concept_ids],
         projected_relationships,
+        assertion_records,
     )
 
 
@@ -873,6 +945,191 @@ def _build_dynamic_anchor_regions(
     return candidate_regions, diagnostics
 
 
+def _concept_kind(primary_type: str, name: str = "") -> str:
+    raw = str(primary_type or "").strip().upper()
+    if raw.startswith("CONCEPT_"):
+        return raw.removeprefix("CONCEPT_").lower() or "concept"
+    if ":" in name:
+        return name.split(":", 1)[0].strip().lower() or "concept"
+    return raw.lower() or "concept"
+
+
+def _build_facet_candidate_regions(
+    assertion_records: list[dict[str, Any]],
+    *,
+    max_facets_per_referent: int = 6,
+    max_regions: int = 120,
+) -> list[dict[str, Any]]:
+    if not assertion_records:
+        return []
+
+    assertions_by_referent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    facet_buckets: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    def add_view(
+        *,
+        record: dict[str, Any],
+        referent_id: str,
+        referent_name: str,
+        referent_type: str,
+        counterpart_id: str,
+        counterpart_name: str,
+        counterpart_type: str,
+        role: str,
+    ) -> None:
+        rel_type = str(record.get("rel_type") or "RELATES_TO").upper()
+        family = _edge_family_for(
+            rel_type=rel_type,
+            source_name=str(record.get("source_concept_name") or ""),
+            target_name=str(record.get("target_concept_name") or ""),
+        )
+        counterpart_kind = _concept_kind(counterpart_type, counterpart_name)
+        key = (referent_id, role, family, counterpart_kind)
+        bucket = facet_buckets.setdefault(
+            key,
+            {
+                "referent_id": referent_id,
+                "referent_name": referent_name,
+                "referent_type": referent_type,
+                "role": role,
+                "edge_family": family,
+                "counterpart_kind": counterpart_kind,
+                "assertions": [],
+                "counterpart_ids": set(),
+                "counterpart_names": set(),
+                "rel_counter": Counter(),
+                "context_names": set(),
+                "score": 0.0,
+            },
+        )
+        bucket["assertions"].append(record)
+        bucket["counterpart_ids"].add(counterpart_id)
+        bucket["counterpart_names"].add(counterpart_name)
+        bucket["rel_counter"][rel_type] += 1
+        context_name = str(record.get("context_name") or "").strip()
+        if context_name:
+            bucket["context_names"].add(context_name)
+        bucket["score"] += float(record.get("weight") or 0.0) + 1.0
+
+    for record in assertion_records:
+        source_id = str(record.get("source_concept_id") or "").strip()
+        target_id = str(record.get("target_concept_id") or "").strip()
+        if not source_id or not target_id or source_id == target_id:
+            continue
+        assertions_by_referent[source_id].append(record)
+        assertions_by_referent[target_id].append(record)
+        add_view(
+            record=record,
+            referent_id=source_id,
+            referent_name=str(record.get("source_concept_name") or source_id),
+            referent_type=str(record.get("source_concept_type") or ""),
+            counterpart_id=target_id,
+            counterpart_name=str(record.get("target_concept_name") or target_id),
+            counterpart_type=str(record.get("target_concept_type") or ""),
+            role="source",
+        )
+        add_view(
+            record=record,
+            referent_id=target_id,
+            referent_name=str(record.get("target_concept_name") or target_id),
+            referent_type=str(record.get("target_concept_type") or ""),
+            counterpart_id=source_id,
+            counterpart_name=str(record.get("source_concept_name") or source_id),
+            counterpart_type=str(record.get("source_concept_type") or ""),
+            role="target",
+        )
+
+    ranked_buckets = sorted(
+        facet_buckets.values(),
+        key=lambda bucket: (
+            -len(bucket["assertions"]),
+            -float(bucket["score"]),
+            str(bucket["referent_name"]),
+            str(bucket["edge_family"]),
+            str(bucket["counterpart_kind"]),
+        ),
+    )
+    kept_by_referent: Counter[str] = Counter()
+    regions: list[dict[str, Any]] = []
+    for bucket in ranked_buckets:
+        referent_id = str(bucket["referent_id"])
+        if len(assertions_by_referent[referent_id]) < 2:
+            continue
+        if kept_by_referent[referent_id] >= max_facets_per_referent:
+            continue
+        kept_by_referent[referent_id] += 1
+
+        rel_types = [rel_type for rel_type, _ in bucket["rel_counter"].most_common()]
+        counterpart_names = sorted(str(name) for name in bucket["counterpart_names"])
+        counterpart_ids = sorted(str(node_id) for node_id in bucket["counterpart_ids"])
+        representative_edges = []
+        assertion_ids = []
+        source_ids = {referent_id, *counterpart_ids}
+        for record in bucket["assertions"]:
+            assertion_id = str(record.get("assertion_id") or "").strip()
+            if assertion_id:
+                assertion_ids.append(assertion_id)
+            representative_edges.append(
+                {
+                    "source_id": str(record.get("source_concept_id") or ""),
+                    "source_name": str(record.get("source_concept_name") or ""),
+                    "target_id": str(record.get("target_concept_id") or ""),
+                    "target_name": str(record.get("target_concept_name") or ""),
+                    "rel_type": str(record.get("rel_type") or "RELATES_TO").upper(),
+                    "weight": float(record.get("weight") or 0.0),
+                    "relationship_id": str(record.get("id") or ""),
+                    "assertion_id": assertion_id,
+                    "assertion_name": str(record.get("assertion_name") or ""),
+                    "context_name": str(record.get("context_name") or ""),
+                }
+            )
+        role = str(bucket["role"])
+        family_label = str(bucket["edge_family"]).replace("_", " ")
+        title = (
+            f"{bucket['referent_name']} as {role} in "
+            f"{family_label} {bucket['counterpart_kind']} relations"
+        )
+        regions.append(
+            {
+                "region_id": (
+                    f"facet_{len(regions) + 1}_"
+                    f"{hashlib.md5(title.encode('utf-8')).hexdigest()[:10]}"
+                ),
+                "kind": "referent_facet",
+                "title": title,
+                "description": (
+                    f"{bucket['referent_name']} appears as {role} across "
+                    f"{len(bucket['assertions'])} assertion(s), mainly via "
+                    f"{', '.join(rel_types) or 'RELATES_TO'} toward "
+                    f"{bucket['counterpart_kind']} counterpart(s): "
+                    f"{', '.join(counterpart_names[:8])}."
+                ),
+                "source_ids": sorted(source_ids),
+                "entity_names": [str(bucket["referent_name"]), *counterpart_names],
+                "rel_types": rel_types,
+                "representative_edges": representative_edges[:16],
+                "pair_metrics": [],
+                "anchor": str(bucket["referent_name"]),
+                "anchor_id": referent_id,
+                "facet_profile": {
+                    "referent_id": referent_id,
+                    "referent_name": str(bucket["referent_name"]),
+                    "referent_type": str(bucket["referent_type"]),
+                    "role": role,
+                    "edge_family": str(bucket["edge_family"]),
+                    "counterpart_kind": str(bucket["counterpart_kind"]),
+                    "counterpart_names": counterpart_names[:12],
+                    "rel_type_counts": dict(bucket["rel_counter"].most_common()),
+                    "assertion_ids": sorted(set(assertion_ids)),
+                    "context_names": sorted(bucket["context_names"])[:8],
+                },
+            }
+        )
+        if len(regions) >= max_regions:
+            break
+    return regions
+
+
 async def _refine_dynamic_role_profiles(
     collection_name: str,
     role_profiles: list[dict[str, Any]],
@@ -1029,6 +1286,7 @@ async def _load_graph_records(
     Collection,
     list[NodeRecord],
     list[RelationshipRecord],
+    list[AssertionRecord],
     dict[str, list[str]],
 ]:
     async with AsyncSessionLocal() as session:
@@ -1124,8 +1382,9 @@ async def _load_graph_records(
         ) in relationships
         if source_id in non_ref_entity_ids and target_id in non_ref_entity_ids
     ]
+    assertion_records: list[AssertionRecord] = []
     if _has_context_scaffold(loaded_nodes):
-        loaded_nodes, loaded_relationships = _project_context_scaffold_graph(
+        loaded_nodes, loaded_relationships, assertion_records = _project_context_scaffold_graph(
             loaded_nodes,
             loaded_relationships,
         )
@@ -1134,6 +1393,7 @@ async def _load_graph_records(
         collection,
         loaded_nodes,
         loaded_relationships,
+        assertion_records,
         {
             entity_id: sorted({alias for alias in aliases})
             for entity_id, aliases in aliases_by_entity_id.items()
@@ -1160,9 +1420,13 @@ def build_collection_analysis(
 async def analyze_collection_graph(
     collection_id: uuid.UUID,
 ) -> dict[str, Any]:
-    collection, nodes, relationships, aliases_by_entity_id = await _load_graph_records(
-        collection_id
-    )
+    (
+        collection,
+        nodes,
+        relationships,
+        assertion_records,
+        aliases_by_entity_id,
+    ) = await _load_graph_records(collection_id)
     analysis = build_collection_analysis(
         nodes,
         relationships,
@@ -1185,6 +1449,28 @@ async def analyze_collection_graph(
             "weight": rel.weight,
         }
         for rel in relationships
+    ]
+    analysis["assertion_records"] = [
+        {
+            "id": str(record.id),
+            "source_concept_id": str(record.source_concept_id),
+            "source_concept_name": record.source_concept_name,
+            "source_concept_type": record.source_concept_type,
+            "target_concept_id": str(record.target_concept_id),
+            "target_concept_name": record.target_concept_name,
+            "target_concept_type": record.target_concept_type,
+            "rel_type": record.rel_type,
+            "weight": record.weight,
+            "source_role": record.source_role,
+            "target_role": record.target_role,
+            "source_mention_id": str(record.source_mention_id),
+            "target_mention_id": str(record.target_mention_id),
+            "assertion_id": str(record.assertion_id) if record.assertion_id else None,
+            "assertion_name": record.assertion_name,
+            "context_id": str(record.context_id) if record.context_id else None,
+            "context_name": record.context_name,
+        }
+        for record in assertion_records
     ]
     analysis["node_records"] = [
         {
@@ -1216,6 +1502,9 @@ async def build_collection_understanding(
     )
     relationship_records: list[dict[str, Any]] = list(
         analysis.get("relationship_records") or []
+    )
+    assertion_records: list[dict[str, Any]] = list(
+        analysis.get("assertion_records") or []
     )
     is_code_like = _is_code_like_collection(relationship_records)
     node_name_by_id: dict[str, str] = {}
@@ -1318,6 +1607,9 @@ async def build_collection_understanding(
 
     candidate_regions: list[dict[str, Any]] = []
     role_profiles: list[dict[str, Any]] = []
+    if assertion_records:
+        candidate_regions = _build_facet_candidate_regions(assertion_records)
+
     analysis_nodes = [
         NodeRecord(
             id=uuid.UUID(str(node["id"])),
@@ -1340,7 +1632,7 @@ async def build_collection_understanding(
         for rel in relationship_records
         if str(rel.get("id") or "").strip()
     ]
-    if analysis_nodes and analysis_relationships:
+    if not candidate_regions and analysis_nodes and analysis_relationships:
         candidate_regions, role_profiles = _build_dynamic_anchor_regions(
             analysis_nodes,
             analysis_relationships,
@@ -1428,7 +1720,7 @@ async def build_collection_understanding(
             "type": "object",
             "properties": {
                 "label": {"type": "string"},
-                "concept_type": {"type": "string", "enum": ["theme", "process", "role", "pattern", "tension", "flow", "concept"]},
+                "concept_type": {"type": "string", "enum": ["theme", "process", "role", "pattern", "tension", "flow", "facet", "concept"]},
                 "description": {"type": "string"},
                 "aliases": {
                     "type": "array",
@@ -1484,7 +1776,8 @@ async def build_collection_understanding(
             code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
             prompt = (
                 "You are inducing one reusable semantic concept from a candidate region in a knowledge graph.\n"
-                "The candidate may be a dynamic anchor neighborhood or a role-similarity clique.\n"
+                "The candidate may be a referent facet, dynamic anchor neighborhood, or role-similarity clique.\n"
+                "For referent facets, name the specific context-supported role, identity, capacity, or aspect of the anchor entity.\n"
                 "If a dynamic role label is present, center the concept on that functional role and its local evidence.\n"
                 "Do not return a mechanical label like cluster, graph region, connector, bridge, or clique.\n"
                 "Infer the higher-level concept, role class, family, pattern, or shared abstraction that these members instantiate together.\n"

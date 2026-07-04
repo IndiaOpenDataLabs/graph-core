@@ -1212,6 +1212,143 @@ async def test_build_collection_understanding_tolerates_missing_relationship_cou
     assert understanding["nodes"]
 
 
+@pytest.mark.asyncio
+async def test_build_collection_understanding_prefers_assertion_facets():
+    collection_id = str(uuid.uuid4())
+    namespace_id = str(uuid.uuid4())
+    krishna_id = str(uuid.uuid4())
+    arjuna_id = str(uuid.uuid4())
+    god_id = str(uuid.uuid4())
+    prince_id = str(uuid.uuid4())
+    analysis = {
+        "collection": {
+            "id": collection_id,
+            "name": "Mahabharata Notes",
+            "namespace_id": namespace_id,
+            "strategy": "custom_graph_rag",
+        },
+        "node_records": [
+            {
+                "id": krishna_id,
+                "name": "PERSON: Krishna",
+                "primary_type": "CONCEPT_PERSON",
+            },
+            {
+                "id": arjuna_id,
+                "name": "PERSON: Arjuna",
+                "primary_type": "CONCEPT_PERSON",
+            },
+            {
+                "id": god_id,
+                "name": "DIVINE: God",
+                "primary_type": "CONCEPT_DIVINE",
+            },
+            {
+                "id": prince_id,
+                "name": "ROLE: Prince",
+                "primary_type": "CONCEPT_ROLE",
+            },
+        ],
+        "relationship_records": [
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": krishna_id,
+                "source_name": "PERSON: Krishna",
+                "target_id": arjuna_id,
+                "target_name": "PERSON: Arjuna",
+                "rel_type": "GUIDES",
+                "weight": 7,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": krishna_id,
+                "source_name": "PERSON: Krishna",
+                "target_id": god_id,
+                "target_name": "DIVINE: God",
+                "rel_type": "IS_A",
+                "weight": 5,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": krishna_id,
+                "source_name": "PERSON: Krishna",
+                "target_id": prince_id,
+                "target_name": "ROLE: Prince",
+                "rel_type": "IS_A",
+                "weight": 5,
+            },
+        ],
+        "assertion_records": [
+            {
+                "id": str(uuid.uuid4()),
+                "source_concept_id": krishna_id,
+                "source_concept_name": "PERSON: Krishna",
+                "source_concept_type": "CONCEPT_PERSON",
+                "target_concept_id": arjuna_id,
+                "target_concept_name": "PERSON: Arjuna",
+                "target_concept_type": "CONCEPT_PERSON",
+                "rel_type": "GUIDES",
+                "weight": 7,
+                "assertion_name": "Krishna guides Arjuna through moral doubt",
+                "context_name": "battlefield counsel",
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_concept_id": krishna_id,
+                "source_concept_name": "PERSON: Krishna",
+                "source_concept_type": "CONCEPT_PERSON",
+                "target_concept_id": god_id,
+                "target_concept_name": "DIVINE: God",
+                "target_concept_type": "CONCEPT_DIVINE",
+                "rel_type": "IS_A",
+                "weight": 5,
+                "assertion_name": "Krishna is worshiped as god",
+                "context_name": "theological identity",
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "source_concept_id": krishna_id,
+                "source_concept_name": "PERSON: Krishna",
+                "source_concept_type": "CONCEPT_PERSON",
+                "target_concept_id": prince_id,
+                "target_concept_name": "ROLE: Prince",
+                "target_concept_type": "CONCEPT_ROLE",
+                "rel_type": "IS_A",
+                "weight": 5,
+                "assertion_name": "Krishna is a Yadava prince",
+                "context_name": "royal identity",
+            },
+        ],
+        "role_groups": [
+            {
+                "group_id": "role:0",
+                "size": 2,
+                "node_ids": [krishna_id, arjuna_id],
+                "node_names": ["PERSON: Krishna", "PERSON: Arjuna"],
+                "avg_cosine": 0.5,
+                "avg_jaccard": 0.5,
+                "total_overlap": 1,
+                "pair_metrics": [],
+                "top_rel_types": ["GUIDES"],
+                "representative_edges": [],
+            }
+        ],
+        "entity_aliases_by_id": {},
+    }
+
+    understanding = await build_collection_understanding(analysis)
+
+    assert understanding["candidate_region_count"] > 0
+    assert {
+        entry["region"]["kind"]
+        for entry in understanding["regions"]
+    } == {"referent_facet"}
+    assert any(
+        "PERSON: Krishna as source" in entry["region"]["title"]
+        for entry in understanding["regions"]
+    )
+
+
 def test_role_similarity_groups_ignore_rel_type_in_neighborhood_signature():
     a = uuid.uuid4()
     b = uuid.uuid4()
