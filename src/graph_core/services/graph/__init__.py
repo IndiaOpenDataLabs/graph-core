@@ -1934,6 +1934,37 @@ class GraphService:
                 "payload": payload,
             }
 
+    async def cancel_job(
+        self,
+        job_id: uuid.UUID,
+        namespace_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+            if job.namespace_id != namespace_id:
+                raise PermissionError(
+                    f"Job {job_id} does not belong to namespace {namespace_id}"
+                )
+            status = str(job.status)
+
+        if status in ("completed", "failed"):
+            return await self.get_job(job_id)
+        await mark_jobs_cancelled([job_id])
+        if status == "cancelled":
+            return await self.get_job(job_id)
+        await finalize_cancelled_jobs([job_id])
+        await purge_queued_job_messages([job_id])
+        await cancel_processing_chunks([job_id])
+        await self.update_job_status(
+            job_id,
+            "cancelled",
+            error="cancelled by operator",
+        )
+        await self.append_job_event(job_id, "cancelled")
+        return await self.get_job(job_id)
+
     async def _set_job_payload(
         self, job_id: uuid.UUID, payload: dict[str, Any]
     ) -> None:
@@ -2717,6 +2748,7 @@ class GraphService:
             async def on_progress(total: int, completed: int) -> None:
                 if job_id is None:
                     return
+                await self._raise_if_enhance_cancelled(job_id)
                 await self.update_job_progress(
                     job_id,
                     total=total,

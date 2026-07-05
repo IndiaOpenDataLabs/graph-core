@@ -761,6 +761,52 @@ async def get_job_status(job_id: str, ctx: Context) -> CallToolResult:
 
 
 @user_tool()
+async def cancel_job(job_id: str, ctx: Context) -> CallToolResult:
+    """Cancel a pending or running async job and release its provider slots.
+
+    Args:
+        job_id: The UUID of the job.
+    """
+    api_key = _extract_api_key(ctx)
+    async with _client(api_key) as client:
+        job = await client.cancel_job(job_id)
+        progress_total = job.get("progress_total") or job.get("chunks_total")
+        progress_completed = job.get(
+            "progress_completed",
+            job.get("chunks_completed", 0),
+        )
+        progress_label = job.get("progress_label") or "chunks"
+        lines = [
+            f"Cancelled job: {job.get('id', job_id)}",
+            f"  type: {job.get('type', job.get('job_type', 'N/A'))}",
+            f"  status: {job.get('status', 'unknown')}",
+            f"  progress: {job.get('progress_percent', 0)}%",
+        ]
+        if progress_total:
+            lines.append(
+                f"  {progress_label}: {progress_completed}/{progress_total}"
+            )
+        if job.get("error"):
+            lines.append(f"  error: {job['error']}")
+    return _result(
+        "\n".join(lines),
+        {
+            "job": {
+                "id": job.get("id", job_id),
+                "type": job.get("type", job.get("job_type")),
+                "status": job.get("status", "unknown"),
+                "progress_percent": job.get("progress_percent", 0),
+                "error": job.get("error"),
+                "progress_label": job.get("progress_label"),
+                "progress_total": job.get("progress_total"),
+                "progress_completed": job.get("progress_completed"),
+                "payload": job.get("payload"),
+            }
+        },
+    )
+
+
+@user_tool()
 async def get_job_result(job_id: str, ctx: Context) -> CallToolResult:
     """Get the final result payload for a completed query or enhance job."""
     api_key = _extract_api_key(ctx)

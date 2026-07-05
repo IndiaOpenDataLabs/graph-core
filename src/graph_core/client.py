@@ -254,6 +254,9 @@ class GraphCoreClient:
     async def get_job_result(self, job_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/jobs/{job_id}/result")
 
+    async def cancel_job(self, job_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/jobs/{job_id}/cancel")
+
     async def list_jobs(
         self,
         limit: int = 20,

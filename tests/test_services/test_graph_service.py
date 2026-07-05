@@ -242,6 +242,43 @@ async def test_cancel_processing_chunks_clears_active_rows(service, test_namespa
 
 
 @pytest.mark.asyncio
+async def test_cancel_job_marks_active_job_and_purges_resources(service, test_namespace):
+    job_id = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=job_id,
+                namespace_id=test_namespace.id,
+                collection_id=None,
+                job_type="enhance",
+                status="running",
+                progress_percent=6,
+                chunks_completed=41,
+                chunks_total=666,
+            )
+        )
+        await session.commit()
+
+    with (
+        patch("graph_core.services.graph.mark_jobs_cancelled", new=AsyncMock()) as mock_mark,
+        patch("graph_core.services.graph.finalize_cancelled_jobs", new=AsyncMock()) as mock_finalize,
+        patch("graph_core.services.graph.purge_queued_job_messages", new=AsyncMock()) as mock_purge,
+        patch("graph_core.services.graph.cancel_processing_chunks", new=AsyncMock()) as mock_cancel,
+    ):
+        result = await service.cancel_job(job_id, test_namespace.id)
+
+    assert result["status"] == "cancelled"
+    assert result["error"] == "cancelled by operator"
+    assert result["progress_label"] == "meta_entities"
+    assert result["progress_completed"] == 41
+    assert result["progress_total"] == 666
+    mock_mark.assert_awaited_once_with([job_id])
+    mock_finalize.assert_awaited_once_with([job_id])
+    mock_purge.assert_awaited_once_with([job_id])
+    mock_cancel.assert_awaited_once_with([job_id])
+
+
+@pytest.mark.asyncio
 async def test_get_collection(service, test_collection):
     coll = await service.get_collection(test_collection.id)
     assert coll.id == test_collection.id
@@ -638,6 +675,73 @@ async def test_enhance_checks_cancellation_inside_generation_loop(test_namespace
             )
 
     analytics_builder.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enhance_cancelled_job_does_not_regress_progress(test_namespace):
+    service = GraphService()
+    job_id = uuid.uuid4()
+    base_collection = Collection(
+        id=uuid.uuid4(),
+        namespace_id=test_namespace.id,
+        name="base",
+        strategy="custom_graph_rag",
+        embedding_dimensions=256,
+    )
+    service.get_collection = AsyncMock(return_value=base_collection)  # type: ignore[method-assign]
+    service._resolve_collection_llm_provider = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_enhance_region_batch_size = AsyncMock(return_value=1)  # type: ignore[method-assign]
+
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=job_id,
+                namespace_id=test_namespace.id,
+                collection_id=base_collection.id,
+                job_type="enhance",
+                status="running",
+                progress_percent=6,
+                chunks_completed=41,
+                chunks_total=666,
+            )
+        )
+        await session.commit()
+
+    async def _fake_build_collection_understanding(*args, **kwargs):
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            assert job is not None
+            job.status = "cancelled"
+            await session.commit()
+        on_progress = kwargs.get("on_progress")
+        if on_progress is not None:
+            await on_progress(666, 0)
+        return {
+            "nodes": [],
+            "edges": [],
+            "chunks": [],
+            "candidate_region_count": 0,
+        }
+
+    with patch(
+        "graph_core.services.graph.analyze_collection_graph",
+        AsyncMock(return_value={"totals": {}, "role_groups": []}),
+    ), patch(
+        "graph_core.services.graph.build_collection_understanding",
+        AsyncMock(side_effect=_fake_build_collection_understanding),
+    ):
+        with pytest.raises(EnhanceJobCancelled):
+            await service.build_collection_understanding(
+                base_collection.id,
+                test_namespace.id,
+                levels=1,
+                job_id=job_id,
+            )
+
+    job = await service.get_job(job_id)
+    assert job["progress_percent"] == 6
+    assert job["progress_completed"] == 41
+    assert job["progress_total"] == 666
 
 
 @pytest.mark.asyncio

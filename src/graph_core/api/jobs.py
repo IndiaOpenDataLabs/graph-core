@@ -48,6 +48,20 @@ async def get_job_result(job_id: uuid.UUID) -> dict:
         raise HTTPException(status_code=404, detail=message)
 
 
+@router.post("/{job_id}/cancel")
+async def cancel_job(
+    job_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+) -> dict:
+    """Cancel a pending or running job and release owned provider slots."""
+    try:
+        return await service.cancel_job(job_id, namespace_id)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Job belongs to another namespace")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+
 @router.get("/{job_id}/stream")
 async def stream_job_events(job_id: uuid.UUID):
     """SSE stream of transient job events via Redis pubsub."""
