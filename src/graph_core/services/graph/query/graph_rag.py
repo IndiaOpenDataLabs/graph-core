@@ -2082,6 +2082,7 @@ async def _plan_graph_query(
 
 
 async def _collection_has_context_layer(collection: Collection) -> bool:
+    started = time.perf_counter()
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(GraphEntity.id)
@@ -2091,7 +2092,14 @@ async def _collection_has_context_layer(collection: Collection) -> bool:
             )
             .limit(1)
         )
-        return result.scalar_one_or_none() is not None
+        has_context = result.scalar_one_or_none() is not None
+    logger.info(
+        "graph_rag context_layer_check collection=%s has_context=%s elapsed=%.3fs",
+        collection.name,
+        has_context,
+        time.perf_counter() - started,
+    )
+    return has_context
 
 
 async def _contexts_for_document_paths(
@@ -2102,6 +2110,7 @@ async def _contexts_for_document_paths(
 ) -> dict[uuid.UUID, ContextEvidenceCandidate]:
     if not document_paths:
         return {}
+    started = time.perf_counter()
     params: dict[str, Any] = {"cid": _uuid_for_sql(collection_id)}
     placeholders: list[str] = []
     for index, path in enumerate(document_paths):
@@ -2118,7 +2127,7 @@ async def _contexts_for_document_paths(
         doc_filter = f" AND ed.document_id IN ({', '.join(doc_placeholders)})"
 
     async with AsyncSessionLocal() as session:
-        rows = await session.execute(
+        result = await session.execute(
             text(
                 f"""
                 SELECT e.id, e.canonical_name, ed.document_path, ed.description
@@ -2132,6 +2141,7 @@ async def _contexts_for_document_paths(
             ),
             params,
         )
+    rows = result.all()
 
     candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
     for row in rows:
@@ -2145,6 +2155,14 @@ async def _contexts_for_document_paths(
             score=document_paths.get(document_path, 0.0) * 0.85,
             reasons=[f"same document as vector hit ({document_path})"],
         )
+    logger.info(
+        "graph_rag context_document_paths collection_id=%s documents=%d rows=%d candidates=%d elapsed=%.3fs",
+        collection_id,
+        len(document_paths),
+        len(rows),
+        len(candidates),
+        time.perf_counter() - started,
+    )
     return candidates
 
 
@@ -2157,6 +2175,7 @@ async def _contexts_for_graph_hits(
 ) -> dict[uuid.UUID, ContextEvidenceCandidate]:
     if not entity_scores and not relationship_scores:
         return {}
+    started = time.perf_counter()
 
     params: dict[str, Any] = {"cid": _uuid_for_sql(collection_id)}
     entity_placeholders: list[str] = []
@@ -2182,7 +2201,7 @@ async def _contexts_for_graph_hits(
         doc_filter = f" AND ed.document_id IN ({', '.join(doc_placeholders)})"
 
     async with AsyncSessionLocal() as session:
-        rows = await session.execute(
+        result = await session.execute(
             text(
                 f"""
                 WITH candidate_contexts AS (
@@ -2283,6 +2302,7 @@ async def _contexts_for_graph_hits(
             ),
             params,
         )
+    rows = result.all()
 
     candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
     for row in rows:
@@ -2311,6 +2331,15 @@ async def _contexts_for_graph_hits(
         reason = str(row[6] or "")
         if reason and reason not in candidate.reasons:
             candidate.reasons.append(reason)
+    logger.info(
+        "graph_rag context_graph_hits collection_id=%s entity_scores=%d relationship_scores=%d rows=%d candidates=%d elapsed=%.3fs",
+        collection_id,
+        len(entity_scores),
+        len(relationship_scores),
+        len(rows),
+        len(candidates),
+        time.perf_counter() - started,
+    )
     return candidates
 
 
@@ -2322,6 +2351,7 @@ async def _contexts_for_anchor_literals(
 ) -> list[ContextEvidenceCandidate]:
     if not anchors:
         return []
+    started = time.perf_counter()
 
     params: dict[str, Any] = {"cid": _uuid_for_sql(collection_id)}
     context_clauses: list[str] = []
@@ -2355,7 +2385,7 @@ async def _contexts_for_anchor_literals(
         doc_filter = f" AND ctx_ed.document_id IN ({', '.join(doc_placeholders)})"
 
     async with AsyncSessionLocal() as session:
-        rows = await session.execute(
+        result = await session.execute(
             text(
                 f"""
                 WITH matched_contexts AS (
@@ -2420,6 +2450,7 @@ async def _contexts_for_anchor_literals(
             ),
             params,
         )
+    rows = result.all()
 
     candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
     for row in rows:
@@ -2436,6 +2467,14 @@ async def _contexts_for_anchor_literals(
             )
             candidates[context_id] = candidate
         candidate.score += float(row[4] or 1.0)
+    logger.info(
+        "graph_rag context_anchor_literals collection_id=%s anchors=%d rows=%d candidates=%d elapsed=%.3fs",
+        collection_id,
+        len(anchors),
+        len(rows),
+        len(candidates),
+        time.perf_counter() - started,
+    )
     return sorted(candidates.values(), key=lambda item: item.score, reverse=True)
 
 
@@ -2450,6 +2489,7 @@ async def _select_context_evidence_candidates(
     max_contexts: int = 8,
 ) -> list[ContextEvidenceCandidate]:
     started = time.perf_counter()
+    vector_started = started
     entity_hits = await _graph_rag_vectors.search_entity_embeddings(
         collection_id=collection.id,
         query_embedding=entity_query_embedding,
@@ -2488,25 +2528,28 @@ async def _select_context_evidence_candidates(
         document_path = str(hit.metadata.get("document_path") or "")
         if document_path:
             document_path_scores[document_path] = max(
-                document_path_scores.get(document_path, 0.0),
-                score,
-            )
-    vector_elapsed = time.perf_counter() - started
+            document_path_scores.get(document_path, 0.0),
+            score,
+        )
+    vector_elapsed = time.perf_counter() - vector_started
 
+    graph_started = time.perf_counter()
     graph_candidates = await _contexts_for_graph_hits(
         collection_id=collection.id,
         entity_scores=entity_scores,
         relationship_scores=relationship_scores,
         document_ids=document_ids,
     )
-    graph_elapsed = time.perf_counter() - started
+    graph_elapsed = time.perf_counter() - graph_started
+    document_started = time.perf_counter()
     document_candidates = await _contexts_for_document_paths(
         collection_id=collection.id,
         document_paths=document_path_scores,
         document_ids=document_ids,
     )
-    document_elapsed = time.perf_counter() - started
+    document_elapsed = time.perf_counter() - document_started
     merged = dict(graph_candidates)
+    merge_started = time.perf_counter()
     for context_id, doc_candidate in document_candidates.items():
         candidate = merged.get(context_id)
         if candidate is None:
@@ -2517,7 +2560,9 @@ async def _select_context_evidence_candidates(
             if reason not in candidate.reasons:
                 candidate.reasons.append(reason)
 
+    anchor_elapsed = 0.0
     if plan is not None and plan.scope == "anchored" and plan.anchors:
+        anchor_started = time.perf_counter()
         anchor_candidates = await _contexts_for_anchor_literals(
             collection_id=collection.id,
             anchors=plan.anchors,
@@ -2533,10 +2578,11 @@ async def _select_context_evidence_candidates(
                 if reason not in candidate.reasons:
                     candidate.reasons.append(reason)
         max_contexts = max(max_contexts, len(plan.anchors) * 3)
+        anchor_elapsed = time.perf_counter() - anchor_started
 
     total_elapsed = time.perf_counter() - started
     logger.info(
-        "graph_rag context_candidates collection=%s entity_hits=%d relationship_hits=%d graph_candidates=%d document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs document=%.3fs total=%.3fs",
+        "graph_rag context_candidates collection=%s entity_hits=%d relationship_hits=%d graph_candidates=%d document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs document=%.3fs merge=%.3fs anchor=%.3fs total=%.3fs",
         collection.name,
         len(entity_hits),
         len(relationship_hits),
@@ -2544,8 +2590,10 @@ async def _select_context_evidence_candidates(
         len(document_candidates),
         len(merged),
         vector_elapsed,
-        graph_elapsed - vector_elapsed,
-        document_elapsed - graph_elapsed,
+        graph_elapsed,
+        document_elapsed,
+        time.perf_counter() - merge_started,
+        anchor_elapsed,
         total_elapsed,
     )
 
@@ -2859,6 +2907,14 @@ async def _context_mix_artifacts(
         max_assertions_per_context=max_assertions_per_context,
     )
     assertions_elapsed = time.perf_counter() - assertions_started
+    logger.info(
+        "graph_rag context_mix_selected collection=%s contexts=%d coverage=%s selection=%.3fs assertions=%.3fs",
+        collection.name,
+        len(contexts),
+        coverage,
+        selection_elapsed,
+        assertions_elapsed,
+    )
     context, entities_used, relationships_used, rel_context = (
         _build_context_evidence_text(
             contexts,
