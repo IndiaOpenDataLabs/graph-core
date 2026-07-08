@@ -2651,9 +2651,7 @@ async def _select_context_evidence_candidates(
         total_elapsed,
     )
 
-    return sorted(scored_contexts, key=lambda item: item.score, reverse=True)[
-        :max_contexts
-    ]
+    return sorted(scored_contexts, key=lambda item: item.score, reverse=True)
 
 
 def _merge_context_candidates(
