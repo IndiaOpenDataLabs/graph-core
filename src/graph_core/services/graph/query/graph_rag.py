@@ -68,7 +68,7 @@ _META_PROJECTION_EDGE_BASE_SCORE = 0.72
 _META_PROJECTION_MAX_BASE_REFS = 40
 _META_PROJECTION_MAX_BASE_RELS = 80
 _CONTEXT_MIX_TOP_K = 40
-_CONTEXT_MIX_MAX_CONTEXTS = 8
+_CONTEXT_MIX_MAX_CONTEXTS = 30
 _COLLECTION_COVERAGE_MAX_DOCUMENTS = 200
 _COLLECTION_COVERAGE_CONTEXTS_PER_DOCUMENT = 4
 _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 16
@@ -2519,7 +2519,7 @@ async def _select_context_evidence_candidates(
     plan: GraphQueryPlan | None = None,
     frame_plan: GraphQueryFramePlan | None = None,
     top_k: int = 40,
-    max_contexts: int = 8,
+    max_contexts: int = 30,
 ) -> list[ContextEvidenceCandidate]:
     started = time.perf_counter()
     vector_started = started
