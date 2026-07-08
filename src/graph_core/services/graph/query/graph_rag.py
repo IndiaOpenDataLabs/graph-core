@@ -410,6 +410,13 @@ class GraphQueryPlan:
 
 
 @dataclass
+class GraphQueryFramePlan:
+    focus_terms: list[str]
+    competing_terms: list[str]
+    relation_hints: list[str]
+
+
+@dataclass
 class DerivedRouteProfile:
     primary_route: str
     route_scores: dict[str, float]
@@ -1940,6 +1947,46 @@ def _normalise_plan_list(value: Any, *, max_items: int = 12) -> list[str]:
     return items
 
 
+def _expand_frame_terms(terms: list[str], *, max_items: int = 16) -> list[str]:
+    expanded = list(terms)
+    token_counts: dict[str, int] = {}
+    for term in terms:
+        tokens = {
+            "".join(ch for ch in raw_token.casefold() if ch.isalnum())
+            for raw_token in term.split()
+        }
+        for token in tokens:
+            if len(token) >= 4:
+                token_counts[token] = token_counts.get(token, 0) + 1
+
+    seen = {term.casefold() for term in expanded}
+    for token, count in sorted(
+        token_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        if count < 2 or token in seen:
+            continue
+        expanded.append(token)
+        seen.add(token)
+        if len(expanded) >= max_items:
+            break
+    return expanded[:max_items]
+
+
+def _fallback_graph_query_frame_plan(
+    question: str,
+    plan: GraphQueryPlan | None = None,
+) -> GraphQueryFramePlan:
+    terms = list(plan.requested_fields) if plan else []
+    if not terms:
+        terms = [_diagnostic_entity_text(question)]
+    return GraphQueryFramePlan(
+        focus_terms=_expand_frame_terms(terms),
+        competing_terms=[],
+        relation_hints=[],
+    )
+
+
 def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
     lowered = f" {question.casefold()} "
     operation = "describe"
@@ -2079,6 +2126,78 @@ async def _plan_graph_query(
         plan.output_shape,
     )
     return plan
+
+
+async def _plan_graph_query_frame(
+    question: str,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
+    plan: GraphQueryPlan | None = None,
+) -> GraphQueryFramePlan:
+    fallback = _fallback_graph_query_frame_plan(question, plan)
+    llm_provider = await _resolve_llm_provider(
+        namespace_id=namespace_id,
+        llm_profile_id=llm_profile_id,
+    )
+    if isinstance(llm_provider, LocalEchoLLMProvider):
+        return fallback
+
+    schema = {
+        "title": "GraphQueryFramePlan",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "focus_terms": {"type": "array", "items": {"type": "string"}},
+            "competing_terms": {"type": "array", "items": {"type": "string"}},
+            "relation_hints": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["focus_terms", "competing_terms", "relation_hints"],
+    }
+    prompt = (
+        "Identify the graph retrieval frame for this question without assuming "
+        "any domain schema. A frame is the topic, process, source scope, or "
+        "conceptual region the answer should stay inside; it is not a named "
+        "entity anchor.\n\n"
+        "Return:\n"
+        "- focus_terms: literal terms and close variants that define the target "
+        "context. Use the user's wording where possible.\n"
+        "- competing_terms: nearby frames likely to be confused with the focus "
+        "and should be demoted when evidence is mostly about them.\n"
+        "- relation_hints: generic action/edge words that describe how evidence "
+        "inside the frame connects, without inventing a domain schema.\n\n"
+        "Do not include output-control words unless they are domain terms. "
+        "Do not include named anchors from the question as focus terms.\n\n"
+        f"Question: {question}\n"
+        f"Query plan requested_fields: {plan.requested_fields if plan else []}\n"
+        f"Query plan anchors: {plan.anchors if plan else []}"
+    )
+    try:
+        extracted = await llm_provider.structured_extract(prompt, schema)
+    except Exception:
+        logger.exception("graph_rag frame_plan_failed")
+        return fallback
+
+    focus_terms = _normalise_plan_list(extracted.get("focus_terms"), max_items=10)
+    competing_terms = _normalise_plan_list(
+        extracted.get("competing_terms"),
+        max_items=12,
+    )
+    relation_hints = _normalise_plan_list(
+        extracted.get("relation_hints"),
+        max_items=12,
+    )
+    frame_plan = GraphQueryFramePlan(
+        focus_terms=_expand_frame_terms(focus_terms or fallback.focus_terms),
+        competing_terms=competing_terms,
+        relation_hints=relation_hints,
+    )
+    logger.info(
+        "graph_rag frame_plan focus=%s competing=%s relations=%s",
+        frame_plan.focus_terms,
+        frame_plan.competing_terms,
+        frame_plan.relation_hints,
+    )
+    return frame_plan
 
 
 async def _collection_has_context_layer(collection: Collection) -> bool:
@@ -2343,6 +2462,54 @@ async def _contexts_for_graph_hits(
     return candidates
 
 
+def _apply_frame_precision(
+    contexts: list[ContextEvidenceCandidate],
+    frame_plan: GraphQueryFramePlan,
+) -> list[ContextEvidenceCandidate]:
+    if not frame_plan.focus_terms:
+        return contexts
+
+    focus_terms = _expand_frame_terms(frame_plan.focus_terms, max_items=12)
+    competing_terms = _expand_frame_terms(frame_plan.competing_terms, max_items=12)
+    scored: list[ContextEvidenceCandidate] = []
+    for context in contexts:
+        text = " ".join(
+            [
+                context.name,
+                context.description,
+                context.document_path,
+                " ".join(context.reasons),
+            ]
+        ).casefold()
+        score = context.score
+        matched_focus = any(term.casefold() in text for term in focus_terms)
+        matched_competing = any(
+            term.casefold() in text for term in competing_terms
+        )
+        reasons = list(context.reasons)
+        if matched_focus:
+            score += 4.0
+            reasons.append("focus frame match")
+        if matched_competing:
+            score -= 2.5
+            reasons.append("competing frame match")
+        if score <= 0:
+            continue
+        scored.append(
+            ContextEvidenceCandidate(
+                context_id=context.context_id,
+                name=context.name,
+                document_path=context.document_path,
+                description=context.description,
+                score=score,
+                reasons=list(dict.fromkeys(reasons)),
+            )
+        )
+    if not scored:
+        return contexts
+    return sorted(scored, key=lambda item: item.score, reverse=True)
+
+
 async def _select_context_evidence_candidates(
     *,
     collection: Collection,
@@ -2350,6 +2517,7 @@ async def _select_context_evidence_candidates(
     relationship_query_embedding: list[float],
     document_ids: list[uuid.UUID] | None = None,
     plan: GraphQueryPlan | None = None,
+    frame_plan: GraphQueryFramePlan | None = None,
     top_k: int = 40,
     max_contexts: int = 8,
 ) -> list[ContextEvidenceCandidate]:
@@ -2424,6 +2592,11 @@ async def _select_context_evidence_candidates(
         for reason in doc_candidate.reasons:
             if reason not in candidate.reasons:
                 candidate.reasons.append(reason)
+
+    if frame_plan is not None and frame_plan.focus_terms:
+        merged_list = _apply_frame_precision(list(merged.values()), frame_plan)
+        if merged_list:
+            merged = {candidate.context_id: candidate for candidate in merged_list}
 
     total_elapsed = time.perf_counter() - started
     logger.info(
@@ -2713,6 +2886,8 @@ def _build_context_evidence_text(
 async def _context_mix_artifacts(
     question: str,
     collection: Collection,
+    namespace_id: uuid.UUID,
+    llm_profile_id: uuid.UUID | None,
     entity_query_embedding: list[float],
     relationship_query_embedding: list[float],
     *,
@@ -2730,12 +2905,19 @@ async def _context_mix_artifacts(
         max_assertions_per_context = _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT
         coverage = True
     else:
+        frame_plan = await _plan_graph_query_frame(
+            question,
+            namespace_id,
+            llm_profile_id,
+            plan,
+        )
         contexts = await _select_context_evidence_candidates(
             collection=collection,
             entity_query_embedding=entity_query_embedding,
             relationship_query_embedding=relationship_query_embedding,
             document_ids=document_ids,
             plan=plan,
+            frame_plan=frame_plan,
             top_k=_CONTEXT_MIX_TOP_K,
             max_contexts=_CONTEXT_MIX_MAX_CONTEXTS,
         )
@@ -3689,6 +3871,8 @@ async def _build_graph_query_artifacts(
         context_artifacts = await _context_mix_artifacts(
             question,
             collection,
+            namespace_id,
+            llm_profile_id,
             entity_query_embedding,
             relationship_query_embedding,
             document_ids=document_ids,
