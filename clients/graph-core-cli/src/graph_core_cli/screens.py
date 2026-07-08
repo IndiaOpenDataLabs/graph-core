@@ -832,6 +832,7 @@ class ConsoleScreen(Screen):
         "/jobs list [--limit N] [--collection COLLECTION]": "List recent jobs.",
         "/jobs show JOB_ID": "Show job status.",
         "/jobs watch JOB_ID": "Poll a job until it finishes.",
+        "/jobs cancel JOB_ID": "Cancel a running job.",
         "/disconnect": "Return to admin mode and keep the saved namespace token.",
     }
     UTILITY_COMMAND_INSERT_TEXT = {
@@ -890,6 +891,7 @@ class ConsoleScreen(Screen):
         "/jobs list [--limit N] [--collection COLLECTION]": "/jobs list",
         "/jobs show JOB_ID": "/jobs show <job_id>",
         "/jobs watch JOB_ID": "/jobs watch <job_id>",
+        "/jobs cancel JOB_ID": "/jobs cancel <job_id>",
         "/disconnect": "/disconnect",
     }
     STRATEGIES = ["vector", "light_rag", "custom_graph_rag"]
@@ -1670,9 +1672,13 @@ class ConsoleScreen(Screen):
             job_id = self._resolve_job_id(args[1])
             await self._watch_job(job_id)
             return
+        if len(args) >= 2 and args[0] == "cancel":
+            job_id = self._resolve_job_id(args[1])
+            self._write(await self._call("cancel_job", {"job_id": job_id}))
+            return
         raise ValueError(
             "Usage: /jobs list [--limit N] [--collection COLLECTION] | "
-            "/jobs show JOB_ID | /jobs watch JOB_ID"
+            "/jobs show JOB_ID | /jobs watch JOB_ID | /jobs cancel JOB_ID"
         )
 
     async def _call(
