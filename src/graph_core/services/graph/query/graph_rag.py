@@ -2657,7 +2657,7 @@ async def _load_context_assertions(
         placeholders.append(f":{key}")
 
     async with AsyncSessionLocal() as session:
-        rows = await session.execute(
+        result = await session.execute(
             text(
                 f"""
                 WITH owned_assertions AS (
@@ -2692,6 +2692,7 @@ async def _load_context_assertions(
             ),
             params,
         )
+    rows = result.all()
     query_elapsed = time.perf_counter() - started
     logger.info(
         "graph_rag context_assertions collection_id=%s context_ids=%d max_assertions_per_context=%d rows=%d query=%.3fs",
@@ -2736,7 +2737,7 @@ async def _collection_coverage_contexts(
         doc_filter = f" AND ed.document_id IN ({', '.join(doc_placeholders)})"
 
     async with AsyncSessionLocal() as session:
-        rows = await session.execute(
+        result = await session.execute(
             text(
                 f"""
                 WITH selected_documents AS (
@@ -2776,6 +2777,7 @@ async def _collection_coverage_contexts(
             ),
             params,
         )
+    rows = result.all()
 
     contexts: list[ContextEvidenceCandidate] = []
     for row in rows:
