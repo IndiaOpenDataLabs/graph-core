@@ -2343,141 +2343,6 @@ async def _contexts_for_graph_hits(
     return candidates
 
 
-async def _contexts_for_anchor_literals(
-    *,
-    collection_id: uuid.UUID,
-    anchors: list[str],
-    document_ids: list[uuid.UUID] | None = None,
-) -> list[ContextEvidenceCandidate]:
-    if not anchors:
-        return []
-    started = time.perf_counter()
-
-    params: dict[str, Any] = {"cid": _uuid_for_sql(collection_id)}
-    context_clauses: list[str] = []
-    graph_clauses: list[str] = []
-    for index, anchor in enumerate(anchors):
-        key = f"anchor_{index}"
-        params[key] = f"%{anchor}%"
-        context_clauses.append(
-            f"""
-            ctx.canonical_name ILIKE :{key}
-            OR ctx_ed.description ILIKE :{key}
-            OR ctx_ed.document_path ILIKE :{key}
-            """
-        )
-        graph_clauses.append(
-            f"""
-            e.canonical_name ILIKE :{key}
-            OR ed.description ILIKE :{key}
-            OR assertion.canonical_name ILIKE :{key}
-            OR assertion_ed.description ILIKE :{key}
-            """
-        )
-
-    doc_filter = ""
-    if document_ids:
-        doc_placeholders: list[str] = []
-        for index, document_id in enumerate(document_ids):
-            key = f"anchor_document_id_{index}"
-            params[key] = _uuid_for_sql(document_id)
-            doc_placeholders.append(f":{key}")
-        doc_filter = f" AND ctx_ed.document_id IN ({', '.join(doc_placeholders)})"
-
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            text(
-                f"""
-                WITH matched_contexts AS (
-                    SELECT
-                        ctx.id,
-                        ctx.canonical_name,
-                        ctx_ed.document_path,
-                        ctx_ed.description,
-                        5.0 AS score
-                    FROM graph_entities ctx
-                    JOIN entity_descriptions ctx_ed ON ctx_ed.entity_id = ctx.id
-                    WHERE ctx.collection_id = :cid
-                      AND ctx.primary_type = 'CONTEXT'
-                      AND (
-                        {' OR '.join(f'({clause})' for clause in context_clauses)}
-                      )
-                      {doc_filter}
-
-                    UNION ALL
-
-                    SELECT
-                        ctx.id,
-                        ctx.canonical_name,
-                        ctx_ed.document_path,
-                        ctx_ed.description,
-                        CASE
-                          WHEN e.primary_type LIKE 'CONCEPT_%' THEN 4.0
-                          WHEN e.primary_type LIKE 'MENTION_%' THEN 3.0
-                          WHEN assertion.id IS NOT NULL THEN 2.0
-                          ELSE 1.0
-                        END AS score
-                    FROM graph_entities e
-                    JOIN entity_descriptions ed ON ed.entity_id = e.id
-                    LEFT JOIN graph_relationships edge
-                      ON edge.collection_id = :cid
-                     AND (edge.source_entity_id = e.id OR edge.target_entity_id = e.id)
-                    LEFT JOIN graph_relationships owns
-                      ON owns.collection_id = :cid
-                     AND owns.rel_type = 'HAS_ASSERTION'
-                     AND (
-                        owns.target_entity_id = e.id
-                        OR owns.target_entity_id = edge.source_entity_id
-                        OR owns.target_entity_id = edge.target_entity_id
-                     )
-                    LEFT JOIN graph_entities assertion
-                      ON assertion.id = owns.target_entity_id
-                    LEFT JOIN entity_descriptions assertion_ed
-                      ON assertion_ed.entity_id = assertion.id
-                    JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
-                    JOIN entity_descriptions ctx_ed ON ctx_ed.entity_id = ctx.id
-                    WHERE e.collection_id = :cid
-                      AND ctx.primary_type = 'CONTEXT'
-                      AND (
-                        {' OR '.join(f'({clause})' for clause in graph_clauses)}
-                      )
-                      {doc_filter}
-                )
-                SELECT id, canonical_name, document_path, description, score
-                FROM matched_contexts
-                ORDER BY document_path, score DESC, canonical_name
-                """
-            ),
-            params,
-        )
-    rows = result.all()
-
-    candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
-    for row in rows:
-        context_id = uuid.UUID(str(row[0]))
-        candidate = candidates.get(context_id)
-        if candidate is None:
-            candidate = ContextEvidenceCandidate(
-                context_id=context_id,
-                name=str(row[1]),
-                document_path=str(row[2] or ""),
-                description=str(row[3] or ""),
-                score=0.0,
-                reasons=["literal anchor match"],
-            )
-            candidates[context_id] = candidate
-        candidate.score += float(row[4] or 1.0)
-    logger.info(
-        "graph_rag context_anchor_literals collection_id=%s anchors=%d rows=%d candidates=%d elapsed=%.3fs",
-        collection_id,
-        len(anchors),
-        len(rows),
-        len(candidates),
-        time.perf_counter() - started,
-    )
-    return sorted(candidates.values(), key=lambda item: item.score, reverse=True)
-
-
 async def _select_context_evidence_candidates(
     *,
     collection: Collection,
@@ -2560,29 +2425,9 @@ async def _select_context_evidence_candidates(
             if reason not in candidate.reasons:
                 candidate.reasons.append(reason)
 
-    anchor_elapsed = 0.0
-    if plan is not None and plan.scope == "anchored" and plan.anchors:
-        anchor_started = time.perf_counter()
-        anchor_candidates = await _contexts_for_anchor_literals(
-            collection_id=collection.id,
-            anchors=plan.anchors,
-            document_ids=document_ids,
-        )
-        for anchor_candidate in anchor_candidates:
-            candidate = merged.get(anchor_candidate.context_id)
-            if candidate is None:
-                merged[anchor_candidate.context_id] = anchor_candidate
-                continue
-            candidate.score += anchor_candidate.score
-            for reason in anchor_candidate.reasons:
-                if reason not in candidate.reasons:
-                    candidate.reasons.append(reason)
-        max_contexts = max(max_contexts, len(plan.anchors) * 3)
-        anchor_elapsed = time.perf_counter() - anchor_started
-
     total_elapsed = time.perf_counter() - started
     logger.info(
-        "graph_rag context_candidates collection=%s entity_hits=%d relationship_hits=%d graph_candidates=%d document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs document=%.3fs merge=%.3fs anchor=%.3fs total=%.3fs",
+        "graph_rag context_candidates collection=%s entity_hits=%d relationship_hits=%d graph_candidates=%d document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs document=%.3fs merge=%.3fs total=%.3fs",
         collection.name,
         len(entity_hits),
         len(relationship_hits),
@@ -2593,7 +2438,6 @@ async def _select_context_evidence_candidates(
         graph_elapsed,
         document_elapsed,
         time.perf_counter() - merge_started,
-        anchor_elapsed,
         total_elapsed,
     )
 
