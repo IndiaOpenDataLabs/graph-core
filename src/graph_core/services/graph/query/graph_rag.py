@@ -69,7 +69,6 @@ _META_PROJECTION_MAX_BASE_REFS = 40
 _META_PROJECTION_MAX_BASE_RELS = 80
 _CONTEXT_MIX_TOP_K = 40
 _CONTEXT_MIX_MAX_CONTEXTS = 30
-_CONTEXT_MIX_RELATIVE_SCORE_FLOOR = 0.3
 _COLLECTION_COVERAGE_MAX_DOCUMENTS = 200
 _COLLECTION_COVERAGE_CONTEXTS_PER_DOCUMENT = 4
 _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 16
@@ -621,6 +620,15 @@ def _extract_query_keywords(question: str) -> list[str]:
 
 def _query_token_set(question: str) -> set[str]:
     return {w.lower() for w in _extract_query_keywords(question)}
+
+
+def _text_token_set(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw_token in text.split():
+        token = "".join(ch for ch in raw_token.casefold() if ch.isalnum())
+        if len(token) >= 3:
+            tokens.add(token)
+    return tokens
 
 
 # ---------------------------------------------------------------------------
@@ -2511,21 +2519,30 @@ def _apply_frame_precision(
     return sorted(scored, key=lambda item: item.score, reverse=True)
 
 
-def _apply_context_score_floor(
-    contexts: list[ContextEvidenceCandidate],
+def _score_context_assertion_relevance(
+    question: str,
     *,
-    relative_floor: float = _CONTEXT_MIX_RELATIVE_SCORE_FLOOR,
-) -> tuple[list[ContextEvidenceCandidate], float]:
-    if not contexts:
-        return [], 0.0
-    top_score = max(context.score for context in contexts)
-    if top_score <= 0:
-        return contexts, 0.0
-    min_score = top_score * relative_floor
-    filtered = [context for context in contexts if context.score >= min_score]
-    if not filtered:
-        return [max(contexts, key=lambda item: item.score)], min_score
-    return filtered, min_score
+    context_name: str,
+    assertion_name: str,
+    evidence: str,
+    frame_plan: GraphQueryFramePlan | None = None,
+) -> float:
+    combined_text = " ".join([context_name, assertion_name, evidence]).casefold()
+    combined_tokens = _text_token_set(combined_text)
+    question_tokens = _query_token_set(question)
+    score = float(len(combined_tokens & question_tokens))
+
+    if frame_plan and frame_plan.focus_terms:
+        focus_terms = _expand_frame_terms(frame_plan.focus_terms, max_items=12)
+        competing_terms = _expand_frame_terms(frame_plan.competing_terms, max_items=12)
+        if any(term.casefold() in combined_text for term in focus_terms):
+            score += 2.0
+        if any(term.casefold() in combined_text for term in competing_terms):
+            score -= 1.0
+
+    if assertion_name and assertion_name.casefold() in combined_text:
+        score += 0.5
+    return score
 
 
 async def _select_context_evidence_candidates(
@@ -2617,17 +2634,6 @@ async def _select_context_evidence_candidates(
             merged = {candidate.context_id: candidate for candidate in merged_list}
 
     scored_contexts = list(merged.values())
-    score_floor = 0.0
-    if scored_contexts:
-        scored_contexts, score_floor = _apply_context_score_floor(scored_contexts)
-        logger.info(
-            "graph_rag context_candidates_floor collection=%s top_score=%.3f floor=%.3f kept=%d total=%d",
-            collection.name,
-            max(context.score for context in scored_contexts) if scored_contexts else 0.0,
-            score_floor,
-            len(scored_contexts),
-            len(merged),
-        )
 
     total_elapsed = time.perf_counter() - started
     logger.info(
@@ -2672,6 +2678,8 @@ async def _load_context_assertions(
     *,
     collection_id: uuid.UUID,
     context_ids: list[uuid.UUID],
+    question: str = "",
+    frame_plan: GraphQueryFramePlan | None = None,
     max_assertions_per_context: int = 40,
 ) -> list[ContextAssertionEvidence]:
     if not context_ids:
@@ -2725,16 +2733,9 @@ async def _load_context_assertions(
         )
     rows = result.all()
     query_elapsed = time.perf_counter() - started
-    logger.info(
-        "graph_rag context_assertions collection_id=%s context_ids=%d max_assertions_per_context=%d rows=%d query=%.3fs",
-        collection_id,
-        len(context_ids),
-        max_assertions_per_context,
-        len(rows),
-        query_elapsed,
-    )
-    return [
-        ContextAssertionEvidence(
+    grouped: dict[uuid.UUID, list[tuple[float, str, ContextAssertionEvidence]]] = {}
+    for row in rows:
+        assertion = ContextAssertionEvidence(
             context_id=uuid.UUID(str(row[0])),
             context_name=str(row[1]),
             document_path=str(row[2] or ""),
@@ -2742,8 +2743,40 @@ async def _load_context_assertions(
             assertion=str(row[4]),
             evidence=str(row[5] or ""),
         )
-        for row in rows
-    ]
+        relevance = _score_context_assertion_relevance(
+            question,
+            context_name=assertion.context_name,
+            assertion_name=assertion.assertion,
+            evidence=assertion.evidence,
+            frame_plan=frame_plan,
+        )
+        grouped.setdefault(assertion.context_id, []).append(
+            (relevance, assertion.assertion.casefold(), assertion)
+        )
+
+    selected: list[ContextAssertionEvidence] = []
+    selected_count = 0
+    for context_id in context_ids:
+        scored_assertions = grouped.get(context_id, [])
+        if not scored_assertions:
+            continue
+        positive = [item for item in scored_assertions if item[0] > 0]
+        ranked = positive if positive else scored_assertions
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        chosen = [assertion for _, _, assertion in ranked[:max_assertions_per_context]]
+        selected.extend(chosen)
+        selected_count += len(chosen)
+
+    logger.info(
+        "graph_rag context_assertions collection_id=%s context_ids=%d max_assertions_per_context=%d rows=%d selected=%d query=%.3fs",
+        collection_id,
+        len(context_ids),
+        max_assertions_per_context,
+        len(rows),
+        selected_count,
+        query_elapsed,
+    )
+    return selected
 
 
 async def _collection_coverage_contexts(
@@ -2963,6 +2996,8 @@ async def _context_mix_artifacts(
     assertions = await _load_context_assertions(
         collection_id=collection.id,
         context_ids=[context.context_id for context in contexts],
+        question=question,
+        frame_plan=frame_plan if plan is not None and plan.scope != "collection" else None,
         max_assertions_per_context=max_assertions_per_context,
     )
     assertions_elapsed = time.perf_counter() - assertions_started

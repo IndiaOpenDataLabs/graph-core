@@ -30,8 +30,7 @@ from graph_core.services.graph.query.graph_rag import (
     DocumentRoutingDecision,
     GraphQueryArtifacts,
     GraphQueryState,
-    ContextEvidenceCandidate,
-    _apply_context_score_floor,
+    _score_context_assertion_relevance,
 )
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
 from graph_core.services.graph_rag.extractor import LLMGraphExtractor
@@ -102,38 +101,23 @@ class _FakeHit:
         self.metadata = metadata or {}
 
 
-def test_apply_context_score_floor_keeps_relative_top_candidates():
-    contexts = [
-        ContextEvidenceCandidate(
-            context_id=uuid.uuid4(),
-            name="top",
-            document_path="a",
-            description="",
-            score=1.0,
-            reasons=[],
-        ),
-        ContextEvidenceCandidate(
-            context_id=uuid.uuid4(),
-            name="kept",
-            document_path="b",
-            description="",
-            score=0.35,
-            reasons=[],
-        ),
-        ContextEvidenceCandidate(
-            context_id=uuid.uuid4(),
-            name="dropped",
-            document_path="c",
-            description="",
-            score=0.29,
-            reasons=[],
-        ),
-    ]
+def test_score_context_assertion_relevance_prefers_query_matches():
+    high = _score_context_assertion_relevance(
+        "Who is Indra for the modern mind?",
+        context_name="Indra",
+        assertion_name="Indra as a symbol of force",
+        evidence="Indra is viewed as relevant in contemporary interpretation.",
+        frame_plan=None,
+    )
+    low = _score_context_assertion_relevance(
+        "Who is Indra for the modern mind?",
+        context_name="Ritual practice",
+        assertion_name="Sacred timing",
+        evidence="This discusses a seasonal recitation structure.",
+        frame_plan=None,
+    )
 
-    filtered, floor = _apply_context_score_floor(contexts)
-
-    assert floor == pytest.approx(0.3)
-    assert [context.name for context in filtered] == ["top", "kept"]
+    assert high > low
 
 
 @pytest.mark.asyncio
