@@ -69,6 +69,7 @@ _META_PROJECTION_MAX_BASE_REFS = 40
 _META_PROJECTION_MAX_BASE_RELS = 80
 _CONTEXT_MIX_TOP_K = 40
 _CONTEXT_MIX_MAX_CONTEXTS = 30
+_CONTEXT_MIX_RELATIVE_SCORE_FLOOR = 0.3
 _COLLECTION_COVERAGE_MAX_DOCUMENTS = 200
 _COLLECTION_COVERAGE_CONTEXTS_PER_DOCUMENT = 4
 _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 16
@@ -2510,6 +2511,23 @@ def _apply_frame_precision(
     return sorted(scored, key=lambda item: item.score, reverse=True)
 
 
+def _apply_context_score_floor(
+    contexts: list[ContextEvidenceCandidate],
+    *,
+    relative_floor: float = _CONTEXT_MIX_RELATIVE_SCORE_FLOOR,
+) -> tuple[list[ContextEvidenceCandidate], float]:
+    if not contexts:
+        return [], 0.0
+    top_score = max(context.score for context in contexts)
+    if top_score <= 0:
+        return contexts, 0.0
+    min_score = top_score * relative_floor
+    filtered = [context for context in contexts if context.score >= min_score]
+    if not filtered:
+        return [max(contexts, key=lambda item: item.score)], min_score
+    return filtered, min_score
+
+
 async def _select_context_evidence_candidates(
     *,
     collection: Collection,
@@ -2598,6 +2616,19 @@ async def _select_context_evidence_candidates(
         if merged_list:
             merged = {candidate.context_id: candidate for candidate in merged_list}
 
+    scored_contexts = list(merged.values())
+    score_floor = 0.0
+    if scored_contexts:
+        scored_contexts, score_floor = _apply_context_score_floor(scored_contexts)
+        logger.info(
+            "graph_rag context_candidates_floor collection=%s top_score=%.3f floor=%.3f kept=%d total=%d",
+            collection.name,
+            max(context.score for context in scored_contexts) if scored_contexts else 0.0,
+            score_floor,
+            len(scored_contexts),
+            len(merged),
+        )
+
     total_elapsed = time.perf_counter() - started
     logger.info(
         "graph_rag context_candidates collection=%s entity_hits=%d relationship_hits=%d graph_candidates=%d document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs document=%.3fs merge=%.3fs total=%.3fs",
@@ -2614,7 +2645,7 @@ async def _select_context_evidence_candidates(
         total_elapsed,
     )
 
-    return sorted(merged.values(), key=lambda item: item.score, reverse=True)[
+    return sorted(scored_contexts, key=lambda item: item.score, reverse=True)[
         :max_contexts
     ]
 

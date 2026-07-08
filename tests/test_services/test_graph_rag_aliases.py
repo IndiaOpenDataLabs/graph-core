@@ -30,6 +30,8 @@ from graph_core.services.graph.query.graph_rag import (
     DocumentRoutingDecision,
     GraphQueryArtifacts,
     GraphQueryState,
+    ContextEvidenceCandidate,
+    _apply_context_score_floor,
 )
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
 from graph_core.services.graph_rag.extractor import LLMGraphExtractor
@@ -98,6 +100,40 @@ class _FakeHit:
     def __init__(self, distance: float, metadata: dict[str, object] | None = None):
         self.distance = distance
         self.metadata = metadata or {}
+
+
+def test_apply_context_score_floor_keeps_relative_top_candidates():
+    contexts = [
+        ContextEvidenceCandidate(
+            context_id=uuid.uuid4(),
+            name="top",
+            document_path="a",
+            description="",
+            score=1.0,
+            reasons=[],
+        ),
+        ContextEvidenceCandidate(
+            context_id=uuid.uuid4(),
+            name="kept",
+            document_path="b",
+            description="",
+            score=0.35,
+            reasons=[],
+        ),
+        ContextEvidenceCandidate(
+            context_id=uuid.uuid4(),
+            name="dropped",
+            document_path="c",
+            description="",
+            score=0.29,
+            reasons=[],
+        ),
+    ]
+
+    filtered, floor = _apply_context_score_floor(contexts)
+
+    assert floor == pytest.approx(0.3)
+    assert [context.name for context in filtered] == ["top", "kept"]
 
 
 @pytest.mark.asyncio
