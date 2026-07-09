@@ -385,7 +385,11 @@ async def ingest_document_pipeline(job_id: uuid.UUID) -> None:
             )
         )
 
-    chunks = _chunker.chunk_text(text, domain=domain)
+    chunks = _chunker.chunk_document(
+        text,
+        domain=domain,
+        document_path=document_path,
+    )
     total_chunks = max(len(chunks), 1)
 
     if not chunks:

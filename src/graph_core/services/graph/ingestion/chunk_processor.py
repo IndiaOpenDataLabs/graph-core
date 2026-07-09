@@ -7,6 +7,7 @@ for vector, custom_graph_rag, and light_rag strategies.
 import hashlib
 import uuid
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -52,6 +53,13 @@ class ChunkIngestionResult:
     chunk_hash: str
     entity_count: int
     relationship_count: int
+
+
+@dataclass(frozen=True)
+class _SourceHierarchy:
+    document_path: str | None
+    folder_path: str | None
+    headings: tuple[str, ...]
 
 
 # ── Module-level singleton dependencies ──
@@ -477,6 +485,189 @@ def _falkor_node(
     }
 
 
+def _parse_source_hierarchy(
+    text: str,
+    *,
+    document_path: str | None,
+) -> _SourceHierarchy:
+    parsed_document_path: str | None = None
+    folder_path: str | None = None
+    headings: tuple[str, ...] = ()
+    marker = "\n\nChunk text:\n"
+    if text.startswith("Source hierarchy:\n") and marker in text:
+        prefix = text.split(marker, 1)[0]
+        for raw_line in prefix.splitlines()[1:]:
+            label, _, value = raw_line.partition(":")
+            value = value.strip()
+            if not value:
+                continue
+            if label == "Document":
+                parsed_document_path = normalize_document_path(value)
+            elif label == "Folder":
+                folder_path = normalize_document_path(value)
+            elif label == "Section":
+                headings = tuple(
+                    part.strip()
+                    for part in value.split(">")
+                    if part.strip()
+                )
+
+    normalized_document_path = (
+        parsed_document_path
+        or (normalize_document_path(document_path) if document_path else None)
+    )
+    if folder_path is None and normalized_document_path:
+        parent = PurePosixPath(normalized_document_path).parent.as_posix()
+        if parent not in ("", "."):
+            folder_path = parent
+    return _SourceHierarchy(
+        document_path=normalized_document_path,
+        folder_path=folder_path,
+        headings=headings,
+    )
+
+
+async def _upsert_source_hierarchy(
+    session,
+    *,
+    collection: Collection,
+    hierarchy: _SourceHierarchy,
+    context_id: uuid.UUID,
+    context_name: str,
+    chunk_hash: str,
+    document_id: uuid.UUID | None,
+    document_path: str | None,
+    embedding_provider: EmbeddingProvider,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    nodes: list[dict[str, object]] = []
+    edges: list[dict[str, object]] = []
+    previous_id: uuid.UUID | None = None
+    previous_name: str | None = None
+
+    async def add_node(
+        *,
+        stable_key: str,
+        name: str,
+        primary_type: str,
+        description: str,
+        rel_type: str | None = None,
+    ) -> uuid.UUID:
+        nonlocal previous_id, previous_name
+        entity_id = deterministic_uuid(collection.id, stable_key)
+        await _upsert_context_entity(
+            session,
+            collection=collection,
+            entity_id=entity_id,
+            canonical_name=name[:256],
+            primary_type=primary_type,
+            description=description,
+            chunk_hash=chunk_hash,
+            document_id=document_id,
+            document_path=document_path,
+            embedding_provider=embedding_provider,
+        )
+        nodes.append(
+            _falkor_node(
+                entity_id=entity_id,
+                name=name,
+                collection=collection,
+                document_id=document_id,
+                document_path=document_path,
+            )
+        )
+        if previous_id is not None and previous_name is not None and rel_type:
+            relationship_id = deterministic_uuid(
+                collection.id,
+                f"source_hierarchy:{previous_id}:{rel_type}:{entity_id}",
+            )
+            edges.append(
+                await _upsert_context_relationship(
+                    session,
+                    collection=collection,
+                    relationship_id=relationship_id,
+                    source_id=previous_id,
+                    target_id=entity_id,
+                    source_name=previous_name,
+                    target_name=name,
+                    rel_type=rel_type,
+                    description=f"{previous_name} contains {name}.",
+                    keywords=["source", "hierarchy"],
+                    weight=1.0,
+                    chunk_hash=chunk_hash,
+                    document_id=document_id,
+                    document_path=document_path,
+                )
+            )
+        previous_id = entity_id
+        previous_name = name
+        return entity_id
+
+    if hierarchy.folder_path:
+        parts = [part for part in hierarchy.folder_path.split("/") if part]
+        cumulative: list[str] = []
+        for part in parts:
+            cumulative.append(part)
+            folder = "/".join(cumulative)
+            await add_node(
+                stable_key=f"source_folder:{folder}",
+                name=f"folder:{folder}",
+                primary_type="SOURCE_FOLDER",
+                description=f"Source folder {folder}.",
+                rel_type="CONTAINS",
+            )
+
+    if hierarchy.document_path:
+        await add_node(
+            stable_key=f"source_document:{hierarchy.document_path}",
+            name=f"document:{hierarchy.document_path}",
+            primary_type="SOURCE_DOCUMENT",
+            description=f"Source document {hierarchy.document_path}.",
+            rel_type="CONTAINS" if previous_id is not None else None,
+        )
+
+    section_path: list[str] = []
+    for heading in hierarchy.headings:
+        section_path.append(heading)
+        section_key = " > ".join(section_path)
+        document_scope = hierarchy.document_path or str(document_id or chunk_hash)
+        await add_node(
+            stable_key=f"source_section:{document_scope}:{section_key}",
+            name=f"section:{document_scope}:{section_key}"[:256],
+            primary_type="SOURCE_SECTION",
+            description=(
+                f"Source section {section_key}"
+                f"{' in ' + document_scope if document_scope else ''}."
+            ),
+            rel_type="HAS_SECTION",
+        )
+
+    if previous_id is not None and previous_name is not None:
+        relationship_id = deterministic_uuid(
+            collection.id,
+            f"source_hierarchy:{previous_id}:HAS_CONTEXT:{context_id}",
+        )
+        edges.append(
+            await _upsert_context_relationship(
+                session,
+                collection=collection,
+                relationship_id=relationship_id,
+                source_id=previous_id,
+                target_id=context_id,
+                source_name=previous_name,
+                target_name=context_name,
+                rel_type="HAS_CONTEXT",
+                description=f"{previous_name} contains context {context_name}.",
+                keywords=["source", "context"],
+                weight=1.0,
+                chunk_hash=chunk_hash,
+                document_id=document_id,
+                document_path=document_path,
+            )
+        )
+
+    return nodes, edges
+
+
 def _enforce_namespace(collection: Collection, namespace_id: uuid.UUID) -> None:
     """Raise if the collection does not belong to the given namespace."""
     if collection.namespace_id != namespace_id:
@@ -683,6 +874,10 @@ async def _ingest_graph_chunk(
         f"{' from ' + context_seed if context_seed else ''}. "
         f"Text excerpt: {_short_text(text, 1200)}"
     )
+    source_hierarchy = _parse_source_hierarchy(
+        text,
+        document_path=document_path,
+    )
     entity_by_name = {entity.name: entity for entity in extraction.entities}
     nodes_to_upsert: list[dict[str, object]] = []
     edges_to_upsert: list[dict[str, object]] = []
@@ -709,6 +904,19 @@ async def _ingest_graph_chunk(
                 document_path=document_path,
             )
         )
+        hierarchy_nodes, hierarchy_edges = await _upsert_source_hierarchy(
+            session,
+            collection=collection,
+            hierarchy=source_hierarchy,
+            context_id=context_id,
+            context_name=context_name,
+            chunk_hash=chunk_hash,
+            document_id=document_id,
+            document_path=document_path,
+            embedding_provider=embedding_provider,
+        )
+        nodes_to_upsert.extend(hierarchy_nodes)
+        edges_to_upsert.extend(hierarchy_edges)
 
         for index, rel in enumerate(extraction.relationships):
             rel_type = normalize_rel_type(rel.rel_type)

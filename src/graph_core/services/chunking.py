@@ -8,12 +8,133 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 import tiktoken
 from chonkie import CodeChunker
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
 from graph_core.models.domain_config import get_domain_config
+
+
+_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})(?:[ \t]+|$)(.*)$")
+_SETEXT_UNDERLINE_RE = re.compile(r"^[ \t]{0,3}(=+|-+)[ \t]*$")
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+
+
+@dataclass(frozen=True)
+class SourceHierarchy:
+    document_path: str | None
+    folder_path: str | None
+    headings: tuple[str, ...]
+
+    def prefix(self) -> str:
+        lines = ["Source hierarchy:"]
+        if self.document_path:
+            lines.append(f"Document: {self.document_path}")
+        if self.folder_path:
+            lines.append(f"Folder: {self.folder_path}")
+        if self.headings:
+            lines.append("Section: " + " > ".join(self.headings))
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines) + "\n\nChunk text:\n"
+
+
+def _normalize_source_path(document_path: str | None) -> str | None:
+    normalized = str(document_path or "").strip().replace("\\", "/")
+    if not normalized:
+        return None
+    normalized = PurePosixPath(normalized).as_posix()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized or None
+
+
+def _folder_path(document_path: str | None) -> str | None:
+    if not document_path:
+        return None
+    parent = PurePosixPath(document_path).parent.as_posix()
+    if parent in ("", "."):
+        return None
+    return parent
+
+
+def _clean_heading(heading: str) -> str:
+    cleaned = heading.strip()
+    cleaned = re.sub(r"[ \t]+#+[ \t]*$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+@dataclass(frozen=True)
+class _MarkdownHeading:
+    level: int
+    text: str
+    offset: int
+
+
+def _markdown_headings_before(text: str, offset: int) -> list[_MarkdownHeading]:
+    headings: list[_MarkdownHeading] = []
+    previous_content: tuple[str, int] | None = None
+    in_fence: str | None = None
+    position = 0
+
+    for raw_line in text.splitlines(keepends=True):
+        line_start = position
+        position += len(raw_line)
+        if line_start > offset:
+            break
+
+        line = raw_line.rstrip("\r\n")
+        fence_match = _FENCE_RE.match(line)
+        if fence_match:
+            fence_marker = fence_match.group(1)[0]
+            if in_fence == fence_marker:
+                in_fence = None
+            elif in_fence is None:
+                in_fence = fence_marker
+            previous_content = None
+            continue
+        if in_fence is not None:
+            continue
+
+        atx_match = _ATX_HEADING_RE.match(line)
+        if atx_match:
+            heading = _clean_heading(atx_match.group(2))
+            if heading:
+                headings.append(
+                    _MarkdownHeading(
+                        level=len(atx_match.group(1)),
+                        text=heading,
+                        offset=line_start,
+                    )
+                )
+            previous_content = None
+            continue
+
+        setext_match = _SETEXT_UNDERLINE_RE.match(line)
+        if setext_match and previous_content is not None:
+            content, content_offset = previous_content
+            heading = _clean_heading(content)
+            if heading:
+                headings.append(
+                    _MarkdownHeading(
+                        level=1 if setext_match.group(1).startswith("=") else 2,
+                        text=heading,
+                        offset=content_offset,
+                    )
+                )
+            previous_content = None
+            continue
+
+        if line.strip():
+            previous_content = (line, line_start)
+        else:
+            previous_content = None
+
+    return headings
 
 
 class DocumentChunker:
@@ -69,6 +190,35 @@ class DocumentChunker:
         if get_domain_config(domain).use_ast_chunking:
             return self._chunk_code(text)
         return self._clean_chunks(self._prose_splitter.split_text(text))
+
+    def chunk_document(
+        self,
+        text: str,
+        *,
+        domain: str | None = None,
+        document_path: str | None = None,
+    ) -> list[str]:
+        chunks = self.chunk_text(text, domain=domain)
+        if not chunks:
+            return []
+        if get_domain_config(domain).use_ast_chunking:
+            return chunks
+
+        enriched: list[str] = []
+        cursor = 0
+        for chunk in chunks:
+            start = text.find(chunk, cursor)
+            if start < 0:
+                start = cursor
+            cursor = max(start + len(chunk), cursor)
+            hierarchy = self._source_hierarchy_at(
+                text,
+                start,
+                document_path=document_path,
+            )
+            prefix = hierarchy.prefix()
+            enriched.append(f"{prefix}{chunk}" if prefix else chunk)
+        return enriched
 
     def _chunk_code(self, text: str) -> list[str]:
         language_name = self._infer_code_language(text)
@@ -135,6 +285,31 @@ class DocumentChunker:
     @staticmethod
     def _clean_chunks(chunks: list[str]) -> list[str]:
         return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+
+    @staticmethod
+    def _source_hierarchy_at(
+        text: str,
+        offset: int,
+        *,
+        document_path: str | None = None,
+    ) -> SourceHierarchy:
+        normalized_path = _normalize_source_path(document_path)
+        folder_path = _folder_path(normalized_path)
+        heading_stack: dict[int, str] = {}
+        for heading_info in _markdown_headings_before(text, offset):
+            level = heading_info.level
+            heading = heading_info.text
+            heading_stack[level] = heading
+            for existing_level in list(heading_stack):
+                if existing_level > level:
+                    del heading_stack[existing_level]
+        return SourceHierarchy(
+            document_path=normalized_path,
+            folder_path=folder_path,
+            headings=tuple(
+                heading_stack[level] for level in sorted(heading_stack)
+            ),
+        )
 
     @staticmethod
     def _join_code_units(left: str, right: str) -> str:

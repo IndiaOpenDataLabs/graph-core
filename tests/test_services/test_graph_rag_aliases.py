@@ -18,6 +18,7 @@ from graph_core.models.graph_rag import (
 )
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph import GraphService
+from graph_core.services.graph.ingestion import chunk_processor
 from graph_core.services.graph.analytics import (
     NodeRecord,
     RelationshipRecord,
@@ -292,6 +293,77 @@ async def test_load_context_assertions_prefers_assertion_embedding_scores(
 
     graph_rag._graph_rag_vectors.search_entity_embeddings.assert_awaited_once()
     assert assertions[0].assertion == high_embedding_assertion.canonical_name
+
+
+@pytest.mark.asyncio
+async def test_source_hierarchy_upsert_links_sections_to_context(
+    db_session,
+    monkeypatch,
+    test_graph_rag_collection,
+):
+    context_id = uuid.uuid4()
+    context = GraphEntity(
+        id=context_id,
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="context:library/book.md:chunk",
+        primary_type="CONTEXT",
+        description_count=0,
+    )
+    db_session.add(context)
+    await db_session.commit()
+
+    monkeypatch.setattr(
+        chunk_processor._graph_rag_vectors,
+        "upsert_entity_embedding",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        chunk_processor._graph_rag_vectors,
+        "upsert_entity_centroid",
+        AsyncMock(),
+    )
+
+    nodes, edges = await chunk_processor._upsert_source_hierarchy(
+        db_session,
+        collection=test_graph_rag_collection,
+        hierarchy=chunk_processor._SourceHierarchy(
+            document_path="library/book.md",
+            folder_path="library",
+            headings=("Book", "Technique 2"),
+        ),
+        context_id=context_id,
+        context_name=context.canonical_name,
+        chunk_hash="chunk-hash",
+        document_id=uuid.uuid4(),
+        document_path="library/book.md",
+        embedding_provider=_FakeEmbeddingProvider(),
+    )
+
+    entity_rows = await db_session.execute(
+        select(GraphEntity.primary_type, GraphEntity.canonical_name).where(
+            GraphEntity.collection_id == test_graph_rag_collection.id,
+            GraphEntity.primary_type.in_(
+                ["SOURCE_FOLDER", "SOURCE_DOCUMENT", "SOURCE_SECTION"]
+            ),
+        )
+    )
+    rel_rows = await db_session.execute(
+        select(GraphRelationship.rel_type).where(
+            GraphRelationship.collection_id == test_graph_rag_collection.id
+        )
+    )
+
+    primary_types = {primary_type for primary_type, _ in entity_rows.all()}
+    rel_types = {rel_type for (rel_type,) in rel_rows.all()}
+
+    assert primary_types == {
+        "SOURCE_FOLDER",
+        "SOURCE_DOCUMENT",
+        "SOURCE_SECTION",
+    }
+    assert {"CONTAINS", "HAS_SECTION", "HAS_CONTEXT"} <= rel_types
+    assert any(node["name"] == "folder:library" for node in nodes)
+    assert any(edge["rel_type"] == "HAS_CONTEXT" for edge in edges)
 
 
 @pytest.mark.asyncio
