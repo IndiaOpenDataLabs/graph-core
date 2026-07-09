@@ -116,6 +116,8 @@ class GraphRAGVectorStore:
         top_k: int,
         entity_id: uuid.UUID | None = None,
         document_ids: list[uuid.UUID] | None = None,
+        primary_types: list[str] | None = None,
+        primary_type_prefixes: list[str] | None = None,
     ) -> list[VectorSearchHit]:
         tbl = table_name(collection_id, "entity_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -131,27 +133,46 @@ class GraphRAGVectorStore:
             "qemb": _embedding_literal(query_embedding),
         }
         if entity_id:
-            where_extra = "AND entity_id = :entity_id"
+            where_extra = "AND ee.entity_id = :entity_id"
             params["entity_id"] = _uuid_for_sql(entity_id)
         if document_ids:
             document_clause, document_params = _expand_uuid_params(
                 document_ids, "document_id"
             )
             where_extra += (
-                f" AND document_id IN ({document_clause})" if document_clause else ""
+                f" AND ee.document_id IN ({document_clause})" if document_clause else ""
             )
             params.update(document_params)
+        type_clauses: list[str] = []
+        if primary_types:
+            type_placeholders: list[str] = []
+            for index, primary_type in enumerate(primary_types):
+                key = f"primary_type_{index}"
+                params[key] = primary_type
+                type_placeholders.append(f":{key}")
+            type_clauses.append(f"ge.primary_type IN ({', '.join(type_placeholders)})")
+        if primary_type_prefixes:
+            for index, prefix in enumerate(primary_type_prefixes):
+                key = f"primary_type_prefix_{index}"
+                params[key] = f"{prefix}%"
+                type_clauses.append(f"ge.primary_type LIKE :{key}")
+        join_extra = ""
+        if type_clauses:
+            join_extra = "JOIN graph_entities ge ON ge.id = ee.entity_id"
+            where_extra += " AND (" + " OR ".join(type_clauses) + ")"
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 text(
                     f"""
-                    SELECT id::text, entity_id::text, description_id::text, name, description,
-                           document_id::text, document_path,
-                           1 - (embedding <=> (:qemb){cast}) as score,
-                           embedding <=> (:qemb){cast} as distance
-                    FROM {tbl}
-                    WHERE collection_id = :cid {where_extra}
+                    SELECT ee.id::text, ee.entity_id::text, ee.description_id::text,
+                           ee.name, ee.description, ee.document_id::text,
+                           ee.document_path,
+                           1 - (ee.embedding <=> (:qemb){cast}) as score,
+                           ee.embedding <=> (:qemb){cast} as distance
+                    FROM {tbl} ee
+                    {join_extra}
+                    WHERE ee.collection_id = :cid {where_extra}
                     ORDER BY distance
                     LIMIT :top_k
                     """

@@ -9,6 +9,7 @@ from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
 from graph_core.models.domain_config import CODE_REL_TYPE_TAXONOMY, get_domain_config
 from graph_core.models.graph_rag import (
+    EntityDescription,
     GraphEntity,
     GraphRelationship,
     GraphRelationshipType,
@@ -118,6 +119,179 @@ def test_score_context_assertion_relevance_prefers_query_matches():
     )
 
     assert high > low
+
+
+@pytest.mark.asyncio
+async def test_context_selection_searches_contextual_entity_embeddings(
+    monkeypatch,
+    test_graph_rag_collection,
+):
+    mention_id = uuid.uuid4()
+    context_id = uuid.uuid4()
+    search_calls = []
+
+    async def search_entity_embeddings(**kwargs):
+        search_calls.append(kwargs)
+        if kwargs.get("primary_type_prefixes") == ["MENTION_"]:
+            return [_FakeHit(distance=0.1, metadata={"entity_id": str(mention_id)})]
+        return []
+
+    captured = {}
+
+    async def contexts_for_graph_hits(**kwargs):
+        captured.update(kwargs)
+        return {
+            context_id: graph_rag.ContextEvidenceCandidate(
+                context_id=context_id,
+                name="context:doc:chunk",
+                document_path="doc.md",
+                description="Context-local evidence",
+                score=0.9,
+                reasons=["matched mention/assertion embedding"],
+            )
+        }
+
+    monkeypatch.setattr(
+        graph_rag._graph_rag_vectors,
+        "search_entity_embeddings",
+        search_entity_embeddings,
+    )
+    monkeypatch.setattr(
+        graph_rag._graph_rag_vectors,
+        "search_relationship_embeddings",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_contexts_for_graph_hits",
+        contexts_for_graph_hits,
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_contexts_for_document_paths",
+        AsyncMock(return_value={}),
+    )
+
+    contexts = await graph_rag._select_context_evidence_candidates(
+        collection=test_graph_rag_collection,
+        entity_query_embedding=[0.1, 0.2, 0.3],
+        relationship_query_embedding=[0.1, 0.2, 0.3],
+    )
+
+    contextual_call = search_calls[1]
+    assert contextual_call["primary_types"] == ["ASSERTION"]
+    assert contextual_call["primary_type_prefixes"] == ["MENTION_"]
+    assert captured["entity_scores"][mention_id] == pytest.approx(0.9)
+    assert captured["entity_score_reasons"][mention_id] == (
+        "matched mention/assertion embedding"
+    )
+    assert contexts[0].context_id == context_id
+
+
+@pytest.mark.asyncio
+async def test_load_context_assertions_prefers_assertion_embedding_scores(
+    db_session,
+    monkeypatch,
+    test_graph_rag_collection,
+):
+    context = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="context:doc:chunk",
+        primary_type="CONTEXT",
+        description_count=0,
+    )
+    high_embedding_assertion = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="assertion:semantic match",
+        primary_type="ASSERTION",
+        description_count=0,
+    )
+    token_match_assertion = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="assertion:indra token overlap",
+        primary_type="ASSERTION",
+        description_count=0,
+    )
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="HAS_ASSERTION",
+    )
+    db_session.add_all(
+        [
+            context,
+            high_embedding_assertion,
+            token_match_assertion,
+            rel_type,
+            EntityDescription(
+                id=uuid.uuid4(),
+                entity_id=context.id,
+                description="Context description",
+                document_path="doc.md",
+            ),
+            EntityDescription(
+                id=uuid.uuid4(),
+                entity_id=high_embedding_assertion.id,
+                description="Semantically relevant evidence.",
+                document_path="doc.md",
+            ),
+            EntityDescription(
+                id=uuid.uuid4(),
+                entity_id=token_match_assertion.id,
+                description="Indra literal token evidence.",
+                document_path="doc.md",
+            ),
+            GraphRelationship(
+                id=uuid.uuid4(),
+                collection_id=test_graph_rag_collection.id,
+                source_entity_id=context.id,
+                target_entity_id=high_embedding_assertion.id,
+                relationship_type_id=rel_type.id,
+                rel_type="HAS_ASSERTION",
+                weight=1,
+                keywords=[],
+            ),
+            GraphRelationship(
+                id=uuid.uuid4(),
+                collection_id=test_graph_rag_collection.id,
+                source_entity_id=context.id,
+                target_entity_id=token_match_assertion.id,
+                relationship_type_id=rel_type.id,
+                rel_type="HAS_ASSERTION",
+                weight=1,
+                keywords=[],
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    monkeypatch.setattr(graph_rag, "AsyncSessionLocal", _SessionFactory(db_session))
+    monkeypatch.setattr(
+        graph_rag._graph_rag_vectors,
+        "search_entity_embeddings",
+        AsyncMock(
+            return_value=[
+                _FakeHit(
+                    distance=0.05,
+                    metadata={"entity_id": str(high_embedding_assertion.id)},
+                )
+            ]
+        ),
+    )
+
+    assertions = await graph_rag._load_context_assertions(
+        collection_id=test_graph_rag_collection.id,
+        context_ids=[context.id],
+        entity_query_embedding=[0.1, 0.2, 0.3],
+        question="Indra",
+        max_assertions_per_context=1,
+    )
+
+    graph_rag._graph_rag_vectors.search_entity_embeddings.assert_awaited_once()
+    assert assertions[0].assertion == high_embedding_assertion.canonical_name
 
 
 @pytest.mark.asyncio

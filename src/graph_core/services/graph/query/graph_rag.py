@@ -69,6 +69,7 @@ _META_PROJECTION_MAX_BASE_REFS = 40
 _META_PROJECTION_MAX_BASE_RELS = 80
 _CONTEXT_MIX_TOP_K = 40
 _CONTEXT_MIX_MAX_CONTEXTS = 30
+_CONTEXT_MENTION_TOP_K = 40
 _COLLECTION_COVERAGE_MAX_DOCUMENTS = 200
 _COLLECTION_COVERAGE_CONTEXTS_PER_DOCUMENT = 4
 _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 16
@@ -2299,6 +2300,7 @@ async def _contexts_for_graph_hits(
     collection_id: uuid.UUID,
     entity_scores: dict[uuid.UUID, float],
     relationship_scores: dict[uuid.UUID, float],
+    entity_score_reasons: dict[uuid.UUID, str] | None = None,
     document_ids: list[uuid.UUID] | None = None,
 ) -> dict[uuid.UUID, ContextEvidenceCandidate]:
     if not entity_scores and not relationship_scores:
@@ -2433,6 +2435,7 @@ async def _contexts_for_graph_hits(
     rows = result.all()
 
     candidates: dict[uuid.UUID, ContextEvidenceCandidate] = {}
+    entity_score_reasons = entity_score_reasons or {}
     for row in rows:
         context_id = uuid.UUID(str(row[0]))
         entity_id = _uuid_from_value(row[4])
@@ -2456,7 +2459,9 @@ async def _contexts_for_graph_hits(
             )
             candidates[context_id] = candidate
         candidate.score += score
-        reason = str(row[6] or "")
+        reason = entity_score_reasons.get(entity_id) if entity_id is not None else None
+        if not reason:
+            reason = str(row[6] or "")
         if reason and reason not in candidate.reasons:
             candidate.reasons.append(reason)
     logger.info(
@@ -2564,6 +2569,14 @@ async def _select_context_evidence_candidates(
         top_k=top_k,
         document_ids=document_ids,
     )
+    contextual_entity_hits = await _graph_rag_vectors.search_entity_embeddings(
+        collection_id=collection.id,
+        query_embedding=entity_query_embedding,
+        top_k=_CONTEXT_MENTION_TOP_K,
+        document_ids=document_ids,
+        primary_types=["ASSERTION"],
+        primary_type_prefixes=["MENTION_"],
+    )
     relationship_hits = await _graph_rag_vectors.search_relationship_embeddings(
         collection_id=collection.id,
         query_embedding=relationship_query_embedding,
@@ -2572,6 +2585,7 @@ async def _select_context_evidence_candidates(
     )
 
     entity_scores: dict[uuid.UUID, float] = {}
+    entity_score_reasons: dict[uuid.UUID, str] = {}
     relationship_scores: dict[uuid.UUID, float] = {}
     document_path_scores: dict[str, float] = {}
     for hit in entity_hits:
@@ -2579,6 +2593,19 @@ async def _select_context_evidence_candidates(
         entity_id = _uuid_from_value(hit.metadata.get("entity_id"))
         if entity_id is not None:
             entity_scores[entity_id] = max(entity_scores.get(entity_id, 0.0), score)
+        document_path = str(hit.metadata.get("document_path") or "")
+        if document_path:
+            document_path_scores[document_path] = max(
+                document_path_scores.get(document_path, 0.0),
+                score,
+            )
+    for hit in contextual_entity_hits:
+        score = _vector_hit_score(hit)
+        entity_id = _uuid_from_value(hit.metadata.get("entity_id"))
+        if entity_id is not None:
+            if score > entity_scores.get(entity_id, 0.0):
+                entity_scores[entity_id] = score
+                entity_score_reasons[entity_id] = "matched mention/assertion embedding"
         document_path = str(hit.metadata.get("document_path") or "")
         if document_path:
             document_path_scores[document_path] = max(
@@ -2596,9 +2623,9 @@ async def _select_context_evidence_candidates(
         document_path = str(hit.metadata.get("document_path") or "")
         if document_path:
             document_path_scores[document_path] = max(
-            document_path_scores.get(document_path, 0.0),
-            score,
-        )
+                document_path_scores.get(document_path, 0.0),
+                score,
+            )
     vector_elapsed = time.perf_counter() - vector_started
 
     graph_started = time.perf_counter()
@@ -2606,6 +2633,7 @@ async def _select_context_evidence_candidates(
         collection_id=collection.id,
         entity_scores=entity_scores,
         relationship_scores=relationship_scores,
+        entity_score_reasons=entity_score_reasons,
         document_ids=document_ids,
     )
     graph_elapsed = time.perf_counter() - graph_started
@@ -2637,9 +2665,13 @@ async def _select_context_evidence_candidates(
 
     total_elapsed = time.perf_counter() - started
     logger.info(
-        "graph_rag context_candidates collection=%s entity_hits=%d relationship_hits=%d graph_candidates=%d document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs document=%.3fs merge=%.3fs total=%.3fs",
+        "graph_rag context_candidates collection=%s entity_hits=%d "
+        "contextual_entity_hits=%d relationship_hits=%d graph_candidates=%d "
+        "document_candidates=%d total_candidates=%d vector=%.3fs graph=%.3fs "
+        "document=%.3fs merge=%.3fs total=%.3fs",
         collection.name,
         len(entity_hits),
+        len(contextual_entity_hits),
         len(relationship_hits),
         len(graph_candidates),
         len(document_candidates),
@@ -2676,6 +2708,7 @@ async def _load_context_assertions(
     *,
     collection_id: uuid.UUID,
     context_ids: list[uuid.UUID],
+    entity_query_embedding: list[float] | None = None,
     question: str = "",
     frame_plan: GraphQueryFramePlan | None = None,
     max_assertions_per_context: int = 40,
@@ -2683,9 +2716,12 @@ async def _load_context_assertions(
     if not context_ids:
         return []
     started = time.perf_counter()
+    query_limit_per_context = max_assertions_per_context
+    if entity_query_embedding is not None:
+        query_limit_per_context = max(max_assertions_per_context * 4, 40)
     params: dict[str, Any] = {
         "cid": _uuid_for_sql(collection_id),
-        "limit_per_context": max_assertions_per_context,
+        "limit_per_context": query_limit_per_context,
     }
     placeholders: list[str] = []
     for index, context_id in enumerate(context_ids):
@@ -2731,7 +2767,27 @@ async def _load_context_assertions(
         )
     rows = result.all()
     query_elapsed = time.perf_counter() - started
-    grouped: dict[uuid.UUID, list[tuple[float, str, ContextAssertionEvidence]]] = {}
+    assertion_scores: dict[uuid.UUID, float] = {}
+    if entity_query_embedding is not None:
+        assertion_hits = await _graph_rag_vectors.search_entity_embeddings(
+            collection_id=collection_id,
+            query_embedding=entity_query_embedding,
+            top_k=max(max_assertions_per_context * max(1, len(context_ids)), 20),
+            primary_types=["ASSERTION"],
+        )
+        for hit in assertion_hits:
+            assertion_id = _uuid_from_value(hit.metadata.get("entity_id"))
+            if assertion_id is None:
+                continue
+            assertion_scores[assertion_id] = max(
+                assertion_scores.get(assertion_id, 0.0),
+                _vector_hit_score(hit),
+            )
+
+    grouped: dict[
+        uuid.UUID,
+        list[tuple[float, float, str, ContextAssertionEvidence]],
+    ] = {}
     for row in rows:
         assertion = ContextAssertionEvidence(
             context_id=uuid.UUID(str(row[0])),
@@ -2748,8 +2804,9 @@ async def _load_context_assertions(
             evidence=assertion.evidence,
             frame_plan=frame_plan,
         )
+        embedding_score = assertion_scores.get(assertion.assertion_id, 0.0)
         grouped.setdefault(assertion.context_id, []).append(
-            (relevance, assertion.assertion.casefold(), assertion)
+            (embedding_score, relevance, assertion.assertion.casefold(), assertion)
         )
 
     selected: list[ContextAssertionEvidence] = []
@@ -2758,19 +2815,32 @@ async def _load_context_assertions(
         scored_assertions = grouped.get(context_id, [])
         if not scored_assertions:
             continue
-        positive = [item for item in scored_assertions if item[0] > 0]
-        ranked = positive if positive else scored_assertions
-        ranked.sort(key=lambda item: (-item[0], item[1]))
-        chosen = [assertion for _, _, assertion in ranked[:max_assertions_per_context]]
+        embedding_ranked = [item for item in scored_assertions if item[0] > 0]
+        positive = [item for item in scored_assertions if item[1] > 0]
+        if embedding_ranked:
+            ranked = embedding_ranked
+        elif positive:
+            ranked = positive
+        else:
+            ranked = scored_assertions
+        ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        chosen = [
+            assertion
+            for _, _, _, assertion in ranked[:max_assertions_per_context]
+        ]
         selected.extend(chosen)
         selected_count += len(chosen)
 
     logger.info(
-        "graph_rag context_assertions collection_id=%s context_ids=%d max_assertions_per_context=%d rows=%d selected=%d query=%.3fs",
+        "graph_rag context_assertions collection_id=%s context_ids=%d "
+        "max_assertions_per_context=%d query_limit_per_context=%d rows=%d "
+        "embedding_scores=%d selected=%d query=%.3fs",
         collection_id,
         len(context_ids),
         max_assertions_per_context,
+        query_limit_per_context,
         len(rows),
+        len(assertion_scores),
         selected_count,
         query_elapsed,
     )
@@ -2994,6 +3064,7 @@ async def _context_mix_artifacts(
     assertions = await _load_context_assertions(
         collection_id=collection.id,
         context_ids=[context.context_id for context in contexts],
+        entity_query_embedding=entity_query_embedding,
         question=question,
         frame_plan=frame_plan if plan is not None and plan.scope != "collection" else None,
         max_assertions_per_context=max_assertions_per_context,
