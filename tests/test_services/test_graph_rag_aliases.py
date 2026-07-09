@@ -367,6 +367,89 @@ async def test_source_hierarchy_upsert_links_sections_to_context(
 
 
 @pytest.mark.asyncio
+async def test_context_graph_hits_expands_source_section_to_context(
+    db_session,
+    monkeypatch,
+    test_graph_rag_collection,
+):
+    document = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="document:library/book.md",
+        primary_type="SOURCE_DOCUMENT",
+        description_count=0,
+    )
+    section = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="section:library/book.md:Book > Technique 2",
+        primary_type="SOURCE_SECTION",
+        description_count=0,
+    )
+    context = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="context:library/book.md:chunk",
+        primary_type="CONTEXT",
+        description_count=0,
+    )
+    rel_types = {
+        rel_type: GraphRelationshipType(
+            id=uuid.uuid4(),
+            collection_id=test_graph_rag_collection.id,
+            canonical_type=rel_type,
+        )
+        for rel_type in ("HAS_SECTION", "HAS_CONTEXT")
+    }
+    db_session.add_all(
+        [
+            document,
+            section,
+            context,
+            *rel_types.values(),
+            EntityDescription(
+                id=uuid.uuid4(),
+                entity_id=context.id,
+                description="Technique 2 context.",
+                document_path="library/book.md",
+            ),
+            GraphRelationship(
+                id=uuid.uuid4(),
+                collection_id=test_graph_rag_collection.id,
+                source_entity_id=document.id,
+                target_entity_id=section.id,
+                relationship_type_id=rel_types["HAS_SECTION"].id,
+                rel_type="HAS_SECTION",
+                weight=1,
+                keywords=[],
+            ),
+            GraphRelationship(
+                id=uuid.uuid4(),
+                collection_id=test_graph_rag_collection.id,
+                source_entity_id=section.id,
+                target_entity_id=context.id,
+                relationship_type_id=rel_types["HAS_CONTEXT"].id,
+                rel_type="HAS_CONTEXT",
+                weight=1,
+                keywords=[],
+            ),
+        ]
+    )
+    await db_session.commit()
+    monkeypatch.setattr(graph_rag, "AsyncSessionLocal", _SessionFactory(db_session))
+
+    contexts = await graph_rag._contexts_for_graph_hits(
+        collection_id=test_graph_rag_collection.id,
+        entity_scores={document.id: 0.9},
+        relationship_scores={},
+    )
+
+    assert context.id in contexts
+    assert contexts[context.id].score == pytest.approx(0.9)
+    assert "matched source hierarchy containing context" in contexts[context.id].reasons
+
+
+@pytest.mark.asyncio
 async def test_resolve_entity_reuses_case_insensitive_canonical_match(
     db_session,
     test_graph_rag_collection,
@@ -1342,6 +1425,20 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
         primary_type="CONCEPT_PERSON",
         description_count=0,
     )
+    source_document = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="document:library/book.md",
+        primary_type="SOURCE_DOCUMENT",
+        description_count=0,
+    )
+    source_section = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=collection_id,
+        canonical_name="section:library/book.md:Book > Technique 2",
+        primary_type="SOURCE_SECTION",
+        description_count=0,
+    )
     rel_types = {
         rel_type: GraphRelationshipType(
             id=uuid.uuid4(),
@@ -1354,6 +1451,8 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
             "HAS_OBJECT_MENTION",
             "DENOTES",
             "CALLS",
+            "HAS_SECTION",
+            "HAS_CONTEXT",
         )
     }
 
@@ -1390,7 +1489,11 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
             target_mention,
             source_concept,
             target_concept,
+            source_document,
+            source_section,
             *rel_types.values(),
+            relationship(source_document, source_section, "HAS_SECTION"),
+            relationship(source_section, context, "HAS_CONTEXT"),
             relationship(context, assertion, "HAS_ASSERTION"),
             relationship(assertion, source_mention, "HAS_SUBJECT_MENTION"),
             relationship(assertion, target_mention, "HAS_OBJECT_MENTION"),
@@ -1428,6 +1531,12 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
     assert analysis["assertion_records"][0]["description"] == (
         "Krishna guides Arjuna through moral doubt on the battlefield."
     )
+    assert analysis["assertion_records"][0]["source_document"] == (
+        "document:library/book.md"
+    )
+    assert analysis["assertion_records"][0]["source_sections"] == [
+        "section:library/book.md:Book > Technique 2"
+    ]
 
 
 @pytest.mark.asyncio

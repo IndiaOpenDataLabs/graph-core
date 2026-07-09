@@ -75,6 +75,8 @@ class AssertionRecord:
     assertion_name: str = ""
     context_id: uuid.UUID | None = None
     context_name: str = ""
+    source_document: str = ""
+    source_sections: tuple[str, ...] = ()
 
 
 _CODE_REL_TYPES = {value.upper() for value in rel_types_for_domain("code")}
@@ -91,6 +93,12 @@ _CONTEXT_SCAFFOLD_REL_TYPES = {
     "HAS_OBJECT_MENTION",
     "DENOTES",
 }
+_SOURCE_HIERARCHY_NODE_TYPES = {
+    "SOURCE_FOLDER",
+    "SOURCE_DOCUMENT",
+    "SOURCE_SECTION",
+}
+_SOURCE_HIERARCHY_REL_TYPES = {"CONTAINS", "HAS_SECTION", "HAS_CONTEXT"}
 
 
 # Enhancement defaults favor broader, burner-like recall.
@@ -302,6 +310,65 @@ def _has_context_scaffold(nodes: list[NodeRecord]) -> bool:
     )
 
 
+def _source_hierarchy_by_context(
+    node_by_id: dict[uuid.UUID, NodeRecord],
+    relationships: list[RelationshipRecord],
+) -> dict[uuid.UUID, dict[str, Any]]:
+    children_by_source: dict[uuid.UUID, list[RelationshipRecord]] = defaultdict(list)
+    for rel in relationships:
+        rel_type = str(rel.rel_type or "").upper()
+        if rel_type in _SOURCE_HIERARCHY_REL_TYPES:
+            children_by_source[rel.source_id].append(rel)
+
+    hierarchy: dict[uuid.UUID, dict[str, Any]] = {}
+
+    def walk(
+        node_id: uuid.UUID,
+        *,
+        document: str,
+        sections: tuple[str, ...],
+        seen: set[uuid.UUID],
+    ) -> None:
+        if node_id in seen:
+            return
+        node = node_by_id.get(node_id)
+        if node is None:
+            return
+        node_type = str(node.primary_type or "").upper()
+        next_document = document
+        next_sections = sections
+        if node_type == "SOURCE_DOCUMENT":
+            next_document = node.name
+        elif node_type == "SOURCE_SECTION":
+            next_sections = (*sections, node.name)
+        elif node_type == "CONTEXT":
+            current = hierarchy.get(node_id)
+            candidate = {
+                "source_document": next_document,
+                "source_sections": next_sections,
+            }
+            if current is None or (
+                not current.get("source_document")
+                and candidate.get("source_document")
+            ) or len(candidate["source_sections"]) > len(current["source_sections"]):
+                hierarchy[node_id] = candidate
+            return
+
+        next_seen = {*seen, node_id}
+        for rel in children_by_source.get(node_id, []):
+            walk(
+                rel.target_id,
+                document=next_document,
+                sections=next_sections,
+                seen=next_seen,
+            )
+
+    for node in node_by_id.values():
+        if str(node.primary_type or "").upper() in _SOURCE_HIERARCHY_NODE_TYPES:
+            walk(node.id, document="", sections=(), seen=set())
+    return hierarchy
+
+
 def _project_context_scaffold_graph(
     nodes: list[NodeRecord],
     relationships: list[RelationshipRecord],
@@ -324,6 +391,8 @@ def _project_context_scaffold_graph(
     concept_id_by_mention_id: dict[uuid.UUID, uuid.UUID] = {}
     assertion_id_by_mention_id: dict[uuid.UUID, uuid.UUID] = {}
     context_id_by_assertion_id: dict[uuid.UUID, uuid.UUID] = {}
+    context_id_by_context_child_id: dict[uuid.UUID, uuid.UUID] = {}
+    source_hierarchy = _source_hierarchy_by_context(node_by_id, relationships)
     for rel in relationships:
         rel_type = str(rel.rel_type or "").upper()
         if (
@@ -347,6 +416,12 @@ def _project_context_scaffold_graph(
             and node_by_id[rel.target_id].primary_type.upper() == "ASSERTION"
         ):
             context_id_by_assertion_id[rel.target_id] = rel.source_id
+        elif (
+            rel_type == "HAS_CONTEXT"
+            and node_by_id.get(rel.target_id) is not None
+            and node_by_id[rel.target_id].primary_type.upper() == "CONTEXT"
+        ):
+            context_id_by_context_child_id[rel.target_id] = rel.target_id
 
     projected_relationships: list[RelationshipRecord] = []
     assertion_records: list[AssertionRecord] = []
@@ -390,7 +465,12 @@ def _project_context_scaffold_graph(
             if assertion_id is not None
             else None
         )
+        if context_id is None:
+            context_id = context_id_by_context_child_id.get(rel.source_id)
+        if context_id is None:
+            context_id = context_id_by_context_child_id.get(rel.target_id)
         context_node = node_by_id.get(context_id) if context_id else None
+        hierarchy = source_hierarchy.get(context_id, {}) if context_id else {}
         assertion_records.append(
             AssertionRecord(
                 id=rel.id,
@@ -411,12 +491,22 @@ def _project_context_scaffold_graph(
                 assertion_name=assertion_node.name if assertion_node else "",
                 context_id=context_id,
                 context_name=context_node.name if context_node else "",
+                source_document=str(hierarchy.get("source_document") or ""),
+                source_sections=tuple(
+                    str(section)
+                    for section in hierarchy.get("source_sections", ())
+                    if str(section).strip()
+                ),
             )
         )
 
     return (
         [node for node in nodes if node.id in concept_ids],
-        projected_relationships,
+        [
+            rel
+            for rel in projected_relationships
+            if str(rel.rel_type or "").upper() not in _SOURCE_HIERARCHY_REL_TYPES
+        ],
         assertion_records,
     )
 
@@ -1007,6 +1097,8 @@ def _build_facet_candidate_regions(
                 "counterpart_names": set(),
                 "rel_counter": Counter(),
                 "context_names": set(),
+                "source_documents": set(),
+                "source_sections": set(),
                 "score": 0.0,
             },
         )
@@ -1017,6 +1109,13 @@ def _build_facet_candidate_regions(
         context_name = str(record.get("context_name") or "").strip()
         if context_name:
             bucket["context_names"].add(context_name)
+        source_document = str(record.get("source_document") or "").strip()
+        if source_document:
+            bucket["source_documents"].add(source_document)
+        for section in record.get("source_sections", []) or []:
+            section_name = str(section or "").strip()
+            if section_name:
+                bucket["source_sections"].add(section_name)
         bucket["score"] += float(record.get("weight") or 0.0) + 1.0
 
     for record in assertion_records:
@@ -1089,6 +1188,8 @@ def _build_facet_candidate_regions(
                     "assertion_id": assertion_id,
                     "assertion_name": str(record.get("assertion_name") or ""),
                     "context_name": str(record.get("context_name") or ""),
+                    "source_document": str(record.get("source_document") or ""),
+                    "source_sections": list(record.get("source_sections") or []),
                     "description": str(record.get("description") or ""),
                 }
             )
@@ -1131,6 +1232,8 @@ def _build_facet_candidate_regions(
                     "rel_type_counts": dict(bucket["rel_counter"].most_common()),
                     "assertion_ids": sorted(set(assertion_ids)),
                     "context_names": sorted(bucket["context_names"])[:8],
+                    "source_documents": sorted(bucket["source_documents"])[:8],
+                    "source_sections": sorted(bucket["source_sections"])[:12],
                 },
             }
         )
@@ -1164,6 +1267,8 @@ def _build_shared_class_candidate_regions(
                 "target_type": str(record.get("target_concept_type") or ""),
                 "members": {},
                 "assertions": [],
+                "source_documents": set(),
+                "source_sections": set(),
                 "score": 0.0,
             },
         )
@@ -1173,6 +1278,13 @@ def _build_shared_class_candidate_regions(
             "type": str(record.get("source_concept_type") or ""),
         }
         bucket["assertions"].append(record)
+        source_document = str(record.get("source_document") or "").strip()
+        if source_document:
+            bucket["source_documents"].add(source_document)
+        for section in record.get("source_sections", []) or []:
+            section_name = str(section or "").strip()
+            if section_name:
+                bucket["source_sections"].add(section_name)
         bucket["score"] += float(record.get("weight") or 0.0) + 1.0
 
     ranked = sorted(
@@ -1209,6 +1321,8 @@ def _build_shared_class_candidate_regions(
                     "assertion_id": assertion_id,
                     "assertion_name": str(record.get("assertion_name") or ""),
                     "context_name": str(record.get("context_name") or ""),
+                    "source_document": str(record.get("source_document") or ""),
+                    "source_sections": list(record.get("source_sections") or []),
                     "description": str(record.get("description") or ""),
                 }
             )
@@ -1242,6 +1356,8 @@ def _build_shared_class_candidate_regions(
                     "member_names": member_names,
                     "rel_type": rel_type,
                     "assertion_ids": sorted(set(assertion_ids)),
+                    "source_documents": sorted(bucket["source_documents"])[:8],
+                    "source_sections": sorted(bucket["source_sections"])[:12],
                 },
             }
         )
@@ -1265,6 +1381,16 @@ def _region_evidence_keys(region: dict[str, Any]) -> tuple[set[str], set[str]]:
             for value in profile.get("context_names", [])
             if str(value).strip()
         )
+        context_names.update(
+            str(value).strip()
+            for value in profile.get("source_documents", [])
+            if str(value).strip()
+        )
+        context_names.update(
+            str(value).strip()
+            for value in profile.get("source_sections", [])
+            if str(value).strip()
+        )
     for edge in region.get("representative_edges", []):
         if not isinstance(edge, dict):
             continue
@@ -1276,6 +1402,13 @@ def _region_evidence_keys(region: dict[str, Any]) -> tuple[set[str], set[str]]:
         context_name = str(edge.get("context_name") or "").strip()
         if context_name:
             context_names.add(context_name)
+        source_document = str(edge.get("source_document") or "").strip()
+        if source_document:
+            context_names.add(source_document)
+        for section in edge.get("source_sections", []) or []:
+            section_name = str(section or "").strip()
+            if section_name:
+                context_names.add(section_name)
     return assertion_ids, context_names
 
 
@@ -1698,6 +1831,8 @@ async def analyze_collection_graph(
             "assertion_name": record.assertion_name,
             "context_id": str(record.context_id) if record.context_id else None,
             "context_name": record.context_name,
+            "source_document": record.source_document,
+            "source_sections": list(record.source_sections),
             "description": record.description,
         }
         for record in assertion_records

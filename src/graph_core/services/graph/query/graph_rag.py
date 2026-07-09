@@ -2336,8 +2336,8 @@ async def _contexts_for_graph_hits(
                 f"""
                 WITH candidate_contexts AS (
                     SELECT e.id AS context_id, e.id AS matched_entity_id,
-                           NULL::uuid AS matched_relationship_id,
-                           'direct context entity hit'::text AS reason
+                           NULL AS matched_relationship_id,
+                           'direct context entity hit' AS reason
                     FROM graph_entities e
                     WHERE e.collection_id = :cid
                       AND e.primary_type = 'CONTEXT'
@@ -2347,8 +2347,8 @@ async def _contexts_for_graph_hits(
 
                     SELECT ctx.id AS context_id,
                            owns.target_entity_id AS matched_entity_id,
-                           NULL::uuid AS matched_relationship_id,
-                           'matched assertion owned by context'::text AS reason
+                           NULL AS matched_relationship_id,
+                           'matched assertion owned by context' AS reason
                     FROM graph_relationships owns
                     JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
                     WHERE owns.collection_id = :cid
@@ -2360,8 +2360,8 @@ async def _contexts_for_graph_hits(
 
                     SELECT ctx.id AS context_id,
                            edge.target_entity_id AS matched_entity_id,
-                           NULL::uuid AS matched_relationship_id,
-                           'matched node attached to context'::text AS reason
+                           NULL AS matched_relationship_id,
+                           'matched node attached to context' AS reason
                     FROM graph_relationships edge
                     JOIN graph_entities ctx ON ctx.id = edge.source_entity_id
                     WHERE edge.collection_id = :cid
@@ -2376,8 +2376,8 @@ async def _contexts_for_graph_hits(
                                THEN ar.source_entity_id
                              ELSE ar.target_entity_id
                            END AS matched_entity_id,
-                           NULL::uuid AS matched_relationship_id,
-                           'matched node connected to context assertion'::text
+                           NULL AS matched_relationship_id,
+                           'matched node connected to context assertion'
                            AS reason
                     FROM graph_relationships owns
                     JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
@@ -2392,9 +2392,9 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id, NULL::uuid AS matched_entity_id,
+                    SELECT ctx.id AS context_id, NULL AS matched_entity_id,
                            edge.id AS matched_relationship_id,
-                           'matched relationship attached to context'::text
+                           'matched relationship attached to context'
                            AS reason
                     FROM graph_relationships edge
                     JOIN graph_entities ctx
@@ -2406,9 +2406,48 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id, NULL::uuid AS matched_entity_id,
+                    SELECT ctx.id AS context_id,
+                           source_hit.id AS matched_entity_id,
+                           NULL AS matched_relationship_id,
+                           'matched source hierarchy containing context'
+                           AS reason
+                    FROM graph_entities source_hit
+                    JOIN graph_relationships path1
+                      ON path1.source_entity_id = source_hit.id
+                    LEFT JOIN graph_relationships path2
+                      ON path2.source_entity_id = path1.target_entity_id
+                     AND path1.rel_type IN ('CONTAINS', 'HAS_SECTION')
+                    LEFT JOIN graph_relationships path3
+                      ON path3.source_entity_id = path2.target_entity_id
+                     AND path2.rel_type IN ('CONTAINS', 'HAS_SECTION')
+                    LEFT JOIN graph_relationships path4
+                      ON path4.source_entity_id = path3.target_entity_id
+                     AND path3.rel_type IN ('CONTAINS', 'HAS_SECTION')
+                    JOIN graph_entities ctx
+                      ON ctx.id = CASE
+                        WHEN path1.rel_type = 'HAS_CONTEXT'
+                          THEN path1.target_entity_id
+                        WHEN path2.rel_type = 'HAS_CONTEXT'
+                          THEN path2.target_entity_id
+                        WHEN path3.rel_type = 'HAS_CONTEXT'
+                          THEN path3.target_entity_id
+                        WHEN path4.rel_type = 'HAS_CONTEXT'
+                          THEN path4.target_entity_id
+                      END
+                    WHERE source_hit.collection_id = :cid
+                      AND source_hit.primary_type IN (
+                        'SOURCE_FOLDER',
+                        'SOURCE_DOCUMENT',
+                        'SOURCE_SECTION'
+                      )
+                      AND source_hit.id IN ({entity_clause})
+                      AND ctx.primary_type = 'CONTEXT'
+
+                    UNION ALL
+
+                    SELECT ctx.id AS context_id, NULL AS matched_entity_id,
                            edge.id AS matched_relationship_id,
-                           'matched relationship attached to owned assertion'::text
+                           'matched relationship attached to owned assertion'
                            AS reason
                     FROM graph_relationships owns
                     JOIN graph_entities ctx ON ctx.id = owns.source_entity_id
