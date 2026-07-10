@@ -2335,7 +2335,8 @@ async def _contexts_for_graph_hits(
             text(
                 f"""
                 WITH candidate_contexts AS (
-                    SELECT e.id AS context_id, e.id AS matched_entity_id,
+                    SELECT CAST(e.id AS TEXT) AS context_id,
+                           CAST(e.id AS TEXT) AS matched_entity_id,
                            NULL AS matched_relationship_id,
                            'direct context entity hit' AS reason
                     FROM graph_entities e
@@ -2345,8 +2346,8 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id,
-                           owns.target_entity_id AS matched_entity_id,
+                    SELECT CAST(ctx.id AS TEXT) AS context_id,
+                           CAST(owns.target_entity_id AS TEXT) AS matched_entity_id,
                            NULL AS matched_relationship_id,
                            'matched assertion owned by context' AS reason
                     FROM graph_relationships owns
@@ -2358,8 +2359,8 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id,
-                           edge.target_entity_id AS matched_entity_id,
+                    SELECT CAST(ctx.id AS TEXT) AS context_id,
+                           CAST(edge.target_entity_id AS TEXT) AS matched_entity_id,
                            NULL AS matched_relationship_id,
                            'matched node attached to context' AS reason
                     FROM graph_relationships edge
@@ -2370,12 +2371,14 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id,
-                           CASE
-                             WHEN ar.source_entity_id IN ({entity_clause})
-                               THEN ar.source_entity_id
-                             ELSE ar.target_entity_id
-                           END AS matched_entity_id,
+                    SELECT CAST(ctx.id AS TEXT) AS context_id,
+                           CAST(
+                             CASE
+                               WHEN ar.source_entity_id IN ({entity_clause})
+                                 THEN ar.source_entity_id
+                               ELSE ar.target_entity_id
+                             END AS TEXT
+                           ) AS matched_entity_id,
                            NULL AS matched_relationship_id,
                            'matched node connected to context assertion'
                            AS reason
@@ -2392,8 +2395,9 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id, NULL AS matched_entity_id,
-                           edge.id AS matched_relationship_id,
+                    SELECT CAST(ctx.id AS TEXT) AS context_id,
+                           NULL AS matched_entity_id,
+                           CAST(edge.id AS TEXT) AS matched_relationship_id,
                            'matched relationship attached to context'
                            AS reason
                     FROM graph_relationships edge
@@ -2406,8 +2410,8 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id,
-                           source_hit.id AS matched_entity_id,
+                    SELECT CAST(ctx.id AS TEXT) AS context_id,
+                           CAST(source_hit.id AS TEXT) AS matched_entity_id,
                            NULL AS matched_relationship_id,
                            'matched source hierarchy containing context'
                            AS reason
@@ -2445,8 +2449,9 @@ async def _contexts_for_graph_hits(
 
                     UNION ALL
 
-                    SELECT ctx.id AS context_id, NULL AS matched_entity_id,
-                           edge.id AS matched_relationship_id,
+                    SELECT CAST(ctx.id AS TEXT) AS context_id,
+                           NULL AS matched_entity_id,
+                           CAST(edge.id AS TEXT) AS matched_relationship_id,
                            'matched relationship attached to owned assertion'
                            AS reason
                     FROM graph_relationships owns
@@ -2463,7 +2468,7 @@ async def _contexts_for_graph_hits(
                        cc.matched_entity_id, cc.matched_relationship_id,
                        cc.reason
                 FROM candidate_contexts cc
-                JOIN graph_entities c ON c.id = cc.context_id
+                JOIN graph_entities c ON CAST(c.id AS TEXT) = cc.context_id
                 JOIN entity_descriptions ed ON ed.entity_id = c.id
                 WHERE c.collection_id = :cid
                   {doc_filter}
