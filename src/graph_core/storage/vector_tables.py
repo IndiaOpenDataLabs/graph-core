@@ -68,7 +68,8 @@ def create_entity_embeddings_sql(collection_id: uuid.UUID, dimensions: int) -> s
             name VARCHAR(256) NOT NULL,
             description TEXT NOT NULL,
             embedding vector({dimensions}) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT now()
+            created_at TIMESTAMPTZ DEFAULT now(),
+            CONSTRAINT uq_{tbl}_description_id UNIQUE (description_id)
         )
     """
 
@@ -89,7 +90,8 @@ def create_relationship_embeddings_sql(
             target_name VARCHAR(256) NOT NULL,
             description TEXT NOT NULL,
             embedding vector({dimensions}) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT now()
+            created_at TIMESTAMPTZ DEFAULT now(),
+            CONSTRAINT uq_{tbl}_relationship_id UNIQUE (relationship_id)
         )
     """
 

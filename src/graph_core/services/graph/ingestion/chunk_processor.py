@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from graph_core.database import AsyncSessionLocal
@@ -240,6 +240,48 @@ async def _graph_relationship_type_id(
     return rel_type_id, canonical_type
 
 
+async def _upsert_canonical_graph_entity(
+    session,
+    *,
+    collection_id: uuid.UUID,
+    entity_id: uuid.UUID,
+    canonical_name: str,
+    primary_type: str,
+) -> uuid.UUID:
+    entity_insert = pg_insert(GraphEntity).values(
+        id=entity_id,
+        collection_id=collection_id,
+        canonical_name=canonical_name[:256],
+        primary_type=primary_type[:64],
+        description_count=1,
+    )
+    inserted_id = (
+        await session.execute(
+            entity_insert.on_conflict_do_nothing().returning(GraphEntity.id)
+        )
+    ).scalar_one_or_none()
+    if inserted_id is not None:
+        return inserted_id
+    existing_id = (
+        await session.execute(
+            select(GraphEntity.id).where(
+                or_(
+                    GraphEntity.id == entity_id,
+                    (
+                        (GraphEntity.collection_id == collection_id)
+                        & (GraphEntity.canonical_name == canonical_name[:256])
+                    ),
+                )
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_id is None:
+        raise RuntimeError(
+            f"Graph entity conflict could not be resolved: {canonical_name[:256]}"
+        )
+    return existing_id
+
+
 async def _upsert_context_entity(
     session,
     *,
@@ -253,34 +295,23 @@ async def _upsert_context_entity(
     document_path: str | None,
     embedding_provider: EmbeddingProvider,
     precomputed_embedding: list[float] | None = None,
-) -> None:
-    await session.execute(
-        pg_insert(GraphEntity)
-        .values(
-            id=entity_id,
-            collection_id=collection.id,
-            canonical_name=canonical_name[:256],
-            primary_type=primary_type[:64],
-            description_count=1,
-        )
-        .on_conflict_do_update(
-            index_elements=[GraphEntity.id],
-            set_={
-                "canonical_name": canonical_name[:256],
-                "primary_type": primary_type[:64],
-                "description_count": 1,
-            },
-        )
+) -> uuid.UUID:
+    canonical_entity_id = await _upsert_canonical_graph_entity(
+        session,
+        collection_id=collection.id,
+        entity_id=entity_id,
+        canonical_name=canonical_name,
+        primary_type=primary_type,
     )
     description_id = deterministic_uuid(
         collection.id,
-        f"desc:{entity_id}:{document_id or chunk_hash}",
+        f"desc:{canonical_entity_id}:{document_id or chunk_hash}",
     )
     await session.execute(
         pg_insert(EntityDescription)
         .values(
             id=description_id,
-            entity_id=entity_id,
+            entity_id=canonical_entity_id,
             description=description,
             weight=1,
             source_chunk_hashes=[chunk_hash],
@@ -305,7 +336,7 @@ async def _upsert_context_entity(
         f"{canonical_name}: {description}"
     )
     await _graph_rag_vectors.upsert_entity_embedding(
-        entity_id=entity_id,
+        entity_id=canonical_entity_id,
         collection_id=collection.id,
         name=canonical_name[:256],
         description=description,
@@ -316,7 +347,7 @@ async def _upsert_context_entity(
         session=session,
     )
     await _graph_rag_vectors.upsert_entity_centroid(
-        entity_id=entity_id,
+        entity_id=canonical_entity_id,
         collection_id=collection.id,
         canonical_name=canonical_name[:256],
         primary_type=primary_type[:64],
@@ -324,6 +355,7 @@ async def _upsert_context_entity(
         embedding=embedding,
         session=session,
     )
+    return canonical_entity_id
 
 
 async def _upsert_reasoning_entity(
@@ -337,34 +369,24 @@ async def _upsert_reasoning_entity(
     chunk_hash: str,
     document_id: uuid.UUID | None,
     document_path: str | None,
-) -> None:
+) -> uuid.UUID:
     """Persist an executable structural node without polluting vector seeds."""
-    await session.execute(
-        pg_insert(GraphEntity)
-        .values(
-            id=entity_id,
-            collection_id=collection.id,
-            canonical_name=canonical_name[:256],
-            primary_type=primary_type[:64],
-            description_count=1,
-        )
-        .on_conflict_do_update(
-            index_elements=[GraphEntity.id],
-            set_={
-                "canonical_name": canonical_name[:256],
-                "primary_type": primary_type[:64],
-            },
-        )
+    canonical_entity_id = await _upsert_canonical_graph_entity(
+        session,
+        collection_id=collection.id,
+        entity_id=entity_id,
+        canonical_name=canonical_name,
+        primary_type=primary_type,
     )
     description_id = deterministic_uuid(
         collection.id,
-        f"reasoning-desc:{entity_id}:{document_id or chunk_hash}",
+        f"reasoning-desc:{canonical_entity_id}:{document_id or chunk_hash}",
     )
     await session.execute(
         pg_insert(EntityDescription)
         .values(
             id=description_id,
-            entity_id=entity_id,
+            entity_id=canonical_entity_id,
             description=description,
             weight=1,
             source_chunk_hashes=[chunk_hash],
@@ -378,6 +400,7 @@ async def _upsert_reasoning_entity(
             set_={"description": description},
         )
     )
+    return canonical_entity_id
 
 
 def _context_concept_values(
@@ -458,7 +481,7 @@ async def _resolve_context_concept(
         collection.id,
         f"concept:{concept_type}:{mention_name.lower()}",
     )
-    await _upsert_context_entity(
+    concept_id = await _upsert_context_entity(
         session,
         collection=collection,
         entity_id=concept_id,
@@ -655,7 +678,7 @@ async def _upsert_source_hierarchy(
     ) -> uuid.UUID:
         nonlocal previous_id, previous_name
         entity_id = deterministic_uuid(collection.id, stable_key)
-        await _upsert_context_entity(
+        entity_id = await _upsert_context_entity(
             session,
             collection=collection,
             entity_id=entity_id,
@@ -1015,7 +1038,7 @@ async def _ingest_graph_chunk(
     predicate_mappings: list[PredicateMappingInput] = []
 
     async with AsyncSessionLocal() as session:
-        await _upsert_context_entity(
+        context_id = await _upsert_context_entity(
             session,
             collection=collection,
             entity_id=context_id,
@@ -1100,7 +1123,7 @@ async def _ingest_graph_chunk(
                 ]
             )
 
-            await _upsert_context_entity(
+            assertion_id = await _upsert_context_entity(
                 session,
                 collection=collection,
                 entity_id=assertion_id,
@@ -1230,7 +1253,7 @@ async def _ingest_graph_chunk(
                     f"rule:{assertion_id}",
                 )
                 rule_name = f"rule:{assertion_text}"[:256]
-                await _upsert_reasoning_entity(
+                rule_id = await _upsert_reasoning_entity(
                     session,
                     collection=collection,
                     entity_id=rule_id,
@@ -1268,7 +1291,7 @@ async def _ingest_graph_chunk(
                         f"condition:{assertion_id}:{condition_index}:{condition_text}",
                     )
                     condition_name = f"condition:{condition_text}"[:256]
-                    await _upsert_reasoning_entity(
+                    condition_id = await _upsert_reasoning_entity(
                         session,
                         collection=collection,
                         entity_id=condition_id,
@@ -1318,7 +1341,7 @@ async def _ingest_graph_chunk(
                         f"exception:{assertion_id}:{exception_index}:{exception_text}",
                     )
                     exception_name = f"exception:{exception_text}"[:256]
-                    await _upsert_reasoning_entity(
+                    exception_id = await _upsert_reasoning_entity(
                         session,
                         collection=collection,
                         entity_id=exception_id,
@@ -1369,7 +1392,7 @@ async def _ingest_graph_chunk(
                     f"scope:{assertion_id}:{scope_index}:{scope_text}",
                 )
                 scope_name = f"scope:{scope_text}"[:256]
-                await _upsert_reasoning_entity(
+                scope_id = await _upsert_reasoning_entity(
                     session,
                     collection=collection,
                     entity_id=scope_id,

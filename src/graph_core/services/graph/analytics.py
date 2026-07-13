@@ -2181,6 +2181,14 @@ async def _persist_projection(
 ) -> str:
     digest = _projection_spec_hash(spec)
     async with AsyncSessionLocal() as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {
+                "lock_key": (
+                    f"graph-projection:{version.id}:{spec['name']}:{digest}"
+                )
+            },
+        )
         existing = (
             await session.execute(
                 select(GraphProjectionSnapshot).where(

@@ -148,7 +148,15 @@ class GraphRAGVectorStore:
                 text(
                     f"INSERT INTO {tbl} "
                     f"(entity_id, collection_id, document_id, document_path, name, description, description_id, embedding) "
-                    f"VALUES (:eid, :cid, :document_id, :document_path, :name, :desc, :did, (:emb){cast})"
+                    f"VALUES (:eid, :cid, :document_id, :document_path, :name, :desc, :did, (:emb){cast}) "
+                    "ON CONFLICT (description_id) DO UPDATE SET "
+                    "entity_id = EXCLUDED.entity_id, "
+                    "collection_id = EXCLUDED.collection_id, "
+                    "document_id = EXCLUDED.document_id, "
+                    "document_path = EXCLUDED.document_path, "
+                    "name = EXCLUDED.name, "
+                    "description = EXCLUDED.description, "
+                    "embedding = EXCLUDED.embedding"
                 ),
                 {
                     "eid": _uuid_for_sql(entity_id),
@@ -279,7 +287,15 @@ class GraphRAGVectorStore:
                 text(
                     f"INSERT INTO {tbl} "
                     f"(relationship_id, collection_id, document_id, document_path, source_name, target_name, description, embedding) "
-                    f"VALUES (:rid, :cid, :document_id, :document_path, :sn, :tn, :desc, (:emb){cast})"
+                    f"VALUES (:rid, :cid, :document_id, :document_path, :sn, :tn, :desc, (:emb){cast}) "
+                    "ON CONFLICT (relationship_id) DO UPDATE SET "
+                    "collection_id = EXCLUDED.collection_id, "
+                    "document_id = EXCLUDED.document_id, "
+                    "document_path = EXCLUDED.document_path, "
+                    "source_name = EXCLUDED.source_name, "
+                    "target_name = EXCLUDED.target_name, "
+                    "description = EXCLUDED.description, "
+                    "embedding = EXCLUDED.embedding"
                 ),
                 {
                     "rid": _uuid_for_sql(relationship_id),
@@ -299,7 +315,7 @@ class GraphRAGVectorStore:
         collection_id: uuid.UUID,
         rows: list[dict],
     ) -> None:
-        """Replace relationship vectors in one transaction using executemany."""
+        """Upsert relationship vectors atomically using executemany."""
         if not rows:
             return
         tbl = table_name(collection_id, "relationship_embeddings")
@@ -326,16 +342,20 @@ class GraphRAGVectorStore:
         ]
         async with AsyncSessionLocal() as session:
             await session.execute(
-                text(f"DELETE FROM {tbl} WHERE relationship_id = :rid"),
-                [{"rid": item["rid"]} for item in params],
-            )
-            await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
                     "(relationship_id, collection_id, document_id, document_path, "
                     "source_name, target_name, description, embedding) "
                     f"VALUES (:rid, :cid, :document_id, :document_path, :sn, :tn, "
-                    f":desc, (:emb){cast})"
+                    f":desc, (:emb){cast}) "
+                    "ON CONFLICT (relationship_id) DO UPDATE SET "
+                    "collection_id = EXCLUDED.collection_id, "
+                    "document_id = EXCLUDED.document_id, "
+                    "document_path = EXCLUDED.document_path, "
+                    "source_name = EXCLUDED.source_name, "
+                    "target_name = EXCLUDED.target_name, "
+                    "description = EXCLUDED.description, "
+                    "embedding = EXCLUDED.embedding"
                 ),
                 params,
             )
