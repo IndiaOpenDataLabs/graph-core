@@ -36,6 +36,7 @@ vector = [
 graph = [
     "falkordb>=1.0.0",
     "networkx>=3.4.2",
+    "scipy>=1.14.0",
 ]
 mcp = [
     "mcp>=1.0.0",
