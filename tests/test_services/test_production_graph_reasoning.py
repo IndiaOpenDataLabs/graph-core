@@ -14,7 +14,11 @@ from graph_core.services.graph.incremental_ingestion import (
     coalesce_predicate_mappings,
     merge_predicate_property_observation,
 )
-from graph_core.services.graph.reasoning import ReasoningSeed, activate_reasoning
+from graph_core.services.graph.reasoning import (
+    ReasoningArgument,
+    ReasoningSeed,
+    activate_reasoning,
+)
 from graph_core.services.graph_rag.extractor import (
     LLMGraphExtractor,
     normalize_predicate_properties,
@@ -23,6 +27,155 @@ from graph_core.services.graph_rag.extractor import (
 
 def _id(value: int) -> uuid.UUID:
     return uuid.UUID(int=value)
+
+
+def test_production_goal_unification_binds_variables() -> None:
+    goal = reasoning._Goal(
+        "CAUSES",
+        (
+            ReasoningArgument("subject", variable_name="cause"),
+            ReasoningArgument("object", entity_id=_id(2)),
+        ),
+    )
+    frame = reasoning._Frame(
+        proposition_id=_id(3),
+        predicate="CAUSES",
+        frame_text="Alpha causes Beta.",
+        modality="asserted",
+        conditions=(),
+        arguments=(
+            ReasoningArgument("subject", entity_id=_id(1)),
+            ReasoningArgument("object", entity_id=_id(2)),
+        ),
+    )
+
+    assert reasoning._unify(goal, frame) == {"cause": str(_id(1))}
+
+
+def test_production_goal_ranking_uses_retrieval_score_after_overlap() -> None:
+    nodes = {
+        _id(1): reasoning._Node(_id(1), "CONCEPT", "Alpha", ""),
+        _id(2): reasoning._Node(_id(2), "CONCEPT", "Beta", ""),
+    }
+    arguments = (
+        ReasoningArgument("subject", entity_id=_id(1)),
+        ReasoningArgument("object", entity_id=_id(2)),
+    )
+    low_score = reasoning._Frame(
+        _id(3),
+        "AFFECTS",
+        "Alpha affects Beta.",
+        "asserted",
+        (),
+        arguments,
+        0.2,
+    )
+    high_score = reasoning._Frame(
+        _id(9),
+        "INFLUENCES",
+        "Alpha affects Beta.",
+        "asserted",
+        (),
+        arguments,
+        0.9,
+    )
+
+    goals = reasoning._compile_goals(
+        "How does Alpha affect Beta?",
+        nodes,
+        [low_score, high_score],
+        limit=1,
+    )
+
+    assert goals[0].predicate == "INFLUENCES"
+
+
+def test_production_backward_reasoning_proves_rule_conclusion() -> None:
+    nodes = {
+        _id(1): reasoning._Node(_id(1), "CONCEPT", "Alpha", ""),
+        _id(2): reasoning._Node(_id(2), "CONCEPT", "Beta", ""),
+        _id(3): reasoning._Node(_id(3), "PROPOSITION", "Alpha exists", ""),
+        _id(4): reasoning._Node(_id(4), "RULE", "enable rule", ""),
+        _id(5): reasoning._Node(_id(5), "PROPOSITION", "Alpha enables Beta", ""),
+    }
+    edges = [
+        reasoning._Edge(_id(3), _id(4), "ANTECEDENT_OF"),
+        reasoning._Edge(_id(4), _id(5), "CONCLUDES"),
+    ]
+    frames = [
+        reasoning._Frame(
+            _id(3),
+            "EXISTS",
+            "Alpha exists.",
+            "asserted",
+            (),
+            (ReasoningArgument("subject", entity_id=_id(1)),),
+        ),
+        reasoning._Frame(
+            _id(5),
+            "ENABLES",
+            "Alpha enables Beta.",
+            "asserted",
+            (),
+            (
+                ReasoningArgument("subject", entity_id=_id(1)),
+                ReasoningArgument("object", entity_id=_id(2)),
+            ),
+        ),
+    ]
+
+    result = reasoning._backward_reason(
+        "How does Alpha enable Beta?",
+        nodes,
+        edges,
+        frames,
+        {_id(3)},
+    )
+
+    enable_goal = next(
+        goal for goal in result["goals"] if goal["goal"]["predicate"] == "ENABLES"
+    )
+    assert enable_goal["status"] == "proved"
+    assert enable_goal["matches"][0]["alternatives"][0]["status"] == "proved"
+
+
+def test_production_backward_reasoning_labels_conditional_as_hypothesis() -> None:
+    nodes = {
+        _id(1): reasoning._Node(_id(1), "CONCEPT", "Devas", ""),
+        _id(2): reasoning._Node(_id(2), "CONCEPT", "World", ""),
+        _id(3): reasoning._Node(_id(3), "PROPOSITION", "Devas affect world", ""),
+    }
+    frame = reasoning._Frame(
+        _id(3),
+        "AFFECTS",
+        "Devas may affect the experienced world.",
+        "conditional",
+        ("within an internalized ritual framework",),
+        (
+            ReasoningArgument("subject", entity_id=_id(1)),
+            ReasoningArgument("object", entity_id=_id(2)),
+        ),
+    )
+
+    result = reasoning._backward_reason(
+        "How do Devas affect the world?",
+        nodes,
+        [],
+        [frame],
+        set(),
+    )
+
+    assert result["status"] == "supported_hypothesis"
+    assert result["goals"][0]["matches"][0]["conditions"] == [
+        "within an internalized ritual framework"
+    ]
+    assert result["missing_bridges"] == [
+        {
+            "status": "unresolved_conditions",
+            "proposition_id": str(_id(3)),
+            "conditions": ["within an internalized ritual framework"],
+        }
+    ]
 
 
 @pytest.mark.asyncio

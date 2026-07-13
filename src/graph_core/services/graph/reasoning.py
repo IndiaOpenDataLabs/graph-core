@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+import json
 import re
 import uuid
 from collections import defaultdict
@@ -21,8 +21,10 @@ from graph_core.models.graph_rag import (
 from graph_core.models.incremental_graph import (
     GraphCommunity,
     GraphCommunityMembership,
+    GraphFrameArgument,
     GraphNodeMetric,
     GraphProjectionSnapshot,
+    GraphSemanticFrame,
     GraphVersion,
 )
 
@@ -44,7 +46,6 @@ _STOPWORDS = {
     "from",
     "how",
     "should",
-    "take",
     "the",
     "their",
     "this",
@@ -57,6 +58,14 @@ _STOPWORDS = {
 
 
 @dataclass(frozen=True, slots=True)
+class ReasoningArgument:
+    role: str
+    entity_id: uuid.UUID | None = None
+    variable_name: str | None = None
+    literal_value: Any | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ReasoningSeed:
     proposition_id: uuid.UUID
     frame_text: str
@@ -66,6 +75,8 @@ class ReasoningSeed:
     polarity: str = "positive"
     modality: str = "asserted"
     retrieval_score: float = 0.0
+    predicate: str = ""
+    arguments: tuple[ReasoningArgument, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,12 +95,43 @@ class _Edge:
     properties: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _Frame:
+    proposition_id: uuid.UUID
+    predicate: str
+    frame_text: str
+    modality: str
+    conditions: tuple[str, ...]
+    arguments: tuple[ReasoningArgument, ...]
+    retrieval_score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _Goal:
+    predicate: str
+    arguments: tuple[ReasoningArgument, ...]
+
+
 def _tokens(text: str) -> set[str]:
     return {
         token
         for token in re.findall(r"[a-z][a-z0-9_-]{2,}", text.casefold())
         if token not in _STOPWORDS
     }
+
+
+def _goal_token(value: str) -> str:
+    if value.endswith("ies") and len(value) > 4:
+        return value[:-3] + "y"
+    if value.endswith("s") and not value.endswith("ss") and len(value) > 3:
+        return value[:-1]
+    if value.endswith("ing") and len(value) > 5:
+        return value[:-3]
+    return value
+
+
+def _goal_tokens(text: str) -> set[str]:
+    return {_goal_token(token) for token in _tokens(text)}
 
 
 def _operator(question: str) -> str:
@@ -406,6 +448,431 @@ def _mechanism_edges(
     ]
 
 
+def _normalize_predicate(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")
+
+
+def _term(argument: ReasoningArgument) -> tuple[str, str] | None:
+    if argument.entity_id is not None:
+        return "entity", str(argument.entity_id)
+    if argument.variable_name:
+        return "variable", argument.variable_name.lstrip("?")
+    if argument.literal_value is not None:
+        return "literal", json.dumps(argument.literal_value, sort_keys=True, default=str)
+    return None
+
+
+def _argument_payload(argument: ReasoningArgument) -> dict[str, Any]:
+    return {
+        "role": argument.role,
+        "entity_id": str(argument.entity_id) if argument.entity_id else None,
+        "variable_name": argument.variable_name,
+        "literal_value": argument.literal_value,
+    }
+
+
+def _seed_arguments(seed: ReasoningSeed) -> tuple[ReasoningArgument, ...]:
+    if seed.arguments:
+        return seed.arguments
+    roles = ("subject", "object")
+    return tuple(
+        ReasoningArgument(
+            role=roles[index] if index < len(roles) else f"argument_{index}",
+            entity_id=entity_id,
+        )
+        for index, entity_id in enumerate(seed.argument_ids)
+    )
+
+
+async def _load_frames(
+    collection_id: uuid.UUID,
+    proposition_ids: set[uuid.UUID],
+    seeds: list[ReasoningSeed],
+) -> list[_Frame]:
+    frames_by_proposition = {
+        seed.proposition_id: _Frame(
+            proposition_id=seed.proposition_id,
+            predicate=seed.predicate,
+            frame_text=seed.frame_text,
+            modality=seed.modality,
+            conditions=seed.conditions,
+            arguments=_seed_arguments(seed),
+            retrieval_score=seed.retrieval_score,
+        )
+        for seed in seeds
+    }
+    if not proposition_ids:
+        return list(frames_by_proposition.values())
+    async with AsyncSessionLocal() as session:
+        frames = (
+            (
+                await session.execute(
+                    select(GraphSemanticFrame).where(
+                        GraphSemanticFrame.collection_id == collection_id,
+                        GraphSemanticFrame.frame_kind == "proposition",
+                        GraphSemanticFrame.proposition_entity_id.in_(proposition_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        frame_ids = [frame.id for frame in frames]
+        argument_rows = (
+            await session.execute(
+                select(
+                    GraphFrameArgument.frame_id,
+                    GraphFrameArgument.role,
+                    GraphFrameArgument.entity_id,
+                    GraphFrameArgument.variable_name,
+                    GraphFrameArgument.literal_value,
+                )
+                .where(GraphFrameArgument.frame_id.in_(frame_ids))
+                .order_by(GraphFrameArgument.frame_id, GraphFrameArgument.position)
+            )
+        ).all()
+    arguments: dict[uuid.UUID, list[ReasoningArgument]] = defaultdict(list)
+    for frame_id, role, entity_id, variable_name, literal_value in argument_rows:
+        arguments[frame_id].append(
+            ReasoningArgument(
+                role=str(role),
+                entity_id=entity_id,
+                variable_name=str(variable_name) if variable_name else None,
+                literal_value=literal_value,
+            )
+        )
+    for frame in frames:
+        if frame.proposition_entity_id is None:
+            continue
+        retrieved = frames_by_proposition.get(frame.proposition_entity_id)
+        frames_by_proposition[frame.proposition_entity_id] = _Frame(
+            proposition_id=frame.proposition_entity_id,
+            predicate=str(frame.predicate or ""),
+            frame_text=str(frame.frame_text),
+            modality=str(frame.modality or "asserted"),
+            conditions=tuple(frame.conditions_json or ()),
+            arguments=tuple(arguments[frame.id]),
+            retrieval_score=retrieved.retrieval_score if retrieved else 0.0,
+        )
+    return list(frames_by_proposition.values())
+
+
+def _unify(
+    goal: _Goal,
+    frame: _Frame,
+    bindings: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    if _normalize_predicate(goal.predicate) != _normalize_predicate(frame.predicate):
+        return None
+    result = dict(bindings or {})
+    candidate_by_role = {argument.role: argument for argument in frame.arguments}
+    for expected in goal.arguments:
+        candidate = candidate_by_role.get(expected.role)
+        if candidate is None:
+            return None
+        expected_term = _term(expected)
+        candidate_term = _term(candidate)
+        if expected_term is None or candidate_term is None:
+            return None
+        if expected_term[0] == "variable":
+            current = result.get(expected_term[1])
+            if current is not None and current != candidate_term[1]:
+                return None
+            result[expected_term[1]] = candidate_term[1]
+        elif candidate_term[0] == "variable":
+            current = result.get(candidate_term[1])
+            if current is not None and current != expected_term[1]:
+                return None
+            result[candidate_term[1]] = expected_term[1]
+        elif expected_term != candidate_term:
+            return None
+    return result
+
+
+def _compile_goals(
+    question: str,
+    nodes: dict[uuid.UUID, _Node],
+    frames: list[_Frame],
+    *,
+    limit: int = 8,
+) -> list[_Goal]:
+    query_tokens = _goal_tokens(question)
+    query_entity_ids = {
+        node_id
+        for node_id, node in nodes.items()
+        if node.node_type not in {"CONDITION", "EXCEPTION", "RULE", "SCOPE"}
+        and query_tokens & _goal_tokens(f"{node.name} {node.description}")
+    }
+    ranked: list[tuple[int, float, _Frame, _Goal]] = []
+    for frame in frames:
+        if not frame.predicate:
+            continue
+        overlap = len(
+            query_tokens & _goal_tokens(f"{frame.predicate} {frame.frame_text}")
+        )
+        arguments = tuple(
+            argument
+            if argument.entity_id in query_entity_ids or argument.variable_name
+            else ReasoningArgument(
+                role=argument.role,
+                variable_name=f"goal_{argument.role}",
+            )
+            for argument in frame.arguments
+        )
+        constants = sum(argument.entity_id is not None for argument in arguments)
+        if overlap == 0 or (constants == 0 and overlap < 2):
+            continue
+        ranked.append(
+            (overlap, frame.retrieval_score, frame, _Goal(frame.predicate, arguments))
+        )
+    ranked.sort(key=lambda item: (-item[0], -item[1], str(item[2].proposition_id)))
+    goals: list[_Goal] = []
+    seen: set[tuple[str, tuple[tuple[str, str] | None, ...]]] = set()
+    for _, _, _, goal in ranked:
+        key = (
+            _normalize_predicate(goal.predicate),
+            tuple(_term(argument) for argument in goal.arguments),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        goals.append(goal)
+        if len(goals) >= limit:
+            break
+    return goals
+
+
+def _backward_reason(
+    question: str,
+    nodes: dict[uuid.UUID, _Node],
+    edges: list[_Edge],
+    frames: list[_Frame],
+    active_nodes: set[uuid.UUID],
+    *,
+    max_depth: int = 4,
+    max_states: int = 128,
+    max_matches: int = 8,
+) -> dict[str, Any]:
+    incoming: dict[uuid.UUID, list[_Edge]] = defaultdict(list)
+    for edge in edges:
+        incoming[edge.target_id].append(edge)
+    frame_by_proposition = {frame.proposition_id: frame for frame in frames}
+    goals = _compile_goals(question, nodes, frames, limit=max_matches)
+    explored = 0
+
+    def prove(
+        proposition_id: uuid.UUID,
+        bindings: dict[str, str],
+        depth: int,
+        path: set[uuid.UUID],
+    ) -> dict[str, Any]:
+        nonlocal explored
+        explored += 1
+        if explored > max_states:
+            return {"status": "state_limit", "proposition_id": str(proposition_id)}
+        if depth > max_depth:
+            return {"status": "depth_limit", "proposition_id": str(proposition_id)}
+        if proposition_id in path:
+            return {"status": "cycle", "proposition_id": str(proposition_id)}
+        frame = frame_by_proposition.get(proposition_id)
+        concluding_rules = [
+            edge.source_id
+            for edge in incoming[proposition_id]
+            if edge.rel_type == "CONCLUDES"
+        ]
+        if not concluding_rules:
+            unbound = sorted(
+                argument.variable_name.lstrip("?")
+                for argument in (frame.arguments if frame else ())
+                if argument.variable_name
+                and argument.variable_name.lstrip("?") not in bindings
+            )
+            asserted = bool(
+                frame
+                and frame.modality == "asserted"
+                and not frame.conditions
+                and not unbound
+            )
+            return {
+                "status": "asserted" if asserted else "supported_hypothesis",
+                "proposition_id": str(proposition_id),
+                "bindings": bindings,
+                "unbound_variables": unbound,
+                "conditions": list(frame.conditions if frame else ()),
+            }
+        alternatives: list[dict[str, Any]] = []
+        for rule_id in concluding_rules[:max_matches]:
+            blockers = [
+                edge.source_id
+                for edge in incoming[rule_id]
+                if edge.rel_type == "BLOCKS"
+            ]
+            active_blockers = [value for value in blockers if value in active_nodes]
+            antecedents = [
+                edge.source_id
+                for edge in incoming[rule_id]
+                if edge.rel_type == "ANTECEDENT_OF"
+            ]
+            obligations: list[dict[str, Any]] = []
+            for antecedent_id in antecedents:
+                node = nodes.get(antecedent_id)
+                if antecedent_id in active_nodes:
+                    obligations.append(
+                        {
+                            "status": "satisfied",
+                            "node_id": str(antecedent_id),
+                            "statement": (node.description or node.name) if node else "",
+                        }
+                    )
+                elif node and node.node_type in {"ASSERTION", "PROPOSITION"}:
+                    obligations.append(
+                        prove(
+                            antecedent_id,
+                            bindings,
+                            depth + 1,
+                            path | {proposition_id},
+                        )
+                    )
+                else:
+                    obligations.append(
+                        {
+                            "status": "unresolved_subgoal",
+                            "node_id": str(antecedent_id),
+                            "statement": (node.description or node.name) if node else "",
+                        }
+                    )
+            if active_blockers:
+                status = "blocked"
+            elif obligations and all(
+                item["status"] in {"asserted", "proved", "satisfied"}
+                for item in obligations
+            ):
+                status = "proved"
+            elif not antecedents:
+                status = "incomplete_rule"
+            else:
+                status = "supported_hypothesis"
+            alternatives.append(
+                {
+                    "rule_id": str(rule_id),
+                    "status": status,
+                    "active_blockers": [str(value) for value in active_blockers],
+                    "obligations": obligations,
+                }
+            )
+        if any(item["status"] == "proved" for item in alternatives):
+            status = "proved"
+        elif alternatives and all(item["status"] == "blocked" for item in alternatives):
+            status = "blocked"
+        else:
+            status = "supported_hypothesis"
+        return {
+            "status": status,
+            "proposition_id": str(proposition_id),
+            "bindings": bindings,
+            "alternatives": alternatives,
+        }
+
+    goal_results: list[dict[str, Any]] = []
+    covered_tokens: set[str] = set()
+    for goal in goals:
+        matches: list[dict[str, Any]] = []
+        for frame in frames:
+            bindings = _unify(goal, frame)
+            if bindings is None:
+                continue
+            matches.append(prove(frame.proposition_id, bindings, 0, set()))
+            covered_tokens.update(_goal_tokens(f"{frame.predicate} {frame.frame_text}"))
+            if len(matches) >= max_matches:
+                break
+        if any(match["status"] in {"asserted", "proved"} for match in matches):
+            status = "proved"
+        elif any(match["status"] == "supported_hypothesis" for match in matches):
+            status = "supported_hypothesis"
+        else:
+            status = "unresolved"
+        goal_results.append(
+            {
+                "goal": {
+                    "predicate": goal.predicate,
+                    "arguments": [
+                        _argument_payload(argument) for argument in goal.arguments
+                    ],
+                },
+                "status": status,
+                "matches": matches,
+            }
+        )
+    unmatched_terms = sorted(_goal_tokens(question) - covered_tokens)
+
+    def unresolved_obligations(value: Any) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            if value.get("status") == "unresolved" and "goal" in value:
+                found.append(
+                    {
+                        "status": "unresolved_goal",
+                        "goal": value["goal"],
+                    }
+                )
+            if (
+                value.get("status") == "supported_hypothesis"
+                and value.get("conditions")
+            ):
+                found.append(
+                    {
+                        "status": "unresolved_conditions",
+                        "proposition_id": value.get("proposition_id"),
+                        "conditions": value["conditions"],
+                    }
+                )
+            if value.get("status") in {
+                "blocked",
+                "cycle",
+                "depth_limit",
+                "incomplete_rule",
+                "state_limit",
+                "unresolved_subgoal",
+            }:
+                found.append(value)
+            for child in value.values():
+                found.extend(unresolved_obligations(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(unresolved_obligations(child))
+        return found
+
+    missing_bridges = unresolved_obligations(goal_results)
+    if unmatched_terms:
+        missing_bridges.insert(
+            0,
+            {
+                "status": "unmatched_query_terms",
+                "terms": unmatched_terms,
+            },
+        )
+    if goal_results and all(goal["status"] == "proved" for goal in goal_results):
+        status = "proved"
+    elif any(
+        goal["status"] in {"proved", "supported_hypothesis"}
+        for goal in goal_results
+    ):
+        status = "supported_hypothesis"
+    else:
+        status = "unresolved"
+    if unmatched_terms:
+        status = "insufficient_goal_coverage"
+    return {
+        "status": status,
+        "goals": goal_results,
+        "unmatched_query_terms": unmatched_terms,
+        "missing_bridges": missing_bridges[:24],
+        "explored_states": explored,
+        "depth_limit": max_depth,
+        "state_limit": max_states,
+    }
+
+
 async def activate_reasoning(
     collection_id: uuid.UUID,
     question: str,
@@ -420,6 +887,29 @@ async def activate_reasoning(
             "propositions": [],
             "rules": [],
             "conflicts": [],
+            "goal_reasoning": {
+                "status": "unresolved",
+                "goals": [],
+                "unmatched_query_terms": sorted(_goal_tokens(question)),
+                "missing_bridges": [
+                    {
+                        "status": "unmatched_query_terms",
+                        "terms": sorted(_goal_tokens(question)),
+                    }
+                ],
+            },
+            "answer_contract": {
+                "status": "unresolved",
+                "proved_claims": [],
+                "supported_hypotheses": [],
+                "missing_bridges": [
+                    {
+                        "status": "unmatched_query_terms",
+                        "terms": sorted(_goal_tokens(question)),
+                    }
+                ],
+                "policy": "No graph evidence is available for an answer.",
+            },
             "fixed_point": True,
         }
     query_tokens = _tokens(question)
@@ -432,6 +922,87 @@ async def activate_reasoning(
     }
     seed_ids.update(navigation_ids or set())
     nodes, edges = await _bounded_graph(collection_id, seed_ids)
+
+    async def prepare_goal_reasoning(
+        current_nodes: dict[uuid.UUID, _Node],
+        current_edges: list[_Edge],
+        *,
+        max_depth: int,
+        max_states: int,
+    ) -> tuple[list[_Frame], set[uuid.UUID], dict[str, Any]]:
+        proposition_ids = {
+            node_id
+            for node_id, node in current_nodes.items()
+            if node.node_type in {"ASSERTION", "PROPOSITION"}
+        }
+        current_frames = await _load_frames(collection_id, proposition_ids, seeds)
+        active_nodes = {
+            entity_id
+            for seed in seeds
+            for entity_id in seed.argument_ids
+        }
+        active_nodes.update(navigation_ids or set())
+        rule_conclusions = {
+            edge.target_id
+            for edge in current_edges
+            if edge.rel_type == "CONCLUDES"
+        }
+        active_nodes.update(
+            seed.proposition_id
+            for seed in seeds
+            if seed.modality == "asserted"
+            and not seed.conditions
+            and seed.proposition_id not in rule_conclusions
+        )
+        for node_id, node in current_nodes.items():
+            if node.node_type in {"CONDITION", "EXCEPTION"} and (
+                query_tokens & _tokens(f"{node.name} {node.description}")
+            ):
+                active_nodes.add(node_id)
+        return (
+            current_frames,
+            active_nodes,
+            _backward_reason(
+                question,
+                current_nodes,
+                current_edges,
+                current_frames,
+                active_nodes,
+                max_depth=max_depth,
+                max_states=max_states,
+            ),
+        )
+
+    frames, active, backward = await prepare_goal_reasoning(
+        nodes,
+        edges,
+        max_depth=4,
+        max_states=128,
+    )
+    search_hops = 3
+    if backward["goals"] and backward["status"] != "proved":
+        expanded_nodes, expanded_edges = await _bounded_graph(
+            collection_id,
+            seed_ids,
+            max_hops=5,
+            max_nodes=700,
+            max_edges=1200,
+        )
+        expanded_frames, expanded_active, expanded_backward = (
+            await prepare_goal_reasoning(
+                expanded_nodes,
+                expanded_edges,
+                max_depth=6,
+                max_states=192,
+            )
+        )
+        nodes, edges = expanded_nodes, expanded_edges
+        frames, active, backward = (
+            expanded_frames,
+            expanded_active,
+            expanded_backward,
+        )
+        search_hops = 5
     predicate_derivations = _predicate_derivations(edges, nodes)
     mechanism_edges = _mechanism_edges(edges, nodes)
     incoming: dict[uuid.UUID, list[_Edge]] = defaultdict(list)
@@ -442,12 +1013,6 @@ async def activate_reasoning(
     rules = {
         node_id for node_id, node in nodes.items() if node.node_type == "RULE"
     }
-    active = set(seed_ids)
-    for node_id, node in nodes.items():
-        if node.node_type in {"CONDITION", "EXCEPTION"} and (
-            query_tokens & _tokens(f"{node.name} {node.description}")
-        ):
-            active.add(node_id)
     derived: set[uuid.UUID] = set()
     for _ in range(len(rules) + 1):
         changed = False
@@ -522,6 +1087,7 @@ async def activate_reasoning(
             }
         )
     proposition_traces = []
+    frames_by_proposition = {frame.proposition_id: frame for frame in frames}
     seeded_propositions: set[uuid.UUID] = set()
     for seed in seeds:
         seeded_propositions.add(seed.proposition_id)
@@ -534,6 +1100,8 @@ async def activate_reasoning(
             status = "conditional"
         elif "incomplete" in statuses:
             status = "incomplete"
+        elif seed.modality != "asserted" or seed.conditions:
+            status = "conditional"
         else:
             status = "asserted"
         proposition_traces.append(
@@ -564,6 +1132,14 @@ async def activate_reasoning(
             status = "conditional"
         elif "incomplete" in statuses:
             status = "incomplete"
+        elif (
+            node_id in frames_by_proposition
+            and (
+                frames_by_proposition[node_id].modality != "asserted"
+                or frames_by_proposition[node_id].conditions
+            )
+        ):
+            status = "conditional"
         else:
             status = "asserted"
         proposition_traces.append(
@@ -605,11 +1181,6 @@ async def activate_reasoning(
         *(_tokens(item["statement"]) for item in proposition_traces)
     )
     covered = sorted(query_tokens & (frame_tokens | proposition_tokens))
-    required_coverage = (
-        len(query_tokens)
-        if len(query_tokens) <= 3
-        else max(2, math.ceil(len(query_tokens) * 0.6))
-    )
     operator = _operator(question)
     usable = [
         item
@@ -674,11 +1245,63 @@ async def activate_reasoning(
                 if item["polarity"] == "negative"
             ],
         }
+    proved_ids = {
+        match["proposition_id"]
+        for goal in backward["goals"]
+        for match in goal["matches"]
+        if match["status"] in {"asserted", "proved"}
+    }
+    hypothesis_ids = {
+        match["proposition_id"]
+        for goal in backward["goals"]
+        for match in goal["matches"]
+        if match["status"] == "supported_hypothesis"
+    } - proved_ids
+    traces_by_id = {
+        item["proposition_id"]: item for item in proposition_traces
+    }
+
+    def contract_claim(proposition_id: str) -> dict[str, Any]:
+        trace = traces_by_id.get(proposition_id)
+        if trace is not None:
+            return {
+                "proposition_id": proposition_id,
+                "statement": trace["statement"],
+                "status": trace["status"],
+                "conditions": trace["conditions"],
+                "exceptions": trace["exceptions"],
+            }
+        node = nodes.get(uuid.UUID(proposition_id))
+        return {
+            "proposition_id": proposition_id,
+            "statement": (node.description or node.name) if node else "",
+            "status": "unknown",
+            "conditions": [],
+            "exceptions": [],
+        }
+
+    answer_contract = {
+        "status": backward["status"],
+        "proved_claims": [
+            contract_claim(value) for value in sorted(proved_ids)
+        ],
+        "supported_hypotheses": [
+            contract_claim(value) for value in sorted(hypothesis_ids)
+        ],
+        "missing_bridges": backward["missing_bridges"],
+        "policy": (
+            "Only proved_claims may be stated as established. "
+            "supported_hypotheses require explicit qualification. "
+            "Missing bridges must not be silently inferred."
+        ),
+    }
     return {
         "operator": operator,
         "sufficiency": (
-            "sufficient_candidates"
-            if len(covered) >= required_coverage and proposition_traces
+            "proved_graph_answer"
+            if backward["status"] == "proved"
+            else "hypothesis_only"
+            if backward["status"] == "supported_hypothesis"
             else "insufficient_graph_evidence"
         ),
         "covered_query_tokens": covered,
@@ -686,7 +1309,13 @@ async def activate_reasoning(
         "rules": rule_traces,
         "conflicts": conflicts,
         "predicate_derivations": predicate_derivations,
+        "goal_reasoning": backward,
+        "answer_contract": answer_contract,
         "operator_result": operator_result,
         "fixed_point": True,
-        "working_graph": {"nodes": len(nodes), "edges": len(edges)},
+        "working_graph": {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "search_hops": search_hops,
+        },
     }

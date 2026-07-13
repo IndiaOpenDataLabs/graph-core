@@ -45,7 +45,11 @@ from graph_core.models.rel_types import (
 )
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
-from graph_core.services.graph.reasoning import ReasoningSeed, activate_reasoning
+from graph_core.services.graph.reasoning import (
+    ReasoningArgument,
+    ReasoningSeed,
+    activate_reasoning,
+)
 from graph_core.storage.graph_names import collection_graph_name
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.meta_collections import (
@@ -3364,6 +3368,11 @@ async def _augment_with_semantic_frames(
             polarity=frame.polarity,
             modality=frame.modality,
             retrieval_score=frame.score,
+            predicate=frame.predicate,
+            arguments=tuple(
+                ReasoningArgument(role=role, entity_id=entity_id)
+                for role, entity_id, _ in frame.arguments
+            ),
         )
         for frame in frames
         if frame.frame_kind == "proposition" and frame.proposition_id is not None
@@ -3382,7 +3391,13 @@ async def _augment_with_semantic_frames(
     import json
 
     reasoning_section = (
-        "Deterministic Graph Activation:\n"
+        "Goal-Directed Answer Contract:\n"
+        + json.dumps(
+            reasoning_trace["answer_contract"],
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        + "\n\nSupporting Graph Activation (navigation context, not proof):\n"
         + json.dumps(reasoning_trace, ensure_ascii=True, sort_keys=True)
     )
     section = f"{section}\n\n{reasoning_section}"
@@ -4292,10 +4307,14 @@ async def _answer_from_context(
                 "question, acknowledge it briefly without making it the focus."
                 "\n\nTreat the context as a graph-backed record of stored entities, descriptions, aliases, "
                     "and relationships. Use that evidence to ground your answer."
-                    "\n\nIf a Deterministic Graph Activation section is present, "
-                    "its asserted, derived, conditional, blocked, incomplete, "
-                    "conflict, and sufficiency statuses are authoritative. Do not "
-                    "promote a conditional or blocked proposition to an asserted fact."
+                    "\n\nIf a Goal-Directed Answer Contract is present, it is "
+                    "authoritative. State only proved_claims as established facts. "
+                    "Present supported_hypotheses explicitly as possible explanations, "
+                    "not conclusions. Name material missing_bridges when they prevent a "
+                    "direct answer. Never use nearby context or Supporting Graph "
+                    "Activation to silently fill a missing bridge. Supporting activation "
+                    "may explain a proved claim or motivate a labeled hypothesis, but it "
+                    "is not proof by itself."
                 "\n\nIf a Context-Scoped Evidence section is present, each "
                 "context is a source-local evidence scope and each assertion "
                 "is true only inside that source context. Compare or group "
