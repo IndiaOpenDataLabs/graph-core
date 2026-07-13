@@ -114,7 +114,9 @@ def coalesce_predicate_mappings(
                 str((item.inferred_properties or {}).get(name) or _PROPERTY_UNKNOWN)
                 for item in items
             }
-            properties[name] = observed.pop() if len(observed) == 1 else _PROPERTY_UNKNOWN
+            properties[name] = (
+                observed.pop() if len(observed) == 1 else _PROPERTY_UNKNOWN
+            )
         confidence = min(float(item.confidence) for item in items)
         properties["confidence"] = confidence
         first = items[0]
@@ -132,6 +134,27 @@ def coalesce_predicate_mappings(
 
 def ingestion_contract(domain: str | None, extraction_version: str) -> str:
     return f"{extraction_version}:domain:{domain or 'general'}:compiled:v1"
+
+
+def _entity_mapping_values(
+    collection_id: uuid.UUID,
+    segment_id: uuid.UUID,
+    mappings: list[EntityMappingInput],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": uuid.uuid5(segment_id, f"entity-mapping:{item.local_key}"),
+            "collection_id": collection_id,
+            "segment_id": segment_id,
+            "local_key": item.local_key,
+            "raw_name": item.raw_name,
+            "raw_type": item.raw_type,
+            "canonical_entity_id": item.canonical_entity_id,
+            "resolution_method": item.resolution_method,
+            "confidence": item.confidence,
+        }
+        for item in mappings
+    ]
 
 
 async def completed_segment(
@@ -212,28 +235,9 @@ async def publish_chunk_delta(
             await session.execute(
                 pg_insert(GraphEntityMapping)
                 .values(
-                    [
-                        {
-                            "id": uuid.uuid5(
-                                segment_id,
-                                f"entity-mapping:{item.local_key}",
-                            ),
-                            "collection_id": collection.id,
-                            "segment_id": segment_id,
-                            "local_key": item.local_key,
-                            "raw_name": item.raw_name,
-                            "raw_type": item.raw_type,
-                            "canonical_entity_id": item.canonical_entity_id,
-                            "resolution_method": item.resolution_method,
-                            "confidence": item.confidence,
-                            "inferred_properties": item.inferred_properties,
-                        }
-                        for item in entity_mappings
-                    ]
+                    _entity_mapping_values(collection.id, segment_id, entity_mappings)
                 )
-                .on_conflict_do_nothing(
-                    constraint="uq_graph_entity_mapping_local"
-                )
+                .on_conflict_do_nothing(constraint="uq_graph_entity_mapping_local")
             )
         if predicate_mappings:
             predicate_mappings = coalesce_predicate_mappings(predicate_mappings)
@@ -252,13 +256,12 @@ async def publish_chunk_delta(
                             "canonical_predicate_id": item.canonical_predicate_id,
                             "resolution_method": item.resolution_method,
                             "confidence": item.confidence,
+                            "inferred_properties": item.inferred_properties,
                         }
                         for item in predicate_mappings
                     ]
                 )
-                .on_conflict_do_nothing(
-                    constraint="uq_graph_predicate_mapping_local"
-                )
+                .on_conflict_do_nothing(constraint="uq_graph_predicate_mapping_local")
             )
             for item in predicate_mappings if not segment_was_completed else []:
                 predicate_type = await session.get(
@@ -297,9 +300,7 @@ async def publish_chunk_delta(
             await session.execute(
                 pg_insert(GraphChunkContribution)
                 .values(contribution_values)
-                .on_conflict_do_nothing(
-                    constraint="uq_graph_chunk_contribution_object"
-                )
+                .on_conflict_do_nothing(constraint="uq_graph_chunk_contribution_object")
             )
             await session.execute(
                 pg_insert(GraphDerivedDependency)
@@ -321,9 +322,7 @@ async def publish_chunk_delta(
                         for item in contributions
                     ]
                 )
-                .on_conflict_do_nothing(
-                    constraint="uq_graph_derived_dependency"
-                )
+                .on_conflict_do_nothing(constraint="uq_graph_derived_dependency")
             )
         latest = (
             await session.execute(

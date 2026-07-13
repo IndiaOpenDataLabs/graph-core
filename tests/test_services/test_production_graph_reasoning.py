@@ -10,7 +10,9 @@ from graph_core.services.graph.analytics import (
     _compute_projection_analytics,
 )
 from graph_core.services.graph.incremental_ingestion import (
+    EntityMappingInput,
     PredicateMappingInput,
+    _entity_mapping_values,
     coalesce_predicate_mappings,
     merge_predicate_property_observation,
 )
@@ -224,7 +226,9 @@ def test_rule_projection_excludes_semantic_edges() -> None:
         NodeRecord(_id(4), "entity", "CONCEPT"),
     ]
     relationships = [
-        RelationshipRecord(_id(10), _id(1), "condition", _id(2), "rule", "ANTECEDENT_OF", 1),
+        RelationshipRecord(
+            _id(10), _id(1), "condition", _id(2), "rule", "ANTECEDENT_OF", 1
+        ),
         RelationshipRecord(_id(11), _id(2), "rule", _id(3), "claim", "CONCLUDES", 1),
         RelationshipRecord(_id(12), _id(3), "claim", _id(4), "entity", "RELATES_TO", 1),
     ]
@@ -287,6 +291,32 @@ def test_predicate_property_consensus_is_conservative() -> None:
     assert coalesced[0].inferred_properties["causal"] == "unknown"
 
 
+def test_entity_mapping_rows_only_include_entity_mapping_columns() -> None:
+    collection_id = _id(80)
+    segment_id = _id(81)
+    entity_id = _id(82)
+
+    rows = _entity_mapping_values(
+        collection_id,
+        segment_id,
+        [EntityMappingInput("subject", "Agni", "DEITY", entity_id)],
+    )
+
+    assert rows == [
+        {
+            "id": uuid.uuid5(segment_id, "entity-mapping:subject"),
+            "collection_id": collection_id,
+            "segment_id": segment_id,
+            "local_key": "subject",
+            "raw_name": "Agni",
+            "raw_type": "DEITY",
+            "canonical_entity_id": entity_id,
+            "resolution_method": "context_resolver",
+            "confidence": 1.0,
+        }
+    ]
+
+
 def test_predicate_properties_are_specific_to_each_emitted_type() -> None:
     base = {
         "source": {"name": "A", "description": "A"},
@@ -312,9 +342,7 @@ def test_predicate_properties_are_specific_to_each_emitted_type() -> None:
         ],
     }
 
-    relationships = LLMGraphExtractor._extract_generic_relationships(
-        [base], [], None
-    )
+    relationships = LLMGraphExtractor._extract_generic_relationships([base], [], None)
 
     assert [item.predicate_properties["causal"] for item in relationships] == [
         "causal",
@@ -323,15 +351,35 @@ def test_predicate_properties_are_specific_to_each_emitted_type() -> None:
 
 
 def test_causal_projection_and_predicate_derivations_use_properties() -> None:
-    nodes = [NodeRecord(_id(value), f"node-{value}", "CONCEPT") for value in range(1, 4)]
+    nodes = [
+        NodeRecord(_id(value), f"node-{value}", "CONCEPT") for value in range(1, 4)
+    ]
     properties = {
         "causal": "causal",
         "symmetry": "asymmetric",
         "transitivity": "transitive",
     }
     relationships = [
-        RelationshipRecord(_id(10), _id(1), "a", _id(2), "b", "CAUSES", 1, predicate_properties=properties),
-        RelationshipRecord(_id(11), _id(2), "b", _id(3), "c", "CAUSES", 1, predicate_properties=properties),
+        RelationshipRecord(
+            _id(10),
+            _id(1),
+            "a",
+            _id(2),
+            "b",
+            "CAUSES",
+            1,
+            predicate_properties=properties,
+        ),
+        RelationshipRecord(
+            _id(11),
+            _id(2),
+            "b",
+            _id(3),
+            "c",
+            "CAUSES",
+            1,
+            predicate_properties=properties,
+        ),
         RelationshipRecord(_id(12), _id(1), "a", _id(3), "c", "MENTIONS", 1),
     ]
     spec = {
