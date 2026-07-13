@@ -1,6 +1,7 @@
 import uuid
 
 from graph_core.scripts.vedas_reasoning_burner import (
+    FrameSeed,
     Limits,
     QueryPlan,
     WorkingEdge,
@@ -20,6 +21,8 @@ def _id(value: int) -> uuid.UUID:
 def test_compile_query_selects_intent_operator() -> None:
     assert compile_query("When should I do A vs B?").operator == "choose"
     assert compile_query("Explain why this happens").operator == "explain"
+    assert compile_query("How does Agni carry offerings?").operator == "explain"
+    assert compile_query("How to understand the Vedas?").operator == "explain"
     assert compile_query("Suggest a redesign").operator == "redesign"
 
 
@@ -28,6 +31,23 @@ def test_seed_coverage_rejects_semantically_near_but_absent_entities() -> None:
     unrelated = [WorkingNode(_id(1), "Mandala 10", "SECTION", seed_score=0.5)]
 
     assert seed_token_coverage(plan, unrelated) == ()
+
+
+def test_frame_coverage_preserves_relational_query_language() -> None:
+    plan = compile_query("How does Agni carry offerings?")
+    frame = FrameSeed(
+        id=_id(10),
+        kind="proposition",
+        title="Agni carries offerings to the devas",
+        text="Agni serves as messenger and carries ritual offerings to the devas.",
+        predicate="CARRIES_TO",
+        score=0.8,
+        proposition_id=_id(11),
+        argument_ids=(_id(12), _id(13)),
+        executable_status="grounded_binary",
+    )
+
+    assert seed_token_coverage(plan, [], [frame]) == ("agni", "offerings")
 
 
 def test_choose_operator_preserves_conditions_and_exceptions() -> None:

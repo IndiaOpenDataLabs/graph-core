@@ -42,7 +42,9 @@ from graph_core.models.incremental_graph import (
     GraphChunkSegment,
     GraphDerivedDependency,
     GraphEntityMapping,
+    GraphFrameArgument,
     GraphPredicateMapping,
+    GraphSemanticFrame,
     GraphVersion,
 )
 from graph_core.models.ingestion import IngestionRecord
@@ -63,7 +65,11 @@ from graph_core.services.graph_rag.extractor import (
     LLMGraphExtractor,
 )
 from graph_core.services.sanitizer import TextSanitizer
-from graph_core.storage.vector_tables import get_collection_dimensions, table_name
+from graph_core.storage.vector_tables import (
+    ensure_semantic_frame_table,
+    get_collection_dimensions,
+    table_name,
+)
 
 DEFAULT_COLLECTION_ID = uuid.UUID("855f1950-ff65-4f47-9549-9a20f9a1332d")
 DEFAULT_EMBEDDING_PROFILE_ID = uuid.UUID("7f4dbd8a-3ce7-4736-bcee-6a5e096a3b64")
@@ -105,6 +111,32 @@ class RelationshipRow:
     description_id: uuid.UUID
     keywords: tuple[str, ...]
     weight: int
+
+
+@dataclass(frozen=True)
+class FrameArgumentRow:
+    id: uuid.UUID
+    position: int
+    role: str
+    entity_id: uuid.UUID
+    argument_type: str
+
+
+@dataclass(frozen=True)
+class SemanticFrameRow:
+    id: uuid.UUID
+    proposition_id: uuid.UUID
+    relationship_id: uuid.UUID
+    predicate: str
+    title: str
+    frame_text: str
+    content_hash: str
+    polarity: str
+    modality: str
+    conditions: tuple[str, ...]
+    exceptions: tuple[str, ...]
+    scopes: tuple[str, ...]
+    arguments: tuple[FrameArgumentRow, ...]
 
 
 @dataclass(frozen=True)
@@ -153,6 +185,29 @@ def canonical_name(value: str) -> str:
 
 def canonical_type(value: str) -> str:
     return normalize_rel_type(value or "CONCEPT")[:64]
+
+
+def make_proposition_fingerprint(
+    source_id: uuid.UUID,
+    target_id: uuid.UUID,
+    rel_type: str,
+    relationship: ExtractedRelationship,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "source": str(source_id),
+                "predicate": rel_type,
+                "target": str(target_id),
+                "conditions": sorted(relationship.conditions),
+                "exceptions": sorted(relationship.exceptions),
+                "scopes": sorted(relationship.scopes),
+                "polarity": relationship.polarity,
+                "modality": relationship.modality,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
 
 
 async def load_runtime(
@@ -518,21 +573,9 @@ def compile_rows(
         weight = max(1, int(float(extracted.weight or 1.0) * 10))
         add_relationship(source, target, rel_type, description, keywords, weight)
 
-        proposition_fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "source": str(source.id),
-                    "predicate": rel_type,
-                    "target": str(target.id),
-                    "conditions": sorted(extracted.conditions),
-                    "exceptions": sorted(extracted.exceptions),
-                    "scopes": sorted(extracted.scopes),
-                    "polarity": extracted.polarity,
-                    "modality": extracted.modality,
-                },
-                sort_keys=True,
-            ).encode()
-        ).hexdigest()
+        proposition_fingerprint = make_proposition_fingerprint(
+            source.id, target.id, rel_type, extracted
+        )
         proposition = add_reasoning_entity(
             f"proposition:{proposition_fingerprint}",
             f"proposition:{proposition_fingerprint[:16]}",
@@ -613,12 +656,97 @@ def compile_rows(
     return entities, list(relationships_by_key.values())
 
 
+def compile_semantic_frames(
+    collection: Collection,
+    extraction: ExtractionResult,
+) -> list[SemanticFrameRow]:
+    """Preserve retrieval-rich meanings while linking them to executable atoms."""
+    frames: list[SemanticFrameRow] = []
+    for relationship in extraction.relationships:
+        source_name = canonical_name(relationship.source_name)
+        target_name = canonical_name(relationship.target_name)
+        if (
+            not source_name
+            or not target_name
+            or source_name.casefold() == target_name.casefold()
+        ):
+            continue
+        source_id = deterministic_uuid(
+            collection.id, f"entity:{source_name.casefold()}"
+        )
+        target_id = deterministic_uuid(
+            collection.id, f"entity:{target_name.casefold()}"
+        )
+        predicate = normalize_rel_type(relationship.rel_type or "RELATES_TO")
+        fingerprint = make_proposition_fingerprint(
+            source_id, target_id, predicate, relationship
+        )
+        proposition_id = deterministic_uuid(collection.id, f"proposition:{fingerprint}")
+        relationship_id = deterministic_uuid(
+            collection.id,
+            f"relationship:{source_id}:{predicate}:{target_id}",
+        )
+        frame_id = deterministic_uuid(
+            collection.id, f"semantic-frame:proposition:{proposition_id}"
+        )
+        title = f"{source_name} {predicate.replace('_', ' ').lower()} {target_name}"
+        parts = [title + ".", relationship.description.strip()]
+        if relationship.conditions:
+            parts.append("Conditions: " + "; ".join(relationship.conditions) + ".")
+        if relationship.exceptions:
+            parts.append("Exceptions: " + "; ".join(relationship.exceptions) + ".")
+        if relationship.scopes:
+            parts.append("Scope: " + "; ".join(relationship.scopes) + ".")
+        parts.append(
+            f"Polarity: {relationship.polarity}. Modality: {relationship.modality}."
+        )
+        frame_text = " ".join(part for part in parts if part).strip()
+        frames.append(
+            SemanticFrameRow(
+                id=frame_id,
+                proposition_id=proposition_id,
+                relationship_id=relationship_id,
+                predicate=predicate,
+                title=title,
+                frame_text=frame_text,
+                content_hash=hashlib.sha256(frame_text.encode()).hexdigest(),
+                polarity=relationship.polarity,
+                modality=relationship.modality,
+                conditions=relationship.conditions,
+                exceptions=relationship.exceptions,
+                scopes=relationship.scopes,
+                arguments=(
+                    FrameArgumentRow(
+                        id=deterministic_uuid(
+                            collection.id, f"frame-argument:{frame_id}:0:subject"
+                        ),
+                        position=0,
+                        role="subject",
+                        entity_id=source_id,
+                        argument_type="entity",
+                    ),
+                    FrameArgumentRow(
+                        id=deterministic_uuid(
+                            collection.id, f"frame-argument:{frame_id}:1:object"
+                        ),
+                        position=1,
+                        role="object",
+                        entity_id=target_id,
+                        argument_type="entity",
+                    ),
+                ),
+            )
+        )
+    return frames
+
+
 async def embed_chunk_objects(
     provider: EmbeddingProvider,
     chunk_text: str,
     entities: list[EntityRow],
     relationships: list[RelationshipRow],
-) -> tuple[list[float], list[list[float]], list[list[float]]]:
+    frames: list[SemanticFrameRow],
+) -> tuple[list[float], list[list[float]], list[list[float]], list[list[float]]]:
     texts = [chunk_text]
     texts.extend(f"{row.name}: {row.description}" for row in entities)
     texts.extend(
@@ -631,9 +759,16 @@ async def embed_chunk_objects(
         )
         for row in relationships
     )
+    texts.extend(row.frame_text for row in frames)
     embeddings = await provider.embed_documents(texts)
     entity_end = 1 + len(entities)
-    return embeddings[0], embeddings[1:entity_end], embeddings[entity_end:]
+    relationship_end = entity_end + len(relationships)
+    return (
+        embeddings[0],
+        embeddings[1:entity_end],
+        embeddings[entity_end:relationship_end],
+        embeddings[relationship_end:],
+    )
 
 
 async def persist_chunk(
@@ -643,9 +778,11 @@ async def persist_chunk(
     extraction: ExtractionResult,
     entities: list[EntityRow],
     relationships: list[RelationshipRow],
+    frames: list[SemanticFrameRow],
     chunk_embedding: list[float],
     entity_embeddings: list[list[float]],
     relationship_embeddings: list[list[float]],
+    frame_embeddings: list[list[float]],
 ) -> None:
     dimensions = await get_collection_dimensions(collection.id)
     if dimensions is None:
@@ -655,6 +792,7 @@ async def persist_chunk(
     entity_table = table_name(collection.id, "entity_embeddings")
     centroid_table = table_name(collection.id, "entity_centroids")
     relationship_table = table_name(collection.id, "relationship_embeddings")
+    frame_table = table_name(collection.id, "semantic_frame_embeddings")
 
     async with AsyncSessionLocal() as session:
         segment_id = deterministic_uuid(
@@ -873,6 +1011,22 @@ async def persist_chunk(
             }
             for row in relationships
         )
+        contribution_rows.extend(
+            {
+                "id": deterministic_uuid(
+                    collection.id,
+                    f"contribution:{segment_id}:semantic_frame:{row.id}",
+                ),
+                "collection_id": collection.id,
+                "segment_id": segment_id,
+                "object_kind": "semantic_frame",
+                "object_id": row.id,
+                "contribution_kind": "evidence",
+                "weight": 1.0,
+                "metadata_json": {"proposition_id": str(row.proposition_id)},
+            }
+            for row in frames
+        )
         if contribution_rows:
             await session.execute(
                 pg_insert(GraphChunkContribution)
@@ -939,6 +1093,57 @@ async def persist_chunk(
                     ]
                 )
                 .on_conflict_do_nothing(index_elements=[RelationshipDescription.id])
+            )
+
+        if frames:
+            await session.execute(
+                pg_insert(GraphSemanticFrame)
+                .values(
+                    [
+                        {
+                            "id": row.id,
+                            "collection_id": collection.id,
+                            "segment_id": segment_id,
+                            "proposition_entity_id": row.proposition_id,
+                            "source_relationship_id": row.relationship_id,
+                            "frame_kind": "proposition",
+                            "predicate": row.predicate,
+                            "title": row.title,
+                            "frame_text": row.frame_text,
+                            "content_hash": row.content_hash,
+                            "polarity": row.polarity,
+                            "modality": row.modality,
+                            "conditions_json": list(row.conditions),
+                            "exceptions_json": list(row.exceptions),
+                            "scopes_json": list(row.scopes),
+                            "executable_status": "grounded_binary",
+                            "metadata_json": {
+                                "contract_version": EXTRACTION_CONTRACT,
+                                "chunk_hash": chunk_hash,
+                            },
+                        }
+                        for row in frames
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[GraphSemanticFrame.id])
+            )
+            await session.execute(
+                pg_insert(GraphFrameArgument)
+                .values(
+                    [
+                        {
+                            "id": argument.id,
+                            "frame_id": row.id,
+                            "position": argument.position,
+                            "role": argument.role,
+                            "entity_id": argument.entity_id,
+                            "argument_type": argument.argument_type,
+                        }
+                        for row in frames
+                        for argument in row.arguments
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=[GraphFrameArgument.id])
             )
 
         await session.execute(
@@ -1035,6 +1240,27 @@ async def persist_chunk(
                 ],
             )
 
+        if frames:
+            await session.execute(
+                text(
+                    f"INSERT INTO {frame_table} "
+                    "(frame_id, collection_id, graph_version_id, frame_kind, "
+                    "content, embedding) VALUES "
+                    f"(:fid, :cid, NULL, :kind, :content, (:emb){cast}) "
+                    "ON CONFLICT (frame_id) DO NOTHING"
+                ),
+                [
+                    {
+                        "fid": _uuid_for_sql(row.id),
+                        "cid": _uuid_for_sql(collection.id),
+                        "kind": "proposition",
+                        "content": row.frame_text,
+                        "emb": vector_literal(embedding),
+                    }
+                    for row, embedding in zip(frames, frame_embeddings, strict=True)
+                ],
+            )
+
         session.add(
             IngestionRecord(
                 collection_id=collection.id,
@@ -1102,15 +1328,18 @@ async def ingest_one(
         await save_extracted_segment(collection, work, chunk_hash, extraction)
 
     entities, relationships = compile_rows(collection, extraction, chunk_hash)
+    frames = compile_semantic_frames(collection, extraction)
     (
         chunk_embedding,
         entity_embeddings,
         relationship_embeddings,
+        frame_embeddings,
     ) = await embed_chunk_objects(
         embedding_provider,
         sanitized,
         entities,
         relationships,
+        frames,
     )
     await persist_chunk(
         collection,
@@ -1119,9 +1348,11 @@ async def ingest_one(
         extraction,
         entities,
         relationships,
+        frames,
         chunk_embedding,
         entity_embeddings,
         relationship_embeddings,
+        frame_embeddings,
     )
     await graph_storage.upsert_nodes(
         [
@@ -1161,6 +1392,10 @@ async def main() -> None:
         args.collection_id,
         args.concurrency,
     )
+    dimensions = await get_collection_dimensions(collection.id)
+    if dimensions is None:
+        raise ValueError("Collection vector dimensions are not initialized")
+    await ensure_semantic_frame_table(collection.id, dimensions)
     if args.reset or args.reset_only:
         await reset_collection(collection)
         print(f"reset collection={collection.id}", flush=True)

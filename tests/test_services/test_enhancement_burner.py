@@ -5,6 +5,7 @@ from graph_core.scripts.vedas_enhance_burner import (
     Edge,
     Node,
     build_projection,
+    compile_community_frame_values,
     compute_analytics,
     spec_hash,
 )
@@ -52,3 +53,25 @@ def test_analytics_and_spec_hash_are_deterministic() -> None:
     assert analytics["diagnostics"]["component_count"] == 1
     assert analytics["node_metrics"]["is_articulation"][_id(3)] == 1.0
     assert spec_hash(PROJECTION_SPECS[0]) == spec_hash(dict(PROJECTION_SPECS[0]))
+
+
+def test_community_frames_preserve_retrieval_scale_without_becoming_evidence() -> None:
+    from graph_core.models.collection import Collection
+    from graph_core.models.incremental_graph import GraphVersion
+
+    collection = Collection(id=_id(20), namespace_id=_id(21), name="test")
+    version = GraphVersion(id=_id(22), collection_id=collection.id, version=1)
+    nodes = [Node(_id(1), "CONCEPT", "Agni"), Node(_id(2), "CONCEPT", "Devas")]
+    edges = [Edge(_id(1), _id(2), "SERVES_AS", 1)]
+    analytics = {
+        "communities": [{_id(1), _id(2)}],
+        "node_metrics": {"pagerank": {_id(1): 0.6, _id(2): 0.4}},
+    }
+
+    frames, arguments = compile_community_frame_values(
+        collection, version, nodes, edges, analytics
+    )
+
+    assert frames[0]["executable_status"] == "navigation_only"
+    assert "Agni" in frames[0]["frame_text"]
+    assert [argument["role"] for argument in arguments] == ["member", "member"]

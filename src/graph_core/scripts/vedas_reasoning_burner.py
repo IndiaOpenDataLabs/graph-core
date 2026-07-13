@@ -33,8 +33,10 @@ from graph_core.models.graph_rag import (
 from graph_core.models.incremental_graph import (
     GraphCommunity,
     GraphCommunityMembership,
+    GraphFrameArgument,
     GraphNodeMetric,
     GraphProjectionSnapshot,
+    GraphSemanticFrame,
     GraphVersion,
 )
 from graph_core.services.graph.query import graph_rag as query_logic
@@ -66,12 +68,14 @@ STOPWORDS = {
     "an",
     "and",
     "are",
+    "being",
     "can",
     "do",
     "does",
     "for",
     "from",
     "have",
+    "how",
     "i",
     "in",
     "is",
@@ -82,7 +86,9 @@ STOPWORDS = {
     "or",
     "should",
     "the",
+    "their",
     "this",
+    "take",
     "to",
     "what",
     "when",
@@ -97,6 +103,21 @@ class QueryPlan:
     question: str
     state_tokens: tuple[str, ...]
     desired_outputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FrameSeed:
+    id: uuid.UUID
+    kind: str
+    title: str
+    text: str
+    predicate: str
+    score: float
+    proposition_id: uuid.UUID | None
+    argument_ids: tuple[uuid.UUID, ...]
+    executable_status: str
+    conditions: tuple[str, ...] = ()
+    exceptions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -181,7 +202,15 @@ def compile_query(question: str) -> QueryPlan:
         operator = "evaluate"
         outputs = ("support", "harm", "constraints", "severity")
     elif any(
-        value in lowered for value in ("why", "cause", "mechanism", "first principles")
+        value in lowered
+        for value in (
+            "why",
+            "how does",
+            "how to",
+            "cause",
+            "mechanism",
+            "first principles",
+        )
     ):
         operator = "explain"
         outputs = ("causes", "mechanisms", "conditions", "exceptions")
@@ -196,10 +225,16 @@ def compile_query(question: str) -> QueryPlan:
     )
 
 
-def seed_token_coverage(plan: QueryPlan, seeds: list[WorkingNode]) -> tuple[str, ...]:
+def seed_token_coverage(
+    plan: QueryPlan,
+    seeds: list[WorkingNode],
+    frame_seeds: list[FrameSeed] | None = None,
+) -> tuple[str, ...]:
     entity_tokens: set[str] = set()
     for seed in seeds:
         entity_tokens.update(tokenize(seed.name))
+    for frame in frame_seeds or []:
+        entity_tokens.update(tokenize(f"{frame.title} {frame.predicate} {frame.text}"))
     return tuple(sorted(set(plan.state_tokens) & entity_tokens))
 
 
@@ -281,6 +316,113 @@ async def resolve_seeds(
         if len(seeds) >= limit:
             break
     return seeds
+
+
+async def resolve_frame_seeds(
+    collection: Collection, question: str, limit: int, _min_score: float
+) -> list[FrameSeed]:
+    provider = await query_logic._resolve_embedding_provider(collection)
+    embedding = await query_logic._embed_entity_query(provider, question)
+    hits = await GraphRAGVectorStore().search_semantic_frame_embeddings(
+        collection.id,
+        embedding,
+        top_k=max(limit * 4, 20),
+        frame_kinds=["proposition", "community_summary"],
+    )
+    scored_ids = {
+        uuid.UUID(hit.metadata["frame_id"]): 1.0 - hit.distance for hit in hits
+    }
+    if not scored_ids:
+        return []
+    async with AsyncSessionLocal() as session:
+        frames = (
+            (
+                await session.execute(
+                    select(GraphSemanticFrame).where(
+                        GraphSemanticFrame.id.in_(scored_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        arguments = (
+            await session.execute(
+                select(GraphFrameArgument.frame_id, GraphFrameArgument.entity_id)
+                .where(
+                    GraphFrameArgument.frame_id.in_(scored_ids),
+                    GraphFrameArgument.entity_id.is_not(None),
+                )
+                .order_by(GraphFrameArgument.position)
+            )
+        ).all()
+    argument_ids: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    for frame_id, entity_id in arguments:
+        argument_ids[frame_id].append(entity_id)
+    seeds = [
+        FrameSeed(
+            id=frame.id,
+            kind=frame.frame_kind,
+            title=frame.title,
+            text=frame.frame_text,
+            predicate=str(frame.predicate or ""),
+            score=scored_ids[frame.id],
+            proposition_id=frame.proposition_entity_id,
+            argument_ids=tuple(argument_ids[frame.id]),
+            executable_status=frame.executable_status,
+            conditions=tuple(frame.conditions_json or ()),
+            exceptions=tuple(frame.exceptions_json or ()),
+        )
+        for frame in frames
+    ]
+    query_tokens = tokenize(question)
+
+    def retrieval_rank(item: FrameSeed) -> tuple[float, str]:
+        overlap = len(
+            query_tokens & tokenize(f"{item.title} {item.predicate} {item.text}")
+        )
+        return (-(item.score + min(overlap, 2) * 0.08), str(item.id))
+
+    propositions = sorted(
+        (item for item in seeds if item.kind == "proposition"), key=retrieval_rank
+    )[:limit]
+    communities = sorted(
+        (item for item in seeds if item.kind == "community_summary"),
+        key=retrieval_rank,
+    )[:2]
+    return sorted([*propositions, *communities], key=retrieval_rank)
+
+
+async def expand_frame_seeds(frame_seeds: list[FrameSeed]) -> list[WorkingNode]:
+    """Map retrieval frames onto atoms without treating summaries as proof."""
+    scores: dict[uuid.UUID, float] = {}
+    distances: dict[uuid.UUID, int] = {}
+    community_count = 0
+    for frame in frame_seeds:
+        if frame.kind == "community_summary":
+            community_count += 1
+            if community_count > 2:
+                continue
+            entity_ids = frame.argument_ids[:4]
+            score = frame.score * 0.65
+            distance = 0
+        else:
+            entity_ids = frame.argument_ids
+            score = frame.score
+            distance = 1
+            if frame.proposition_id:
+                entity_ids = (*entity_ids, frame.proposition_id)
+        for entity_id in entity_ids:
+            scores[entity_id] = max(scores.get(entity_id, 0.0), score)
+            candidate_distance = 0 if entity_id == frame.proposition_id else distance
+            distances[entity_id] = min(
+                distances.get(entity_id, candidate_distance), candidate_distance
+            )
+    nodes = await _load_nodes(set(scores))
+    for node_id, node in nodes.items():
+        node.seed_score = scores[node_id]
+        node.distance = distances[node_id]
+    return list(nodes.values())
 
 
 async def load_landmarks(
@@ -470,7 +612,7 @@ async def build_working_graph(
     limits: Limits,
 ) -> WorkingGraph:
     graph = WorkingGraph(nodes={node.id: node for node in seeds})
-    frontier = set(graph.nodes)
+    frontier = {node_id for node_id, node in graph.nodes.items() if node.distance == 0}
     landmark_ids = await load_landmarks(version, list(frontier), limits.max_landmarks)
     landmarks = await _load_nodes(set(landmark_ids))
     for node in landmarks.values():
@@ -598,7 +740,12 @@ def execute_operator(
     }
 
 
-def reason(plan: QueryPlan, graph: WorkingGraph, limits: Limits) -> dict[str, Any]:
+def reason(
+    plan: QueryPlan,
+    graph: WorkingGraph,
+    limits: Limits,
+    frame_seeds: list[FrameSeed] | None = None,
+) -> dict[str, Any]:
     outgoing: dict[uuid.UUID, list[WorkingEdge]] = defaultdict(list)
     incoming: dict[uuid.UUID, list[WorkingEdge]] = defaultdict(list)
     for edge in graph.edges.values():
@@ -606,6 +753,11 @@ def reason(plan: QueryPlan, graph: WorkingGraph, limits: Limits) -> dict[str, An
         incoming[edge.target_id].append(edge)
 
     query_tokens = set(plan.state_tokens)
+    frames_by_proposition = {
+        frame.proposition_id: frame
+        for frame in frame_seeds or []
+        if frame.proposition_id is not None
+    }
     propositions = {
         node_id
         for node_id, node in graph.nodes.items()
@@ -698,6 +850,7 @@ def reason(plan: QueryPlan, graph: WorkingGraph, limits: Limits) -> dict[str, An
     conclusions: list[dict[str, Any]] = []
     for proposition_id in propositions:
         node = graph.nodes[proposition_id]
+        frame = frames_by_proposition.get(proposition_id)
         subjects = [
             edge.target_id
             for edge in outgoing[proposition_id]
@@ -745,6 +898,8 @@ def reason(plan: QueryPlan, graph: WorkingGraph, limits: Limits) -> dict[str, An
         elif "incomplete" in rule_statuses:
             status = "incomplete"
         score = relevance + (0.15 * proximity) + min(support_count, 3) * 0.03
+        if frame:
+            score += 0.2
         score += min(structural_prior, 0.1)
         if status == "blocked":
             score *= 0.25
@@ -752,19 +907,23 @@ def reason(plan: QueryPlan, graph: WorkingGraph, limits: Limits) -> dict[str, An
             "proposition_id": str(proposition_id),
             "status": status,
             "score": round(score, 6),
-            "statement": node.description,
+            "statement": frame.text if frame else node.description,
             "subjects": [
                 graph.nodes[value].name for value in subjects if value in graph.nodes
             ],
             "objects": [
                 graph.nodes[value].name for value in objects if value in graph.nodes
             ],
-            "conditions": [
+            "conditions": list(frame.conditions)
+            if frame and frame.conditions
+            else [
                 graph.nodes[value].description
                 for value in conditions
                 if value in graph.nodes
             ],
-            "exceptions": [
+            "exceptions": list(frame.exceptions)
+            if frame and frame.exceptions
+            else [
                 graph.nodes[value].description
                 for value in exceptions
                 if value in graph.nodes
@@ -799,11 +958,14 @@ def trace_payload(
     plan: QueryPlan,
     version: GraphVersion,
     seeds: list[WorkingNode],
+    frame_seeds: list[FrameSeed],
     graph: WorkingGraph,
     limits: Limits,
     reasoning: dict[str, Any],
     covered_tokens: tuple[str, ...],
 ) -> dict[str, Any]:
+    required_coverage = min(2, len(plan.state_tokens))
+    has_coverage = len(covered_tokens) >= required_coverage
     return {
         "graph_version": version.version,
         "plan": asdict(plan),
@@ -817,6 +979,20 @@ def trace_payload(
             }
             for node in seeds
         ],
+        "frame_seeds": [
+            {
+                "id": str(frame.id),
+                "kind": frame.kind,
+                "title": frame.title,
+                "predicate": frame.predicate,
+                "score": round(frame.score, 6),
+                "proposition_id": (
+                    str(frame.proposition_id) if frame.proposition_id else None
+                ),
+                "executable_status": frame.executable_status,
+            }
+            for frame in frame_seeds
+        ],
         "working_graph": {
             "nodes": len(graph.nodes),
             "edges": len(graph.edges),
@@ -828,7 +1004,7 @@ def trace_payload(
         "covered_query_tokens": covered_tokens,
         "sufficiency": (
             "sufficient_candidates"
-            if covered_tokens and reasoning["conclusions"]
+            if has_coverage and reasoning["conclusions"]
             else "insufficient_graph_evidence"
         ),
         "retrieval_note": (
@@ -847,6 +1023,7 @@ async def verbalize(collection: Collection, payload: dict[str, Any]) -> str:
     compact = {
         "plan": payload["plan"],
         "seeds": payload["seeds"],
+        "frame_seeds": payload["frame_seeds"],
         "reasoning": payload["reasoning"],
     }
     return await provider.chat(
@@ -877,20 +1054,46 @@ async def main() -> None:
     )
     collection, version = await load_collection(args.collection_id)
     plan = compile_query(args.question)
-    seeds = await resolve_seeds(
+    frame_seeds = await resolve_frame_seeds(
         collection,
         args.question,
         limits.max_seeds,
         args.min_seed_score,
     )
-    covered_tokens = seed_token_coverage(plan, seeds)
+    proposition_frames = [frame for frame in frame_seeds if frame.kind == "proposition"]
+    proposition_coverage = seed_token_coverage(plan, [], proposition_frames)
+    active_frame_seeds = (
+        proposition_frames if len(proposition_coverage) >= 2 else frame_seeds
+    )
+    has_proposition_frame = any(frame.kind == "proposition" for frame in frame_seeds)
+    entity_seeds = []
+    if not has_proposition_frame:
+        entity_seeds = await resolve_seeds(
+            collection,
+            args.question,
+            limits.max_seeds,
+            args.min_seed_score,
+        )
+    frame_nodes = await expand_frame_seeds(active_frame_seeds)
+    seeds_by_id = {node.id: node for node in entity_seeds}
+    for node in frame_nodes:
+        current = seeds_by_id.get(node.id)
+        if current is None:
+            seeds_by_id[node.id] = node
+        else:
+            current.seed_score = max(current.seed_score, node.seed_score)
+            current.distance = min(current.distance, node.distance)
+    seeds = sorted(
+        seeds_by_id.values(), key=lambda node: (-node.seed_score, str(node.id))
+    )
+    covered_tokens = seed_token_coverage(plan, seeds, frame_seeds)
     if covered_tokens:
         graph = await build_working_graph(collection, version, seeds, limits)
     else:
         graph = WorkingGraph()
-    reasoning = reason(plan, graph, limits)
+    reasoning = reason(plan, graph, limits, frame_seeds)
     payload = trace_payload(
-        plan, version, seeds, graph, limits, reasoning, covered_tokens
+        plan, version, seeds, frame_seeds, graph, limits, reasoning, covered_tokens
     )
     if args.trace_only:
         print(json.dumps(payload, indent=2, ensure_ascii=True))

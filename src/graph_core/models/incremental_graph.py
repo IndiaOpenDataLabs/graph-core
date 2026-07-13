@@ -266,6 +266,97 @@ class GraphVersion(Base):
     )
 
 
+class GraphSemanticFrame(Base):
+    __tablename__ = "graph_semantic_frames"
+
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collection_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("collections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    segment_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_chunk_segments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    graph_version_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_versions.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    proposition_entity_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_entities.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    source_relationship_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_relationships.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    frame_kind = Column(String(32), nullable=False, index=True)
+    predicate = Column(String(128), nullable=True, index=True)
+    title = Column(String(512), nullable=False)
+    frame_text = Column(Text, nullable=False)
+    content_hash = Column(String(64), nullable=False, index=True)
+    polarity = Column(String(32), nullable=False, default="positive")
+    modality = Column(String(32), nullable=False, default="asserted")
+    conditions_json = Column(JSON, nullable=True)
+    exceptions_json = Column(JSON, nullable=True)
+    scopes_json = Column(JSON, nullable=True)
+    executable_status = Column(String(32), nullable=False, default="legacy")
+    metadata_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "ix_graph_semantic_frames_lookup",
+            "collection_id",
+            "frame_kind",
+            "predicate",
+        ),
+    )
+
+
+class GraphFrameArgument(Base):
+    __tablename__ = "graph_frame_arguments"
+
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    frame_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_semantic_frames.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    position = Column(Integer, nullable=False)
+    role = Column(String(64), nullable=False)
+    entity_id = Column(
+        UUIDType(as_uuid=True),
+        ForeignKey("graph_entities.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    literal_value = Column(JSON, nullable=True)
+    variable_name = Column(String(128), nullable=True)
+    argument_type = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "frame_id",
+            "position",
+            "role",
+            name="uq_graph_frame_argument_position",
+        ),
+        Index("ix_graph_frame_arguments_role_entity", "role", "entity_id"),
+    )
+
+
 class GraphProjectionSnapshot(Base):
     __tablename__ = "graph_projection_snapshots"
 

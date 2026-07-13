@@ -1,7 +1,10 @@
 import uuid
 
 from graph_core.models.collection import Collection
-from graph_core.scripts.vedas_ingest_burner import compile_rows
+from graph_core.scripts.vedas_ingest_burner import (
+    compile_rows,
+    compile_semantic_frames,
+)
 from graph_core.services.graph_rag.extractor import (
     ExtractedEntity,
     ExtractedRelationship,
@@ -64,6 +67,14 @@ def test_compile_rows_materializes_executable_reasoning_structure():
         "BLOCKS",
         "CONCLUDES",
     } <= {relationship.rel_type for relationship in relationships}
+    frames = compile_semantic_frames(_collection(), extraction)
+    assert len(frames) == 1
+    assert frames[0].predicate == "PROMOTES"
+    assert "Practice A promotes calm" in frames[0].frame_text
+    assert [argument.role for argument in frames[0].arguments] == [
+        "subject",
+        "object",
+    ]
 
 
 def test_cross_chunk_reasoning_ids_are_stable_but_evidence_is_local():

@@ -23,9 +23,11 @@ from graph_core.models.incremental_graph import (
     GraphDerivedDependency,
     GraphEntityMapping,
     GraphEntityRedirect,
+    GraphFrameArgument,
     GraphNodeMetric,
     GraphPredicateMapping,
     GraphProjectionSnapshot,
+    GraphSemanticFrame,
     GraphVersion,
 )
 from graph_core.models.ingestion import IngestionRecord
@@ -50,6 +52,8 @@ __all__ = [
     "GraphChunkContribution",
     "GraphDerivedDependency",
     "GraphVersion",
+    "GraphSemanticFrame",
+    "GraphFrameArgument",
     "GraphProjectionSnapshot",
     "GraphNodeMetric",
     "GraphCommunity",

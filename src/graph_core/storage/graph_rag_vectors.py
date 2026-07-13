@@ -62,6 +62,64 @@ class GraphRAGVectorStore:
 
     # ── Entity Embeddings ──
 
+    async def search_semantic_frame_embeddings(
+        self,
+        collection_id: uuid.UUID,
+        query_embedding: list[float],
+        top_k: int,
+        frame_kinds: list[str] | None = None,
+    ) -> list[VectorSearchHit]:
+        """Search retrieval-rich frames that point back to executable graph atoms."""
+        tbl = table_name(collection_id, "semantic_frame_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+
+        params: dict[str, Any] = {
+            "cid": _uuid_for_sql(collection_id),
+            "top_k": top_k,
+            "qemb": _embedding_literal(query_embedding),
+        }
+        kind_clause = ""
+        if frame_kinds:
+            placeholders = []
+            for index, frame_kind in enumerate(frame_kinds):
+                key = f"frame_kind_{index}"
+                params[key] = frame_kind
+                placeholders.append(f":{key}")
+            kind_clause = f"AND frame_kind IN ({', '.join(placeholders)})"
+
+        cast = _vector_cast_sql(dimensions)
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    f"""
+                    SELECT id::text, frame_id::text, frame_kind, content,
+                           graph_version_id::text,
+                           embedding <=> (:qemb){cast} AS distance
+                    FROM {tbl}
+                    WHERE collection_id = :cid {kind_clause}
+                    ORDER BY distance
+                    LIMIT :top_k
+                    """
+                ),
+                params,
+            )
+            return [
+                VectorSearchHit(
+                    id=row[0],
+                    distance=float(row[5]),
+                    content=row[3],
+                    metadata={
+                        "frame_id": row[1],
+                        "frame_kind": row[2],
+                        "graph_version_id": row[4],
+                        "collection_id": _uuid_for_sql(collection_id),
+                    },
+                )
+                for row in result
+            ]
+
     async def upsert_entity_embedding(
         self,
         entity_id: uuid.UUID,
@@ -408,10 +466,7 @@ class GraphRAGVectorStore:
         tbl = table_name(collection_id, "entity_centroids")
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                text(
-                    f"SELECT embedding::text FROM {tbl} "
-                    f"WHERE entity_id = :eid"
-                ),
+                text(f"SELECT embedding::text FROM {tbl} WHERE entity_id = :eid"),
                 {"eid": _uuid_for_sql(entity_id)},
             )
             row = result.one_or_none()
@@ -606,5 +661,7 @@ class GraphRAGVectorStore:
                 elif isinstance(emb, str):
                     # pgvector returns vectors as "[0.1,0.2,...]" strings
                     inner = emb.strip("[]")
-                    result_dict[row[0]] = [float(v) for v in inner.split(",") if v.strip()]
+                    result_dict[row[0]] = [
+                        float(v) for v in inner.split(",") if v.strip()
+                    ]
         return result_dict

@@ -31,6 +31,7 @@ def table_name(collection_id: uuid.UUID, kind: str) -> str:
         relationship_embeddings
         entity_centroids
         chunk_embeddings
+        semantic_frame_embeddings
     """
     return f"vc_{_safe_id(collection_id)}_{kind}"
 
@@ -72,12 +73,15 @@ def create_entity_embeddings_sql(collection_id: uuid.UUID, dimensions: int) -> s
     """
 
 
-def create_relationship_embeddings_sql(collection_id: uuid.UUID, dimensions: int) -> str:
+def create_relationship_embeddings_sql(
+    collection_id: uuid.UUID, dimensions: int
+) -> str:
     tbl = table_name(collection_id, "relationship_embeddings")
     return f"""
         CREATE TABLE {tbl} (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            relationship_id UUID NOT NULL REFERENCES graph_relationships(id) ON DELETE CASCADE,
+            relationship_id UUID NOT NULL
+                REFERENCES graph_relationships(id) ON DELETE CASCADE,
             collection_id UUID NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
             document_id UUID,
             document_path VARCHAR(1024),
@@ -124,12 +128,33 @@ def create_chunk_embeddings_sql(collection_id: uuid.UUID, dimensions: int) -> st
     """
 
 
+def create_semantic_frame_embeddings_sql(
+    collection_id: uuid.UUID, dimensions: int
+) -> str:
+    tbl = table_name(collection_id, "semantic_frame_embeddings")
+    return f"""
+        CREATE TABLE {tbl} (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            frame_id UUID NOT NULL
+                REFERENCES graph_semantic_frames(id) ON DELETE CASCADE,
+            collection_id UUID NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            graph_version_id UUID REFERENCES graph_versions(id) ON DELETE CASCADE,
+            frame_kind VARCHAR(32) NOT NULL,
+            content TEXT NOT NULL,
+            embedding vector({dimensions}) NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            CONSTRAINT uq_{tbl}_frame_id UNIQUE (frame_id)
+        )
+    """
+
+
 ALL_KINDS = [
     "vector_chunks",
     "entity_embeddings",
     "relationship_embeddings",
     "entity_centroids",
     "chunk_embeddings",
+    "semantic_frame_embeddings",
 ]
 
 CREATE_SQL_MAP: dict[str, callable] = {
@@ -138,7 +163,20 @@ CREATE_SQL_MAP: dict[str, callable] = {
     "relationship_embeddings": create_relationship_embeddings_sql,
     "entity_centroids": create_entity_centroids_sql,
     "chunk_embeddings": create_chunk_embeddings_sql,
+    "semantic_frame_embeddings": create_semantic_frame_embeddings_sql,
 }
+
+
+async def ensure_semantic_frame_table(
+    collection_id: uuid.UUID, dimensions: int
+) -> None:
+    """Create the frame vector table for collections created before this feature."""
+    sql = create_semantic_frame_embeddings_sql(collection_id, dimensions).replace(
+        "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1
+    )
+    async with AsyncSessionLocal() as session:
+        await session.execute(text(sql))
+        await session.commit()
 
 
 async def create_all_tables(collection_id: uuid.UUID, dimensions: int) -> None:

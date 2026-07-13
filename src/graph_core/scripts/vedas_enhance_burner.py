@@ -16,24 +16,45 @@ import hashlib
 import json
 import math
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import networkx as nx
 from scipy.sparse.linalg import eigsh
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from graph_core.database import AsyncSessionLocal
+from graph_core.database import AsyncSessionLocal, _uuid_for_sql
+from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.models.collection import Collection
 from graph_core.models.graph_rag import GraphEntity, GraphRelationship
 from graph_core.models.incremental_graph import (
+    GraphChunkSegment,
     GraphCommunity,
     GraphCommunityMembership,
     GraphComponentMetric,
+    GraphFrameArgument,
     GraphNodeMetric,
     GraphProjectionSnapshot,
+    GraphSemanticFrame,
     GraphVersion,
+)
+from graph_core.scripts.vedas_ingest_burner import (
+    SemanticFrameRow,
+    compile_semantic_frames,
+    deterministic_uuid,
+    extraction_from_payload,
+    vector_literal,
+)
+from graph_core.services.graph.ingestion.chunk_processor import (
+    _resolve_embedding_provider,
+)
+from graph_core.storage.vector_tables import (
+    ensure_semantic_frame_table,
+    get_collection_dimensions,
+    table_name,
 )
 
 DEFAULT_COLLECTION_ID = uuid.UUID("855f1950-ff65-4f47-9549-9a20f9a1332d")
@@ -64,6 +85,7 @@ REASONING_EDGE_TYPES = {
 class Node:
     id: uuid.UUID
     node_type: str
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -287,9 +309,11 @@ async def load_graph(
             raise ValueError("Collection has no published graph version")
         node_rows = (
             await session.execute(
-                select(GraphEntity.id, GraphEntity.primary_type).where(
-                    GraphEntity.collection_id == collection_id
-                )
+                select(
+                    GraphEntity.id,
+                    GraphEntity.canonical_name,
+                    GraphEntity.primary_type,
+                ).where(GraphEntity.collection_id == collection_id)
             )
         ).all()
         edge_rows = (
@@ -302,7 +326,10 @@ async def load_graph(
                 ).where(GraphRelationship.collection_id == collection_id)
             )
         ).all()
-    nodes = [Node(row.id, str(row.primary_type or "")) for row in node_rows]
+    nodes = [
+        Node(row.id, str(row.primary_type or ""), str(row.canonical_name))
+        for row in node_rows
+    ]
     edges = [
         Edge(row.source_entity_id, row.target_entity_id, row.rel_type, row.weight)
         for row in edge_rows
@@ -400,6 +427,220 @@ async def persist_projection(
     return "completed"
 
 
+async def compile_ingestion_frame_values(
+    collection: Collection,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Recompile stored extraction JSON into retrieval-rich frames without an LLM."""
+    async with AsyncSessionLocal() as session:
+        segments = (
+            (
+                await session.execute(
+                    select(GraphChunkSegment).where(
+                        GraphChunkSegment.collection_id == collection.id,
+                        GraphChunkSegment.status == "completed",
+                        GraphChunkSegment.tombstoned_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    frames_by_id: dict[uuid.UUID, tuple[SemanticFrameRow, uuid.UUID]] = {}
+    for segment in segments:
+        extraction = extraction_from_payload(segment.raw_extraction or {})
+        for frame in compile_semantic_frames(collection, extraction):
+            frames_by_id.setdefault(frame.id, (frame, segment.id))
+
+    frame_values: list[dict[str, Any]] = []
+    argument_values: list[dict[str, Any]] = []
+    for frame, segment_id in frames_by_id.values():
+        frame_values.append(
+            {
+                "id": frame.id,
+                "collection_id": collection.id,
+                "segment_id": segment_id,
+                "proposition_entity_id": frame.proposition_id,
+                "source_relationship_id": frame.relationship_id,
+                "frame_kind": "proposition",
+                "predicate": frame.predicate,
+                "title": frame.title,
+                "frame_text": frame.frame_text,
+                "content_hash": frame.content_hash,
+                "polarity": frame.polarity,
+                "modality": frame.modality,
+                "conditions_json": list(frame.conditions),
+                "exceptions_json": list(frame.exceptions),
+                "scopes_json": list(frame.scopes),
+                "executable_status": "grounded_binary",
+                "metadata_json": {"backfilled_without_llm": True},
+            }
+        )
+        argument_values.extend(
+            {
+                "id": argument.id,
+                "frame_id": frame.id,
+                "position": argument.position,
+                "role": argument.role,
+                "entity_id": argument.entity_id,
+                "argument_type": argument.argument_type,
+            }
+            for argument in frame.arguments
+        )
+    return frame_values, argument_values
+
+
+def compile_community_frame_values(
+    collection: Collection,
+    version: GraphVersion,
+    nodes: list[Node],
+    edges: list[Edge],
+    analytics: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Create deterministic, navigation-only summaries at community resolution."""
+    node_by_id = {node.id: node for node in nodes}
+    pagerank = analytics["node_metrics"].get("pagerank", {})
+    frame_values: list[dict[str, Any]] = []
+    argument_values: list[dict[str, Any]] = []
+    for members in analytics["communities"]:
+        semantic_members = [member for member in members if member in node_by_id]
+        if len(semantic_members) < 2:
+            continue
+        ordered = sorted(
+            semantic_members,
+            key=lambda node_id: (-pagerank.get(node_id, 0.0), str(node_id)),
+        )
+        top_members = ordered[:10]
+        member_set = set(semantic_members)
+        predicate_counts = Counter(
+            edge.rel_type
+            for edge in edges
+            if edge.source_id in member_set and edge.target_id in member_set
+        )
+        predicates = [name for name, _ in predicate_counts.most_common(8)]
+        names = [node_by_id[node_id].name for node_id in top_members]
+        membership_key = hashlib.sha256(
+            "|".join(sorted(str(node_id) for node_id in member_set)).encode()
+        ).hexdigest()
+        frame_id = deterministic_uuid(
+            collection.id,
+            f"community-summary:{version.id}:{membership_key}",
+        )
+        title = "Community: " + ", ".join(names[:4])
+        frame_text = (
+            f"A semantic community connecting {', '.join(names)}. "
+            f"Prominent relationship families: {', '.join(predicates) or 'none'}. "
+            "Use this frame to locate relevant propositions; it is not evidence."
+        )
+        frame_values.append(
+            {
+                "id": frame_id,
+                "collection_id": collection.id,
+                "graph_version_id": version.id,
+                "frame_kind": "community_summary",
+                "title": title,
+                "frame_text": frame_text,
+                "content_hash": hashlib.sha256(frame_text.encode()).hexdigest(),
+                "polarity": "unknown",
+                "modality": "navigation",
+                "executable_status": "navigation_only",
+                "metadata_json": {
+                    "member_count": len(member_set),
+                    "predicate_families": predicates,
+                },
+            }
+        )
+        argument_values.extend(
+            {
+                "id": deterministic_uuid(
+                    collection.id,
+                    f"frame-argument:{frame_id}:{position}:member",
+                ),
+                "frame_id": frame_id,
+                "position": position,
+                "role": "member",
+                "entity_id": node_id,
+                "argument_type": "entity",
+            }
+            for position, node_id in enumerate(top_members)
+        )
+    return frame_values, argument_values
+
+
+async def persist_frame_values(
+    collection: Collection,
+    provider: EmbeddingProvider,
+    frame_values: list[dict[str, Any]],
+    argument_values: list[dict[str, Any]],
+    *,
+    batch_size: int = 64,
+) -> tuple[int, int]:
+    if not frame_values:
+        return 0, 0
+    dimensions = await get_collection_dimensions(collection.id)
+    if dimensions is None:
+        raise ValueError("Collection vector dimensions are not initialized")
+    await ensure_semantic_frame_table(collection.id, dimensions)
+    frame_table = table_name(collection.id, "semantic_frame_embeddings")
+
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            pg_insert(GraphSemanticFrame)
+            .values(frame_values)
+            .on_conflict_do_nothing(index_elements=[GraphSemanticFrame.id])
+        )
+        if argument_values:
+            await session.execute(
+                pg_insert(GraphFrameArgument)
+                .values(argument_values)
+                .on_conflict_do_nothing(index_elements=[GraphFrameArgument.id])
+            )
+        await session.commit()
+
+    async with AsyncSessionLocal() as session:
+        existing_ids = set(
+            (
+                await session.execute(text(f"SELECT frame_id FROM {frame_table}"))
+            ).scalars()
+        )
+    missing = [row for row in frame_values if row["id"] not in existing_ids]
+    embedded = 0
+    cast = f"::vector({dimensions})"
+    for offset in range(0, len(missing), batch_size):
+        batch = missing[offset : offset + batch_size]
+        embeddings = await provider.embed_documents(
+            [str(row["frame_text"]) for row in batch]
+        )
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text(
+                    f"INSERT INTO {frame_table} "
+                    "(frame_id, collection_id, graph_version_id, frame_kind, "
+                    "content, embedding) VALUES "
+                    f"(:fid, :cid, :vid, :kind, :content, (:emb){cast}) "
+                    "ON CONFLICT (frame_id) DO NOTHING"
+                ),
+                [
+                    {
+                        "fid": _uuid_for_sql(row["id"]),
+                        "cid": _uuid_for_sql(collection.id),
+                        "vid": (
+                            _uuid_for_sql(row["graph_version_id"])
+                            if row.get("graph_version_id")
+                            else None
+                        ),
+                        "kind": row["frame_kind"],
+                        "content": row["frame_text"],
+                        "emb": vector_literal(embedding),
+                    }
+                    for row, embedding in zip(batch, embeddings, strict=True)
+                ],
+            )
+            await session.commit()
+        embedded += len(batch)
+    return len(frame_values), embedded
+
+
 async def main() -> None:
     args = parse_args()
     collection, version, nodes, edges = await load_graph(args.collection_id)
@@ -407,9 +648,24 @@ async def main() -> None:
         f"collection={collection.name} version={version.version} "
         f"nodes={len(nodes)} edges={len(edges)}"
     )
+    embedding_provider = await _resolve_embedding_provider(collection)
+    ingestion_frames, ingestion_arguments = await compile_ingestion_frame_values(
+        collection
+    )
+    frame_count, embedded_count = await persist_frame_values(
+        collection,
+        embedding_provider,
+        ingestion_frames,
+        ingestion_arguments,
+    )
+    print(f"proposition_frames: materialized={frame_count} embedded={embedded_count}")
+
+    affinity_analytics: dict[str, Any] | None = None
     for spec in PROJECTION_SPECS:
         graph = build_projection(nodes, edges, spec)
         analytics = compute_analytics(graph)
+        if spec["name"] == "semantic_affinity_undirected":
+            affinity_analytics = analytics
         status = await persist_projection(
             version, spec, graph, analytics, force=args.force
         )
@@ -417,6 +673,21 @@ async def main() -> None:
             f"{spec['name']}: {status} nodes={graph.number_of_nodes()} "
             f"edges={graph.number_of_edges()}"
         )
+    if affinity_analytics is not None:
+        summary_frames, summary_arguments = compile_community_frame_values(
+            collection,
+            version,
+            nodes,
+            edges,
+            affinity_analytics,
+        )
+        frame_count, embedded_count = await persist_frame_values(
+            collection,
+            embedding_provider,
+            summary_frames,
+            summary_arguments,
+        )
+        print(f"community_frames: materialized={frame_count} embedded={embedded_count}")
 
 
 if __name__ == "__main__":
