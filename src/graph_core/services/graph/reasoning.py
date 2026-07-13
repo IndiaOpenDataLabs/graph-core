@@ -6,7 +6,7 @@ import math
 import re
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import case, or_, select
@@ -16,6 +16,7 @@ from graph_core.models.graph_rag import (
     EntityDescription,
     GraphEntity,
     GraphRelationship,
+    GraphRelationshipType,
 )
 from graph_core.models.incremental_graph import (
     GraphCommunity,
@@ -80,6 +81,7 @@ class _Edge:
     source_id: uuid.UUID
     target_id: uuid.UUID
     rel_type: str
+    properties: dict[str, Any] = field(default_factory=dict)
 
 
 def _tokens(text: str) -> set[str]:
@@ -229,29 +231,34 @@ async def _bounded_graph(
             break
         async with AsyncSessionLocal() as session:
             rows = (
-                (
-                    await session.execute(
-                        select(GraphRelationship)
-                        .where(
-                            GraphRelationship.collection_id == collection_id,
-                            or_(
-                                GraphRelationship.source_entity_id.in_(frontier),
-                                GraphRelationship.target_entity_id.in_(frontier),
-                            ),
-                        )
-                        .order_by(structural_first, GraphRelationship.weight.desc())
-                        .limit(max_edges - len(edges))
+                await session.execute(
+                    select(
+                        GraphRelationship,
+                        GraphRelationshipType.inferred_properties,
                     )
+                    .join(
+                        GraphRelationshipType,
+                        GraphRelationshipType.id
+                        == GraphRelationship.relationship_type_id,
+                    )
+                    .where(
+                        GraphRelationship.collection_id == collection_id,
+                        or_(
+                            GraphRelationship.source_entity_id.in_(frontier),
+                            GraphRelationship.target_entity_id.in_(frontier),
+                        ),
+                    )
+                    .order_by(structural_first, GraphRelationship.weight.desc())
+                    .limit(max_edges - len(edges))
                 )
-                .scalars()
-                .all()
-            )
+            ).all()
         new_ids: set[uuid.UUID] = set()
-        for row in rows:
+        for row, predicate_properties in rows:
             edge = _Edge(
                 row.source_entity_id,
                 row.target_entity_id,
                 str(row.rel_type or "").upper(),
+                dict(predicate_properties or {}),
             )
             edges[(edge.source_id, edge.target_id, edge.rel_type)] = edge
             if edge.source_id not in nodes:
@@ -266,6 +273,136 @@ async def _bounded_graph(
         edge
         for edge in edges.values()
         if edge.source_id in nodes and edge.target_id in nodes
+    ]
+
+
+def _predicate_derivations(
+    edges: list[_Edge],
+    nodes: dict[uuid.UUID, _Node] | None = None,
+    *,
+    limit: int = 64,
+) -> list[dict[str, str]]:
+    semantic = [edge for edge in edges if edge.rel_type not in _STRUCTURAL_TYPES]
+    known = {(edge.source_id, edge.rel_type, edge.target_id) for edge in semantic}
+    derived: list[dict[str, str]] = []
+    for edge in semantic:
+        if edge.properties.get("symmetry") != "symmetric":
+            continue
+        reverse = (edge.target_id, edge.rel_type, edge.source_id)
+        if reverse in known:
+            continue
+        known.add(reverse)
+        derived.append(
+            {
+                "source": str(edge.target_id),
+                **(
+                    {"source_name": nodes[edge.target_id].name}
+                    if nodes and edge.target_id in nodes
+                    else {}
+                ),
+                "target": str(edge.source_id),
+                **(
+                    {"target_name": nodes[edge.source_id].name}
+                    if nodes and edge.source_id in nodes
+                    else {}
+                ),
+                "predicate": edge.rel_type,
+                "derivation": "symmetry",
+            }
+        )
+        if len(derived) >= limit:
+            return derived
+
+    transitive_types = {
+        edge.rel_type
+        for edge in semantic
+        if edge.properties.get("transitivity") == "transitive"
+    }
+    for rel_type in sorted(transitive_types):
+        pairs = {
+            (source_id, target_id)
+            for source_id, candidate_type, target_id in known
+            if candidate_type == rel_type
+        }
+        changed = True
+        while changed and len(derived) < limit:
+            changed = False
+            additions = {
+                (source_id, target_id)
+                for source_id, middle_id in pairs
+                for candidate_middle, target_id in pairs
+                if middle_id == candidate_middle
+                and source_id != target_id
+                and (source_id, target_id) not in pairs
+            }
+            for source_id, target_id in sorted(
+                additions,
+                key=lambda item: (str(item[0]), str(item[1])),
+            ):
+                pairs.add((source_id, target_id))
+                known.add((source_id, rel_type, target_id))
+                derived.append(
+                    {
+                        "source": str(source_id),
+                        **(
+                            {"source_name": nodes[source_id].name}
+                            if nodes and source_id in nodes
+                            else {}
+                        ),
+                        "target": str(target_id),
+                        **(
+                            {"target_name": nodes[target_id].name}
+                            if nodes and target_id in nodes
+                            else {}
+                        ),
+                        "predicate": rel_type,
+                        "derivation": "transitivity",
+                    }
+                )
+                changed = True
+                if len(derived) >= limit:
+                    break
+    return derived
+
+
+def _mechanism_edges(
+    edges: list[_Edge],
+    nodes: dict[uuid.UUID, _Node],
+) -> list[dict[str, str]]:
+    lexical_markers = (
+        "CAUSE",
+        "ENABLE",
+        "LEAD",
+        "PRODUCE",
+        "RESULT",
+        "TRIGGER",
+        "TRANSMIT",
+        "CARRY",
+        "DELIVER",
+        "BEFORE",
+        "AFTER",
+    )
+    candidates = [
+        edge
+        for edge in edges
+        if edge.rel_type not in _STRUCTURAL_TYPES
+        and (
+            edge.properties.get("causal") == "causal"
+            or edge.properties.get("temporal") == "temporal"
+            or any(marker in edge.rel_type for marker in lexical_markers)
+        )
+    ]
+    return [
+        {
+            "source": str(edge.source_id),
+            "source_name": nodes[edge.source_id].name,
+            "target": str(edge.target_id),
+            "target_name": nodes[edge.target_id].name,
+            "predicate": edge.rel_type,
+            "causal": str(edge.properties.get("causal") or "unknown"),
+            "temporal": str(edge.properties.get("temporal") or "unknown"),
+        }
+        for edge in candidates[:24]
     ]
 
 
@@ -295,6 +432,8 @@ async def activate_reasoning(
     }
     seed_ids.update(navigation_ids or set())
     nodes, edges = await _bounded_graph(collection_id, seed_ids)
+    predicate_derivations = _predicate_derivations(edges, nodes)
+    mechanism_edges = _mechanism_edges(edges, nodes)
     incoming: dict[uuid.UUID, list[_Edge]] = defaultdict(list)
     outgoing: dict[uuid.UUID, list[_Edge]] = defaultdict(list)
     for edge in edges:
@@ -517,9 +656,10 @@ async def activate_reasoning(
         }
     elif operator == "explain":
         operator_result = {
-            "mechanism_chain_candidates": [
+            "mechanism_chain_candidates": mechanism_edges,
+            "supporting_propositions": [
                 item["proposition_id"] for item in usable
-            ]
+            ],
         }
     else:
         operator_result = {
@@ -545,6 +685,7 @@ async def activate_reasoning(
         "propositions": proposition_traces,
         "rules": rule_traces,
         "conflicts": conflicts,
+        "predicate_derivations": predicate_derivations,
         "operator_result": operator_result,
         "fixed_point": True,
         "working_graph": {"nodes": len(nodes), "edges": len(edges)},

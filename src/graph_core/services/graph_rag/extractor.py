@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from graph_core.llm.interface import LLMProvider
@@ -44,6 +44,7 @@ class ExtractedRelationship:
     scopes: tuple[str, ...] = ()
     polarity: str = "positive"
     modality: str = "asserted"
+    predicate_properties: dict[str, str | float] = field(default_factory=dict)
 
 
 @dataclass
@@ -93,6 +94,41 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": ["asserted", "probable", "possible", "normative", "unknown"],
         },
+        "predicate_properties": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "directionality": {
+                    "type": "string",
+                    "enum": ["directed", "undirected", "unknown"],
+                },
+                "symmetry": {
+                    "type": "string",
+                    "enum": ["symmetric", "asymmetric", "unknown"],
+                },
+                "transitivity": {
+                    "type": "string",
+                    "enum": ["transitive", "non_transitive", "unknown"],
+                },
+                "causal": {
+                    "type": "string",
+                    "enum": ["causal", "non_causal", "unknown"],
+                },
+                "temporal": {
+                    "type": "string",
+                    "enum": ["temporal", "non_temporal", "unknown"],
+                },
+                "confidence": {"type": "number"},
+            },
+            "required": [
+                "directionality",
+                "symmetry",
+                "transitivity",
+                "causal",
+                "temporal",
+                "confidence",
+            ],
+        },
     },
     "required": [
         "source",
@@ -128,8 +164,43 @@ _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
                                     "items": {"type": "string"},
                                 },
                                 "weight": {"type": "number"},
+                                "predicate_properties": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "directionality": {
+                                            "type": "string",
+                                            "enum": ["directed", "undirected", "unknown"],
+                                        },
+                                        "symmetry": {
+                                            "type": "string",
+                                            "enum": ["symmetric", "asymmetric", "unknown"],
+                                        },
+                                        "transitivity": {
+                                            "type": "string",
+                                            "enum": ["transitive", "non_transitive", "unknown"],
+                                        },
+                                        "causal": {
+                                            "type": "string",
+                                            "enum": ["causal", "non_causal", "unknown"],
+                                        },
+                                        "temporal": {
+                                            "type": "string",
+                                            "enum": ["temporal", "non_temporal", "unknown"],
+                                        },
+                                        "confidence": {"type": "number"},
+                                    },
+                                    "required": [
+                                        "directionality",
+                                        "symmetry",
+                                        "transitivity",
+                                        "causal",
+                                        "temporal",
+                                        "confidence",
+                                    ],
+                                },
                             },
-                            "required": ["name"],
+                            "required": ["name", "predicate_properties"],
                         },
                         "minItems": 1,
                     },
@@ -185,6 +256,28 @@ def _build_code_taxonomy_schema() -> dict[str, Any]:
 
 _CODE_EXTRACTION_SCHEMA = _build_code_taxonomy_schema()
 
+_PREDICATE_PROPERTY_VALUES = {
+    "directionality": {"directed", "undirected", "unknown"},
+    "symmetry": {"symmetric", "asymmetric", "unknown"},
+    "transitivity": {"transitive", "non_transitive", "unknown"},
+    "causal": {"causal", "non_causal", "unknown"},
+    "temporal": {"temporal", "non_temporal", "unknown"},
+}
+
+
+def normalize_predicate_properties(value: Any) -> dict[str, str | float]:
+    source = value if isinstance(value, dict) else {}
+    normalized: dict[str, str | float] = {}
+    for name, allowed in _PREDICATE_PROPERTY_VALUES.items():
+        candidate = str(source.get(name) or "unknown").strip().lower()
+        normalized[name] = candidate if candidate in allowed else "unknown"
+    try:
+        confidence = float(source.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    normalized["confidence"] = max(0.0, min(1.0, confidence))
+    return normalized
+
 
 _EXTRACTION_SYSTEM_PROMPT = """---Role---
 You are a Knowledge Graph Specialist responsible for extracting
@@ -198,7 +291,8 @@ relationships from input text.
      concepts that are explicitly supported by the text.
    - For N-ary relationships, decompose them into binary pairs.
    - For each relationship, extract: source, target, description, keywords,
-     weight, rel_type, conditions, exceptions, scopes, polarity, modality.
+     weight, rel_type, conditions, exceptions, scopes, polarity, modality,
+     and predicate_properties.
    - Relationship descriptions must explain the nature of the connection,
      the context in which it holds, and why it matters. Include the local
      evidence phrase or sentence when possible.
@@ -229,12 +323,19 @@ relationships from input text.
        scopes      (array of population, time, place, or contextual scopes)
        polarity    (positive, negative, or unknown)
        modality    (asserted, probable, possible, normative, or unknown)
+       predicate_properties (directionality, symmetry, transitivity, causal,
+                    temporal, and confidence). Use unknown unless the text and
+                    predicate meaning clearly justify the property. In
+                    particular, never infer transitivity from one ordinary
+                    A-to-B observation.
    - "rel_type" is a list of one or more objects, each with:
        name        (string)
        description (string, role-specific: explains the connection in
                     the semantic role of THIS rel_type entry)
        keywords    (array of strings, role-specific)
        weight      (float 0..1, role-specific confidence)
+       predicate_properties (properties of THIS predicate entry, not the
+                    endpoint pair in general)
      {domain_rel_type_guidance}
    - Emit every distinct rel_type that is genuinely supported for the
      pair. Multi-entry rel_type lists are expected when the same pair
@@ -300,6 +401,8 @@ entities and relationships from source code.
        description (string)
        keywords    (array of strings)
        weight      (float 0..1)
+       predicate_properties (directionality, symmetry, transitivity, causal,
+                    temporal, confidence; use unknown conservatively)
    - A rel_type array may be empty when the chunk does not support that
      operation.
    - {domain_rel_type_guidance}
@@ -715,6 +818,9 @@ class LLMGraphExtractor:
                 "description": description,
                 "keywords": keywords,
                 "weight": weight,
+                "predicate_properties": normalize_predicate_properties(
+                    entry.get("predicate_properties")
+                ),
             })
 
         if not out and not strict_vocab:
@@ -723,6 +829,7 @@ class LLMGraphExtractor:
                 "description": fallback_description,
                 "keywords": list(fallback_keywords),
                 "weight": fallback_weight,
+                "predicate_properties": normalize_predicate_properties(None),
             })
         return out
 
@@ -919,6 +1026,9 @@ Only output the structured relationships object.
             )
             polarity = str(rel.get("polarity") or "positive").lower()
             modality = str(rel.get("modality") or "asserted").lower()
+            predicate_properties = normalize_predicate_properties(
+                rel.get("predicate_properties")
+            )
             for entry in cls._coerce_rel_type_entries(
                 rel.get("rel_type"),
                 fallback_description=rel_description,
@@ -928,6 +1038,9 @@ Only output the structured relationships object.
                 domain=domain,
                 strict_vocab=strict_vocab,
             ):
+                entry_properties = dict(entry["predicate_properties"])
+                if float(entry_properties.get("confidence") or 0.0) <= 0:
+                    entry_properties = predicate_properties
                 extracted.append(
                     ExtractedRelationship(
                         source_name=source,
@@ -941,6 +1054,7 @@ Only output the structured relationships object.
                         scopes=scopes,
                         polarity=polarity,
                         modality=modality,
+                        predicate_properties=entry_properties,
                     )
                 )
         return extracted
@@ -1003,6 +1117,9 @@ Only output the structured relationships object.
                             keywords=keywords,
                             weight=weight,
                             rel_type=rel_key,
+                            predicate_properties=normalize_predicate_properties(
+                                item.get("predicate_properties")
+                            ),
                         )
                     )
         return extracted

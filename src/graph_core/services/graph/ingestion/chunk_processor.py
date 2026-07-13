@@ -1160,6 +1160,10 @@ async def _ingest_graph_chunk(
                         collection.id,
                         f"rel_type:{rel_type}",
                     ),
+                    confidence=float(
+                        rel.predicate_properties.get("confidence", 0.0)
+                    ),
+                    inferred_properties=dict(rel.predicate_properties),
                 )
             )
 
@@ -1793,6 +1797,7 @@ def _extraction_payload(extraction: ExtractionResult) -> dict[str, object]:
                 "scopes": list(relationship.scopes),
                 "polarity": relationship.polarity,
                 "modality": relationship.modality,
+                "predicate_properties": relationship.predicate_properties,
             }
             for relationship in extraction.relationships
         ],
@@ -1886,6 +1891,7 @@ async def _get_raw_extraction(
                 scopes=tuple(r.get("scopes", [])),
                 polarity=r.get("polarity", "positive"),
                 modality=r.get("modality", "asserted"),
+                predicate_properties=dict(r.get("predicate_properties") or {}),
             )
             for r in (record.relationships_json or [])
         ]

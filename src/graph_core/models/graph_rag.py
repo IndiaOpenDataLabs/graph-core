@@ -180,6 +180,9 @@ class GraphRelationshipType(Base):
         index=True,
     )
     canonical_type = Column(String(64), nullable=False, index=True)
+    inferred_properties = Column(JSON, nullable=True)
+    property_votes = Column(JSON, nullable=True)
+    property_observation_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     aliases = relationship(

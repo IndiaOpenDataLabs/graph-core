@@ -70,6 +70,7 @@ class RelationshipRecord:
     rel_type: str
     weight: int
     description: str = ""
+    predicate_properties: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -172,6 +173,24 @@ _PROJECTION_SPECS: tuple[dict[str, Any], ...] = (
         "directed": True,
         "node_policy": "reasoning_and_arguments",
         "edge_policy": "reasoning_only",
+        "parallel_edges": "sum_weight",
+        "self_loops": "exclude",
+    },
+    {
+        "name": "causal_semantics_directed",
+        "directed": True,
+        "node_policy": "semantic_entities",
+        "edge_policy": "non_reasoning",
+        "property_filter": {"causal": "causal"},
+        "parallel_edges": "sum_weight",
+        "self_loops": "exclude",
+    },
+    {
+        "name": "temporal_semantics_directed",
+        "directed": True,
+        "node_policy": "semantic_entities",
+        "edge_policy": "non_reasoning",
+        "property_filter": {"temporal": "temporal"},
         "parallel_edges": "sum_weight",
         "self_loops": "exclude",
     },
@@ -1740,6 +1759,7 @@ async def _load_graph_records(
                     target_entity.canonical_name,
                     GraphRelationshipType.canonical_type,
                     GraphRelationship.weight,
+                    GraphRelationshipType.inferred_properties,
                 )
                 .join(
                     source_entity,
@@ -1808,6 +1828,7 @@ async def _load_graph_records(
             rel_type=rel_type,
             weight=int(weight or 0),
             description=description_by_relationship_id.get(rel_id, ""),
+            predicate_properties=dict(predicate_properties or {}),
         )
         for (
             rel_id,
@@ -1817,6 +1838,7 @@ async def _load_graph_records(
             target_name,
             rel_type,
             weight,
+            predicate_properties,
         ) in relationships
         if source_id in non_ref_entity_ids and target_id in non_ref_entity_ids
     ]
@@ -1942,7 +1964,9 @@ def _build_projection(
         return True
 
     included = {node.id for node in nodes if include_node(node)}
-    graph.add_nodes_from(included)
+    property_filter = dict(spec.get("property_filter") or {})
+    if not property_filter:
+        graph.add_nodes_from(included)
     for relationship in relationships:
         if relationship.source_id == relationship.target_id:
             continue
@@ -1953,6 +1977,10 @@ def _build_projection(
             continue
         if spec["edge_policy"] == "non_reasoning" and reasoning_edge:
             continue
+        properties = relationship.predicate_properties or {}
+        if any(properties.get(name) != value for name, value in property_filter.items()):
+            continue
+        graph.add_nodes_from((relationship.source_id, relationship.target_id))
         weight = max(1, int(relationship.weight or 1))
         if graph.has_edge(relationship.source_id, relationship.target_id):
             graph[relationship.source_id][relationship.target_id]["weight"] += weight
@@ -1961,6 +1989,20 @@ def _build_projection(
                 relationship.source_id,
                 relationship.target_id,
                 weight=weight,
+            )
+        if (
+            graph.is_directed()
+            and (
+                properties.get("symmetry") == "symmetric"
+                or properties.get("directionality") == "undirected"
+            )
+            and not graph.has_edge(relationship.target_id, relationship.source_id)
+        ):
+            graph.add_edge(
+                relationship.target_id,
+                relationship.source_id,
+                weight=weight,
+                inferred_symmetric=True,
             )
     return graph
 
@@ -2281,6 +2323,11 @@ async def analyze_collection_graph(
             "rel_type": rel.rel_type,
             "weight": rel.weight,
             "description": rel.description,
+            **(
+                {"predicate_properties": rel.predicate_properties}
+                if rel.predicate_properties
+                else {}
+            ),
         }
         for rel in relationships
     ]
@@ -2342,6 +2389,7 @@ async def enhance_structural_analytics_from_analysis(
             rel_type=str(row["rel_type"]),
             weight=int(row.get("weight") or 1),
             description=str(row.get("description") or ""),
+            predicate_properties=dict(row.get("predicate_properties") or {}),
         )
         for row in analysis.get("relationship_records", [])
     ]

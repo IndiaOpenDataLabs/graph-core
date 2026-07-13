@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from graph_core.database import AsyncSessionLocal
 from graph_core.models.collection import Collection
+from graph_core.models.graph_rag import GraphRelationshipType
 from graph_core.models.incremental_graph import (
     GraphChunkContribution,
     GraphChunkSegment,
@@ -38,6 +39,7 @@ class PredicateMappingInput:
     canonical_predicate_id: uuid.UUID
     resolution_method: str = "normalized"
     confidence: float = 1.0
+    inferred_properties: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,85 @@ class ContributionInput:
     contribution_kind: str = "created_or_reused"
     weight: float = 1.0
     metadata: dict[str, Any] | None = None
+
+
+_PROPERTY_UNKNOWN = "unknown"
+_PREDICATE_PROPERTIES = (
+    "directionality",
+    "symmetry",
+    "transitivity",
+    "causal",
+    "temporal",
+)
+
+
+def merge_predicate_property_observation(
+    existing_votes: dict[str, Any] | None,
+    observation: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge one immutable chunk observation into conservative consensus."""
+    votes = {
+        name: {
+            str(value): float(weight)
+            for value, weight in dict((existing_votes or {}).get(name) or {}).items()
+        }
+        for name in _PREDICATE_PROPERTIES
+    }
+    source = observation or {}
+    confidence = max(0.0, min(1.0, float(source.get("confidence") or 0.0)))
+    for name in _PREDICATE_PROPERTIES:
+        value = str(source.get(name) or _PROPERTY_UNKNOWN)
+        votes[name][value] = votes[name].get(value, 0.0) + confidence
+
+    consensus: dict[str, Any] = {}
+    confidence_by_property: dict[str, float] = {}
+    for name in _PREDICATE_PROPERTIES:
+        asserted = {
+            value: weight
+            for value, weight in votes[name].items()
+            if value != _PROPERTY_UNKNOWN and weight > 0
+        }
+        total = sum(asserted.values())
+        if total < 0.75:
+            consensus[name] = _PROPERTY_UNKNOWN
+            confidence_by_property[name] = 0.0
+            continue
+        value, weight = max(asserted.items(), key=lambda item: (item[1], item[0]))
+        agreement = weight / total
+        consensus[name] = value if agreement >= 0.8 else _PROPERTY_UNKNOWN
+        confidence_by_property[name] = agreement if agreement >= 0.8 else 0.0
+    consensus["confidence_by_property"] = confidence_by_property
+    return votes, consensus
+
+
+def coalesce_predicate_mappings(
+    mappings: list[PredicateMappingInput],
+) -> list[PredicateMappingInput]:
+    grouped: dict[str, list[PredicateMappingInput]] = {}
+    for item in mappings:
+        grouped.setdefault(item.raw_predicate, []).append(item)
+    results: list[PredicateMappingInput] = []
+    for raw_predicate, items in grouped.items():
+        properties: dict[str, Any] = {}
+        for name in _PREDICATE_PROPERTIES:
+            observed = {
+                str((item.inferred_properties or {}).get(name) or _PROPERTY_UNKNOWN)
+                for item in items
+            }
+            properties[name] = observed.pop() if len(observed) == 1 else _PROPERTY_UNKNOWN
+        confidence = min(float(item.confidence) for item in items)
+        properties["confidence"] = confidence
+        first = items[0]
+        results.append(
+            PredicateMappingInput(
+                raw_predicate=raw_predicate,
+                canonical_predicate_id=first.canonical_predicate_id,
+                resolution_method=first.resolution_method,
+                confidence=confidence,
+                inferred_properties=properties,
+            )
+        )
+    return results
 
 
 def ingestion_contract(domain: str | None, extraction_version: str) -> str:
@@ -95,6 +176,10 @@ async def publish_chunk_delta(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
             {"lock_key": f"graph-version:{collection.id}"},
         )
+        prior_segment = await session.get(GraphChunkSegment, segment_id)
+        segment_was_completed = bool(
+            prior_segment is not None and prior_segment.status == "completed"
+        )
         segment_insert = pg_insert(GraphChunkSegment).values(
             id=segment_id,
             collection_id=collection.id,
@@ -141,6 +226,7 @@ async def publish_chunk_delta(
                             "canonical_entity_id": item.canonical_entity_id,
                             "resolution_method": item.resolution_method,
                             "confidence": item.confidence,
+                            "inferred_properties": item.inferred_properties,
                         }
                         for item in entity_mappings
                     ]
@@ -150,9 +236,7 @@ async def publish_chunk_delta(
                 )
             )
         if predicate_mappings:
-            predicate_mappings = list(
-                {item.raw_predicate: item for item in predicate_mappings}.values()
-            )
+            predicate_mappings = coalesce_predicate_mappings(predicate_mappings)
             await session.execute(
                 pg_insert(GraphPredicateMapping)
                 .values(
@@ -176,6 +260,23 @@ async def publish_chunk_delta(
                     constraint="uq_graph_predicate_mapping_local"
                 )
             )
+            for item in predicate_mappings if not segment_was_completed else []:
+                predicate_type = await session.get(
+                    GraphRelationshipType,
+                    item.canonical_predicate_id,
+                    with_for_update=True,
+                )
+                if predicate_type is None:
+                    continue
+                votes, consensus = merge_predicate_property_observation(
+                    predicate_type.property_votes,
+                    item.inferred_properties,
+                )
+                predicate_type.property_votes = votes
+                predicate_type.inferred_properties = consensus
+                predicate_type.property_observation_count = (
+                    int(predicate_type.property_observation_count or 0) + 1
+                )
         if contributions:
             contribution_values = [
                 {

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import re
 import uuid
 from collections import defaultdict
@@ -88,7 +89,6 @@ STOPWORDS = {
     "the",
     "their",
     "this",
-    "take",
     "to",
     "what",
     "when",
@@ -106,6 +106,14 @@ class QueryPlan:
 
 
 @dataclass(frozen=True)
+class FrameArgumentPattern:
+    role: str
+    entity_id: uuid.UUID | None = None
+    variable_name: str | None = None
+    literal_value: Any | None = None
+
+
+@dataclass(frozen=True)
 class FrameSeed:
     id: uuid.UUID
     kind: str
@@ -118,6 +126,14 @@ class FrameSeed:
     executable_status: str
     conditions: tuple[str, ...] = ()
     exceptions: tuple[str, ...] = ()
+    arguments: tuple[FrameArgumentPattern, ...] = ()
+
+
+@dataclass(frozen=True)
+class GoalPattern:
+    predicate: str
+    arguments: tuple[FrameArgumentPattern, ...]
+    source: str = "question"
 
 
 @dataclass
@@ -155,6 +171,9 @@ class Limits:
     max_edges: int = 900
     max_landmarks: int = 4
     max_conclusions: int = 30
+    max_goal_depth: int = 4
+    max_goal_states: int = 128
+    max_goal_matches: int = 8
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +186,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-hops", type=int, default=3)
     parser.add_argument("--max-nodes", type=int, default=500)
     parser.add_argument("--max-edges", type=int, default=900)
+    parser.add_argument("--max-goal-depth", type=int, default=4)
+    parser.add_argument("--max-goal-states", type=int, default=128)
     parser.add_argument("--min-seed-score", type=float, default=0.35)
     parser.add_argument(
         "--trace-only",
@@ -183,6 +204,20 @@ def tokenize(text: str) -> set[str]:
         for token in re.findall(r"[a-z][a-z0-9_-]{2,}", text.casefold())
         if token not in STOPWORDS
     }
+
+
+def _goal_token(value: str) -> str:
+    if value.endswith("ies") and len(value) > 4:
+        return value[:-3] + "y"
+    if value.endswith("s") and not value.endswith("ss") and len(value) > 3:
+        return value[:-1]
+    if value.endswith("ing") and len(value) > 5:
+        return value[:-3]
+    return value
+
+
+def goal_tokens(text: str) -> set[str]:
+    return {_goal_token(token) for token in tokenize(text)}
 
 
 def compile_query(question: str) -> QueryPlan:
@@ -232,10 +267,18 @@ def seed_token_coverage(
 ) -> tuple[str, ...]:
     entity_tokens: set[str] = set()
     for seed in seeds:
-        entity_tokens.update(tokenize(seed.name))
+        entity_tokens.update(goal_tokens(seed.name))
     for frame in frame_seeds or []:
-        entity_tokens.update(tokenize(f"{frame.title} {frame.predicate} {frame.text}"))
-    return tuple(sorted(set(plan.state_tokens) & entity_tokens))
+        entity_tokens.update(
+            goal_tokens(f"{frame.title} {frame.predicate} {frame.text}")
+        )
+    return tuple(
+        sorted(
+            token
+            for token in plan.state_tokens
+            if _goal_token(token) in entity_tokens
+        )
+    )
 
 
 async def load_collection(
@@ -323,15 +366,13 @@ async def resolve_frame_seeds(
 ) -> list[FrameSeed]:
     provider = await query_logic._resolve_embedding_provider(collection)
     embedding = await query_logic._embed_entity_query(provider, question)
-    hits = await GraphRAGVectorStore().search_semantic_frame_embeddings(
-        collection.id,
+    evidence = await query_logic._semantic_frame_evidence(
+        question,
+        collection,
         embedding,
-        top_k=max(limit * 4, 20),
-        frame_kinds=["proposition", "community_summary"],
+        top_k=limit,
     )
-    scored_ids = {
-        uuid.UUID(hit.metadata["frame_id"]): 1.0 - hit.distance for hit in hits
-    }
+    scored_ids = {item.frame_id: item.score for item in evidence}
     if not scored_ids:
         return []
     async with AsyncSessionLocal() as session:
@@ -348,17 +389,32 @@ async def resolve_frame_seeds(
         )
         arguments = (
             await session.execute(
-                select(GraphFrameArgument.frame_id, GraphFrameArgument.entity_id)
+                select(
+                    GraphFrameArgument.frame_id,
+                    GraphFrameArgument.role,
+                    GraphFrameArgument.entity_id,
+                    GraphFrameArgument.variable_name,
+                    GraphFrameArgument.literal_value,
+                )
                 .where(
                     GraphFrameArgument.frame_id.in_(scored_ids),
-                    GraphFrameArgument.entity_id.is_not(None),
                 )
                 .order_by(GraphFrameArgument.position)
             )
         ).all()
     argument_ids: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
-    for frame_id, entity_id in arguments:
-        argument_ids[frame_id].append(entity_id)
+    argument_patterns: dict[uuid.UUID, list[FrameArgumentPattern]] = defaultdict(list)
+    for frame_id, role, entity_id, variable_name, literal_value in arguments:
+        if entity_id is not None:
+            argument_ids[frame_id].append(entity_id)
+        argument_patterns[frame_id].append(
+            FrameArgumentPattern(
+                role=str(role),
+                entity_id=entity_id,
+                variable_name=str(variable_name) if variable_name else None,
+                literal_value=literal_value,
+            )
+        )
     seeds = [
         FrameSeed(
             id=frame.id,
@@ -372,6 +428,7 @@ async def resolve_frame_seeds(
             executable_status=frame.executable_status,
             conditions=tuple(frame.conditions_json or ()),
             exceptions=tuple(frame.exceptions_json or ()),
+            arguments=tuple(argument_patterns[frame.id]),
         )
         for frame in frames
     ]
@@ -423,6 +480,73 @@ async def expand_frame_seeds(frame_seeds: list[FrameSeed]) -> list[WorkingNode]:
         node.seed_score = scores[node_id]
         node.distance = distances[node_id]
     return list(nodes.values())
+
+
+async def load_working_frames(graph: WorkingGraph) -> list[FrameSeed]:
+    proposition_ids = {
+        node_id
+        for node_id, node in graph.nodes.items()
+        if node.node_type == "PROPOSITION"
+    }
+    if not proposition_ids:
+        return []
+    async with AsyncSessionLocal() as session:
+        frames = (
+            (
+                await session.execute(
+                    select(GraphSemanticFrame).where(
+                        GraphSemanticFrame.proposition_entity_id.in_(proposition_ids),
+                        GraphSemanticFrame.frame_kind == "proposition",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows = (
+            await session.execute(
+                select(
+                    GraphFrameArgument.frame_id,
+                    GraphFrameArgument.role,
+                    GraphFrameArgument.entity_id,
+                    GraphFrameArgument.variable_name,
+                    GraphFrameArgument.literal_value,
+                )
+                .where(GraphFrameArgument.frame_id.in_([frame.id for frame in frames]))
+                .order_by(GraphFrameArgument.frame_id, GraphFrameArgument.position)
+            )
+        ).all()
+    arguments: dict[uuid.UUID, list[FrameArgumentPattern]] = defaultdict(list)
+    for frame_id, role, entity_id, variable_name, literal_value in rows:
+        arguments[frame_id].append(
+            FrameArgumentPattern(
+                role=str(role),
+                entity_id=entity_id,
+                variable_name=str(variable_name) if variable_name else None,
+                literal_value=literal_value,
+            )
+        )
+    return [
+        FrameSeed(
+            id=frame.id,
+            kind=str(frame.frame_kind),
+            title=str(frame.title),
+            text=str(frame.frame_text),
+            predicate=str(frame.predicate or ""),
+            score=0.0,
+            proposition_id=frame.proposition_entity_id,
+            argument_ids=tuple(
+                argument.entity_id
+                for argument in arguments[frame.id]
+                if argument.entity_id is not None
+            ),
+            executable_status=str(frame.executable_status),
+            conditions=tuple(frame.conditions_json or ()),
+            exceptions=tuple(frame.exceptions_json or ()),
+            arguments=tuple(arguments[frame.id]),
+        )
+        for frame in frames
+    ]
 
 
 async def load_landmarks(
@@ -668,6 +792,321 @@ def _active_text(node: WorkingNode, query_tokens: set[str]) -> bool:
     return bool(query_tokens & node_tokens)
 
 
+def _frame_arguments(frame: FrameSeed) -> tuple[FrameArgumentPattern, ...]:
+    if frame.arguments:
+        return frame.arguments
+    roles = ("subject", "object")
+    return tuple(
+        FrameArgumentPattern(
+            role=roles[index] if index < len(roles) else f"argument_{index}",
+            entity_id=entity_id,
+        )
+        for index, entity_id in enumerate(frame.argument_ids)
+    )
+
+
+def _term(argument: FrameArgumentPattern) -> tuple[str, str] | None:
+    if argument.entity_id is not None:
+        return "entity", str(argument.entity_id)
+    if argument.variable_name:
+        return "variable", argument.variable_name.lstrip("?")
+    if argument.literal_value is not None:
+        return "literal", json.dumps(argument.literal_value, sort_keys=True)
+    return None
+
+
+def _argument_payload(argument: FrameArgumentPattern) -> dict[str, Any]:
+    return {
+        "role": argument.role,
+        "entity_id": str(argument.entity_id) if argument.entity_id else None,
+        "variable_name": argument.variable_name,
+        "literal_value": argument.literal_value,
+    }
+
+
+def unify_goal(
+    goal: GoalPattern,
+    frame: FrameSeed,
+    bindings: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    if normalize_predicate(goal.predicate) != normalize_predicate(frame.predicate):
+        return None
+    result = dict(bindings or {})
+    candidate_by_role = {argument.role: argument for argument in _frame_arguments(frame)}
+    for expected in goal.arguments:
+        candidate = candidate_by_role.get(expected.role)
+        if candidate is None:
+            return None
+        expected_term = _term(expected)
+        candidate_term = _term(candidate)
+        if expected_term is None or candidate_term is None:
+            return None
+        if expected_term[0] == "variable":
+            current = result.get(expected_term[1])
+            if current is not None and current != candidate_term[1]:
+                return None
+            result[expected_term[1]] = candidate_term[1]
+        elif candidate_term[0] == "variable":
+            current = result.get(candidate_term[1])
+            if current is not None and current != expected_term[1]:
+                return None
+            result[candidate_term[1]] = expected_term[1]
+        elif expected_term != candidate_term:
+            return None
+    return result
+
+
+def normalize_predicate(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")
+
+
+def compile_goal_patterns(
+    plan: QueryPlan,
+    graph: WorkingGraph,
+    frames: list[FrameSeed],
+    limits: Limits,
+) -> list[GoalPattern]:
+    query_tokens = {_goal_token(token) for token in plan.state_tokens}
+    query_entity_ids = {
+        node_id
+        for node_id, node in graph.nodes.items()
+        if query_tokens & goal_tokens(node.name)
+        and node.node_type not in PROVENANCE_TYPES | REASONING_TYPES
+    }
+    ranked: list[tuple[int, float, FrameSeed, GoalPattern]] = []
+    for frame in frames:
+        if frame.kind != "proposition" or not frame.predicate:
+            continue
+        overlap = len(query_tokens & goal_tokens(f"{frame.title} {frame.predicate}"))
+        arguments = tuple(
+            argument
+            if argument.entity_id in query_entity_ids or argument.variable_name
+            else FrameArgumentPattern(
+                role=argument.role,
+                variable_name=f"goal_{argument.role}",
+            )
+            for argument in _frame_arguments(frame)
+        )
+        constant_count = sum(argument.entity_id is not None for argument in arguments)
+        if overlap == 0 or (constant_count == 0 and overlap < 2):
+            continue
+        ranked.append(
+            (
+                overlap,
+                frame.score,
+                frame,
+                GoalPattern(frame.predicate, arguments),
+            )
+        )
+    ranked.sort(key=lambda item: (-item[0], -item[1], str(item[2].id)))
+    goals: list[GoalPattern] = []
+    seen: set[tuple[str, tuple[tuple[str, str] | None, ...]]] = set()
+    for _, _, _, goal in ranked:
+        key = (normalize_predicate(goal.predicate), tuple(_term(arg) for arg in goal.arguments))
+        if key in seen:
+            continue
+        seen.add(key)
+        goals.append(goal)
+        if len(goals) >= limits.max_goal_matches:
+            break
+    return goals
+
+
+def backward_chain(
+    plan: QueryPlan,
+    graph: WorkingGraph,
+    frames: list[FrameSeed],
+    limits: Limits,
+    active_nodes: set[uuid.UUID],
+) -> dict[str, Any]:
+    outgoing: dict[uuid.UUID, list[WorkingEdge]] = defaultdict(list)
+    incoming: dict[uuid.UUID, list[WorkingEdge]] = defaultdict(list)
+    for edge in graph.edges.values():
+        outgoing[edge.source_id].append(edge)
+        incoming[edge.target_id].append(edge)
+    frame_by_proposition = {
+        frame.proposition_id: frame
+        for frame in frames
+        if frame.proposition_id is not None
+    }
+    goals = compile_goal_patterns(plan, graph, frames, limits)
+    explored = 0
+
+    def prove(
+        proposition_id: uuid.UUID,
+        bindings: dict[str, str],
+        depth: int,
+        path: set[uuid.UUID],
+    ) -> dict[str, Any]:
+        nonlocal explored
+        explored += 1
+        if explored > limits.max_goal_states:
+            return {"status": "state_limit", "proposition_id": str(proposition_id)}
+        if depth > limits.max_goal_depth:
+            return {"status": "depth_limit", "proposition_id": str(proposition_id)}
+        if proposition_id in path:
+            return {"status": "cycle", "proposition_id": str(proposition_id)}
+        concluding_rules = [
+            edge.source_id
+            for edge in incoming[proposition_id]
+            if edge.rel_type == "CONCLUDES"
+        ]
+        frame = frame_by_proposition.get(proposition_id)
+        unbound_variables = sorted(
+            {
+                argument.variable_name.lstrip("?")
+                for argument in _frame_arguments(frame)
+                if argument.variable_name
+                and argument.variable_name.lstrip("?") not in bindings
+            }
+            if frame
+            else set()
+        )
+        if not concluding_rules:
+            return {
+                "status": "conditional" if unbound_variables else "asserted",
+                "proposition_id": str(proposition_id),
+                "bindings": bindings,
+                "unbound_variables": unbound_variables,
+            }
+        alternatives: list[dict[str, Any]] = []
+        for rule_id in concluding_rules[: limits.max_goal_matches]:
+            blockers = [
+                edge.source_id
+                for edge in incoming[rule_id]
+                if edge.rel_type == "BLOCKS"
+            ]
+            active_blockers = [value for value in blockers if value in active_nodes]
+            antecedents = [
+                edge.source_id
+                for edge in incoming[rule_id]
+                if edge.rel_type == "ANTECEDENT_OF"
+            ]
+            obligations: list[dict[str, Any]] = []
+            for antecedent_id in antecedents:
+                node = graph.nodes.get(antecedent_id)
+                if antecedent_id in active_nodes:
+                    obligations.append(
+                        {
+                            "status": "satisfied",
+                            "node_id": str(antecedent_id),
+                            "statement": node.description if node else "",
+                        }
+                    )
+                elif node and node.node_type == "PROPOSITION":
+                    obligations.append(
+                        prove(
+                            antecedent_id,
+                            bindings,
+                            depth + 1,
+                            path | {proposition_id},
+                        )
+                    )
+                else:
+                    obligations.append(
+                        {
+                            "status": "unresolved_subgoal",
+                            "node_id": str(antecedent_id),
+                            "statement": (
+                                node.description or node.name if node else ""
+                            ),
+                        }
+                    )
+            if active_blockers:
+                status = "blocked"
+            elif obligations and all(
+                item["status"] in {"asserted", "proved", "satisfied"}
+                for item in obligations
+            ):
+                status = "proved"
+            elif not antecedents:
+                status = "incomplete_rule"
+            else:
+                status = "conditional"
+            alternatives.append(
+                {
+                    "rule_id": str(rule_id),
+                    "status": status,
+                    "active_blockers": [str(value) for value in active_blockers],
+                    "obligations": obligations,
+                }
+            )
+        status = (
+            "proved"
+            if any(item["status"] == "proved" for item in alternatives)
+            else "blocked"
+            if alternatives and all(item["status"] == "blocked" for item in alternatives)
+            else "conditional"
+        )
+        return {
+            "status": status,
+            "proposition_id": str(proposition_id),
+            "bindings": bindings,
+            "alternatives": alternatives,
+        }
+
+    proofs: list[dict[str, Any]] = []
+    for goal in goals:
+        matches: list[dict[str, Any]] = []
+        for proposition_id, frame in frame_by_proposition.items():
+            bindings = unify_goal(goal, frame)
+            if bindings is None:
+                continue
+            matches.append(prove(proposition_id, bindings, 0, set()))
+            if len(matches) >= limits.max_goal_matches:
+                break
+        proofs.append(
+            {
+                "goal": {
+                    "predicate": goal.predicate,
+                    "arguments": [
+                        _argument_payload(argument) for argument in goal.arguments
+                    ],
+                },
+                "status": (
+                    "proved"
+                    if any(item["status"] in {"asserted", "proved"} for item in matches)
+                    else "unresolved"
+                ),
+                "matches": matches,
+            }
+        )
+    goal_predicates = {normalize_predicate(goal.predicate) for goal in goals}
+    goal_coverage_tokens: set[str] = set()
+    for frame in frames:
+        if normalize_predicate(frame.predicate) in goal_predicates:
+            goal_coverage_tokens.update(
+                goal_tokens(f"{frame.title} {frame.predicate} {frame.text}")
+            )
+    unmatched_query_terms = sorted(
+        token
+        for token in plan.state_tokens
+        if _goal_token(token) not in goal_coverage_tokens
+    )
+    return {
+        "status": (
+            "insufficient_goal_coverage"
+            if unmatched_query_terms
+            else "proved"
+            if any(item["status"] == "proved" for item in proofs)
+            else "unresolved"
+        ),
+        "unmatched_query_terms": unmatched_query_terms,
+        "unresolved_query_goals": [
+            {
+                "terms": unmatched_query_terms,
+                "status": "no_unifiable_proposition_pattern",
+            }
+        ]
+        if unmatched_query_terms
+        else [],
+        "goals": proofs,
+        "explored_states": explored,
+        "state_limit": limits.max_goal_states,
+        "depth_limit": limits.max_goal_depth,
+    }
+
+
 def execute_operator(
     plan: QueryPlan,
     conclusions: list[dict[str, Any]],
@@ -774,6 +1213,30 @@ def reason(
                 active_nodes.add(node_id)
         elif node.seed_score > 0 or text_matches_state:
             active_nodes.add(node_id)
+    rule_conclusions = {
+        edge.target_id
+        for edge in graph.edges.values()
+        if edge.rel_type == "CONCLUDES"
+    }
+    active_nodes.update(
+        frame.proposition_id
+        for frame in frame_seeds or []
+        if frame.proposition_id is not None
+        and frame.proposition_id not in rule_conclusions
+    )
+    backward = backward_chain(
+        plan,
+        graph,
+        list(frame_seeds or []),
+        limits,
+        active_nodes,
+    )
+    backward_match_ids = {
+        uuid.UUID(match["proposition_id"])
+        for goal in backward["goals"]
+        for match in goal["matches"]
+        if match.get("proposition_id")
+    }
     activated_propositions: set[uuid.UUID] = set()
 
     # Monotonic forward chaining reaches a fixed point in at most |rules| rounds.
@@ -846,6 +1309,18 @@ def reason(
     for trace in rule_traces:
         for conclusion_id in trace["conclusions"]:
             conclusion_rule_statuses[uuid.UUID(conclusion_id)].add(trace["status"])
+    backward_rule_ids = {
+        alternative["rule_id"]
+        for goal in backward["goals"]
+        for match in goal["matches"]
+        for alternative in match.get("alternatives", [])
+    }
+    rule_traces = [
+        trace
+        for trace in rule_traces
+        if trace["rule_id"] in backward_rule_ids
+        or trace["status"] in {"fired", "blocked"}
+    ][:64]
 
     conclusions: list[dict[str, Any]] = []
     for proposition_id in propositions:
@@ -900,6 +1375,8 @@ def reason(
         score = relevance + (0.15 * proximity) + min(support_count, 3) * 0.03
         if frame:
             score += 0.2
+        if proposition_id in backward_match_ids:
+            score += 0.25
         score += min(structural_prior, 0.1)
         if status == "blocked":
             score *= 0.25
@@ -950,6 +1427,7 @@ def reason(
         "conclusions": selected_conclusions,
         "conflicts": conflicts,
         "operator_result": execute_operator(plan, selected_conclusions, conflicts),
+        "backward_reasoning": backward,
         "fixed_point": True,
     }
 
@@ -964,7 +1442,11 @@ def trace_payload(
     reasoning: dict[str, Any],
     covered_tokens: tuple[str, ...],
 ) -> dict[str, Any]:
-    required_coverage = min(2, len(plan.state_tokens))
+    required_coverage = (
+        len(plan.state_tokens)
+        if len(plan.state_tokens) <= 3
+        else max(2, math.ceil(len(plan.state_tokens) * 0.6))
+    )
     has_coverage = len(covered_tokens) >= required_coverage
     return {
         "graph_version": version.version,
@@ -1051,6 +1533,8 @@ async def main() -> None:
         max_hops=args.max_hops,
         max_nodes=args.max_nodes,
         max_edges=args.max_edges,
+        max_goal_depth=args.max_goal_depth,
+        max_goal_states=args.max_goal_states,
     )
     collection, version = await load_collection(args.collection_id)
     plan = compile_query(args.question)
@@ -1091,7 +1575,10 @@ async def main() -> None:
         graph = await build_working_graph(collection, version, seeds, limits)
     else:
         graph = WorkingGraph()
-    reasoning = reason(plan, graph, limits, frame_seeds)
+    working_frames = await load_working_frames(graph)
+    frame_by_id = {frame.id: frame for frame in working_frames}
+    frame_by_id.update({frame.id: frame for frame in frame_seeds})
+    reasoning = reason(plan, graph, limits, list(frame_by_id.values()))
     payload = trace_payload(
         plan, version, seeds, frame_seeds, graph, limits, reasoning, covered_tokens
     )

@@ -10,8 +10,8 @@
 Production now includes idempotent chunk deltas and graph versions, lean
 proposition/rule materialization, multi-resolution embedded frames, versioned
 structural projections, and bounded mix-mode graph activation. Remaining phases
-in this document include deletion/retraction, dynamic predicate-property
-compilation, domain bootstrap contracts, and backward goal unification.
+in this document include deletion/retraction, domain bootstrap contracts,
+cross-predicate ontology refinement, and backward goal unification.
 
 ## 1. Objective
 
