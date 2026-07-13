@@ -148,10 +148,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-edges", type=int, default=900)
     parser.add_argument("--min-seed-score", type=float, default=0.35)
     parser.add_argument(
-        "--answer",
+        "--trace-only",
         action="store_true",
-        help="Use one LLM call to verbalize the graph reasoning trace.",
+        help="Print the graph reasoning trace without calling the LLM.",
     )
+    parser.add_argument("--answer", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -891,9 +892,13 @@ async def main() -> None:
     payload = trace_payload(
         plan, version, seeds, graph, limits, reasoning, covered_tokens
     )
-    if args.answer:
-        payload["answer"] = await verbalize(collection, payload)
-    print(json.dumps(payload, indent=2, ensure_ascii=True))
+    if args.trace_only:
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
+        return
+    if payload["sufficiency"] == "insufficient_graph_evidence":
+        print("The graph does not contain sufficient evidence to answer this question.")
+        return
+    print(await verbalize(collection, payload))
 
 
 if __name__ == "__main__":
