@@ -294,6 +294,53 @@ class GraphRAGVectorStore:
             )
             await session.commit()
 
+    async def upsert_relationship_embeddings(
+        self,
+        collection_id: uuid.UUID,
+        rows: list[dict],
+    ) -> None:
+        """Replace relationship vectors in one transaction using executemany."""
+        if not rows:
+            return
+        tbl = table_name(collection_id, "relationship_embeddings")
+        dimensions = await get_collection_dimensions(collection_id)
+        if dimensions is None:
+            raise ValueError(f"Collection {collection_id} has no embedding dimensions")
+        cast = _vector_cast_sql(dimensions)
+        params = [
+            {
+                "rid": _uuid_for_sql(row["relationship_id"]),
+                "cid": _uuid_for_sql(collection_id),
+                "document_id": (
+                    _uuid_for_sql(row["document_id"])
+                    if row.get("document_id")
+                    else None
+                ),
+                "document_path": row.get("document_path"),
+                "sn": row["source_name"],
+                "tn": row["target_name"],
+                "desc": row["description"],
+                "emb": _embedding_literal(row["embedding"]),
+            }
+            for row in rows
+        ]
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text(f"DELETE FROM {tbl} WHERE relationship_id = :rid"),
+                [{"rid": item["rid"]} for item in params],
+            )
+            await session.execute(
+                text(
+                    f"INSERT INTO {tbl} "
+                    "(relationship_id, collection_id, document_id, document_path, "
+                    "source_name, target_name, description, embedding) "
+                    f"VALUES (:rid, :cid, :document_id, :document_path, :sn, :tn, "
+                    f":desc, (:emb){cast})"
+                ),
+                params,
+            )
+            await session.commit()
+
     async def search_relationship_embeddings(
         self,
         collection_id: uuid.UUID,

@@ -33,6 +33,8 @@ from graph_core.services.document_identity import (
 from graph_core.services.graph.analytics import (
     analyze_collection_graph,
     build_collection_understanding,
+    enhance_semantic_frames,
+    enhance_structural_analytics_from_analysis,
 )
 from graph_core.services.graph.ingestion import (
     deterministic_uuid,
@@ -2678,6 +2680,27 @@ class GraphService:
             await self._raise_if_enhance_cancelled(job_id)
             analysis = await analyze_collection_graph(source_collection.id)
             await self._raise_if_enhance_cancelled(job_id)
+            if analysis.get("node_records") and analysis.get(
+                "relationship_records"
+            ):
+                analysis["structural_analytics"] = (
+                    await enhance_structural_analytics_from_analysis(analysis)
+                )
+                await self._raise_if_enhance_cancelled(job_id)
+            if "semantic_communities" in analysis:
+                source_embedding_provider = (
+                    await self._resolve_collection_embedding_provider(
+                        source_collection
+                    )
+                )
+                analysis["semantic_frame_enhancement"] = (
+                    await enhance_semantic_frames(
+                        analysis,
+                        source_collection,
+                        source_embedding_provider,
+                    )
+                )
+                await self._raise_if_enhance_cancelled(job_id)
             llm_provider = await self._resolve_collection_llm_provider(
                 source_collection, None
             )

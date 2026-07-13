@@ -1,11 +1,17 @@
 # Incremental Compiled Graph Reasoning Plan
 
-> **Status:** Design - awaiting implementation
+> **Status:** Core production port implemented; advanced compiler phases pending
 >
 > **Date:** 2026-07-12
 >
 > **Scope:** `custom_graph_rag` ingestion, knowledge compilation, structural
 > analytics, and graph-native query reasoning for large evolving collections
+
+Production now includes idempotent chunk deltas and graph versions, lean
+proposition/rule materialization, multi-resolution embedded frames, versioned
+structural projections, and bounded mix-mode graph activation. Remaining phases
+in this document include deletion/retraction, dynamic predicate-property
+compilation, domain bootstrap contracts, and backward goal unification.
 
 ## 1. Objective
 
@@ -608,4 +614,3 @@ memory/runtime, working-graph size, reasoning expansions, and query latency.
 - using centrality or community membership as evidence of truth
 - running unbounded clique, motif, path, or graph-rewrite searches
 - requiring the MCP server to access a client's filesystem
-

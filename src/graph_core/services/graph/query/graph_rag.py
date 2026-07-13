@@ -32,6 +32,10 @@ from graph_core.models.graph_rag import (
     RelationshipDescription,
     RelationshipTypeAlias,
 )
+from graph_core.models.incremental_graph import (
+    GraphFrameArgument,
+    GraphSemanticFrame,
+)
 from graph_core.models.profile import Profile
 from graph_core.models.rel_types import (
     normalize_rel_type as normalize_dim,
@@ -41,6 +45,7 @@ from graph_core.models.rel_types import (
 )
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.vector import QueryResult
+from graph_core.services.graph.reasoning import ReasoningSeed, activate_reasoning
 from graph_core.storage.graph_names import collection_graph_name
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.meta_collections import (
@@ -54,12 +59,13 @@ _graph_rag_vectors = GraphRAGVectorStore()
 _crypto = CredentialCrypto()
 logger = logging.getLogger(__name__)
 _ENTITY_RETRIEVAL_INSTRUCTION = (
-    "Retrieve ontology entities whose descriptions best explain the user's "
-    "state, process, causal mechanism, or source of exhaustion."
+    "Retrieve ontology entities whose descriptions best match the user's "
+    "subject, requested operation, constraints, process, or causal mechanism."
 )
 _RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
     "Retrieve relationship descriptions that best explain the user's question, "
-    "especially causes, mechanisms, tensions, and energy depletion."
+    "especially its requested predicates, causes, mechanisms, constraints, and "
+    "comparisons."
 )
 _MIX_REWRITE_MIN_SCORE = 0.3
 _REL_ENDPOINT_ENTITY_SCORE_MIN = 0.0
@@ -468,6 +474,24 @@ class ContextAssertionEvidence:
     evidence: str
 
 
+@dataclass
+class SemanticFrameEvidence:
+    frame_id: uuid.UUID
+    frame_kind: str
+    title: str
+    frame_text: str
+    predicate: str
+    score: float
+    proposition_id: uuid.UUID | None
+    source_relationship_id: uuid.UUID | None
+    executable_status: str
+    polarity: str
+    modality: str
+    conditions: tuple[str, ...]
+    exceptions: tuple[str, ...]
+    arguments: tuple[tuple[str, uuid.UUID, str], ...]
+
+
 def _format_retrieval_query(instruction: str, query: str) -> str:
     return f"<Instruct>: {instruction}\n<Query>: {query}"
 
@@ -630,6 +654,34 @@ def _text_token_set(text: str) -> set[str]:
         if len(token) >= 3:
             tokens.add(token)
     return tokens
+
+
+_FRAME_QUERY_STOPWORDS = {
+    "and",
+    "are",
+    "can",
+    "does",
+    "for",
+    "from",
+    "how",
+    "into",
+    "should",
+    "take",
+    "that",
+    "the",
+    "their",
+    "this",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "why",
+}
+
+
+def _frame_query_tokens(text: str) -> set[str]:
+    return _text_token_set(text) - _FRAME_QUERY_STOPWORDS
 
 
 # ---------------------------------------------------------------------------
@@ -3061,6 +3113,306 @@ def _build_context_evidence_text(
     )
 
 
+async def _semantic_frame_evidence(
+    question: str,
+    collection: Collection,
+    query_embedding: list[float],
+    *,
+    document_ids: list[uuid.UUID] | None = None,
+    top_k: int = 12,
+) -> list[SemanticFrameEvidence]:
+    """Retrieve rich frames, preserving links to executable graph objects."""
+    from graph_core.storage.vector_tables import table_name
+
+    vector_table = table_name(collection.id, "semantic_frame_embeddings")
+    async with AsyncSessionLocal() as session:
+        exists = (
+            await session.execute(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": vector_table},
+            )
+        ).scalar_one_or_none()
+    if exists is None:
+        return []
+    hits = await _graph_rag_vectors.search_semantic_frame_embeddings(
+        collection.id,
+        query_embedding,
+        top_k=max(top_k * 4, 32),
+        frame_kinds=["proposition", "community_summary"],
+    )
+    scores = {
+        uuid.UUID(str(hit.metadata["frame_id"])): 1.0 - float(hit.distance)
+        for hit in hits
+    }
+    query_tokens = _frame_query_tokens(question)
+    lexical_query = " | ".join(sorted(query_tokens))
+    if lexical_query:
+        async with AsyncSessionLocal() as session:
+            lexical_rows = (
+                await session.execute(
+                    text(
+                        "SELECT id, ts_rank_cd("
+                        "to_tsvector('simple', coalesce(title, '') || ' ' || "
+                        "coalesce(frame_text, '')), "
+                        "to_tsquery('simple', :query)) AS rank "
+                        "FROM graph_semantic_frames "
+                        "WHERE collection_id = :collection_id "
+                        "AND frame_kind IN ('proposition', 'community_summary') "
+                        "AND to_tsvector('simple', coalesce(title, '') || ' ' || "
+                        "coalesce(frame_text, '')) @@ to_tsquery('simple', :query) "
+                        "ORDER BY rank DESC LIMIT :limit"
+                    ),
+                    {
+                        "query": lexical_query,
+                        "collection_id": _uuid_for_sql(collection.id),
+                        "limit": max(top_k * 4, 32),
+                    },
+                )
+            ).all()
+        for frame_id, rank in lexical_rows:
+            rank_value = max(float(rank or 0.0), 0.0)
+            lexical_score = 0.45 + (0.2 * rank_value / (1.0 + rank_value))
+            scores[frame_id] = max(scores.get(frame_id, 0.0), lexical_score)
+    if not scores:
+        return []
+    async with AsyncSessionLocal() as session:
+        frames = list(
+            (
+                await session.execute(
+                    select(GraphSemanticFrame).where(
+                        GraphSemanticFrame.id.in_(scores)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        argument_rows = (
+            await session.execute(
+                select(
+                    GraphFrameArgument.frame_id,
+                    GraphFrameArgument.role,
+                    GraphFrameArgument.entity_id,
+                    GraphEntity.canonical_name,
+                )
+                .join(GraphEntity, GraphEntity.id == GraphFrameArgument.entity_id)
+                .where(GraphFrameArgument.frame_id.in_(scores))
+                .order_by(GraphFrameArgument.frame_id, GraphFrameArgument.position)
+            )
+        ).all()
+    arguments: dict[uuid.UUID, list[tuple[str, uuid.UUID, str]]] = defaultdict(list)
+    for frame_id, role, entity_id, name in argument_rows:
+        arguments[frame_id].append((str(role), entity_id, str(name)))
+    allowed_documents = {str(value) for value in document_ids or []}
+    evidence: list[SemanticFrameEvidence] = []
+    for frame in frames:
+        metadata = dict(frame.metadata_json or {})
+        if allowed_documents:
+            frame_document_id = str(metadata.get("document_id") or "")
+            if frame_document_id not in allowed_documents:
+                continue
+        evidence.append(
+            SemanticFrameEvidence(
+                frame_id=frame.id,
+                frame_kind=str(frame.frame_kind),
+                title=str(frame.title),
+                frame_text=str(frame.frame_text),
+                predicate=str(frame.predicate or ""),
+                score=scores[frame.id],
+                proposition_id=frame.proposition_entity_id,
+                source_relationship_id=frame.source_relationship_id,
+                executable_status=str(frame.executable_status),
+                polarity=str(frame.polarity),
+                modality=str(frame.modality),
+                conditions=tuple(frame.conditions_json or ()),
+                exceptions=tuple(frame.exceptions_json or ()),
+                arguments=tuple(arguments[frame.id]),
+            )
+        )
+    def rank(item: SemanticFrameEvidence) -> tuple[float, str]:
+        frame_tokens = _frame_query_tokens(
+            f"{item.title} {item.predicate} {item.frame_text}"
+        )
+        overlap = len(query_tokens & frame_tokens)
+        return (-(item.score + min(overlap, 2) * 0.08), str(item.frame_id))
+
+    propositions = sorted(
+        (item for item in evidence if item.frame_kind == "proposition"), key=rank
+    )[:top_k]
+    covered_tokens = (
+        set().union(
+            *(
+                query_tokens
+                & _frame_query_tokens(
+                    f"{item.title} {item.predicate} {item.frame_text}"
+                )
+                for item in propositions
+            )
+        )
+        if propositions
+        else set()
+    )
+    communities: list[SemanticFrameEvidence] = []
+    if len(covered_tokens) < 2:
+        communities = sorted(
+            (
+                item
+                for item in evidence
+                if item.frame_kind == "community_summary"
+            ),
+            key=rank,
+        )[:2]
+    return sorted([*propositions, *communities], key=rank)
+
+
+def _semantic_frame_context(
+    frames: list[SemanticFrameEvidence],
+) -> tuple[str, list[str], list[str], set[str], dict[str, float]]:
+    propositions = [frame for frame in frames if frame.frame_kind == "proposition"]
+    communities = [
+        frame for frame in frames if frame.frame_kind == "community_summary"
+    ]
+    lines: list[str] = []
+    entity_names: list[str] = []
+    relationship_ids: list[str] = []
+    discovered_ids: set[str] = set()
+    relevance: dict[str, float] = {}
+    if propositions:
+        lines.extend(
+            [
+                "Semantic Proposition Evidence:",
+                "Each item is a complete graph proposition linked to ordered "
+                "arguments and its executable assertion/relationship.",
+            ]
+        )
+        for frame in propositions:
+            argument_text = ", ".join(
+                f"{role}={name}" for role, _, name in frame.arguments
+            ) or "(none)"
+            lines.append(
+                f"- {frame.title} [predicate={frame.predicate}; "
+                f"status={frame.executable_status}; score={frame.score:.4f}]\n"
+                f"  Arguments: {argument_text}\n"
+                f"  Statement: {frame.frame_text}"
+            )
+            if frame.conditions:
+                lines.append("  Conditions: " + "; ".join(frame.conditions))
+            if frame.exceptions:
+                lines.append("  Exceptions: " + "; ".join(frame.exceptions))
+            if frame.proposition_id:
+                discovered_ids.add(str(frame.proposition_id))
+                relevance[str(frame.proposition_id)] = frame.score
+            if frame.source_relationship_id:
+                relationship_ids.append(str(frame.source_relationship_id))
+            for _, entity_id, name in frame.arguments:
+                discovered_ids.add(str(entity_id))
+                relevance[str(entity_id)] = max(
+                    relevance.get(str(entity_id), 0.0), frame.score
+                )
+                entity_names.append(name)
+    if communities:
+        lines.extend(
+            [
+                "Internal Community Navigation:",
+                "These structural summaries may locate propositions but are not "
+                "evidence.",
+            ]
+        )
+        for frame in communities:
+            lines.append(f"- {frame.frame_text}")
+            for _, entity_id, name in frame.arguments:
+                discovered_ids.add(str(entity_id))
+                relevance[str(entity_id)] = max(
+                    relevance.get(str(entity_id), 0.0), frame.score * 0.65
+                )
+                entity_names.append(name)
+    return (
+        "\n".join(lines),
+        list(dict.fromkeys(entity_names)),
+        list(dict.fromkeys(relationship_ids)),
+        discovered_ids,
+        relevance,
+    )
+
+
+async def _augment_with_semantic_frames(
+    artifacts: GraphQueryArtifacts,
+    *,
+    question: str,
+    collection: Collection,
+    query_embedding: list[float],
+    document_ids: list[uuid.UUID] | None,
+) -> GraphQueryArtifacts:
+    frames = await _semantic_frame_evidence(
+        question,
+        collection,
+        query_embedding,
+        document_ids=document_ids,
+    )
+    if not frames:
+        return artifacts
+    section, names, relationship_ids, discovered_ids, relevance = (
+        _semantic_frame_context(frames)
+    )
+    reasoning_seeds = [
+        ReasoningSeed(
+            proposition_id=frame.proposition_id,
+            frame_text=frame.frame_text,
+            argument_ids=tuple(entity_id for _, entity_id, _ in frame.arguments),
+            conditions=frame.conditions,
+            exceptions=frame.exceptions,
+            polarity=frame.polarity,
+            modality=frame.modality,
+            retrieval_score=frame.score,
+        )
+        for frame in frames
+        if frame.frame_kind == "proposition" and frame.proposition_id is not None
+    ]
+    reasoning_trace = await activate_reasoning(
+        collection.id,
+        question,
+        reasoning_seeds,
+        navigation_ids={
+            entity_id
+            for frame in frames
+            if frame.frame_kind == "community_summary"
+            for _, entity_id, _ in frame.arguments
+        },
+    )
+    import json
+
+    reasoning_section = (
+        "Deterministic Graph Activation:\n"
+        + json.dumps(reasoning_trace, ensure_ascii=True, sort_keys=True)
+    )
+    section = f"{section}\n\n{reasoning_section}"
+    merged_relevance = dict(artifacts.state.entity_relevance)
+    for entity_id, score in relevance.items():
+        merged_relevance[entity_id] = max(
+            merged_relevance.get(entity_id, 0.0), score
+        )
+    state = GraphQueryState(
+        discovered_entity_ids=set(artifacts.state.discovered_entity_ids)
+        | discovered_ids,
+        entity_relevance=merged_relevance,
+        traversed_rel_ids=list(
+            dict.fromkeys([*artifacts.state.traversed_rel_ids, *relationship_ids])
+        ),
+        rel_score_cache=dict(artifacts.state.rel_score_cache),
+        rel_combined_score_cache=dict(artifacts.state.rel_combined_score_cache),
+    )
+    return replace(
+        artifacts,
+        context=f"{artifacts.context}\n\n{section}",
+        entities_used=list(dict.fromkeys([*artifacts.entities_used, *names])),
+        relationships_used=list(
+            dict.fromkeys([*artifacts.relationships_used, *relationship_ids])
+        ),
+        rel_context=f"{artifacts.rel_context}\n{section}".strip(),
+        state=state,
+    )
+
+
 async def _context_mix_artifacts(
     question: str,
     collection: Collection,
@@ -3939,7 +4291,11 @@ async def _answer_from_context(
                 "for part of the "
                 "question, acknowledge it briefly without making it the focus."
                 "\n\nTreat the context as a graph-backed record of stored entities, descriptions, aliases, "
-                "and relationships. Use that evidence to ground your answer."
+                    "and relationships. Use that evidence to ground your answer."
+                    "\n\nIf a Deterministic Graph Activation section is present, "
+                    "its asserted, derived, conditional, blocked, incomplete, "
+                    "conflict, and sufficiency statuses are authoritative. Do not "
+                    "promote a conditional or blocked proposition to an asserted fact."
                 "\n\nIf a Context-Scoped Evidence section is present, each "
                 "context is a source-local evidence scope and each assertion "
                 "is true only inside that source context. Compare or group "
@@ -4019,6 +4375,17 @@ def _strip_context_label(context: str) -> str:
     return context
 
 
+def _semantic_frame_suffix(context: str) -> str:
+    markers = (
+        "Semantic Proposition Evidence:",
+        "Internal Community Navigation:",
+    )
+    offsets = [context.find(marker) for marker in markers if marker in context]
+    if not offsets:
+        return ""
+    return context[min(offsets) :].strip()
+
+
 async def _build_graph_query_artifacts(
     question: str,
     collection: Collection,
@@ -4060,7 +4427,13 @@ async def _build_graph_query_artifacts(
             plan=query_plan,
         )
         if context_artifacts is not None:
-            return context_artifacts
+            return await _augment_with_semantic_frames(
+                context_artifacts,
+                question=question,
+                collection=collection,
+                query_embedding=entity_query_embedding,
+                document_ids=document_ids,
+            )
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
         kwargs = {
@@ -4153,7 +4526,7 @@ async def _build_graph_query_artifacts(
         len(entities_used),
         len(relationships_used),
     )
-    return GraphQueryArtifacts(
+    artifacts = GraphQueryArtifacts(
         context=context,
         entities_used=entities_used,
         relationships_used=relationships_used,
@@ -4161,6 +4534,15 @@ async def _build_graph_query_artifacts(
         route_profile=route_profile,
         state=state,
     )
+    if effective_mode == "mix":
+        return await _augment_with_semantic_frames(
+            artifacts,
+            question=question,
+            collection=collection,
+            query_embedding=entity_query_embedding,
+            document_ids=document_ids,
+        )
+    return artifacts
 
 
 async def graph_rag_query(
@@ -4228,6 +4610,7 @@ async def graph_rag_query(
             document_ids=document_ids,
         )
         if projection_state.discovered_entity_ids or projection_state.traversed_rel_ids:
+            semantic_frame_suffix = _semantic_frame_suffix(base.context)
             projected_base_state = _merge_states(base.state, projection_state)
             (
                 projected_context,
@@ -4239,6 +4622,13 @@ async def graph_rag_query(
                 collection,
                 document_ids=document_ids,
             )
+            if semantic_frame_suffix:
+                projected_context = (
+                    f"{projected_context}\n\n{semantic_frame_suffix}"
+                )
+                projected_rel_context = (
+                    f"{projected_rel_context}\n{semantic_frame_suffix}"
+                ).strip()
             base = replace(
                 base,
                 context=projected_context,

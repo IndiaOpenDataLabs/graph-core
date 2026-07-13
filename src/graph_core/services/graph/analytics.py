@@ -15,14 +15,17 @@ import uuid
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from itertools import combinations
 from typing import Any
 
 import networkx as nx
-from sqlalchemy import select
+from scipy.sparse.linalg import eigsh
+from sqlalchemy import delete, insert, select, text
 from sqlalchemy.orm import aliased
 
 from graph_core.database import AsyncSessionLocal
+from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.llm import LocalEchoLLMProvider
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
@@ -33,7 +36,21 @@ from graph_core.models.graph_rag import (
     GraphRelationshipType,
     RelationshipDescription,
 )
+from graph_core.models.incremental_graph import (
+    GraphCommunity,
+    GraphCommunityMembership,
+    GraphComponentMetric,
+    GraphNodeMetric,
+    GraphProjectionSnapshot,
+    GraphVersion,
+)
 from graph_core.models.rel_types import rel_types_for_domain
+from graph_core.services.graph.semantic_frames import (
+    FrameArgumentInput,
+    SemanticFrameInput,
+    deterministic_frame_id,
+    replace_community_frames,
+)
 
 
 @dataclass(slots=True)
@@ -99,6 +116,66 @@ _SOURCE_HIERARCHY_NODE_TYPES = {
     "SOURCE_SECTION",
 }
 _SOURCE_HIERARCHY_REL_TYPES = {"CONTAINS", "HAS_SECTION", "HAS_CONTEXT"}
+_COMMUNITY_EXCLUDED_NODE_TYPES = {
+    "ASSERTION",
+    "CONDITION",
+    "CONTEXT",
+    "EVIDENCE_CHUNK",
+    "EXCEPTION",
+    "PROPOSITION",
+    "RULE",
+    "SCOPE",
+    "SOURCE_DOCUMENT",
+    "SOURCE_FOLDER",
+    "SOURCE_SECTION",
+}
+
+_PROVENANCE_NODE_TYPES = {
+    "ASSERTION",
+    "CONTEXT",
+    "EVIDENCE_CHUNK",
+    "SOURCE_DOCUMENT",
+    "SOURCE_FOLDER",
+    "SOURCE_SECTION",
+}
+_REASONING_NODE_TYPES = {"CONDITION", "EXCEPTION", "PROPOSITION", "RULE", "SCOPE"}
+_REASONING_EDGE_TYPES = {
+    "ANTECEDENT_OF",
+    "APPLIES_TO",
+    "BLOCKS",
+    "CONCLUDES",
+    "CONDITION",
+    "EXCEPTION",
+    "OBJECT",
+    "SUBJECT",
+    "SUPPORTS",
+}
+_PROJECTION_SPECS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "semantic_entities_directed",
+        "directed": True,
+        "node_policy": "semantic_entities",
+        "edge_policy": "non_reasoning",
+        "parallel_edges": "sum_weight",
+        "self_loops": "exclude",
+    },
+    {
+        "name": "semantic_affinity_undirected",
+        "directed": False,
+        "node_policy": "semantic_entities",
+        "edge_policy": "non_reasoning",
+        "parallel_edges": "sum_weight",
+        "self_loops": "exclude",
+    },
+    {
+        "name": "rule_dependency_directed",
+        "directed": True,
+        "node_policy": "reasoning_and_arguments",
+        "edge_policy": "reasoning_only",
+        "parallel_edges": "sum_weight",
+        "self_loops": "exclude",
+    },
+)
 
 
 # Enhancement defaults favor broader, burner-like recall.
@@ -1778,6 +1855,397 @@ def build_collection_analysis(
     }
 
 
+def _build_semantic_communities(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+) -> list[dict[str, Any]]:
+    """Compute deterministic weighted communities for navigation, not evidence."""
+    graph = nx.Graph()
+    node_by_id = {
+        node.id: node
+        for node in nodes
+        if node.primary_type.upper() not in _COMMUNITY_EXCLUDED_NODE_TYPES
+        and not node.primary_type.upper().startswith("MENTION_")
+    }
+    graph.add_nodes_from(node_by_id)
+    for relationship in relationships:
+        if (
+            relationship.source_id not in node_by_id
+            or relationship.target_id not in node_by_id
+        ):
+            continue
+        if relationship.source_id == relationship.target_id:
+            continue
+        weight = max(1.0, float(relationship.weight or 1))
+        if graph.has_edge(relationship.source_id, relationship.target_id):
+            graph[relationship.source_id][relationship.target_id]["weight"] += weight
+        else:
+            graph.add_edge(
+                relationship.source_id,
+                relationship.target_id,
+                weight=weight,
+            )
+    if graph.number_of_edges() == 0:
+        return []
+    pagerank = nx.pagerank(graph, weight="weight")
+    communities = nx.community.louvain_communities(
+        graph,
+        weight="weight",
+        seed=0,
+    )
+    results: list[dict[str, Any]] = []
+    for members in communities:
+        if len(members) < 2:
+            continue
+        member_set = set(members)
+        ordered = sorted(
+            member_set,
+            key=lambda node_id: (-pagerank.get(node_id, 0.0), str(node_id)),
+        )
+        predicate_counts = Counter(
+            relationship.rel_type
+            for relationship in relationships
+            if relationship.source_id in member_set
+            and relationship.target_id in member_set
+        )
+        results.append(
+            {
+                "member_ids": [str(node_id) for node_id in ordered],
+                "member_names": [node_by_id[node_id].name for node_id in ordered],
+                "predicate_families": [
+                    predicate for predicate, _ in predicate_counts.most_common(8)
+                ],
+            }
+        )
+    results.sort(key=lambda item: (-len(item["member_ids"]), item["member_ids"][0]))
+    return results
+
+
+def _projection_spec_hash(spec: dict[str, Any]) -> str:
+    payload = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _build_projection(
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+    spec: dict[str, Any],
+) -> nx.Graph | nx.DiGraph:
+    graph: nx.Graph | nx.DiGraph = nx.DiGraph() if spec["directed"] else nx.Graph()
+
+    def include_node(node: NodeRecord) -> bool:
+        node_type = node.primary_type.upper()
+        if node_type in _PROVENANCE_NODE_TYPES or node_type.startswith("MENTION_"):
+            return False
+        if spec["node_policy"] == "semantic_entities":
+            return node_type not in _REASONING_NODE_TYPES
+        return True
+
+    included = {node.id for node in nodes if include_node(node)}
+    graph.add_nodes_from(included)
+    for relationship in relationships:
+        if relationship.source_id == relationship.target_id:
+            continue
+        if relationship.source_id not in included or relationship.target_id not in included:
+            continue
+        reasoning_edge = relationship.rel_type.upper() in _REASONING_EDGE_TYPES
+        if spec["edge_policy"] == "reasoning_only" and not reasoning_edge:
+            continue
+        if spec["edge_policy"] == "non_reasoning" and reasoning_edge:
+            continue
+        weight = max(1, int(relationship.weight or 1))
+        if graph.has_edge(relationship.source_id, relationship.target_id):
+            graph[relationship.source_id][relationship.target_id]["weight"] += weight
+        else:
+            graph.add_edge(
+                relationship.source_id,
+                relationship.target_id,
+                weight=weight,
+            )
+    return graph
+
+
+def _ranked_metric(values: dict[uuid.UUID, float]) -> list[tuple[uuid.UUID, float, int]]:
+    ordered = sorted(values.items(), key=lambda item: (-item[1], str(item[0])))
+    return [
+        (node_id, float(value), rank)
+        for rank, (node_id, value) in enumerate(ordered, 1)
+    ]
+
+
+def _spectral_diagnostics(graph: nx.Graph) -> dict[str, float | str]:
+    if graph.number_of_nodes() < 3 or graph.number_of_edges() == 0:
+        return {"status": "insufficient_graph"}
+    largest_nodes = max(nx.connected_components(graph), key=len)
+    component = graph.subgraph(largest_nodes)
+    if component.number_of_nodes() < 3:
+        return {"status": "insufficient_component"}
+    try:
+        laplacian = nx.normalized_laplacian_matrix(component, weight="weight")
+        eigenvalues = sorted(
+            float(value)
+            for value in eigsh(
+                laplacian,
+                k=2,
+                which="SM",
+                return_eigenvectors=False,
+            )
+        )
+    except Exception as exc:
+        return {"status": "failed", "reason": type(exc).__name__}
+    return {
+        "status": "computed",
+        "largest_component_nodes": float(component.number_of_nodes()),
+        "fiedler_value": eigenvalues[1],
+        "spectral_gap": eigenvalues[1] - eigenvalues[0],
+    }
+
+
+def _harmonic_centrality(graph: nx.Graph) -> tuple[dict[uuid.UUID, float], int]:
+    node_count = graph.number_of_nodes()
+    if node_count <= 10_000:
+        return nx.harmonic_centrality(graph), node_count
+    sample_size = min(128, node_count)
+    sources = sorted(graph.nodes, key=str)[:sample_size]
+    values = {node_id: 0.0 for node_id in graph.nodes}
+    for source_id in sources:
+        for target_id, distance in nx.single_source_shortest_path_length(
+            graph, source_id
+        ).items():
+            if distance:
+                values[target_id] += 1.0 / distance
+    scale = node_count / sample_size
+    return ({node_id: value * scale for node_id, value in values.items()}, sample_size)
+
+
+def _compute_projection_analytics(graph: nx.Graph | nx.DiGraph) -> dict[str, Any]:
+    undirected = graph.to_undirected()
+    metrics: dict[str, dict[uuid.UUID, float]] = {}
+    strongly_connected: list[set[uuid.UUID]] = []
+    if graph.is_directed():
+        metrics["in_degree"] = dict(graph.in_degree(weight="weight"))
+        metrics["out_degree"] = dict(graph.out_degree(weight="weight"))
+        strongly_connected = list(nx.strongly_connected_components(graph))
+    else:
+        metrics["degree"] = dict(graph.degree(weight="weight"))
+    harmonic_sample_size = 0
+    if graph.number_of_nodes():
+        metrics["pagerank"] = nx.pagerank(graph, weight="weight")
+        metrics["harmonic_centrality"], harmonic_sample_size = _harmonic_centrality(
+            undirected
+        )
+        metrics["clustering"] = nx.clustering(undirected, weight="weight")
+        if undirected.number_of_edges():
+            metrics["core_number"] = {
+                node_id: float(value)
+                for node_id, value in nx.core_number(undirected).items()
+            }
+            sample = min(
+                graph.number_of_nodes(),
+                64 if graph.number_of_nodes() > 100_000 else 256,
+            )
+            metrics["betweenness_approx"] = nx.betweenness_centrality(
+                graph,
+                k=sample,
+                normalized=True,
+                weight=None,
+                seed=0,
+            )
+    articulation = (
+        set(nx.articulation_points(undirected))
+        if undirected.number_of_edges()
+        else set()
+    )
+    metrics["is_articulation"] = {
+        node_id: float(node_id in articulation) for node_id in graph.nodes
+    }
+    communities = (
+        list(nx.community.louvain_communities(undirected, weight="weight", seed=0))
+        if undirected.number_of_edges()
+        else [{node_id} for node_id in undirected.nodes]
+    )
+    components = list(nx.connected_components(undirected))
+    component_metrics = [
+        ("__graph__", "component_count", float(len(components)), {"scc_count": len(strongly_connected)}),
+        (
+            "__graph__",
+            "bridge_count",
+            float(len(list(nx.bridges(undirected)))) if undirected.number_of_edges() else 0.0,
+            None,
+        ),
+    ]
+    spectral = _spectral_diagnostics(undirected)
+    if spectral.get("status") == "computed":
+        for metric in ("fiedler_value", "spectral_gap"):
+            component_metrics.append(
+                ("largest_component", metric, float(spectral[metric]), None)
+            )
+    return {
+        "node_metrics": metrics,
+        "communities": communities,
+        "component_metrics": component_metrics,
+        "diagnostics": {
+            "component_count": len(components),
+            "scc_count": len(strongly_connected),
+            "community_count": len(communities),
+            "spectral": spectral,
+            "betweenness_sample_size": min(
+                graph.number_of_nodes(),
+                64 if graph.number_of_nodes() > 100_000 else 256,
+            ),
+            "harmonic_sample_size": harmonic_sample_size,
+        },
+    }
+
+
+def _row_batches(rows: list[dict[str, Any]], size: int = 5000):
+    for offset in range(0, len(rows), size):
+        yield rows[offset : offset + size]
+
+
+async def _latest_graph_version(collection_id: uuid.UUID) -> GraphVersion:
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"graph-version:{collection_id}"},
+        )
+        version = (
+            await session.execute(
+                select(GraphVersion)
+                .where(GraphVersion.collection_id == collection_id)
+                .order_by(GraphVersion.version.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            version = GraphVersion(
+                collection_id=collection_id,
+                version=1,
+                status="ready",
+                manifest={"source": "legacy_full_graph"},
+                published_at=datetime.now(UTC),
+            )
+            session.add(version)
+            await session.flush()
+        await session.commit()
+        return version
+
+
+async def _persist_projection(
+    version: GraphVersion,
+    spec: dict[str, Any],
+    graph: nx.Graph | nx.DiGraph,
+    analytics: dict[str, Any],
+) -> str:
+    digest = _projection_spec_hash(spec)
+    async with AsyncSessionLocal() as session:
+        existing = (
+            await session.execute(
+                select(GraphProjectionSnapshot).where(
+                    GraphProjectionSnapshot.graph_version_id == version.id,
+                    GraphProjectionSnapshot.name == spec["name"],
+                    GraphProjectionSnapshot.spec_hash == digest,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None and existing.status == "completed":
+            return "skipped"
+        if existing is not None:
+            await session.execute(
+                delete(GraphProjectionSnapshot).where(
+                    GraphProjectionSnapshot.id == existing.id
+                )
+            )
+        snapshot_id = uuid.uuid4()
+        session.add(
+            GraphProjectionSnapshot(
+                id=snapshot_id,
+                graph_version_id=version.id,
+                name=spec["name"],
+                spec_hash=digest,
+                specification=spec,
+                status="building",
+                node_count=graph.number_of_nodes(),
+                edge_count=graph.number_of_edges(),
+            )
+        )
+        await session.flush()
+        for metric, values in analytics["node_metrics"].items():
+            rows = [
+                {
+                    "projection_id": snapshot_id,
+                    "entity_id": node_id,
+                    "metric": metric,
+                    "value": value,
+                    "rank": rank,
+                }
+                for node_id, value, rank in _ranked_metric(values)
+            ]
+            for batch in _row_batches(rows):
+                await session.execute(insert(GraphNodeMetric), batch)
+        for index, members in enumerate(analytics["communities"], 1):
+            community_id = uuid.uuid4()
+            session.add(
+                GraphCommunity(
+                    id=community_id,
+                    projection_id=snapshot_id,
+                    algorithm="louvain",
+                    community_key=f"community-{index}",
+                    metadata_json={"size": len(members)},
+                )
+            )
+            await session.flush()
+            membership_rows = [
+                {
+                    "community_id": community_id,
+                    "entity_id": node_id,
+                    "strength": 1.0,
+                }
+                for node_id in members
+            ]
+            for batch in _row_batches(membership_rows):
+                await session.execute(insert(GraphCommunityMembership), batch)
+        component_rows = [
+            {
+                "projection_id": snapshot_id,
+                "component_key": key,
+                "metric": metric,
+                "value": value,
+                "metadata_json": metadata,
+            }
+            for key, metric, value, metadata in analytics["component_metrics"]
+        ]
+        if component_rows:
+            await session.execute(insert(GraphComponentMetric), component_rows)
+        snapshot = await session.get(GraphProjectionSnapshot, snapshot_id)
+        snapshot.status = "completed"
+        snapshot.diagnostics = analytics["diagnostics"]
+        snapshot.completed_at = datetime.now(UTC)
+        await session.commit()
+    return "completed"
+
+
+async def enhance_structural_analytics(
+    collection_id: uuid.UUID,
+    nodes: list[NodeRecord],
+    relationships: list[RelationshipRecord],
+) -> dict[str, Any]:
+    """Compute and persist deterministic analytics for the latest graph version."""
+    version = await _latest_graph_version(collection_id)
+    results: dict[str, Any] = {"graph_version": version.version, "projections": {}}
+    for spec in _PROJECTION_SPECS:
+        graph = _build_projection(nodes, relationships, spec)
+        analytics = _compute_projection_analytics(graph)
+        status = await _persist_projection(version, spec, graph, analytics)
+        results["projections"][spec["name"]] = {
+            "status": status,
+            "nodes": graph.number_of_nodes(),
+            "edges": graph.number_of_edges(),
+            "diagnostics": analytics["diagnostics"],
+        }
+    return results
+
+
 async def analyze_collection_graph(
     collection_id: uuid.UUID,
 ) -> dict[str, Any]:
@@ -1789,6 +2257,10 @@ async def analyze_collection_graph(
         aliases_by_entity_id,
     ) = await _load_graph_records(collection_id)
     analysis = build_collection_analysis(
+        nodes,
+        relationships,
+    )
+    analysis["semantic_communities"] = _build_semantic_communities(
         nodes,
         relationships,
     )
@@ -1846,6 +2318,88 @@ async def analyze_collection_graph(
         for node in nodes
     ]
     return analysis
+
+
+async def enhance_structural_analytics_from_analysis(
+    analysis: dict[str, Any],
+) -> dict[str, Any]:
+    collection_id = uuid.UUID(str(analysis["collection"]["id"]))
+    nodes = [
+        NodeRecord(
+            id=uuid.UUID(str(row["id"])),
+            name=str(row["name"]),
+            primary_type=str(row.get("primary_type") or ""),
+        )
+        for row in analysis.get("node_records", [])
+    ]
+    relationships = [
+        RelationshipRecord(
+            id=uuid.UUID(str(row["id"])),
+            source_id=uuid.UUID(str(row["source_id"])),
+            source_name=str(row["source_name"]),
+            target_id=uuid.UUID(str(row["target_id"])),
+            target_name=str(row["target_name"]),
+            rel_type=str(row["rel_type"]),
+            weight=int(row.get("weight") or 1),
+            description=str(row.get("description") or ""),
+        )
+        for row in analysis.get("relationship_records", [])
+    ]
+    return await enhance_structural_analytics(collection_id, nodes, relationships)
+
+
+async def enhance_semantic_frames(
+    analysis: dict[str, Any],
+    collection: Collection,
+    embedding_provider: EmbeddingProvider,
+) -> dict[str, int]:
+    """Materialize embedded community navigation frames after graph analytics."""
+    frames: list[SemanticFrameInput] = []
+    for community in analysis.get("semantic_communities", []):
+        member_ids = [uuid.UUID(value) for value in community["member_ids"]]
+        member_names = list(community["member_names"])
+        predicates = list(community["predicate_families"])
+        membership_hash = hashlib.sha256(
+            "|".join(sorted(str(value) for value in member_ids)).encode()
+        ).hexdigest()
+        frame_id = deterministic_frame_id(
+            collection.id,
+            f"community-summary:{membership_hash}",
+        )
+        top_names = member_names[:10]
+        title = "Community: " + ", ".join(top_names[:4])
+        frame_text = (
+            f"A semantic community connecting {', '.join(top_names)}. "
+            f"Prominent relationship families: {', '.join(predicates) or 'none'}. "
+            "Use this frame only to locate relevant propositions; it is not evidence."
+        )
+        frames.append(
+            SemanticFrameInput(
+                id=frame_id,
+                collection_id=collection.id,
+                frame_kind="community_summary",
+                title=title,
+                frame_text=frame_text,
+                content_hash=hashlib.sha256(frame_text.encode()).hexdigest(),
+                polarity="unknown",
+                modality="navigation",
+                executable_status="navigation_only",
+                metadata={
+                    "member_count": len(member_ids),
+                    "predicate_families": predicates,
+                },
+                arguments=tuple(
+                    FrameArgumentInput("member", entity_id, position)
+                    for position, entity_id in enumerate(member_ids[:10])
+                ),
+            )
+        )
+    persisted, embedded = await replace_community_frames(
+        collection,
+        embedding_provider,
+        frames,
+    )
+    return {"community_frames": persisted, "community_embeddings": embedded}
 
 
 async def build_collection_understanding(
