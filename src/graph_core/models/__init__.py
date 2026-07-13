@@ -14,6 +14,20 @@ from graph_core.models.graph_rag import (
     RelationshipDescription,
     RelationshipTypeAlias,
 )
+from graph_core.models.incremental_graph import (
+    GraphChunkContribution,
+    GraphChunkSegment,
+    GraphCommunity,
+    GraphCommunityMembership,
+    GraphComponentMetric,
+    GraphDerivedDependency,
+    GraphEntityMapping,
+    GraphEntityRedirect,
+    GraphNodeMetric,
+    GraphPredicateMapping,
+    GraphProjectionSnapshot,
+    GraphVersion,
+)
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.job import Job, JobEvent
 from graph_core.models.namespace import Namespace
@@ -29,6 +43,18 @@ __all__ = [
     "JobEvent",
     "IngestionRecord",
     "IngestionChunk",
+    "GraphChunkSegment",
+    "GraphEntityMapping",
+    "GraphPredicateMapping",
+    "GraphEntityRedirect",
+    "GraphChunkContribution",
+    "GraphDerivedDependency",
+    "GraphVersion",
+    "GraphProjectionSnapshot",
+    "GraphNodeMetric",
+    "GraphCommunity",
+    "GraphCommunityMembership",
+    "GraphComponentMetric",
     "ChatSession",
     "ChatMessage",
     "GraphEntity",

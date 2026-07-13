@@ -1447,6 +1447,11 @@ async def _save_raw_extraction(
                     "keywords": r.keywords,
                     "weight": r.weight,
                     "rel_type": r.rel_type,
+                    "conditions": list(r.conditions),
+                    "exceptions": list(r.exceptions),
+                    "scopes": list(r.scopes),
+                    "polarity": r.polarity,
+                    "modality": r.modality,
                 }
                 for r in extraction.relationships
             ],
@@ -1499,6 +1504,11 @@ async def _get_raw_extraction(
                 keywords=r.get("keywords", []),
                 weight=r.get("weight", 1.0),
                 rel_type=r.get("rel_type", "RELATES_TO"),
+                conditions=tuple(r.get("conditions", [])),
+                exceptions=tuple(r.get("exceptions", [])),
+                scopes=tuple(r.get("scopes", [])),
+                polarity=r.get("polarity", "positive"),
+                modality=r.get("modality", "asserted"),
             )
             for r in (record.relationships_json or [])
         ]

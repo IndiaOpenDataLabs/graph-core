@@ -292,7 +292,12 @@ class FalkorDBGraphStorage:
             {"nodes": payload},
         )
 
-    async def upsert_edges(self, edges: list[dict[str, Any]]) -> None:
+    async def upsert_edges(
+        self,
+        edges: list[dict[str, Any]],
+        *,
+        merge_existing_keywords: bool = True,
+    ) -> None:
         if not edges:
             return
         graph = await self._get_graph()
@@ -335,17 +340,18 @@ class FalkorDBGraphStorage:
                 "     r.rel_type = edge.rel_type",
                 {"edges": payload},
             )
-        await self._merge_keywords_for_edges(
-            [
-                (
-                    e["source_id"],
-                    e["target_id"],
-                    e.get("keywords") or [],
-                    e.get("rel_type"),
-                )
-                for e in edges
-            ]
-        )
+        if merge_existing_keywords:
+            await self._merge_keywords_for_edges(
+                [
+                    (
+                        e["source_id"],
+                        e["target_id"],
+                        e.get("keywords") or [],
+                        e.get("rel_type"),
+                    )
+                    for e in edges
+                ]
+            )
 
     async def relabel_edges(
         self,

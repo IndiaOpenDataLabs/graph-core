@@ -39,6 +39,11 @@ class ExtractedRelationship:
     keywords: list[str]
     weight: float
     rel_type: str = DEFAULT_REL_TYPE
+    conditions: tuple[str, ...] = ()
+    exceptions: tuple[str, ...] = ()
+    scopes: tuple[str, ...] = ()
+    polarity: str = "positive"
+    modality: str = "asserted"
 
 
 @dataclass
@@ -77,6 +82,17 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
         },
         "weight": {"type": "number"},
+        "conditions": {"type": "array", "items": {"type": "string"}},
+        "exceptions": {"type": "array", "items": {"type": "string"}},
+        "scopes": {"type": "array", "items": {"type": "string"}},
+        "polarity": {
+            "type": "string",
+            "enum": ["positive", "negative", "unknown"],
+        },
+        "modality": {
+            "type": "string",
+            "enum": ["asserted", "probable", "possible", "normative", "unknown"],
+        },
     },
     "required": [
         "source",
@@ -182,7 +198,7 @@ relationships from input text.
      concepts that are explicitly supported by the text.
    - For N-ary relationships, decompose them into binary pairs.
    - For each relationship, extract: source, target, description, keywords,
-     weight, rel_type.
+     weight, rel_type, conditions, exceptions, scopes, polarity, modality.
    - Relationship descriptions must explain the nature of the connection,
      the context in which it holds, and why it matters. Include the local
      evidence phrase or sentence when possible.
@@ -208,6 +224,11 @@ relationships from input text.
        description (string),
        keywords    (array of strings),
        weight      (float 0..1)
+       conditions  (array of conditions required for the claim)
+       exceptions  (array of conditions that defeat the claim)
+       scopes      (array of population, time, place, or contextual scopes)
+       polarity    (positive, negative, or unknown)
+       modality    (asserted, probable, possible, normative, or unknown)
    - "rel_type" is a list of one or more objects, each with:
        name        (string)
        description (string, role-specific: explains the connection in
@@ -881,6 +902,23 @@ Only output the structured relationships object.
                 rel_weight = max(0.0, min(1.0, rel_weight))
             except (ValueError, TypeError):
                 rel_weight = 1.0
+            conditions = tuple(
+                str(value).strip()
+                for value in rel.get("conditions", [])
+                if str(value).strip()
+            )
+            exceptions = tuple(
+                str(value).strip()
+                for value in rel.get("exceptions", [])
+                if str(value).strip()
+            )
+            scopes = tuple(
+                str(value).strip()
+                for value in rel.get("scopes", [])
+                if str(value).strip()
+            )
+            polarity = str(rel.get("polarity") or "positive").lower()
+            modality = str(rel.get("modality") or "asserted").lower()
             for entry in cls._coerce_rel_type_entries(
                 rel.get("rel_type"),
                 fallback_description=rel_description,
@@ -898,6 +936,11 @@ Only output the structured relationships object.
                         keywords=list(entry["keywords"]),
                         weight=entry["weight"],
                         rel_type=entry["rel_type"],
+                        conditions=conditions,
+                        exceptions=exceptions,
+                        scopes=scopes,
+                        polarity=polarity,
+                        modality=modality,
                     )
                 )
         return extracted
