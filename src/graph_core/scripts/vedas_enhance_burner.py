@@ -1,8 +1,8 @@
 """Build versioned structural analytics for the incrementally ingested graph.
 
-This burner is deliberately independent of the existing LLM-based enhancement
-job. It computes deterministic named projections and persists their metrics for
-the latest published graph version.
+It computes deterministic named projections and persists their metrics for the
+latest published graph version. Before writing, it also dry-runs the production
+meta-concept candidate gate without an LLM or meta-graph materialization.
 
 Usage:
     uv run python -m graph_core.scripts.vedas_enhance_burner
@@ -47,6 +47,12 @@ from graph_core.scripts.vedas_ingest_burner import (
     deterministic_uuid,
     extraction_from_payload,
     vector_literal,
+)
+from graph_core.services.graph.analytics import (
+    analyze_collection_graph as analyze_meta_collection_graph,
+)
+from graph_core.services.graph.analytics import (
+    build_collection_understanding as build_meta_collection_understanding,
 )
 from graph_core.services.graph.ingestion.chunk_processor import (
     _resolve_embedding_provider,
@@ -94,6 +100,35 @@ class Edge:
     target_id: uuid.UUID
     rel_type: str
     weight: int
+
+
+def summarize_meta_concept_plan(
+    analysis: dict[str, Any],
+    understanding: dict[str, Any],
+) -> dict[str, Any]:
+    kinds = Counter(
+        str(entry.get("region", {}).get("kind") or "unknown")
+        for entry in understanding.get("regions", [])
+    )
+    return {
+        "raw_role_cliques": len(analysis.get("role_groups") or []),
+        "accepted_candidates": int(
+            understanding.get("candidate_region_count") or 0
+        ),
+        "candidate_kinds": dict(sorted(kinds.items())),
+        "projected_nodes": len(understanding.get("nodes") or []),
+        "projected_edges": len(understanding.get("edges") or []),
+        "projected_chunks": len(understanding.get("chunks") or []),
+    }
+
+
+async def build_meta_concept_plan(collection_id: uuid.UUID) -> dict[str, Any]:
+    analysis = await analyze_meta_collection_graph(collection_id)
+    understanding = await build_meta_collection_understanding(
+        analysis,
+        llm_provider=None,
+    )
+    return summarize_meta_concept_plan(analysis, understanding)
 
 
 PROJECTION_SPECS: tuple[dict[str, Any], ...] = (
@@ -648,6 +683,8 @@ async def main() -> None:
         f"collection={collection.name} version={version.version} "
         f"nodes={len(nodes)} edges={len(edges)}"
     )
+    concept_plan = await build_meta_concept_plan(collection.id)
+    print(f"meta_concept_plan={json.dumps(concept_plan, sort_keys=True)}")
     embedding_provider = await _resolve_embedding_provider(collection)
     ingestion_frames, ingestion_arguments = await compile_ingestion_frame_values(
         collection

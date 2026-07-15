@@ -8,6 +8,7 @@ from graph_core.scripts.vedas_enhance_burner import (
     compile_community_frame_values,
     compute_analytics,
     spec_hash,
+    summarize_meta_concept_plan,
 )
 
 
@@ -75,3 +76,25 @@ def test_community_frames_preserve_retrieval_scale_without_becoming_evidence() -
     assert frames[0]["executable_status"] == "navigation_only"
     assert "Agni" in frames[0]["frame_text"]
     assert [argument["role"] for argument in arguments] == ["member", "member"]
+
+
+def test_meta_concept_plan_reports_production_candidate_reduction() -> None:
+    analysis = {"role_groups": [{"group_id": "one"}, {"group_id": "two"}]}
+    understanding = {
+        "candidate_region_count": 1,
+        "regions": [{"region": {"kind": "role_clique"}}],
+        "nodes": [{"id": "concept"}, {"id": "reference"}],
+        "edges": [{"id": "evidence"}],
+        "chunks": [{"chunk_hash": "concept"}],
+    }
+
+    summary = summarize_meta_concept_plan(analysis, understanding)
+
+    assert summary == {
+        "raw_role_cliques": 2,
+        "accepted_candidates": 1,
+        "candidate_kinds": {"role_clique": 1},
+        "projected_nodes": 2,
+        "projected_edges": 1,
+        "projected_chunks": 1,
+    }

@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     graph_rag_max_concurrent_workers: int = 5
     graph_rag_query_embedding_concurrency: int = 4
     graph_rag_max_context_tokens: int = 32_000
+    graph_enhance_llm_batch_tokens: int = 8_000
+    graph_enhance_llm_batch_max_regions: int = 16
     sqlalchemy_pool_size: int = 10
     sqlalchemy_max_overflow: int = 20
     sqlalchemy_pool_timeout: float = 30

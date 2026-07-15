@@ -20,10 +20,12 @@ from itertools import combinations
 from typing import Any
 
 import networkx as nx
+import tiktoken
 from scipy.sparse.linalg import eigsh
 from sqlalchemy import delete, insert, select, text
 from sqlalchemy.orm import aliased
 
+from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.llm import LocalEchoLLMProvider
@@ -202,6 +204,10 @@ _ROLE_GROUP_OVERLAP_MIN = 2
 _ROLE_GROUP_COSINE_MIN = 0.2
 _ROLE_GROUP_JACCARD_MIN = 0.1
 _ROLE_GROUP_MIN_SIGNATURE = 1
+_META_ROLE_CLIQUE_MIN_SIZE = 4
+_META_ROLE_CLIQUE_MIN_COSINE = 0.5
+_META_ROLE_CLIQUE_MIN_JACCARD = 0.3
+_ENHANCE_TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
 
 _EDGE_FAMILY_ORDER: tuple[str, ...] = (
     "definitional",
@@ -1137,6 +1143,32 @@ def _build_dynamic_anchor_regions(
         for profile in selected_profiles
     ]
     return candidate_regions, diagnostics
+
+
+def _select_meta_role_groups(
+    role_groups: list[dict[str, Any]],
+    *,
+    node_count: int,
+) -> list[dict[str, Any]]:
+    """Keep only strong role cliques within a sublinear materialization budget."""
+    accepted: list[dict[str, Any]] = []
+    for group in role_groups:
+        size = int(group.get("size") or 0)
+        cosine = float(group.get("avg_cosine") or 0.0)
+        jaccard = float(group.get("avg_jaccard") or 0.0)
+        strong_triangle = size == 3 and cosine >= 0.75 and jaccard >= 0.5
+        strong_clique = (
+            size >= _META_ROLE_CLIQUE_MIN_SIZE
+            and cosine >= _META_ROLE_CLIQUE_MIN_COSINE
+            and jaccard >= _META_ROLE_CLIQUE_MIN_JACCARD
+        )
+        if strong_triangle or strong_clique:
+            accepted.append(group)
+
+    # Maximal cliques can grow exponentially and are structural observations,
+    # not concepts by definition. Bound only this topology-derived candidate type.
+    budget = max(32, math.ceil(math.sqrt(max(1, node_count))))
+    return accepted[:budget]
 
 
 def _concept_kind(primary_type: str, name: str = "") -> str:
@@ -2651,7 +2683,10 @@ async def build_collection_understanding(
                     f"{role.get('description') or ''}"
                 ).strip()
 
-    role_groups = list(analysis.get("role_groups") or [])
+    role_groups = _select_meta_role_groups(
+        list(analysis.get("role_groups") or []),
+        node_count=len(analysis_nodes),
+    )
     for idx, group in enumerate(role_groups, start=1):
         if int(group.get("size", 0)) < 2:
             continue
@@ -2699,82 +2734,59 @@ async def build_collection_understanding(
     induced_concepts = list(fallback_concepts)
     streamed_regions = False
     if llm_provider and not isinstance(llm_provider, LocalEchoLLMProvider) and candidate_regions:
-        concept_schema = {
+        concept_properties = {
+            "candidate_id": {"type": "string"},
+            "label": {"type": "string"},
+            "concept_type": {
+                "type": "string",
+                "enum": [
+                    "referent_facet",
+                    "shared_class",
+                    "relation_pattern",
+                    "process_flow",
+                    "tension",
+                    "composite_identity",
+                    "theme",
+                    "role",
+                    "concept",
+                ],
+            },
+            "description": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "importance_reason": {"type": "string"},
+            "member_entity_names": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        }
+        concept_required = [
+            "candidate_id",
+            "label",
+            "concept_type",
+            "description",
+            "aliases",
+            "importance_reason",
+            "member_entity_names",
+        ]
+        batch_schema = {
             "type": "object",
             "properties": {
-                "label": {"type": "string"},
-                "concept_type": {
-                    "type": "string",
-                    "enum": [
-                        "referent_facet",
-                        "shared_class",
-                        "relation_pattern",
-                        "process_flow",
-                        "tension",
-                        "composite_identity",
-                        "theme",
-                        "role",
-                        "concept",
-                    ],
-                },
-                "description": {"type": "string"},
-                "aliases": {
+                "concepts": {
                     "type": "array",
-                    "items": {"type": "string"},
-                },
-                "importance_reason": {"type": "string"},
-                "member_entity_names": {
-                    "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "type": "object",
+                        "properties": concept_properties,
+                        "required": concept_required,
+                    },
                 },
             },
-            "required": [
-                "label",
-                "concept_type",
-                "description",
-                "aliases",
-                "importance_reason",
-                "member_entity_names",
-            ],
+            "required": ["concepts"],
         }
-
-        async def induce_region_concept(region: dict[str, Any]) -> dict[str, Any]:
-            rel_type = region["rel_types"][0] if region["rel_types"] else "RELATES_TO"
-            dynamic_role = dict(region.get("dynamic_role") or {})
-            template_paths_text = (
-                json.dumps(region.get("template_paths", [])[:3], ensure_ascii=True)
-                if region.get("template_paths")
-                else "none"
-            )
-            directed_edges = (
-                "; ".join(
-                    (
-                        f"{edge['source_name']} -[{rel_type}]-> "
-                        f"{edge['target_name']} "
-                        f"(weight={edge.get('weight', 0)}, "
-                        f"count={edge.get('relationship_count', 1)}"
-                        f"; assertion={edge.get('assertion_name') or 'n/a'}"
-                        f"; evidence={edge.get('description') or 'n/a'})"
-                    )
-                    for edge in region.get("representative_edges", [])[:5]
-                )
-                or "none"
-            )
-            pair_metrics_text = (
-                "; ".join(
-                    (
-                        f"{metric['a']}~{metric['b']} "
-                        f"(overlap={metric['overlap']}, cosine={metric['cosine']}, "
-                        f"jaccard={metric['jaccard']})"
-                    )
-                    for metric in region.get("pair_metrics", [])[:12]
-                )
-                or "none"
-            )
-            code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
-            prompt = (
-                "You are inducing one reusable semantic concept from a candidate region in a knowledge graph.\n"
-                "The candidate may be a referent facet, shared class, dynamic anchor neighborhood, or role-similarity clique.\n"
+        code_guidance = f"{_code_concept_prompt_guidance()}\n\n" if is_code_like else ""
+        prompt_prefix = (
+                "Induce one reusable semantic concept for every supplied candidate region. "
+                "Return exactly one result per candidate_id and preserve candidate_id verbatim.\n"
+                "Candidates may be referent facets, shared classes, dynamic anchor neighborhoods, or strong role-similarity cliques.\n"
                 "Use concept_type=referent_facet for a specific context-supported role, identity, capacity, or aspect of one anchor entity.\n"
                 "Use concept_type=shared_class for sibling entities that instantiate the same category, type, or class.\n"
                 "Use concept_type=relation_pattern for a repeated relationship shape across different entities.\n"
@@ -2795,60 +2807,145 @@ async def build_collection_understanding(
                 "Explain the actual sequence, role split, or operational interplay that the member entities capture, in enough detail that a reader could understand what is happening without reopening the code.\n"
                 "Name the concrete responsibilities, transitions, inputs, outputs, error paths, and state changes implied by the members when the evidence supports them.\n"
                 "Do not describe the answer as a graph, clique, cluster, or evidence chain. Describe the underlying mechanism or workflow itself.\n\n"
-                f"Collection: {collection['name']}\n"
-                f"Candidate id: {region['region_id']}\n"
-                f"Candidate kind: {region.get('kind')}\n"
-                f"Candidate title: {region['title']}\n"
-                f"Candidate description: {region['description']}\n"
-                f"Anchor: {region.get('anchor') or 'none'}\n"
-                f"Dynamic role: {json.dumps(dynamic_role, ensure_ascii=True) if dynamic_role else 'none'}\n"
-                f"Entities: {', '.join(region['entity_names'][:16]) or 'none'}\n"
-                f"Relation types: {', '.join(region['rel_types']) or 'none'}\n"
-                f"Pairwise role-similarity evidence: {pair_metrics_text}\n"
-                f"Representative neighborhood edges: {directed_edges}\n"
-                f"Template traversal paths: {template_paths_text}\n"
+                f"Collection: {collection['name']}\nCandidates:\n"
+        )
+
+        def candidate_payload(region: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "candidate_id": str(region["region_id"]),
+                "kind": str(region.get("kind") or "concept"),
+                "title": str(region.get("title") or "")[:1000],
+                "description": str(region.get("description") or "")[:1600],
+                "anchor": str(region.get("anchor") or ""),
+                "dynamic_role": dict(region.get("dynamic_role") or {}),
+                "entities": [str(value)[:300] for value in region.get("entity_names", [])[:16]],
+                "relation_types": [str(value) for value in region.get("rel_types", [])[:12]],
+                "pair_metrics": [
+                    {
+                        "overlap": metric.get("overlap", 0),
+                        "cosine": metric.get("cosine", 0),
+                        "jaccard": metric.get("jaccard", 0),
+                    }
+                    for metric in (region.get("pair_metrics") or [])[:6]
+                ],
+                "representative_edges": [
+                    {
+                        "source": str(edge.get("source_name") or "")[:300],
+                        "relation": str(edge.get("rel_type") or "RELATES_TO"),
+                        "target": str(edge.get("target_name") or "")[:300],
+                        "weight": edge.get("weight", 0),
+                        "assertion": str(edge.get("assertion_name") or "")[:500],
+                        "evidence": str(edge.get("description") or "")[:800],
+                    }
+                    for edge in region.get("representative_edges", [])[:5]
+                ],
+                "template_paths": list(region.get("template_paths") or [])[:3],
+            }
+
+        indexed_payloads = [
+            (index, region, candidate_payload(region))
+            for index, region in enumerate(candidate_regions)
+        ]
+        token_budget = max(1024, int(settings.graph_enhance_llm_batch_tokens))
+        max_batch_regions = max(1, int(settings.graph_enhance_llm_batch_max_regions))
+        prefix_tokens = len(_ENHANCE_TOKEN_ENCODING.encode(prompt_prefix))
+        packed_batches: list[list[tuple[int, dict[str, Any], dict[str, Any]]]] = []
+        current_batch: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        current_tokens = prefix_tokens + 2
+        for item in indexed_payloads:
+            item_tokens = len(
+                _ENHANCE_TOKEN_ENCODING.encode(
+                    json.dumps(item[2], ensure_ascii=True, separators=(",", ":"))
+                )
+            ) + 2
+            if current_batch and (
+                current_tokens + item_tokens > token_budget
+                or len(current_batch) >= max_batch_regions
+            ):
+                packed_batches.append(current_batch)
+                current_batch = []
+                current_tokens = prefix_tokens + 2
+            current_batch.append(item)
+            current_tokens += item_tokens
+        if current_batch:
+            packed_batches.append(current_batch)
+
+        def valid_concept(value: Any, candidate_id: str) -> dict[str, Any] | None:
+            if not isinstance(value, dict):
+                return None
+            if str(value.get("candidate_id") or "") != candidate_id:
+                return None
+            required_text = ("label", "concept_type", "description", "importance_reason")
+            if any(not str(value.get(key) or "").strip() for key in required_text):
+                return None
+            concept = dict(value)
+            aliases = value.get("aliases")
+            member_names = value.get("member_entity_names")
+            concept["aliases"] = [
+                str(alias)
+                for alias in aliases
+                if str(alias).strip()
+            ] if isinstance(aliases, list) else []
+            concept["member_entity_names"] = [
+                str(name)
+                for name in member_names
+                if str(name).strip()
+            ] if isinstance(member_names, list) else []
+            concept["evidence_region_ids"] = [candidate_id]
+            concept.pop("candidate_id", None)
+            return concept
+
+        async def induce_region_batch(
+            batch: list[tuple[int, dict[str, Any], dict[str, Any]]],
+            *,
+            retry: bool = True,
+        ) -> list[tuple[int, dict[str, Any]]]:
+            prompt = prompt_prefix + json.dumps(
+                [item[2] for item in batch],
+                ensure_ascii=True,
+                separators=(",", ":"),
             )
             try:
-                concept = await llm_provider.structured_extract(
+                parsed = await llm_provider.structured_extract(
                     prompt=prompt,
-                    schema=concept_schema,
+                    schema=batch_schema,
                 )
-                concept["evidence_region_ids"] = [region["region_id"]]
-                return concept
             except Exception:
-                return {
-                    "label": region["title"],
-                    "concept_type": region["kind"],
-                    "description": region["description"],
-                    "aliases": [],
-                    "importance_reason": (
-                        f"Fallback concept for relation type {rel_type} "
-                        f"from candidate {region['region_id']}."
-                    ),
-                    "evidence_region_ids": [region["region_id"]],
-                    "member_entity_names": region["entity_names"][:8],
-                }
+                parsed = {}
+            values = parsed.get("concepts") if isinstance(parsed, dict) else None
+            if not isinstance(values, list):
+                values = [parsed] if len(batch) == 1 and isinstance(parsed, dict) else []
+            parsed_by_id = {
+                str(value.get("candidate_id") or ""): value
+                for value in values
+                if isinstance(value, dict)
+            }
+            completed: list[tuple[int, dict[str, Any]]] = []
+            missing: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+            for index, region, payload in batch:
+                candidate_id = str(region["region_id"])
+                value = parsed_by_id.get(candidate_id)
+                if value is None and len(batch) == 1 and len(values) == 1:
+                    value = {**values[0], "candidate_id": candidate_id}
+                concept = valid_concept(value, candidate_id)
+                if concept is None:
+                    missing.append((index, region, payload))
+                else:
+                    completed.append((index, concept))
+            if missing and retry:
+                completed.extend(await induce_region_batch(missing, retry=False))
+                missing = []
+            for index, region, _payload in missing:
+                completed.append((index, fallback_concepts[index]))
+            return completed
 
         induced_concepts: list[dict[str, Any] | None] = [None] * len(candidate_regions)
-        batch_size = max(1, int(region_batch_size))
+        concurrency = max(1, int(region_batch_size))
         completed_regions = 0
-
-        async def induce_region_concept_at(
-            index: int,
-            region: dict[str, Any],
-        ) -> tuple[int, dict[str, Any]]:
-            concept = await induce_region_concept(region)
-            return index, concept
-
-        pending: set[asyncio.Task[tuple[int, dict[str, Any]]]] = set()
+        pending: set[asyncio.Task[list[tuple[int, dict[str, Any]]]]] = set()
         next_index = 0
-        while next_index < len(candidate_regions) and len(pending) < batch_size:
-            region = candidate_regions[next_index]
-            pending.add(
-                asyncio.create_task(
-                    induce_region_concept_at(next_index, region)
-                )
-            )
+        while next_index < len(packed_batches) and len(pending) < concurrency:
+            pending.add(asyncio.create_task(induce_region_batch(packed_batches[next_index])))
             next_index += 1
 
         while pending:
@@ -2857,22 +2954,20 @@ async def build_collection_understanding(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
-                index, concept = task.result()
-                region = candidate_regions[index]
-                induced_concepts[index] = concept
-                while next_index < len(candidate_regions) and len(pending) < batch_size:
-                    next_region = candidate_regions[next_index]
+                concepts = task.result()
+                while next_index < len(packed_batches) and len(pending) < concurrency:
                     pending.add(
-                        asyncio.create_task(
-                            induce_region_concept_at(next_index, next_region)
-                        )
+                        asyncio.create_task(induce_region_batch(packed_batches[next_index]))
                     )
-                next_index += 1
-                if on_region_concept is not None:
-                    await on_region_concept(region, concept)
-                completed_regions += 1
-                if on_progress is not None:
-                    await on_progress(len(candidate_regions), completed_regions)
+                    next_index += 1
+                for index, concept in concepts:
+                    region = candidate_regions[index]
+                    induced_concepts[index] = concept
+                    if on_region_concept is not None:
+                        await on_region_concept(region, concept)
+                    completed_regions += 1
+                    if on_progress is not None:
+                        await on_progress(len(candidate_regions), completed_regions)
         streamed_regions = True
     region_concepts: list[dict[str, Any]] = [
         {"region": region, "concept": concept}

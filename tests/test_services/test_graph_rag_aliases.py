@@ -1,3 +1,4 @@
+import json
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -18,14 +19,16 @@ from graph_core.models.graph_rag import (
 )
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph import GraphService
-from graph_core.services.graph.ingestion import chunk_processor
 from graph_core.services.graph.analytics import (
+    _ENHANCE_TOKEN_ENCODING,
     NodeRecord,
     RelationshipRecord,
     _build_role_similarity_groups,
+    _select_meta_role_groups,
     analyze_collection_graph,
     build_collection_understanding,
 )
+from graph_core.services.graph.ingestion import chunk_processor
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import (
     DerivedRouteProfile,
@@ -61,6 +64,36 @@ class _FakeLLMProvider(LLMProvider):
             "aliases": ["role family"],
             "importance_reason": "Useful for higher-level navigation.",
             "member_entity_names": ["Source", "Target"],
+        }
+
+
+class _BatchConceptLLMProvider(LLMProvider):
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def chat(self, messages: list[dict]) -> str:
+        return "ok"
+
+    async def chat_stream(self, messages: list[dict]):
+        if False:
+            yield ""
+
+    async def structured_extract(self, prompt: str, schema: dict) -> dict:
+        self.prompts.append(prompt)
+        candidates = json.loads(prompt.split("Candidates:\n", 1)[1])
+        return {
+            "concepts": [
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "label": f"Concept {candidate['candidate_id']}",
+                    "concept_type": "relation_pattern",
+                    "description": "A stable shared relationship pattern.",
+                    "aliases": [],
+                    "importance_reason": "Repeated strong structural evidence.",
+                    "member_entity_names": candidate["entities"][:4],
+                }
+                for candidate in candidates
+            ]
         }
 
 
@@ -1564,7 +1597,7 @@ async def test_build_collection_understanding_tolerates_missing_relationship_cou
         "role_groups": [
             {
                 "group_id": "role:0",
-                "size": 2,
+                "size": 4,
                 "node_ids": [source_id, target_id],
                 "node_names": ["Source", "Target"],
                 "avg_cosine": 0.5,
@@ -1598,6 +1631,88 @@ async def test_build_collection_understanding_tolerates_missing_relationship_cou
     )
 
     assert understanding["nodes"]
+
+
+def test_meta_role_groups_reject_weak_cliques_and_apply_sublinear_budget():
+    groups = [
+        {
+            "group_id": f"role:{index}",
+            "size": 4,
+            "avg_cosine": 0.8,
+            "avg_jaccard": 0.6,
+        }
+        for index in range(100)
+    ]
+    groups.insert(
+        0,
+        {
+            "group_id": "weak-pair",
+            "size": 2,
+            "avg_cosine": 1.0,
+            "avg_jaccard": 1.0,
+        },
+    )
+
+    selected = _select_meta_role_groups(groups, node_count=10_000)
+
+    assert len(selected) == 100
+    assert all(group["group_id"] != "weak-pair" for group in selected)
+
+
+@pytest.mark.asyncio
+async def test_collection_understanding_batches_concepts_with_token_budget(monkeypatch):
+    groups = []
+    for index in range(40):
+        node_ids = [str(uuid.uuid4()) for _ in range(4)]
+        long_name = f"Role {index} " + ("structural evidence " * 30)
+        groups.append(
+            {
+                "group_id": f"role:{index}",
+                "size": 4,
+                "node_ids": node_ids,
+                "node_names": [f"{long_name}{member}" for member in range(4)],
+                "avg_cosine": 0.8,
+                "avg_jaccard": 0.6,
+                "total_overlap": 24,
+                "pair_metrics": [],
+                "top_rel_types": ["RELATES_TO"],
+                "representative_edges": [],
+            }
+        )
+    analysis = {
+        "collection": {
+            "id": str(uuid.uuid4()),
+            "name": "Large graph",
+            "namespace_id": str(uuid.uuid4()),
+            "strategy": "custom_graph_rag",
+        },
+        "relationship_records": [],
+        "role_groups": groups,
+        "entity_aliases_by_id": {},
+    }
+    provider = _BatchConceptLLMProvider()
+    monkeypatch.setattr(
+        "graph_core.services.graph.analytics.settings.graph_enhance_llm_batch_tokens",
+        8_000,
+    )
+    monkeypatch.setattr(
+        "graph_core.services.graph.analytics.settings.graph_enhance_llm_batch_max_regions",
+        100,
+    )
+
+    understanding = await build_collection_understanding(
+        analysis,
+        llm_provider=provider,
+        region_batch_size=2,
+    )
+
+    assert understanding["candidate_region_count"] == 32
+    assert 1 < len(provider.prompts) < understanding["candidate_region_count"]
+    assert all(
+        len(_ENHANCE_TOKEN_ENCODING.encode(prompt)) <= 8_000
+        for prompt in provider.prompts
+    )
+    assert len(understanding["regions"]) == 32
 
 
 @pytest.mark.asyncio
