@@ -14,6 +14,23 @@ from typing import Literal
 MAX_CHUNK_SIZE = 16_000  # characters
 
 
+def _remove_orphan_line_combining_marks(text: str) -> tuple[str, int]:
+    """Remove combining marks that have no base character on their line."""
+    output: list[str] = []
+    at_line_start = True
+    removed = 0
+    for character in text:
+        if at_line_start and unicodedata.combining(character):
+            removed += 1
+            continue
+        output.append(character)
+        if character in "\r\n":
+            at_line_start = True
+        elif not character.isspace():
+            at_line_start = False
+    return "".join(output), removed
+
+
 @dataclass
 class SanitizationReport:
     """What was sanitized and at what severity."""
@@ -41,6 +58,10 @@ class TextSanitizer:
             text = unicodedata.normalize("NFC", text)
             normalized = True
             details.append("nfc-normalized")
+
+        text, orphan_marks_removed = _remove_orphan_line_combining_marks(text)
+        if orphan_marks_removed:
+            details.append(f"orphan-combining-marks-removed:{orphan_marks_removed}")
 
         # 2. Remove zero-width characters
         zero_width = re.compile(r"[\u200b\u200c\u200d\ufeff\u2060]")
@@ -78,7 +99,13 @@ class TextSanitizer:
         # Determine severity
         severity = "none"
         if patterns_stripped:
-            severity = "low" if patterns_stripped <= 2 else "medium" if patterns_stripped <= 5 else "high"
+            severity = (
+                "low"
+                if patterns_stripped <= 2
+                else "medium"
+                if patterns_stripped <= 5
+                else "high"
+            )
 
         report = SanitizationReport(
             normalized=normalized,

@@ -1,3 +1,5 @@
+import unicodedata
+
 from graph_core.services.chunking import DocumentChunker
 
 
@@ -86,3 +88,31 @@ def test_document_chunker_ignores_headings_inside_fenced_code() -> None:
     )
 
     assert hierarchy.headings == ("Real",)
+
+
+def test_document_chunker_repairs_combining_mark_boundaries() -> None:
+    chunks = DocumentChunker._clean_chunks(["ལ", "\u0f74འོ"])
+
+    assert chunks == ["ལ\u0f74", "འོ"]
+    assert unicodedata.combining(chunks[1][0]) == 0
+
+
+def test_document_chunker_normalizes_text_and_bounds_malformed_headings() -> None:
+    chunker = DocumentChunker(chunk_size_tokens=20, chunk_overlap_tokens=0)
+    repeated_heading = "ཡུལ་" * 300
+    chunks = chunker.chunk_document(
+        f"## {repeated_heading}\n\n" + ("ལ\u0f74འོ་" * 200),
+        document_path="book.md",
+    )
+
+    assert chunks
+    for chunk in chunks:
+        prefix, _, body = chunk.partition("\n\nChunk text:\n")
+        section = next(
+            line.removeprefix("Section: ")
+            for line in prefix.splitlines()
+            if line.startswith("Section: ")
+        )
+        assert len(section) <= 512
+        assert body == unicodedata.normalize("NFC", body)
+        assert not body or unicodedata.combining(body[0]) == 0

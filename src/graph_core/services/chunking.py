@@ -7,6 +7,7 @@ AST-first strategy for code.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -17,10 +18,20 @@ from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
 from graph_core.models.domain_config import get_domain_config
 
-
 _ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})(?:[ \t]+|$)(.*)$")
 _SETEXT_UNDERLINE_RE = re.compile(r"^[ \t]{0,3}(=+|-+)[ \t]*$")
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_MAX_HEADING_CHARS = 256
+_MAX_SECTION_PATH_CHARS = 512
+
+
+def _truncate_unicode(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    end = limit
+    while end > 0 and unicodedata.combining(text[end]):
+        end -= 1
+    return text[:end].rstrip()
 
 
 @dataclass(frozen=True)
@@ -36,7 +47,11 @@ class SourceHierarchy:
         if self.folder_path:
             lines.append(f"Folder: {self.folder_path}")
         if self.headings:
-            lines.append("Section: " + " > ".join(self.headings))
+            section_path = " > ".join(self.headings)
+            lines.append(
+                "Section: "
+                + _truncate_unicode(section_path, _MAX_SECTION_PATH_CHARS)
+            )
         if len(lines) == 1:
             return ""
         return "\n".join(lines) + "\n\nChunk text:\n"
@@ -62,10 +77,10 @@ def _folder_path(document_path: str | None) -> str | None:
 
 
 def _clean_heading(heading: str) -> str:
-    cleaned = heading.strip()
+    cleaned = unicodedata.normalize("NFC", heading).strip()
     cleaned = re.sub(r"[ \t]+#+[ \t]*$", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned
+    return _truncate_unicode(cleaned, _MAX_HEADING_CHARS)
 
 
 @dataclass(frozen=True)
@@ -184,6 +199,7 @@ class DocumentChunker:
         )
 
     def chunk_text(self, text: str, domain: str | None = None) -> list[str]:
+        text = unicodedata.normalize("NFC", text)
         if not text.strip():
             return []
 
@@ -198,6 +214,7 @@ class DocumentChunker:
         domain: str | None = None,
         document_path: str | None = None,
     ) -> list[str]:
+        text = unicodedata.normalize("NFC", text)
         chunks = self.chunk_text(text, domain=domain)
         if not chunks:
             return []
@@ -284,7 +301,19 @@ class DocumentChunker:
 
     @staticmethod
     def _clean_chunks(chunks: list[str]) -> list[str]:
-        return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+        cleaned = [
+            unicodedata.normalize("NFC", chunk.strip())
+            for chunk in chunks
+            if chunk and chunk.strip()
+        ]
+        for index in range(1, len(cleaned)):
+            leading_marks = ""
+            while cleaned[index] and unicodedata.combining(cleaned[index][0]):
+                leading_marks += cleaned[index][0]
+                cleaned[index] = cleaned[index][1:]
+            if leading_marks:
+                cleaned[index - 1] += leading_marks
+        return [chunk for chunk in cleaned if chunk]
 
     @staticmethod
     def _source_hierarchy_at(

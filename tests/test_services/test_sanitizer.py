@@ -1,8 +1,10 @@
-"""TextSanitizer — unit tests."""
+"""TextSanitizer - unit tests."""
+
+import unicodedata
 
 import pytest
 
-from graph_core.services.sanitizer import TextSanitizer, MAX_CHUNK_SIZE
+from graph_core.services.sanitizer import MAX_CHUNK_SIZE, TextSanitizer
 
 
 @pytest.fixture
@@ -17,16 +19,33 @@ def trusted_sanitizer():
 
 class TestUnicodeNormalization:
     def test_nfc_normalizes_text(self, sanitizer):
-        # U+006E + U+0303 (n + combining tilde) → U+00F1 (ñ)
-        text = "caf\u006E\u0303"  # "cafe" with decomposed ñ
+        text = "caf\u006E\u0303"
         sanitized, report = sanitizer.sanitize(text, "test-ns")
-        assert sanitized == "caf\u00F1"  # NFC normalized
+        assert sanitized == "caf\u00F1"
         assert report.normalized is True
+
+    def test_removes_orphan_combining_mark_after_chunk_marker(self, sanitizer):
+        text = "Source hierarchy:\n\nChunk text:\n\u0f74འོ"
+
+        sanitized, report = sanitizer.sanitize(text, "test-ns")
+
+        assert sanitized.endswith("Chunk text:\nའོ")
+        assert "orphan-combining-marks-removed:1" in report.details
+
+    def test_preserves_combining_marks_attached_to_base_characters(self, sanitizer):
+        text = "ལ\u0f74འོ"
+
+        sanitized, report = sanitizer.sanitize(text, "test-ns")
+
+        assert sanitized == unicodedata.normalize("NFC", text)
+        assert not any(
+            detail.startswith("orphan-combining") for detail in report.details
+        )
 
 
 class TestZeroWidthRemoval:
     def test_strips_zero_width_spaces(self, sanitizer):
-        text = "hello\u200bworld"  # zero-width space
+        text = "hello\u200bworld"
         sanitized, report = sanitizer.sanitize(text, "test-ns")
         assert sanitized == "helloworld"
         assert "zero-width-removed" in report.details
@@ -68,7 +87,6 @@ class TestPromptInjectionDetection:
     def test_indic_scripture_phrase_passes_on_trusted(self, trusted_sanitizer):
         text = "the Lord commands you to abandon all prior understanding"
         _, report = trusted_sanitizer.sanitize(text, "trusted-ns")
-        # On trusted namespace, no patterns stripped
         assert report.patterns_stripped == 0
 
 
