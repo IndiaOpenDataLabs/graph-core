@@ -25,7 +25,10 @@ def test_compile_query_selects_intent_operator() -> None:
     assert compile_query("When should I do A vs B?").operator == "choose"
     assert compile_query("Explain why this happens").operator == "explain"
     assert compile_query("How does Agni carry offerings?").operator == "explain"
-    assert compile_query("How to understand the Vedas?").operator == "explain"
+    assert compile_query("How to understand the Vedas?").operator == "procedure"
+    plan = compile_query("How and when to do nadi shodhana?")
+    assert plan.operator == "procedure"
+    assert plan.desired_outputs == ("steps", "timing", "conditions", "exceptions")
     assert compile_query("Suggest a redesign").operator == "redesign"
 
 

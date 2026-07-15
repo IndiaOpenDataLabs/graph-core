@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import inspect
 import logging
 import re
@@ -10,7 +11,7 @@ import string
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from typing import Any
 
@@ -35,8 +36,13 @@ from graph_core.models.graph_rag import (
     RelationshipTypeAlias,
 )
 from graph_core.models.incremental_graph import (
+    GraphCommunity,
+    GraphCommunityMembership,
     GraphFrameArgument,
+    GraphNodeMetric,
+    GraphProjectionSnapshot,
     GraphSemanticFrame,
+    GraphVersion,
 )
 from graph_core.models.profile import Profile
 from graph_core.models.rel_types import (
@@ -119,6 +125,7 @@ _MODE_ALIASES = {
 }
 _MAX_QUERY_DIMENSIONS = 25
 
+
 async def _active_dimensions(collection: Collection) -> list[str]:
     """Active graph dimensions for this collection, in priority order.
 
@@ -133,9 +140,7 @@ async def _active_dimensions(collection: Collection) -> list[str]:
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(
-                distinct(GraphRelationshipType.canonical_type)
-            )
+            select(distinct(GraphRelationshipType.canonical_type))
             .select_from(GraphRelationship)
             .join(
                 GraphRelationshipType,
@@ -232,9 +237,7 @@ async def _rank_dimensions(
     dimension_set = set(dimensions)
 
     # Step 1: Find top entities relevant to the question (across all rel_types).
-    entity_query_embedding = await _embed_entity_query(
-        embedding_provider, question
-    )
+    entity_query_embedding = await _embed_entity_query(embedding_provider, question)
     seed_entity_ids, entity_relevance = await _search_entity_seeds(
         question, collection, entity_query_embedding
     )
@@ -298,9 +301,7 @@ async def _rank_dimensions(
 
     # Step 4: Rank candidates by graph-grounded frequency, then score with
     # vector search for fine-grained ranking.
-    sorted_by_count = sorted(
-        rel_type_counts.items(), key=lambda x: x[1], reverse=True
-    )
+    sorted_by_count = sorted(rel_type_counts.items(), key=lambda x: x[1], reverse=True)
     candidate_dims = [rt for rt, _ in sorted_by_count[:50]]
 
     embeddings = await _embed_relationship_queries_batch(
@@ -440,6 +441,19 @@ class GraphQueryPlan:
     anchors: list[str]
     requested_fields: list[str]
     output_shape: str
+    reasoning_operator: str = "describe"
+    requested_outputs: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    focus_terms: list[str] = field(default_factory=list)
+    competing_terms: list[str] = field(default_factory=list)
+    goal_terms: list[str] = field(default_factory=list)
+    relation_hints: list[str] = field(default_factory=list)
+    blocked_relation_hints: list[str] = field(default_factory=list)
+    preferred_path_properties: list[str] = field(default_factory=list)
+    grounded_entity_ids: list[str] = field(default_factory=list)
+    grounded_frame_ids: list[str] = field(default_factory=list)
+    grounded_relationship_ids: list[str] = field(default_factory=list)
+    max_reasoning_hops: int = 3
 
 
 @dataclass
@@ -464,6 +478,7 @@ class GraphQueryArtifacts:
     rel_context: str
     route_profile: DerivedRouteProfile
     state: GraphQueryState
+    reasoning_trace: dict[str, Any] | None = None
 
 
 @dataclass
@@ -569,9 +584,7 @@ async def _embed_relationship_queries_batch(
     for query, rel_type in zip(queries, rel_types):
         focus = ""
         if rel_type:
-            focus = (
-                f" Focus on relationships whose semantic role is {normalize_dim(rel_type)}."
-            )
+            focus = f" Focus on relationships whose semantic role is {normalize_dim(rel_type)}."
         texts.append(
             _format_retrieval_query(
                 _RELATIONSHIP_RETRIEVAL_INSTRUCTION + focus,
@@ -660,9 +673,29 @@ def get_graph_storage(collection: Collection):
 
 def _extract_query_keywords(question: str) -> list[str]:
     stop_words = {
-        "the", "a", "an", "and", "or", "in", "on", "at", "to",
-        "for", "of", "with", "is", "what", "how", "why", "who",
-        "i", "me", "my", "can", "be", "when",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "is",
+        "what",
+        "how",
+        "why",
+        "who",
+        "i",
+        "me",
+        "my",
+        "can",
+        "be",
+        "when",
     }
     tokens = [w.strip(string.punctuation).lower() for w in question.split()]
     keywords = [w for w in tokens if w and w not in stop_words and len(w) > 2]
@@ -769,14 +802,18 @@ class _EntityMentionIndex:
     def _normalize_key(name: str) -> str:
         """Lowercase, strip punctuation, collapse whitespace."""
         lowered = name.casefold()
-        cleaned = lowered.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+        cleaned = lowered.translate(
+            str.maketrans(string.punctuation, " " * len(string.punctuation))
+        )
         return " ".join(cleaned.split())
 
     @staticmethod
     def _question_ngrams(question: str) -> list[str]:
         """Generate 1 to _MENTION_INDEX_MAX_NGRAM word ngrams from the question."""
         cleaned = question.casefold()
-        cleaned = cleaned.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+        cleaned = cleaned.translate(
+            str.maketrans(string.punctuation, " " * len(string.punctuation))
+        )
         words = cleaned.split()
         ngrams: list[str] = []
         for n in range(1, min(_MENTION_INDEX_MAX_NGRAM + 1, len(words) + 1)):
@@ -807,7 +844,9 @@ class _EntityMentionIndex:
                         score=0.98,
                     )
 
-        results = sorted(matched.values(), key=lambda m: (-m.score, -len(m.canonical_name)))
+        results = sorted(
+            matched.values(), key=lambda m: (-m.score, -len(m.canonical_name))
+        )
         return results[:limit]
 
 
@@ -1155,7 +1194,11 @@ async def _search_relationship_seeds(
         top_k=top_k,
         document_ids=document_ids,
     )
-    threshold = settings.graph_rag_min_edge_similarity if min_similarity is None else min_similarity
+    threshold = (
+        settings.graph_rag_min_edge_similarity
+        if min_similarity is None
+        else min_similarity
+    )
     rel_seeds: list[tuple[str, float]] = []
     seen: set[str] = set()
     for hit in hits:
@@ -1344,8 +1387,7 @@ async def _entity_first_state(
                 rel_score_cache,
             )
             combined = (
-                _combined_edge_score(sim, edge_props, query_tokens)
-                * dimension_weight
+                _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             )
             if combined >= effective_min_edge_sim:
                 scored_edges.append((combined, neighbor, rel_id_str))
@@ -1448,8 +1490,7 @@ async def _find_relevant_path(
                 rel_score_cache,
             )
             combined = (
-                _combined_edge_score(sim, edge_props, query_tokens)
-                * dimension_weight
+                _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             )
             previous = rel_combined_score_cache.get(rel_id)
             if previous is None or combined > previous:
@@ -1478,6 +1519,7 @@ async def _relationship_seed_state(
     rel_types: list[str] | None = None,
     dimension_weight: float = 1.0,
     document_ids: list[uuid.UUID] | None = None,
+    required_relationship_ids: list[str] | None = None,
 ) -> GraphQueryState:
     rel_seeds = await _search_relationship_seeds(
         collection,
@@ -1486,6 +1528,11 @@ async def _relationship_seed_state(
         min_similarity=settings.graph_rag_min_edge_similarity,
         document_ids=document_ids,
     )
+    seed_scores = {rel_id: score for rel_id, score in rel_seeds}
+    for rel_id in required_relationship_ids or []:
+        if rel_id:
+            seed_scores[rel_id] = max(seed_scores.get(rel_id, 0.0), 1.0)
+    rel_seeds = sorted(seed_scores.items(), key=lambda item: item[1], reverse=True)
     if query_tokens is None:
         query_tokens = set()
 
@@ -1524,28 +1571,17 @@ async def _relationship_seed_state(
                     "stored_rel_type": str(rel.rel_type or ""),
                 }
             )
-            edge_props = await graph_storage.get_edge(
-                str(rel.source_entity_id),
-                str(rel.target_entity_id),
-                rel_types=rel_types,
-                document_ids=[str(doc_id) for doc_id in document_ids]
-                if document_ids
-                else None,
-            )
-            if edge_props is None:
-                edge_props = await graph_storage.get_edge(
-                    str(rel.target_entity_id),
-                    str(rel.source_entity_id),
-                    rel_types=rel_types,
-                    document_ids=[str(doc_id) for doc_id in document_ids]
-                    if document_ids
-                    else None,
-                )
-            if not edge_props:
+            if rel_types and rel.rel_type not in rel_types:
                 continue
+            # The relational row identifies the exact parallel edge selected by
+            # vector retrieval; an endpoint-only Falkor lookup can return another.
+            edge_props = {
+                "rel_type": rel.rel_type,
+                "weight": rel.weight or 1,
+                "keywords": rel.keywords or [],
+            }
             combined = (
-                _combined_edge_score(sim, edge_props, query_tokens)
-                * dimension_weight
+                _combined_edge_score(sim, edge_props, query_tokens) * dimension_weight
             )
             rel_debug_rows.append(
                 {
@@ -1686,9 +1722,16 @@ async def _entity_anchor_state(
     query_tokens: set[str],
     document_ids: list[uuid.UUID] | None = None,
     max_relationships: int = 40,
+    entity_ids: list[str] | None = None,
 ) -> GraphQueryState:
     wanted_names = [name for name in entity_names if str(name).strip()]
-    if not wanted_names:
+    wanted_ids: list[uuid.UUID] = []
+    for value in entity_ids or []:
+        try:
+            wanted_ids.append(uuid.UUID(value))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if not wanted_names and not wanted_ids:
         return GraphQueryState(
             discovered_entity_ids=set(),
             entity_relevance={},
@@ -1705,29 +1748,38 @@ async def _entity_anchor_state(
     rel_combined_score_cache: dict[str, float] = {}
 
     async with AsyncSessionLocal() as session:
+        entity_conditions = []
+        if wanted_names:
+            entity_conditions.append(
+                func.lower(GraphEntity.canonical_name).in_(
+                    {key.lower() for key in wanted_keys}
+                )
+            )
+        if wanted_ids:
+            entity_conditions.append(GraphEntity.id.in_(wanted_ids))
         entity_rows = (
             await session.execute(
                 select(GraphEntity.id, GraphEntity.canonical_name).where(
                     GraphEntity.collection_id == collection.id,
-                    func.lower(GraphEntity.canonical_name).in_(
-                        {key.lower() for key in wanted_keys}
-                    ),
+                    or_(*entity_conditions),
                 )
             )
         ).all()
-        alias_rows = (
-            await session.execute(
-                select(EntityAlias.entity_id, EntityAlias.alias_name)
-                .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
-                .where(
-                    EntityAlias.collection_id == collection.id,
-                    GraphEntity.collection_id == collection.id,
-                    func.lower(EntityAlias.alias_name).in_(
-                        {key.lower() for key in wanted_keys}
-                    ),
+        alias_rows = []
+        if wanted_names:
+            alias_rows = (
+                await session.execute(
+                    select(EntityAlias.entity_id, EntityAlias.alias_name)
+                    .join(GraphEntity, GraphEntity.id == EntityAlias.entity_id)
+                    .where(
+                        EntityAlias.collection_id == collection.id,
+                        GraphEntity.collection_id == collection.id,
+                        func.lower(EntityAlias.alias_name).in_(
+                            {key.lower() for key in wanted_keys}
+                        ),
+                    )
                 )
-            )
-        ).all()
+            ).all()
         anchor_ids = {str(entity_id) for entity_id, _ in entity_rows}
         anchor_ids.update(str(entity_id) for entity_id, _ in alias_rows)
         if not anchor_ids:
@@ -1763,13 +1815,17 @@ async def _entity_anchor_state(
                 )
             )
         rel_rows = (
-            await session.execute(
-                select(GraphRelationship)
-                .where(*rel_conditions)
-                .order_by(GraphRelationship.weight.desc())
-                .limit(max_relationships)
+            (
+                await session.execute(
+                    select(GraphRelationship)
+                    .where(*rel_conditions)
+                    .order_by(GraphRelationship.weight.desc())
+                    .limit(max_relationships)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     for rel in rel_rows:
         rel_id = str(rel.id)
@@ -2005,6 +2061,377 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
     )
 
 
+async def _latest_query_guidance_projection(
+    collection_id: uuid.UUID,
+) -> uuid.UUID | None:
+    async with AsyncSessionLocal() as session:
+        return (
+            await session.execute(
+                select(GraphProjectionSnapshot.id)
+                .join(
+                    GraphVersion,
+                    GraphVersion.id == GraphProjectionSnapshot.graph_version_id,
+                )
+                .where(
+                    GraphVersion.collection_id == collection_id,
+                    GraphProjectionSnapshot.name == "semantic_affinity_undirected",
+                    GraphProjectionSnapshot.status == "completed",
+                )
+                .order_by(GraphProjectionSnapshot.completed_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+
+async def _query_guidance_metadata(
+    entity_ids: set[uuid.UUID],
+    projection_id: uuid.UUID | None,
+) -> tuple[
+    dict[uuid.UUID, str],
+    dict[uuid.UUID, dict[str, float]],
+    dict[uuid.UUID, set[uuid.UUID]],
+]:
+    if not entity_ids:
+        return {}, {}, {}
+    async with AsyncSessionLocal() as session:
+        entity_rows = (
+            await session.execute(
+                select(GraphEntity.id, GraphEntity.canonical_name).where(
+                    GraphEntity.id.in_(entity_ids)
+                )
+            )
+        ).all()
+        description_rows = (
+            await session.execute(
+                select(EntityDescription.entity_id, EntityDescription.description)
+                .where(EntityDescription.entity_id.in_(entity_ids))
+                .order_by(EntityDescription.weight.desc())
+            )
+        ).all()
+        metric_rows = []
+        membership_rows = []
+        if projection_id is not None:
+            metric_rows = (
+                await session.execute(
+                    select(
+                        GraphNodeMetric.entity_id,
+                        GraphNodeMetric.metric,
+                        GraphNodeMetric.value,
+                    ).where(
+                        GraphNodeMetric.projection_id == projection_id,
+                        GraphNodeMetric.entity_id.in_(entity_ids),
+                        GraphNodeMetric.metric.in_(
+                            ["betweenness_approx", "is_articulation", "pagerank"]
+                        ),
+                    )
+                )
+            ).all()
+            membership_rows = (
+                await session.execute(
+                    select(
+                        GraphCommunityMembership.entity_id,
+                        GraphCommunityMembership.community_id,
+                    )
+                    .join(
+                        GraphCommunity,
+                        GraphCommunity.id == GraphCommunityMembership.community_id,
+                    )
+                    .where(
+                        GraphCommunity.projection_id == projection_id,
+                        GraphCommunityMembership.entity_id.in_(entity_ids),
+                    )
+                )
+            ).all()
+    descriptions: dict[uuid.UUID, str] = {}
+    for entity_id, description in description_rows:
+        descriptions.setdefault(entity_id, str(description or ""))
+    names = {
+        entity_id: f"{name or ''} {descriptions.get(entity_id, '')}".strip()
+        for entity_id, name in entity_rows
+    }
+    metrics: dict[uuid.UUID, dict[str, float]] = defaultdict(dict)
+    maxima: dict[str, float] = defaultdict(float)
+    for entity_id, metric, value in metric_rows:
+        numeric = float(value or 0.0)
+        metrics[entity_id][str(metric)] = numeric
+        maxima[str(metric)] = max(maxima[str(metric)], numeric)
+    for values in metrics.values():
+        for metric in ("betweenness_approx", "pagerank"):
+            maximum = maxima.get(metric, 0.0)
+            values[metric] = values.get(metric, 0.0) / maximum if maximum else 0.0
+    communities: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    for entity_id, community_id in membership_rows:
+        communities[entity_id].add(community_id)
+    return names, metrics, communities
+
+
+_OUTPUT_PATH_HINTS = {
+    "steps": {"requires", "involves", "uses", "begins", "follows", "precedes"},
+    "timing": {"scheduled", "timing", "before", "after", "duration", "occurs"},
+    "conditions": {"condition", "requires", "applies", "indicated", "when"},
+    "exceptions": {"exception", "avoid", "contraindicated", "unless"},
+    "contraindications": {"contraindicated", "risk", "avoid", "harm", "caution"},
+    "causes": {"causes", "produces", "leads", "triggers"},
+    "mechanisms": {"mechanism", "mediates", "regulates", "enables"},
+    "comparison": {"contrasts", "preferable", "alternative", "differs"},
+}
+
+
+async def _guided_query_state(
+    question: str,
+    collection: Collection,
+    initial_state: GraphQueryState,
+    *,
+    plan: GraphQueryPlan | None,
+    document_ids: list[uuid.UUID] | None,
+    max_nodes: int = 180,
+    max_edges: int = 320,
+    frontier_batch: int = 24,
+    alternatives_per_batch: int = 48,
+) -> tuple[GraphQueryState, dict[str, Any]]:
+    started = time.perf_counter()
+    node_scores = {
+        uuid.UUID(entity_id): float(score)
+        for entity_id, score in initial_state.entity_relevance.items()
+        if entity_id
+    }
+    if not node_scores:
+        node_scores = {
+            uuid.UUID(entity_id): 1.0
+            for entity_id in initial_state.discovered_entity_ids
+            if entity_id
+        }
+    if not node_scores:
+        return initial_state, {
+            "strategy": "guided_best_first",
+            "status": "no_seeds",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    requested_outputs = plan.requested_outputs if plan else []
+    output_hints = {
+        hint
+        for output in requested_outputs
+        for hint in _OUTPUT_PATH_HINTS.get(output, set())
+    }
+    focus_tokens = _query_token_set(
+        " ".join(
+            [
+                question,
+                *(plan.goal_terms if plan else []),
+                *(plan.relation_hints if plan else []),
+                *output_hints,
+            ]
+        )
+    )
+    preferred = {
+        value.casefold() for value in (plan.preferred_path_properties if plan else [])
+    }
+    explicit_relationship_ids = set(plan.grounded_relationship_ids if plan else [])
+    projection_id = await _latest_query_guidance_projection(collection.id)
+    node_depth = {entity_id: 0 for entity_id in node_scores}
+    queue = [
+        (-score, 0, str(entity_id), entity_id)
+        for entity_id, score in node_scores.items()
+    ]
+    heapq.heapify(queue)
+    expanded: set[uuid.UUID] = set()
+    rel_scores = dict(initial_state.rel_score_cache)
+    combined_scores = dict(initial_state.rel_combined_score_cache)
+    traversed_ids = list(initial_state.traversed_rel_ids)
+    traversed_set = set(traversed_ids)
+    relation_types_seen: set[str] = set()
+    communities_seen: set[uuid.UUID] = set()
+    batches: list[dict[str, Any]] = []
+    max_nodes = max(max_nodes, len(node_scores))
+
+    while queue and len(node_scores) < max_nodes and len(traversed_ids) < max_edges:
+        frontier: list[uuid.UUID] = []
+        while queue and len(frontier) < frontier_batch:
+            _, depth, _, entity_id = heapq.heappop(queue)
+            if entity_id in expanded or depth >= (
+                plan.max_reasoning_hops if plan else 3
+            ):
+                continue
+            expanded.add(entity_id)
+            frontier.append(entity_id)
+        if not frontier:
+            break
+        conditions = [
+            GraphRelationship.collection_id == collection.id,
+            or_(
+                GraphRelationship.source_entity_id.in_(frontier),
+                GraphRelationship.target_entity_id.in_(frontier),
+            ),
+        ]
+        if document_ids:
+            conditions.append(
+                GraphRelationship.id.in_(
+                    select(RelationshipDescription.relationship_id).where(
+                        RelationshipDescription.document_id.in_(document_ids)
+                    )
+                )
+            )
+        query_started = time.perf_counter()
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        GraphRelationship,
+                        GraphRelationshipType.inferred_properties,
+                    )
+                    .join(
+                        GraphRelationshipType,
+                        GraphRelationshipType.id
+                        == GraphRelationship.relationship_type_id,
+                    )
+                    .where(*conditions)
+                    .limit(2500)
+                )
+            ).all()
+        query_elapsed = time.perf_counter() - query_started
+        candidate_ids = {
+            endpoint
+            for relationship, _ in rows
+            for endpoint in (
+                relationship.source_entity_id,
+                relationship.target_entity_id,
+            )
+            if endpoint not in node_scores
+        }
+        names, metrics, communities = await _query_guidance_metadata(
+            candidate_ids | set(frontier), projection_id
+        )
+        transitions: list[
+            tuple[float, str, uuid.UUID, GraphRelationship, str, tuple[str, ...]]
+        ] = []
+        for relationship, inferred_properties in rows:
+            source_id = relationship.source_entity_id
+            target_id = relationship.target_entity_id
+            if source_id in frontier:
+                parent_id, candidate_id = source_id, target_id
+            elif target_id in frontier:
+                parent_id, candidate_id = target_id, source_id
+            else:
+                continue
+            if candidate_id in expanded:
+                continue
+            rel_type = str(relationship.rel_type or "").upper()
+            rel_overlap = len(
+                focus_tokens & _query_token_set(rel_type.replace("_", " "))
+            )
+            node_overlap = len(
+                focus_tokens & _query_token_set(names.get(candidate_id, ""))
+            )
+            properties = dict(inferred_properties or {})
+            property_score = 0.0
+            if "causal" in preferred and properties.get("causal") == "causal":
+                property_score += 2.0
+            if "temporal" in preferred and properties.get("temporal") == "temporal":
+                property_score += 2.0
+            if (
+                "transitive" in preferred
+                and properties.get("transitivity") == "transitive"
+            ):
+                property_score += 1.5
+            candidate_metrics = metrics.get(candidate_id, {})
+            parent_communities = communities.get(parent_id, set())
+            candidate_communities = communities.get(candidate_id, set())
+            crosses_community = bool(
+                parent_communities
+                and candidate_communities
+                and parent_communities.isdisjoint(candidate_communities)
+            )
+            score = (
+                node_scores.get(parent_id, 0.0) * 0.72
+                + node_overlap * 2.5
+                + rel_overlap * 2.0
+                + property_score
+                + candidate_metrics.get("betweenness_approx", 0.0) * 2.5
+                + candidate_metrics.get("is_articulation", 0.0) * 2.0
+                + candidate_metrics.get("pagerank", 0.0) * 0.5
+                + float(crosses_community) * 1.5
+                + float(rel_type not in relation_types_seen) * 0.35
+                + float(bool(candidate_communities - communities_seen)) * 0.35
+            )
+            if str(relationship.id) in explicit_relationship_ids:
+                score += 8.0
+            community_signature = tuple(
+                sorted(str(value) for value in candidate_communities)
+            )
+            transitions.append(
+                (
+                    score,
+                    str(relationship.id),
+                    candidate_id,
+                    relationship,
+                    rel_type,
+                    community_signature,
+                )
+            )
+        transitions.sort(key=lambda item: (-item[0], item[1]))
+        diverse: list[tuple[Any, ...]] = []
+        deferred: list[tuple[Any, ...]] = []
+        signatures: set[tuple[str, tuple[str, ...]]] = set()
+        for transition in transitions:
+            signature = (transition[4], transition[5])
+            if signature in signatures:
+                deferred.append(transition)
+            else:
+                signatures.add(signature)
+                diverse.append(transition)
+        accepted = 0
+        for score, rel_id, candidate_id, relationship, rel_type, _ in [
+            *diverse,
+            *deferred,
+        ]:
+            if accepted >= alternatives_per_batch or len(node_scores) >= max_nodes:
+                break
+            if rel_id in traversed_set:
+                continue
+            traversed_set.add(rel_id)
+            traversed_ids.append(rel_id)
+            rel_scores[rel_id] = score
+            combined_scores[rel_id] = score
+            previous = node_scores.get(candidate_id)
+            if previous is None or score > previous:
+                node_scores[candidate_id] = score
+                parent_depth = min(
+                    node_depth.get(relationship.source_entity_id, 999),
+                    node_depth.get(relationship.target_entity_id, 999),
+                )
+                depth = min(parent_depth + 1, plan.max_reasoning_hops if plan else 3)
+                node_depth[candidate_id] = depth
+                heapq.heappush(queue, (-score, depth, str(candidate_id), candidate_id))
+            relation_types_seen.add(rel_type)
+            communities_seen.update(communities.get(candidate_id, set()))
+            accepted += 1
+        batches.append(
+            {
+                "frontier": len(frontier),
+                "edge_rows": len(rows),
+                "candidate_nodes": len(candidate_ids),
+                "accepted_alternatives": accepted,
+                "sql_seconds": round(query_elapsed, 4),
+            }
+        )
+    result = GraphQueryState(
+        discovered_entity_ids={str(value) for value in node_scores},
+        entity_relevance={str(key): value for key, value in node_scores.items()},
+        traversed_rel_ids=traversed_ids,
+        rel_score_cache=rel_scores,
+        rel_combined_score_cache=combined_scores,
+    )
+    return result, {
+        "strategy": "guided_best_first",
+        "seed_count": len(initial_state.discovered_entity_ids),
+        "node_count": len(result.discovered_entity_ids),
+        "edge_count": len(result.traversed_rel_ids),
+        "expanded_count": len(expanded),
+        "batches": batches,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+
+
 def _vector_hit_score(hit) -> float:
     return max(0.0, 1.0 - float(hit.distance))
 
@@ -2065,6 +2492,15 @@ def _fallback_graph_query_frame_plan(
     question: str,
     plan: GraphQueryPlan | None = None,
 ) -> GraphQueryFramePlan:
+    if plan and (plan.focus_terms or plan.relation_hints or plan.competing_terms):
+        focus_terms = plan.focus_terms or plan.requested_fields
+        if not focus_terms:
+            focus_terms = [_diagnostic_entity_text(question)]
+        return GraphQueryFramePlan(
+            focus_terms=_expand_frame_terms(focus_terms),
+            competing_terms=list(plan.competing_terms),
+            relation_hints=list(plan.relation_hints),
+        )
     terms = list(plan.requested_fields) if plan else []
     if not terms:
         terms = [_diagnostic_entity_text(question)]
@@ -2075,11 +2511,64 @@ def _fallback_graph_query_frame_plan(
     )
 
 
+def _planned_retrieval_question(
+    question: str,
+    plan: GraphQueryPlan | None,
+) -> str:
+    if plan is None:
+        return question
+    lines = [question]
+    if plan.aliases:
+        lines.append(f"Established alternate names: {', '.join(plan.aliases)}")
+    if plan.focus_terms:
+        lines.append(f"Answer focus: {', '.join(plan.focus_terms)}")
+    if plan.goal_terms:
+        lines.append(f"Required relationship meanings: {', '.join(plan.goal_terms)}")
+    return "\n".join(lines)
+
+
+def _planned_frame_question(
+    question: str,
+    plan: GraphQueryPlan | None,
+) -> str:
+    expanded = _planned_retrieval_question(question, plan)
+    outputs = plan.requested_outputs if plan else []
+    lines = [expanded]
+    if outputs:
+        lines.append(f"Required answer evidence: {', '.join(outputs)}")
+    if plan and plan.relation_hints:
+        lines.append(f"Preferred path meanings: {', '.join(plan.relation_hints)}")
+    if plan and plan.competing_terms:
+        lines.append(f"Competing meanings to demote: {', '.join(plan.competing_terms)}")
+    return "\n".join(lines)
+
+
 def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
     lowered = f" {question.casefold()} "
     operation = "describe"
     scope = "top_k"
     output_shape = "table" if " table " in lowered else "prose"
+    reasoning_operator = "describe"
+    requested_outputs: list[str] = []
+
+    if any(
+        marker in lowered
+        for marker in (
+            " how to ",
+            " how and when ",
+            " how should ",
+            " steps ",
+            " procedure ",
+            " instructions ",
+        )
+    ):
+        reasoning_operator = "procedure"
+        requested_outputs = [
+            "steps",
+            "timing",
+            "conditions",
+            "contraindications",
+        ]
 
     if any(
         marker in lowered
@@ -2104,6 +2593,16 @@ def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
         anchors=[],
         requested_fields=[],
         output_shape=output_shape,
+        reasoning_operator=reasoning_operator,
+        requested_outputs=requested_outputs,
+        aliases=[],
+        focus_terms=[],
+        competing_terms=[],
+        goal_terms=[],
+        relation_hints=[],
+        blocked_relation_hints=[],
+        preferred_path_properties=[],
+        max_reasoning_hops=3,
     )
 
 
@@ -2160,6 +2659,61 @@ async def _plan_graph_query(
                 "type": "string",
                 "enum": ["prose", "bullets", "table"],
             },
+            "reasoning_operator": {
+                "type": "string",
+                "enum": [
+                    "describe",
+                    "procedure",
+                    "explain",
+                    "choose",
+                    "evaluate",
+                    "redesign",
+                ],
+            },
+            "requested_outputs": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "definition",
+                        "steps",
+                        "timing",
+                        "conditions",
+                        "exceptions",
+                        "contraindications",
+                        "causes",
+                        "mechanisms",
+                        "comparison",
+                        "evidence",
+                        "recommendations",
+                        "constraints",
+                    ],
+                },
+            },
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "focus_terms": {"type": "array", "items": {"type": "string"}},
+            "competing_terms": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "goal_terms": {"type": "array", "items": {"type": "string"}},
+            "relation_hints": {"type": "array", "items": {"type": "string"}},
+            "blocked_relation_hints": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "preferred_path_properties": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["causal", "temporal", "transitive", "symmetric"],
+                },
+            },
+            "max_reasoning_hops": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+            },
         },
         "required": [
             "operation",
@@ -2167,6 +2721,16 @@ async def _plan_graph_query(
             "anchors",
             "requested_fields",
             "output_shape",
+            "reasoning_operator",
+            "requested_outputs",
+            "aliases",
+            "focus_terms",
+            "competing_terms",
+            "goal_terms",
+            "relation_hints",
+            "blocked_relation_hints",
+            "preferred_path_properties",
+            "max_reasoning_hops",
         ],
     }
     prompt = (
@@ -2185,6 +2749,22 @@ async def _plan_graph_query(
         "extract, list, compare, or aggregate, stated in the user's terms. "
         "These are not anchors.\n"
         "- output_shape: prose, bullets, or table.\n\n"
+        "- reasoning_operator: procedure for how/when/instruction questions; "
+        "explain for why/mechanism questions; choose for conditional choices; "
+        "evaluate for assessments; redesign for requested changes; otherwise describe.\n"
+        "- requested_outputs: the answer obligations implied by the question, "
+        "using only values allowed by the schema. Procedure questions normally "
+        "need steps, timing, conditions, and contraindications.\n"
+        "- aliases: close synonyms, expanded abbreviations, translated names, "
+        "or alternate established names for explicit anchors. These are retrieval "
+        "bridges, not answers.\n\n"
+        "- focus_terms: domain terms defining the conceptual region in which the answer belongs.\n"
+        "- competing_terms: nearby meanings or regions that could produce plausible but irrelevant evidence.\n"
+        "- goal_terms: predicates or relationship meanings that would directly satisfy the requested outputs.\n"
+        "- relation_hints: relationship meanings that should be preferred while exploring supporting paths.\n"
+        "- blocked_relation_hints: relationship meanings that would lead into a clearly irrelevant interpretation.\n"
+        "- preferred_path_properties: causal, temporal, transitive, or symmetric only when that property matters.\n"
+        "- max_reasoning_hops: smallest depth from 1 to 5 likely to connect the required evidence.\n\n"
         "Scope rules:\n"
         "- collection: the user asks for all/every/list/inventory/table/coverage "
         "over the collection.\n"
@@ -2205,17 +2785,64 @@ async def _plan_graph_query(
     scope = str(extracted.get("scope") or fallback.scope).strip().lower()
     if scope not in {"top_k", "anchored", "collection"}:
         scope = fallback.scope
-    output_shape = str(
-        extracted.get("output_shape") or fallback.output_shape
-    ).strip().lower()
+    output_shape = (
+        str(extracted.get("output_shape") or fallback.output_shape).strip().lower()
+    )
     if output_shape not in {"prose", "bullets", "table"}:
         output_shape = fallback.output_shape
     anchors = _normalise_plan_list(extracted.get("anchors"))
     requested_fields = _normalise_plan_list(extracted.get("requested_fields"))
+    reasoning_operator = (
+        str(extracted.get("reasoning_operator") or fallback.reasoning_operator)
+        .strip()
+        .lower()
+    )
+    if reasoning_operator not in {
+        "describe",
+        "procedure",
+        "explain",
+        "choose",
+        "evaluate",
+        "redesign",
+    }:
+        reasoning_operator = fallback.reasoning_operator
+    aliases = _normalise_plan_list(extracted.get("aliases"), max_items=12)
+    requested_outputs = _normalise_plan_list(
+        extracted.get("requested_outputs"), max_items=12
+    )
+    if not requested_outputs:
+        requested_outputs = fallback.requested_outputs
     if operation == "compare" and anchors:
         scope = "anchored"
-    if scope == "collection" and not _explicit_collection_scope_requested(question):
+    if (
+        scope == "collection"
+        and operation not in {"inventory", "aggregate"}
+        and fallback.scope != "collection"
+    ):
         scope = "anchored" if anchors else "top_k"
+    focus_terms = _normalise_plan_list(extracted.get("focus_terms"), max_items=12)
+    competing_terms = _normalise_plan_list(
+        extracted.get("competing_terms"), max_items=12
+    )
+    goal_terms = _normalise_plan_list(extracted.get("goal_terms"), max_items=16)
+    relation_hints = _normalise_plan_list(extracted.get("relation_hints"), max_items=16)
+    blocked_relation_hints = _normalise_plan_list(
+        extracted.get("blocked_relation_hints"), max_items=12
+    )
+    allowed_properties = {"causal", "temporal", "transitive", "symmetric"}
+    preferred_path_properties = [
+        value
+        for value in _normalise_plan_list(
+            extracted.get("preferred_path_properties"), max_items=4
+        )
+        if value.casefold() in allowed_properties
+    ]
+    try:
+        max_reasoning_hops = min(
+            5, max(1, int(extracted.get("max_reasoning_hops") or 3))
+        )
+    except (TypeError, ValueError):
+        max_reasoning_hops = 3
 
     plan = GraphQueryPlan(
         operation=operation,
@@ -2223,14 +2850,421 @@ async def _plan_graph_query(
         anchors=anchors,
         requested_fields=requested_fields,
         output_shape=output_shape,
+        reasoning_operator=reasoning_operator,
+        requested_outputs=requested_outputs,
+        aliases=aliases,
+        focus_terms=focus_terms,
+        competing_terms=competing_terms,
+        goal_terms=goal_terms,
+        relation_hints=relation_hints,
+        blocked_relation_hints=blocked_relation_hints,
+        preferred_path_properties=preferred_path_properties,
+        max_reasoning_hops=max_reasoning_hops,
     )
     logger.info(
-        "graph_rag query_plan operation=%s scope=%s anchors=%s fields=%s shape=%s",
+        "graph_rag query_plan operation=%s scope=%s operator=%s anchors=%s aliases=%s fields=%s outputs=%s shape=%s",
         plan.operation,
         plan.scope,
+        plan.reasoning_operator,
         plan.anchors,
+        plan.aliases,
         plan.requested_fields,
+        plan.requested_outputs,
         plan.output_shape,
+    )
+    return plan
+
+
+def _retain_diverse_candidate_ids(
+    candidates: list[dict[str, Any]],
+    *,
+    text_fields: tuple[str, ...],
+    limit: int,
+) -> list[str]:
+    remaining = list(candidates)
+    retained: list[dict[str, Any]] = []
+    retained_tokens: list[set[str]] = []
+    while remaining and len(retained) < limit:
+        best_index = 0
+        best_rank = float("-inf")
+        for index, candidate in enumerate(remaining):
+            candidate_tokens = _query_token_set(
+                " ".join(str(candidate.get(field) or "") for field in text_fields)
+            )
+            max_similarity = max(
+                (
+                    len(candidate_tokens & existing)
+                    / max(len(candidate_tokens | existing), 1)
+                    for existing in retained_tokens
+                ),
+                default=0.0,
+            )
+            rank = float(candidate.get("score") or 0.0) + (
+                0.12 * (1.0 - max_similarity)
+            )
+            if rank > best_rank:
+                best_index = index
+                best_rank = rank
+        chosen = remaining.pop(best_index)
+        retained.append(chosen)
+        retained_tokens.append(
+            _query_token_set(
+                " ".join(str(chosen.get(field) or "") for field in text_fields)
+            )
+        )
+    return [str(candidate["id"]) for candidate in retained]
+
+
+async def _plan_grounded_graph_query(
+    question: str,
+    collection: Collection,
+    *,
+    document_ids: list[uuid.UUID] | None,
+) -> GraphQueryPlan:
+    base_plan = await _plan_graph_query(
+        question,
+        collection.namespace_id,
+        collection.llm_profile_id,
+    )
+    fallback = _fallback_graph_query_plan(question)
+    requested_outputs = list(
+        dict.fromkeys([*base_plan.requested_outputs, *fallback.requested_outputs])
+    )
+    base_plan = replace(
+        base_plan,
+        requested_outputs=requested_outputs,
+        requested_fields=list(
+            dict.fromkeys([*base_plan.requested_fields, *requested_outputs])
+        ),
+    )
+    llm = await _resolve_llm_provider(
+        namespace_id=collection.namespace_id,
+        llm_profile_id=collection.llm_profile_id,
+    )
+    if isinstance(llm, LocalEchoLLMProvider):
+        return base_plan
+    retrieval_question = question
+    if requested_outputs:
+        retrieval_question += "\nRequired graph evidence: " + ", ".join(
+            requested_outputs
+        )
+    try:
+        embedding_provider = await _resolve_embedding_provider(collection)
+        entity_embedding = await _embed_entity_query(
+            embedding_provider, retrieval_question
+        )
+        relationship_embedding = await _embed_relationship_query(
+            embedding_provider, retrieval_question, rel_type=None
+        )
+        mention_index = await _get_mention_index(collection)
+        entity_hits = await _top_entity_candidates(
+            collection,
+            entity_embedding,
+            question=question,
+            top_k=40,
+            document_ids=document_ids,
+            mention_index=mention_index,
+        )
+        candidate_names = [name for name, _, _ in entity_hits]
+        async with AsyncSessionLocal() as session:
+            entity_rows = (
+                await session.execute(
+                    select(
+                        GraphEntity.id,
+                        GraphEntity.canonical_name,
+                        GraphEntity.primary_type,
+                    ).where(
+                        GraphEntity.collection_id == collection.id,
+                        GraphEntity.canonical_name.in_(candidate_names),
+                    )
+                )
+            ).all()
+        entity_by_name = {
+            str(name): {
+                "id": str(entity_id),
+                "name": str(name),
+                "type": str(primary_type or ""),
+            }
+            for entity_id, name, primary_type in entity_rows
+        }
+        entity_candidates = [
+            {
+                **entity_by_name[name],
+                "description": description[:300],
+                "score": round(score, 6),
+            }
+            for name, description, score in entity_hits
+            if name in entity_by_name
+        ][:30]
+        frames = await _semantic_frame_evidence(
+            retrieval_question,
+            collection,
+            entity_embedding,
+            document_ids=document_ids,
+            top_k=30,
+        )
+        frame_candidates = [
+            {
+                "id": str(frame.frame_id),
+                "predicate": frame.predicate,
+                "title": frame.title,
+                "statement": frame.frame_text[:500],
+                "arguments": [
+                    {"role": role, "entity_id": str(entity_id), "name": name}
+                    for role, entity_id, name in frame.arguments
+                ],
+                "conditions": list(frame.conditions),
+                "exceptions": list(frame.exceptions),
+                "score": round(frame.score, 6),
+            }
+            for frame in frames
+            if frame.frame_kind == "proposition"
+        ]
+        relationship_hits = await _search_relationship_seeds(
+            collection,
+            relationship_embedding,
+            top_k=40,
+            min_similarity=0.0,
+            document_ids=document_ids,
+        )
+        relationship_ids = [uuid.UUID(rel_id) for rel_id, _ in relationship_hits]
+        relationship_score = dict(relationship_hits)
+        relationship_candidates: list[dict[str, Any]] = []
+        if relationship_ids:
+            async with AsyncSessionLocal() as session:
+                rows = (
+                    await session.execute(
+                        select(
+                            GraphRelationship.id,
+                            GraphRelationship.rel_type,
+                            GraphRelationship.source_entity_id,
+                            GraphRelationship.target_entity_id,
+                            GraphRelationship.keywords,
+                        ).where(GraphRelationship.id.in_(relationship_ids))
+                    )
+                ).all()
+                endpoint_ids = {
+                    endpoint
+                    for row in rows
+                    for endpoint in (row.source_entity_id, row.target_entity_id)
+                }
+                endpoint_rows = (
+                    await session.execute(
+                        select(GraphEntity.id, GraphEntity.canonical_name).where(
+                            GraphEntity.id.in_(endpoint_ids)
+                        )
+                    )
+                ).all()
+            endpoint_names = {entity_id: str(name) for entity_id, name in endpoint_rows}
+            relationship_candidates = [
+                {
+                    "id": str(row.id),
+                    "predicate": str(row.rel_type),
+                    "source_id": str(row.source_entity_id),
+                    "source": endpoint_names.get(row.source_entity_id, ""),
+                    "target_id": str(row.target_entity_id),
+                    "target": endpoint_names.get(row.target_entity_id, ""),
+                    "keywords": list(row.keywords or []),
+                    "score": round(relationship_score.get(str(row.id), 0.0), 6),
+                }
+                for row in rows
+            ]
+            relationship_candidates.sort(key=lambda item: item["score"], reverse=True)
+            relationship_candidates = relationship_candidates[:30]
+    except Exception:
+        logger.exception("graph_rag grounded_candidate_retrieval_failed")
+        return base_plan
+
+    entity_ids = [item["id"] for item in entity_candidates]
+    frame_ids = [item["id"] for item in frame_candidates]
+    relationship_candidate_ids = [item["id"] for item in relationship_candidates]
+    predicates = sorted(
+        {
+            item["predicate"]
+            for item in [*frame_candidates, *relationship_candidates]
+            if item["predicate"]
+        }
+    )
+    retained_entity_ids = _retain_diverse_candidate_ids(
+        entity_candidates,
+        text_fields=("name", "type", "description"),
+        limit=4,
+    )
+    retained_frame_ids = _retain_diverse_candidate_ids(
+        frame_candidates,
+        text_fields=("predicate", "title", "statement"),
+        limit=6,
+    )
+    retained_relationship_ids = _retain_diverse_candidate_ids(
+        relationship_candidates,
+        text_fields=("predicate", "source", "target", "keywords"),
+        limit=6,
+    )
+
+    def constrained_items(values: list[str]) -> dict[str, Any]:
+        return {"type": "string", "enum": values or [""]}
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "selected_entity_ids": {
+                "type": "array",
+                "items": constrained_items(entity_ids),
+                "maxItems": 8,
+            },
+            "excluded_entity_ids": {
+                "type": "array",
+                "items": constrained_items(entity_ids),
+                "maxItems": 6,
+            },
+            "selected_frame_ids": {
+                "type": "array",
+                "items": constrained_items(frame_ids),
+                "maxItems": 8,
+            },
+            "selected_relationship_ids": {
+                "type": "array",
+                "items": constrained_items(relationship_candidate_ids),
+                "maxItems": 8,
+            },
+            "goal_predicates": {
+                "type": "array",
+                "items": constrained_items(predicates),
+                "maxItems": 8,
+            },
+            "blocked_predicates": {
+                "type": "array",
+                "items": constrained_items(predicates),
+                "maxItems": 6,
+            },
+            "preferred_path_properties": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["causal", "temporal", "transitive", "symmetric"],
+                },
+                "maxItems": 4,
+            },
+            "max_reasoning_hops": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+            },
+        },
+        "required": [
+            "selected_entity_ids",
+            "excluded_entity_ids",
+            "selected_frame_ids",
+            "selected_relationship_ids",
+            "goal_predicates",
+            "blocked_predicates",
+            "preferred_path_properties",
+            "max_reasoning_hops",
+        ],
+    }
+    candidate_pack = {
+        "entities": entity_candidates,
+        "proposition_frames": frame_candidates,
+        "relationships": relationship_candidates[:30],
+    }
+    try:
+        grounded = await llm.structured_extract(
+            (
+                "Ground a reasoning plan in the supplied graph candidates. Select "
+                "only identifiers and predicates present below. Resolve ordinary "
+                "wording to encoded graph meaning. Preserve independent branches "
+                "that may satisfy different answer obligations. Prefer complete "
+                "propositions and include risks, exceptions, and blockers when "
+                "relevant. Choose the smallest sufficient set; do not fill arrays "
+                "merely because candidates are available.\n\n"
+                f"Question: {question}\n"
+                f"Reasoning operation: {base_plan.reasoning_operator}\n"
+                f"Required outputs: {requested_outputs}\n\n"
+                f"Graph candidates:\n{candidate_pack}"
+            ),
+            schema,
+        )
+    except Exception:
+        logger.exception("graph_rag grounded_selection_failed")
+        grounded = {}
+
+    def allowed_list(key: str, allowed: set[str], limit: int) -> list[str]:
+        return [
+            value
+            for value in _normalise_plan_list(grounded.get(key), max_items=limit)
+            if value in allowed
+        ]
+
+    llm_entity_ids = allowed_list("selected_entity_ids", set(entity_ids), 8)
+    excluded_entity_ids = allowed_list("excluded_entity_ids", set(entity_ids), 6)
+    llm_frame_ids = allowed_list("selected_frame_ids", set(frame_ids), 8)
+    llm_relationship_ids = allowed_list(
+        "selected_relationship_ids", set(relationship_candidate_ids), 8
+    )
+    selected_entity_ids = list(dict.fromkeys([*llm_entity_ids, *retained_entity_ids]))[
+        :12
+    ]
+    selected_frame_ids = list(dict.fromkeys([*llm_frame_ids, *retained_frame_ids]))[:12]
+    selected_relationship_ids = list(
+        dict.fromkeys([*llm_relationship_ids, *retained_relationship_ids])
+    )[:12]
+    selected_names = [
+        item["name"] for item in entity_candidates if item["id"] in llm_entity_ids
+    ]
+    excluded_names = [
+        item["name"] for item in entity_candidates if item["id"] in excluded_entity_ids
+    ]
+    goal_predicates = allowed_list("goal_predicates", set(predicates), 8)
+    blocked_predicates = allowed_list("blocked_predicates", set(predicates), 6)
+    properties = allowed_list(
+        "preferred_path_properties",
+        {"causal", "temporal", "transitive", "symmetric"},
+        4,
+    )
+    aliases: list[str] = []
+    if selected_entity_ids:
+        async with AsyncSessionLocal() as session:
+            aliases = list(
+                (
+                    await session.execute(
+                        select(EntityAlias.alias_name).where(
+                            EntityAlias.collection_id == collection.id,
+                            EntityAlias.entity_id.in_(
+                                [uuid.UUID(value) for value in selected_entity_ids]
+                            ),
+                        )
+                    )
+                ).scalars()
+            )[:20]
+    try:
+        hops = min(5, max(1, int(grounded.get("max_reasoning_hops") or 3)))
+    except (TypeError, ValueError):
+        hops = 3
+    plan = replace(
+        base_plan,
+        scope="anchored" if selected_names else base_plan.scope,
+        anchors=selected_names,
+        requested_outputs=requested_outputs,
+        aliases=list(dict.fromkeys(str(value) for value in aliases)),
+        focus_terms=selected_names,
+        competing_terms=excluded_names,
+        goal_terms=goal_predicates,
+        relation_hints=goal_predicates,
+        blocked_relation_hints=blocked_predicates,
+        preferred_path_properties=properties,
+        grounded_entity_ids=selected_entity_ids,
+        grounded_frame_ids=selected_frame_ids,
+        grounded_relationship_ids=selected_relationship_ids,
+        max_reasoning_hops=hops,
+    )
+    logger.info(
+        "graph_rag grounded_plan collection=%s entities=%s frames=%s relationships=%s goals=%s",
+        collection.name,
+        selected_entity_ids,
+        selected_frame_ids,
+        selected_relationship_ids,
+        goal_predicates,
     )
     return plan
 
@@ -2242,6 +3276,8 @@ async def _plan_graph_query_frame(
     plan: GraphQueryPlan | None = None,
 ) -> GraphQueryFramePlan:
     fallback = _fallback_graph_query_frame_plan(question, plan)
+    if plan is not None:
+        return fallback
     llm_provider = await _resolve_llm_provider(
         namespace_id=namespace_id,
         llm_profile_id=llm_profile_id,
@@ -2638,9 +3674,7 @@ def _apply_frame_precision(
         ).casefold()
         score = context.score
         matched_focus = any(term.casefold() in text for term in focus_terms)
-        matched_competing = any(
-            term.casefold() in text for term in competing_terms
-        )
+        matched_competing = any(term.casefold() in text for term in competing_terms)
         reasons = list(context.reasons)
         if matched_focus:
             score += 4.0
@@ -2966,8 +4000,7 @@ async def _load_context_assertions(
             ranked = scored_assertions
         ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
         chosen = [
-            assertion
-            for _, _, _, assertion in ranked[:max_assertions_per_context]
+            assertion for _, _, _, assertion in ranked[:max_assertions_per_context]
         ]
         selected.extend(chosen)
         selected_count += len(chosen)
@@ -3113,7 +4146,9 @@ def _build_context_evidence_text(
         ]
         frame_context_ids = {context.context_id for context in frame_contexts}
         retrieved_contexts = [
-            context for context in contexts if context.context_id not in frame_context_ids
+            context
+            for context in contexts
+            if context.context_id not in frame_context_ids
         ]
         context_sections = [
             ("Question-frame evidence", frame_contexts),
@@ -3128,14 +4163,16 @@ def _build_context_evidence_text(
             lines.append(section_title + ":")
         for context in section_contexts:
             entities_used.append(context.name)
-            lines.extend([
-                f"Context {context_index}: {context.name}",
-                f"Source: {context.document_path or '(unknown)'}",
-                f"Routing score: {context.score:.4f}",
-                f"Routing reasons: {', '.join(context.reasons) or '(none)'}",
-                f"Context description: {context.description}",
-                "Assertions:",
-            ])
+            lines.extend(
+                [
+                    f"Context {context_index}: {context.name}",
+                    f"Source: {context.document_path or '(unknown)'}",
+                    f"Routing score: {context.score:.4f}",
+                    f"Routing reasons: {', '.join(context.reasons) or '(none)'}",
+                    f"Context description: {context.description}",
+                    "Assertions:",
+                ]
+            )
             owned_assertions = assertions_by_context.get(context.context_id, [])
             if not owned_assertions:
                 lines.append("- (none)")
@@ -3165,6 +4202,8 @@ async def _semantic_frame_evidence(
     *,
     document_ids: list[uuid.UUID] | None = None,
     top_k: int = 12,
+    required_frame_ids: list[str] | None = None,
+    activated_proposition_scores: dict[str, float] | None = None,
 ) -> list[SemanticFrameEvidence]:
     """Retrieve rich frames, preserving links to executable graph objects."""
     from graph_core.storage.vector_tables import table_name
@@ -3189,6 +4228,43 @@ async def _semantic_frame_evidence(
         uuid.UUID(str(hit.metadata["frame_id"])): 1.0 - float(hit.distance)
         for hit in hits
     }
+    for value in required_frame_ids or []:
+        try:
+            scores[uuid.UUID(value)] = max(scores.get(uuid.UUID(value), 0.0), 1.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    proposition_scores: dict[uuid.UUID, float] = {}
+    for value, score in sorted(
+        (activated_proposition_scores or {}).items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:80]:
+        try:
+            proposition_scores[uuid.UUID(value)] = float(score)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if proposition_scores:
+        async with AsyncSessionLocal() as session:
+            activated_frame_rows = (
+                await session.execute(
+                    select(
+                        GraphSemanticFrame.id,
+                        GraphSemanticFrame.proposition_entity_id,
+                    ).where(
+                        GraphSemanticFrame.collection_id == collection.id,
+                        GraphSemanticFrame.frame_kind == "proposition",
+                        GraphSemanticFrame.proposition_entity_id.in_(
+                            proposition_scores
+                        ),
+                    )
+                )
+            ).all()
+        max_activation = max(proposition_scores.values(), default=1.0) or 1.0
+        for frame_id, proposition_id in activated_frame_rows:
+            activation_score = 0.55 + (
+                0.25 * proposition_scores.get(proposition_id, 0.0) / max_activation
+            )
+            scores[frame_id] = max(scores.get(frame_id, 0.0), activation_score)
     query_tokens = _frame_query_tokens(question)
     lexical_query = " | ".join(sorted(query_tokens))
     if lexical_query:
@@ -3224,9 +4300,7 @@ async def _semantic_frame_evidence(
         frames = list(
             (
                 await session.execute(
-                    select(GraphSemanticFrame).where(
-                        GraphSemanticFrame.id.in_(scores)
-                    )
+                    select(GraphSemanticFrame).where(GraphSemanticFrame.id.in_(scores))
                 )
             )
             .scalars()
@@ -3274,6 +4348,7 @@ async def _semantic_frame_evidence(
                 arguments=tuple(arguments[frame.id]),
             )
         )
+
     def rank(item: SemanticFrameEvidence) -> tuple[float, str]:
         frame_tokens = _frame_query_tokens(
             f"{item.title} {item.predicate} {item.frame_text}"
@@ -3300,11 +4375,7 @@ async def _semantic_frame_evidence(
     communities: list[SemanticFrameEvidence] = []
     if len(covered_tokens) < 2:
         communities = sorted(
-            (
-                item
-                for item in evidence
-                if item.frame_kind == "community_summary"
-            ),
+            (item for item in evidence if item.frame_kind == "community_summary"),
             key=rank,
         )[:2]
     return sorted([*propositions, *communities], key=rank)
@@ -3314,9 +4385,7 @@ def _semantic_frame_context(
     frames: list[SemanticFrameEvidence],
 ) -> tuple[str, list[str], list[str], set[str], dict[str, float]]:
     propositions = [frame for frame in frames if frame.frame_kind == "proposition"]
-    communities = [
-        frame for frame in frames if frame.frame_kind == "community_summary"
-    ]
+    communities = [frame for frame in frames if frame.frame_kind == "community_summary"]
     lines: list[str] = []
     entity_names: list[str] = []
     relationship_ids: list[str] = []
@@ -3331,9 +4400,10 @@ def _semantic_frame_context(
             ]
         )
         for frame in propositions:
-            argument_text = ", ".join(
-                f"{role}={name}" for role, _, name in frame.arguments
-            ) or "(none)"
+            argument_text = (
+                ", ".join(f"{role}={name}" for role, _, name in frame.arguments)
+                or "(none)"
+            )
             lines.append(
                 f"- {frame.title} [predicate={frame.predicate}; "
                 f"status={frame.executable_status}; score={frame.score:.4f}]\n"
@@ -3387,13 +4457,20 @@ async def _augment_with_semantic_frames(
     collection: Collection,
     query_embedding: list[float],
     document_ids: list[uuid.UUID] | None,
+    query_plan: GraphQueryPlan | None = None,
 ) -> GraphQueryArtifacts:
+    started = time.perf_counter()
+    frame_question = _planned_frame_question(question, query_plan)
+    frame_retrieval_started = time.perf_counter()
     frames = await _semantic_frame_evidence(
-        question,
+        frame_question,
         collection,
         query_embedding,
         document_ids=document_ids,
+        required_frame_ids=query_plan.grounded_frame_ids if query_plan else None,
+        activated_proposition_scores=artifacts.state.entity_relevance,
     )
+    frame_retrieval_elapsed = time.perf_counter() - frame_retrieval_started
     if not frames:
         return artifacts
     section, names, relationship_ids, discovered_ids, relevance = (
@@ -3418,6 +4495,7 @@ async def _augment_with_semantic_frames(
         for frame in frames
         if frame.frame_kind == "proposition" and frame.proposition_id is not None
     ]
+    activation_started = time.perf_counter()
     reasoning_trace = await activate_reasoning(
         collection.id,
         question,
@@ -3428,7 +4506,26 @@ async def _augment_with_semantic_frames(
             if frame.frame_kind == "community_summary"
             for _, entity_id, _ in frame.arguments
         },
+        operator=query_plan.reasoning_operator if query_plan else None,
+        requested_outputs=query_plan.requested_outputs if query_plan else None,
+        aliases=query_plan.aliases if query_plan else None,
+        anchor_terms=(query_plan.anchors + query_plan.aliases) if query_plan else None,
+        goal_terms=query_plan.goal_terms if query_plan else None,
+        relation_hints=query_plan.relation_hints if query_plan else None,
+        blocked_relation_hints=(
+            query_plan.blocked_relation_hints if query_plan else None
+        ),
+        preferred_path_properties=(
+            query_plan.preferred_path_properties if query_plan else None
+        ),
+        max_hops=query_plan.max_reasoning_hops if query_plan else 3,
     )
+    activation_elapsed = time.perf_counter() - activation_started
+    reasoning_trace["query_timings_seconds"] = {
+        "semantic_frame_retrieval": round(frame_retrieval_elapsed, 3),
+        "reasoning_activation": round(activation_elapsed, 3),
+        "total_augmentation": round(time.perf_counter() - started, 3),
+    }
     import json
 
     reasoning_section = (
@@ -3444,9 +4541,7 @@ async def _augment_with_semantic_frames(
     section = f"{section}\n\n{reasoning_section}"
     merged_relevance = dict(artifacts.state.entity_relevance)
     for entity_id, score in relevance.items():
-        merged_relevance[entity_id] = max(
-            merged_relevance.get(entity_id, 0.0), score
-        )
+        merged_relevance[entity_id] = max(merged_relevance.get(entity_id, 0.0), score)
     state = GraphQueryState(
         discovered_entity_ids=set(artifacts.state.discovered_entity_ids)
         | discovered_ids,
@@ -3466,6 +4561,160 @@ async def _augment_with_semantic_frames(
         ),
         rel_context=f"{artifacts.rel_context}\n{section}".strip(),
         state=state,
+        reasoning_trace=reasoning_trace,
+    )
+
+
+async def _merge_grounded_branches(
+    artifacts: GraphQueryArtifacts,
+    *,
+    question: str,
+    collection: Collection,
+    relationship_query_embedding: list[float],
+    document_ids: list[uuid.UUID] | None,
+    plan: GraphQueryPlan,
+) -> GraphQueryArtifacts:
+    """Add independently retrieved branch roots to context-layer evidence."""
+    branch_states: list[GraphQueryState] = []
+    query_tokens = _query_token_set(question)
+    if plan.grounded_relationship_ids:
+        branch_states.append(
+            await _relationship_seed_state(
+                collection,
+                relationship_query_embedding,
+                debug_label=f"grounded_branches:{question}",
+                top_k=max(10, len(plan.grounded_relationship_ids)),
+                max_endpoints=24,
+                max_pairs=0,
+                query_tokens=query_tokens,
+                document_ids=document_ids,
+                required_relationship_ids=plan.grounded_relationship_ids,
+            )
+        )
+    if plan.anchors or plan.grounded_entity_ids:
+        branch_states.append(
+            await _entity_anchor_state(
+                collection,
+                plan.anchors,
+                query_tokens=query_tokens,
+                document_ids=document_ids,
+                max_relationships=40,
+                entity_ids=plan.grounded_entity_ids,
+            )
+        )
+    branch_states = [
+        state
+        for state in branch_states
+        if state.discovered_entity_ids or state.traversed_rel_ids
+    ]
+    if not branch_states:
+        return artifacts
+
+    branch_state = _merge_states(*branch_states)
+    branch_context, names, relationships, branch_rel_context = await _build_context(
+        branch_state,
+        collection,
+        document_ids=document_ids,
+    )
+    branch_text = _strip_context_label(branch_context)
+    merged_state = _merge_states(artifacts.state, branch_state)
+    return replace(
+        artifacts,
+        context=(
+            f"{artifacts.context}\n\nIndependent Retrieved Branches:\n{branch_text}"
+        ),
+        entities_used=list(dict.fromkeys([*artifacts.entities_used, *names])),
+        relationships_used=list(
+            dict.fromkeys([*artifacts.relationships_used, *relationships])
+        ),
+        rel_context=(
+            f"{artifacts.rel_context}\nIndependent Retrieved Branches:\n"
+            f"{branch_rel_context}"
+        ).strip(),
+        state=merged_state,
+    )
+
+
+async def _augment_with_guided_query_state(
+    artifacts: GraphQueryArtifacts,
+    *,
+    question: str,
+    collection: Collection,
+    document_ids: list[uuid.UUID] | None,
+    plan: GraphQueryPlan | None,
+) -> GraphQueryArtifacts:
+    guided_state, diagnostics = await _guided_query_state(
+        question,
+        collection,
+        artifacts.state,
+        plan=plan,
+        document_ids=document_ids,
+    )
+    logger.info(
+        "graph_rag guided_query collection=%s diagnostics=%s",
+        collection.name,
+        diagnostics,
+    )
+    new_relationship_ids = set(guided_state.traversed_rel_ids) - set(
+        artifacts.state.traversed_rel_ids
+    )
+    if not new_relationship_ids:
+        return replace(artifacts, state=guided_state)
+    delta_entity_ids: set[str] = set()
+    async with AsyncSessionLocal() as session:
+        endpoint_rows = (
+            await session.execute(
+                select(
+                    GraphRelationship.source_entity_id,
+                    GraphRelationship.target_entity_id,
+                ).where(
+                    GraphRelationship.id.in_(
+                        [uuid.UUID(value) for value in new_relationship_ids]
+                    )
+                )
+            )
+        ).all()
+    for source_id, target_id in endpoint_rows:
+        delta_entity_ids.update((str(source_id), str(target_id)))
+    delta_state = GraphQueryState(
+        discovered_entity_ids=delta_entity_ids,
+        entity_relevance={
+            entity_id: guided_state.entity_relevance.get(entity_id, 0.0)
+            for entity_id in delta_entity_ids
+        },
+        traversed_rel_ids=[
+            rel_id
+            for rel_id in guided_state.traversed_rel_ids
+            if rel_id in new_relationship_ids
+        ],
+        rel_score_cache={
+            rel_id: guided_state.rel_score_cache.get(rel_id, 0.0)
+            for rel_id in new_relationship_ids
+        },
+        rel_combined_score_cache={
+            rel_id: guided_state.rel_combined_score_cache.get(rel_id, 0.0)
+            for rel_id in new_relationship_ids
+        },
+    )
+    context, names, relationships, rel_context = await _build_context(
+        delta_state,
+        collection,
+        document_ids=document_ids,
+    )
+    return replace(
+        artifacts,
+        context=(
+            f"{artifacts.context}\n\nGuided Branch Evidence:\n"
+            f"{_strip_context_label(context)}"
+        ),
+        entities_used=list(dict.fromkeys([*artifacts.entities_used, *names])),
+        relationships_used=list(
+            dict.fromkeys([*artifacts.relationships_used, *relationships])
+        ),
+        rel_context=(
+            f"{artifacts.rel_context}\nGuided Branch Evidence:\n{rel_context}"
+        ).strip(),
+        state=guided_state,
     )
 
 
@@ -3518,7 +4767,9 @@ async def _context_mix_artifacts(
         context_ids=[context.context_id for context in contexts],
         entity_query_embedding=entity_query_embedding,
         question=question,
-        frame_plan=frame_plan if plan is not None and plan.scope != "collection" else None,
+        frame_plan=frame_plan
+        if plan is not None and plan.scope != "collection"
+        else None,
         max_assertions_per_context=max_assertions_per_context,
     )
     assertions_elapsed = time.perf_counter() - assertions_started
@@ -3588,13 +4839,9 @@ def _fallback_mix_interpretation(
     if len(names) >= 2:
         group_a = names[: max(1, len(names) // 2)]
         group_b = names[max(1, len(names) // 2) :]
-        subqueries.append(
-            "How do " + ", ".join(group_a) + " relate to each other?"
-        )
+        subqueries.append("How do " + ", ".join(group_a) + " relate to each other?")
         if group_b:
-            subqueries.append(
-                "How do " + ", ".join(group_b) + " relate to each other?"
-            )
+            subqueries.append("How do " + ", ".join(group_b) + " relate to each other?")
     if not subqueries:
         subqueries = [
             "How does " + names[0] + " relate to the question?",
@@ -3602,6 +4849,35 @@ def _fallback_mix_interpretation(
     return MixInterpretation(
         selected_entities=names,
         retrieval_subqueries=[query for query in subqueries if query.strip()][:4],
+    )
+
+
+def _planned_mix_interpretation(
+    question: str,
+    candidates: list[tuple[str, str, float]],
+    plan: GraphQueryPlan,
+) -> MixInterpretation:
+    selected_entities = [name for name, _, _ in candidates[:8]]
+    if not selected_entities:
+        return MixInterpretation(selected_entities=[], retrieval_subqueries=[])
+    target = ", ".join(plan.anchors or plan.focus_terms or plan.requested_fields)
+    goals = ", ".join(plan.goal_terms or plan.relation_hints or plan.requested_outputs)
+    subqueries = [
+        " | ".join(
+            part
+            for part in (
+                f"Question: {question}",
+                f"Graph entity: {name}",
+                f"Target: {target}" if target else "",
+                f"Required relationship meanings: {goals}" if goals else "",
+            )
+            if part
+        )
+        for name in selected_entities[:4]
+    ]
+    return MixInterpretation(
+        selected_entities=selected_entities,
+        retrieval_subqueries=subqueries,
     )
 
 
@@ -3698,7 +4974,7 @@ def _diagnostic_entity_text(question: str) -> str:
     )
     for prefix in prefixes:
         if normalized.startswith(prefix):
-            candidate = normalized[len(prefix):].strip()
+            candidate = normalized[len(prefix) :].strip()
             if candidate:
                 return candidate
     return normalized
@@ -3760,6 +5036,7 @@ async def _mix_state(
     dimension_weight: float = 1.0,
     document_ids: list[uuid.UUID] | None = None,
     mention_index: _EntityMentionIndex | None = None,
+    plan: GraphQueryPlan | None = None,
 ) -> GraphQueryState:
     if mention_index is None:
         mention_index = await _get_mention_index(collection)
@@ -3789,11 +5066,12 @@ async def _mix_state(
         debug_label=f"mix_base:{question}",
         top_k=10,
         max_endpoints=30,
-        max_pairs=40,
+        max_pairs=0,
         query_tokens=query_tokens,
         rel_types=rel_types,
         dimension_weight=dimension_weight,
         document_ids=document_ids,
+        required_relationship_ids=(plan.grounded_relationship_ids if plan else None),
     )
     rel_base_state = await _filter_relationship_state_by_entity_score(
         collection,
@@ -3811,11 +5089,16 @@ async def _mix_state(
         )
         return rel_base_state
 
-    llm_provider = await _resolve_llm_provider(
-        namespace_id=namespace_id,
-        llm_profile_id=llm_profile_id,
-    )
-    interpretation = await _interpret_mix_queries(question, candidates, llm_provider)
+    if plan is not None:
+        interpretation = _planned_mix_interpretation(question, candidates, plan)
+    else:
+        llm_provider = await _resolve_llm_provider(
+            namespace_id=namespace_id,
+            llm_profile_id=llm_profile_id,
+        )
+        interpretation = await _interpret_mix_queries(
+            question, candidates, llm_provider
+        )
 
     anchor_state = await _entity_anchor_state(
         collection,
@@ -3845,11 +5128,14 @@ async def _mix_state(
             debug_label=f"mix_subquery:{subquery}",
             top_k=10,
             max_endpoints=20,
-            max_pairs=30,
+            max_pairs=0,
             query_tokens=subquery_tokens,
             rel_types=rel_types,
             dimension_weight=dimension_weight,
             document_ids=document_ids,
+            required_relationship_ids=(
+                plan.grounded_relationship_ids if plan else None
+            ),
         )
         subquery_entity_embedding = await _embed_entity_query(
             embedding_provider,
@@ -4035,7 +5321,9 @@ async def _build_context(
                 continue
             entity_conditions = [EntityDescription.entity_id == eid]
             if document_ids:
-                entity_conditions.append(EntityDescription.document_id.in_(document_ids))
+                entity_conditions.append(
+                    EntityDescription.document_id.in_(document_ids)
+                )
             descs_result = await session.execute(
                 select(EntityDescription)
                 .where(*entity_conditions)
@@ -4126,7 +5414,9 @@ async def _meta_base_ref_names_from_artifacts(
                 if entity_id
             ]
             traversed_rel_ids = [
-                uuid.UUID(rel_id) for rel_id in artifacts.state.traversed_rel_ids if rel_id
+                uuid.UUID(rel_id)
+                for rel_id in artifacts.state.traversed_rel_ids
+                if rel_id
             ]
             if not discovered_ids and not traversed_rel_ids:
                 continue
@@ -4390,10 +5680,15 @@ def _split_context_budget_blocks(context: str) -> list[_ContextBudgetBlock]:
             "Semantic Proposition Evidence:",
             "Internal Community Navigation:",
         }
-        starts_relationship_type = bool(re.match(r"^[A-Z][A-Z0-9_ -]+:$", stripped)) and (
-            section == "Relationships By Type:"
-        )
-        if starts_named_block or starts_context or starts_section_item or starts_relationship_type:
+        starts_relationship_type = bool(
+            re.match(r"^[A-Z][A-Z0-9_ -]+:$", stripped)
+        ) and (section == "Relationships By Type:")
+        if (
+            starts_named_block
+            or starts_context
+            or starts_section_item
+            or starts_relationship_type
+        ):
             flush()
         if starts_named_block:
             section = stripped
@@ -4454,8 +5749,7 @@ def _budget_graph_context(context: str, max_tokens: int) -> tuple[str, int]:
     else:
         selected.sort(key=lambda item: item.order)
         bounded = (
-            "\n\n".join(block.text for block in selected)
-            + _CONTEXT_TRUNCATION_NOTICE
+            "\n\n".join(block.text for block in selected) + _CONTEXT_TRUNCATION_NOTICE
         )
 
     bounded_tokens = _CONTEXT_TOKEN_ENCODING.encode(bounded)
@@ -4488,73 +5782,77 @@ async def _answer_from_context(
             settings.graph_rag_max_context_tokens,
             len(_CONTEXT_TOKEN_ENCODING.encode(context)),
         )
-    return await llm_provider.chat([
-        {
-            "role": "system",
-            "content": (
-                "Use the context below to answer the question. "
-                "Draw on the entities and relationships to reason through "
-                "your answer - "
-                "explain, connect, and illuminate rather than just report. "
-                "Write in natural prose. If the context is insufficient "
-                "for part of the "
-                "question, acknowledge it briefly without making it the focus."
-                "\n\nTreat the context as a graph-backed record of stored entities, descriptions, aliases, "
+    return await llm_provider.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Use the context below to answer the question. "
+                    "Draw on the entities and relationships to reason through "
+                    "your answer - "
+                    "explain, connect, and illuminate rather than just report. "
+                    "Write in natural prose. If the context is insufficient "
+                    "for part of the "
+                    "question, acknowledge it briefly without making it the focus."
+                    "\n\nTreat the context as a graph-backed record of stored entities, descriptions, aliases, "
                     "and relationships. Use that evidence to ground your answer."
                     "\n\nIf a Goal-Directed Answer Contract is present, it is "
                     "authoritative. State only proved_claims as established facts. "
+                    "Answer every requested_output in the contract explicitly, "
+                    "including procedure steps, timing, conditions, or exceptions. "
                     "Present supported_hypotheses explicitly as possible explanations, "
                     "not conclusions. Name material missing_bridges when they prevent a "
                     "direct answer. Never use nearby context or Supporting Graph "
                     "Activation to silently fill a missing bridge. Supporting activation "
                     "may explain a proved claim or motivate a labeled hypothesis, but it "
                     "is not proof by itself."
-                "\n\nIf a Context-Scoped Evidence section is present, each "
-                "context is a source-local evidence scope and each assertion "
-                "is true only inside that source context. Compare or group "
-                "across contexts only after preserving which source each "
-                "assertion came from."
-                "\n\nThe context may contain both central evidence and nearby "
-                "distractors. Prefer assertions and source descriptions that "
-                "directly answer the question's subject, action, comparison, "
-                "or requested field. Use routing scores and routing reasons "
-                "only as relevance hints, not as facts. Use lower-scoring or "
-                "merely related contexts only to qualify, contrast, or explain "
-                "absence of support. If evidence appears to conflict, prefer "
-                "the more direct source-local assertion over a broader or more "
-                "generic related assertion. Do not infer that two items "
-                "participate in the same process, argument, event, role, or "
-                "mechanism merely because both are retrieved or mentioned in "
-                "the question; state the connection only when the evidence "
-                "shows it."
-                "\n\nIf a Collection Coverage Evidence section is present, the "
-                "question is collection-wide. Use every listed source scope "
-                "that contains relevant requested fields; do not answer from "
-                "only the most semantically similar contexts."
-                "\n\nIf an Internal Higher-Level Context section is present, it contains progressively broader, "
-                "more synthesized concepts built from lower levels. Use it only for internal navigation: it may "
-                "help you identify which lower-level or base-level entities matter. Do not quote, name, "
-                "or center the answer on higher-level meta concepts when you can answer using Primary Evidence."
-                "\n\nIn the final answer, prefer entities and descriptions from Primary Evidence over entities that "
-                "appear only in higher-level meta layers. If a higher-level layer helps you find the right answer, "
-                "translate back down before answering."
-                "\n\nDo not explain your reasoning using graph terminology. Avoid phrases like graph, node, edge, "
-                "meta graph, base graph, EVIDENCED_BY, CONNECTS_TO, chain, layer, or abstraction ladder in the final answer "
-                "unless the user explicitly asks about the graph representation itself. Instead, restate the underlying "
-                "mechanism, workflow, component behavior, or implementation concern in normal prose."
-                "\n\nThe Relationships By Type section groups edges by"
-                " semantic role. Each edge is listed in the form"
-                " 'SRC -[REL_TYPE]-> TGT: description'. REL_TYPE is the"
-                " semantic role of the edge (e.g. EXPLAINS, CAUSES, IS_AN_EXAMPLE_OF);"
-                " the same SRC and TGT may appear with several different"
-                " REL_TYPEs and each one carries a separate meaning."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"{context}\n\nQuestion: {question}",
-        },
-    ])
+                    "\n\nIf a Context-Scoped Evidence section is present, each "
+                    "context is a source-local evidence scope and each assertion "
+                    "is true only inside that source context. Compare or group "
+                    "across contexts only after preserving which source each "
+                    "assertion came from."
+                    "\n\nThe context may contain both central evidence and nearby "
+                    "distractors. Prefer assertions and source descriptions that "
+                    "directly answer the question's subject, action, comparison, "
+                    "or requested field. Use routing scores and routing reasons "
+                    "only as relevance hints, not as facts. Use lower-scoring or "
+                    "merely related contexts only to qualify, contrast, or explain "
+                    "absence of support. If evidence appears to conflict, prefer "
+                    "the more direct source-local assertion over a broader or more "
+                    "generic related assertion. Do not infer that two items "
+                    "participate in the same process, argument, event, role, or "
+                    "mechanism merely because both are retrieved or mentioned in "
+                    "the question; state the connection only when the evidence "
+                    "shows it."
+                    "\n\nIf a Collection Coverage Evidence section is present, the "
+                    "question is collection-wide. Use every listed source scope "
+                    "that contains relevant requested fields; do not answer from "
+                    "only the most semantically similar contexts."
+                    "\n\nIf an Internal Higher-Level Context section is present, it contains progressively broader, "
+                    "more synthesized concepts built from lower levels. Use it only for internal navigation: it may "
+                    "help you identify which lower-level or base-level entities matter. Do not quote, name, "
+                    "or center the answer on higher-level meta concepts when you can answer using Primary Evidence."
+                    "\n\nIn the final answer, prefer entities and descriptions from Primary Evidence over entities that "
+                    "appear only in higher-level meta layers. If a higher-level layer helps you find the right answer, "
+                    "translate back down before answering."
+                    "\n\nDo not explain your reasoning using graph terminology. Avoid phrases like graph, node, edge, "
+                    "meta graph, base graph, EVIDENCED_BY, CONNECTS_TO, chain, layer, or abstraction ladder in the final answer "
+                    "unless the user explicitly asks about the graph representation itself. Instead, restate the underlying "
+                    "mechanism, workflow, component behavior, or implementation concern in normal prose."
+                    "\n\nThe Relationships By Type section groups edges by"
+                    " semantic role. Each edge is listed in the form"
+                    " 'SRC -[REL_TYPE]-> TGT: description'. REL_TYPE is the"
+                    " semantic role of the edge (e.g. EXPLAINS, CAUSES, IS_AN_EXAMPLE_OF);"
+                    " the same SRC and TGT may appear with several different"
+                    " REL_TYPEs and each one carries a separate meaning."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"{context}\n\nQuestion: {question}",
+            },
+        ]
+    )
 
 
 async def _load_meta_collections(collection: Collection) -> list[Collection]:
@@ -4584,7 +5882,7 @@ async def _load_meta_collections(collection: Collection) -> list[Collection]:
 def _strip_context_label(context: str) -> str:
     prefix = "Context:\n"
     if context.startswith(prefix):
-        return context[len(prefix):]
+        return context[len(prefix) :]
     return context
 
 
@@ -4608,14 +5906,30 @@ async def _build_graph_query_artifacts(
     document_ids: list[uuid.UUID] | None = None,
     query_plan: GraphQueryPlan | None = None,
 ) -> GraphQueryArtifacts:
-    embedding_provider = await _resolve_embedding_provider(collection)
-    entity_query_embedding = await _embed_entity_query(embedding_provider, question)
-    mention_index = await _get_mention_index(collection)
-
+    build_started = time.perf_counter()
+    build_timings: dict[str, float] = {}
     requested_mode = (mode or "mix").lower()
     effective_mode = _MODE_ALIASES.get(requested_mode, "mix")
     if effective_mode == "mix" and query_plan is None:
-        query_plan = await _plan_graph_query(question, namespace_id, llm_profile_id)
+        query_plan = await _plan_grounded_graph_query(
+            question,
+            collection,
+            document_ids=document_ids,
+        )
+    retrieval_question = _planned_retrieval_question(question, query_plan)
+    provider_started = time.perf_counter()
+    embedding_provider = await _resolve_embedding_provider(collection)
+    build_timings["embedding_provider"] = time.perf_counter() - provider_started
+    entity_embedding_started = time.perf_counter()
+    entity_query_embedding = await _embed_entity_query(
+        embedding_provider,
+        retrieval_question,
+    )
+    build_timings["entity_embedding"] = time.perf_counter() - entity_embedding_started
+    mention_index_started = time.perf_counter()
+    mention_index = await _get_mention_index(collection)
+    build_timings["mention_index"] = time.perf_counter() - mention_index_started
+
     dimensions: list[str] = []
     logger.info(
         "graph_rag dimension_gating_disabled collection=%s mode=%s threshold=%.3f",
@@ -4623,14 +5937,19 @@ async def _build_graph_query_artifacts(
         effective_mode,
         _REL_ENDPOINT_ENTITY_SCORE_MIN,
     )
+    relationship_embedding_started = time.perf_counter()
     relationship_query_embedding = await _embed_relationship_query(
         embedding_provider,
-        question,
+        retrieval_question,
         rel_type=None,
     )
+    build_timings["relationship_embedding"] = (
+        time.perf_counter() - relationship_embedding_started
+    )
     if effective_mode == "mix":
+        context_mix_started = time.perf_counter()
         context_artifacts = await _context_mix_artifacts(
-            question,
+            retrieval_question,
             collection,
             namespace_id,
             llm_profile_id,
@@ -4639,14 +5958,115 @@ async def _build_graph_query_artifacts(
             document_ids=document_ids,
             plan=query_plan,
         )
+        build_timings["context_mix"] = time.perf_counter() - context_mix_started
         if context_artifacts is not None:
-            return await _augment_with_semantic_frames(
+            if query_plan is not None and (
+                query_plan.anchors
+                or query_plan.grounded_entity_ids
+                or query_plan.grounded_relationship_ids
+            ):
+                branch_merge_started = time.perf_counter()
+                context_artifacts = await _merge_grounded_branches(
+                    context_artifacts,
+                    question=retrieval_question,
+                    collection=collection,
+                    relationship_query_embedding=relationship_query_embedding,
+                    document_ids=document_ids,
+                    plan=query_plan,
+                )
+                build_timings["grounded_branch_merge"] = (
+                    time.perf_counter() - branch_merge_started
+                )
+            guided_started = time.perf_counter()
+            context_artifacts = await _augment_with_guided_query_state(
+                context_artifacts,
+                question=retrieval_question,
+                collection=collection,
+                document_ids=document_ids,
+                plan=query_plan,
+            )
+            build_timings["guided_query"] = time.perf_counter() - guided_started
+            augmentation_started = time.perf_counter()
+            result = await _augment_with_semantic_frames(
                 context_artifacts,
                 question=question,
                 collection=collection,
                 query_embedding=entity_query_embedding,
                 document_ids=document_ids,
+                query_plan=query_plan,
             )
+            build_timings["semantic_augmentation"] = (
+                time.perf_counter() - augmentation_started
+            )
+            build_timings["total"] = time.perf_counter() - build_started
+            if result.reasoning_trace is not None:
+                result.reasoning_trace["artifact_timings_seconds"] = {
+                    key: round(value, 3) for key, value in build_timings.items()
+                }
+            return result
+        if query_plan is not None and (
+            query_plan.grounded_entity_ids
+            or query_plan.grounded_relationship_ids
+            or query_plan.grounded_frame_ids
+        ):
+            empty_state = GraphQueryState(
+                discovered_entity_ids=set(),
+                entity_relevance={},
+                traversed_rel_ids=[],
+                rel_score_cache={},
+                rel_combined_score_cache={},
+            )
+            grounded_artifacts = GraphQueryArtifacts(
+                context="Context:\n",
+                entities_used=[],
+                relationships_used=[],
+                rel_context="",
+                route_profile=DerivedRouteProfile(
+                    primary_route="grounded_branches",
+                    route_scores={"grounded_branches": 1.0},
+                    rel_type_scores={},
+                ),
+                state=empty_state,
+            )
+            branch_merge_started = time.perf_counter()
+            grounded_artifacts = await _merge_grounded_branches(
+                grounded_artifacts,
+                question=retrieval_question,
+                collection=collection,
+                relationship_query_embedding=relationship_query_embedding,
+                document_ids=document_ids,
+                plan=query_plan,
+            )
+            build_timings["grounded_branch_merge"] = (
+                time.perf_counter() - branch_merge_started
+            )
+            guided_started = time.perf_counter()
+            grounded_artifacts = await _augment_with_guided_query_state(
+                grounded_artifacts,
+                question=retrieval_question,
+                collection=collection,
+                document_ids=document_ids,
+                plan=query_plan,
+            )
+            build_timings["guided_query"] = time.perf_counter() - guided_started
+            augmentation_started = time.perf_counter()
+            result = await _augment_with_semantic_frames(
+                grounded_artifacts,
+                question=question,
+                collection=collection,
+                query_embedding=entity_query_embedding,
+                document_ids=document_ids,
+                query_plan=query_plan,
+            )
+            build_timings["semantic_augmentation"] = (
+                time.perf_counter() - augmentation_started
+            )
+            build_timings["total"] = time.perf_counter() - build_started
+            if result.reasoning_trace is not None:
+                result.reasoning_trace["artifact_timings_seconds"] = {
+                    key: round(value, 3) for key, value in build_timings.items()
+                }
+            return result
 
     async def _build_state_for(rel_type: str | None) -> GraphQueryState:
         kwargs = {
@@ -4655,7 +6075,7 @@ async def _build_graph_query_artifacts(
         }
         if effective_mode == "relationship-first":
             return await _relationship_first_state(
-                question,
+                retrieval_question,
                 collection,
                 entity_query_embedding,
                 relationship_query_embedding,
@@ -4665,7 +6085,7 @@ async def _build_graph_query_artifacts(
             )
         if effective_mode == "mix":
             return await _mix_state(
-                question,
+                retrieval_question,
                 collection,
                 namespace_id,
                 llm_profile_id,
@@ -4675,6 +6095,7 @@ async def _build_graph_query_artifacts(
                 **kwargs,
                 document_ids=document_ids,
                 mention_index=mention_index,
+                plan=query_plan,
             )
         if effective_mode == "hybrid":
             entity_state = await _entity_first_state(
@@ -4697,7 +6118,7 @@ async def _build_graph_query_artifacts(
             )
             return _merge_states(entity_state, relationship_state)
         return await _entity_first_state(
-            question,
+            retrieval_question,
             collection,
             entity_query_embedding,
             relationship_query_embedding,
@@ -4748,12 +6169,20 @@ async def _build_graph_query_artifacts(
         state=state,
     )
     if effective_mode == "mix":
+        artifacts = await _augment_with_guided_query_state(
+            artifacts,
+            question=retrieval_question,
+            collection=collection,
+            document_ids=document_ids,
+            plan=query_plan,
+        )
         return await _augment_with_semantic_frames(
             artifacts,
             question=question,
             collection=collection,
             query_embedding=entity_query_embedding,
             document_ids=document_ids,
+            query_plan=query_plan,
         )
     return artifacts
 
@@ -4774,7 +6203,11 @@ async def graph_rag_query(
     document_ids = routing.document_ids if not routing.use_all_documents else None
     effective_mode = _MODE_ALIASES.get((mode or "mix").lower(), "mix")
     query_plan = (
-        await _plan_graph_query(question, namespace_id, llm_profile_id)
+        await _plan_grounded_graph_query(
+            question,
+            collection,
+            document_ids=document_ids,
+        )
         if effective_mode == "mix"
         else None
     )
@@ -4797,7 +6230,25 @@ async def graph_rag_query(
     )
     meta_collections = await _load_meta_collections(collection)
     meta_artifacts: list[tuple[Collection, GraphQueryArtifacts]] = []
+    meta_query_plan = (
+        replace(
+            query_plan,
+            anchors=[],
+            aliases=[],
+            grounded_entity_ids=[],
+            grounded_frame_ids=[],
+            grounded_relationship_ids=[],
+        )
+        if query_plan is not None
+        else None
+    )
     for meta_collection in meta_collections:
+        meta_kwargs = {
+            **artifact_kwargs,
+            "document_ids": None,
+        }
+        if "query_plan" in inspect.signature(_build_graph_query_artifacts).parameters:
+            meta_kwargs["query_plan"] = meta_query_plan
         meta_artifacts.append(
             (
                 meta_collection,
@@ -4807,10 +6258,7 @@ async def graph_rag_query(
                     namespace_id,
                     mode,
                     llm_profile_id,
-                    **{
-                        **artifact_kwargs,
-                        "document_ids": None,
-                    },
+                    **meta_kwargs,
                 ),
             )
         )
@@ -4836,9 +6284,7 @@ async def graph_rag_query(
                 document_ids=document_ids,
             )
             if semantic_frame_suffix:
-                projected_context = (
-                    f"{projected_context}\n\n{semantic_frame_suffix}"
-                )
+                projected_context = f"{projected_context}\n\n{semantic_frame_suffix}"
                 projected_rel_context = (
                     f"{projected_rel_context}\n{semantic_frame_suffix}"
                 ).strip()
@@ -4889,9 +6335,7 @@ async def graph_rag_query(
     )
     fallback_text = meta_fallback or base.rel_context or entity_fallback
     all_meta_entities = [
-        entity
-        for _, artifacts in meta_artifacts
-        for entity in artifacts.entities_used
+        entity for _, artifacts in meta_artifacts for entity in artifacts.entities_used
     ]
     all_meta_relationships = [
         relationship
@@ -4907,15 +6351,9 @@ async def graph_rag_query(
     )
     return QueryResult(
         response=response,
-        entities_used=list(
-            dict.fromkeys(
-                base.entities_used + all_meta_entities
-            )
-        ),
+        entities_used=list(dict.fromkeys(base.entities_used + all_meta_entities)),
         relationships_used=list(
-            dict.fromkeys(
-                base.relationships_used + all_meta_relationships
-            )
+            dict.fromkeys(base.relationships_used + all_meta_relationships)
         ),
         mode=_MODE_ALIASES.get((mode or "mix").lower(), "mix"),
     )

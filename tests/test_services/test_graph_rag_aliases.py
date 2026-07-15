@@ -1221,7 +1221,9 @@ async def test_entity_first_state_prioritizes_high_scoring_edges(
     monkeypatch.setattr(
         graph_rag,
         "_search_entity_seeds",
-        AsyncMock(return_value=([str(entity_ids["seed"])], {str(entity_ids["seed"]): 0.1})),
+        AsyncMock(
+            return_value=([str(entity_ids["seed"])], {str(entity_ids["seed"]): 0.1})
+        ),
     )
     monkeypatch.setattr(
         graph_rag._graph_rag_vectors,
@@ -1257,8 +1259,12 @@ async def test_entity_first_state_prioritizes_high_scoring_edges(
         return 0.51
 
     monkeypatch.setattr(graph_rag, "get_graph_storage", lambda _cid: _GraphStorage())
-    monkeypatch.setattr(graph_rag, "_score_relationship", AsyncMock(side_effect=_score_relationship))
-    monkeypatch.setattr(graph_rag, "_combined_edge_score", lambda sim, _edge_props, _query_tokens: sim)
+    monkeypatch.setattr(
+        graph_rag, "_score_relationship", AsyncMock(side_effect=_score_relationship)
+    )
+    monkeypatch.setattr(
+        graph_rag, "_combined_edge_score", lambda sim, _edge_props, _query_tokens: sim
+    )
 
     state = await graph_rag._entity_first_state(
         question="Find the most important link",
@@ -1288,20 +1294,29 @@ async def test_resolve_rel_type_creates_canonical_relationship_type(
 
     assert result.canonical_type == "INVOKES"
     rows = (
-        await db_session.execute(
-            select(GraphRelationshipType).where(
-                GraphRelationshipType.id == result.relationship_type_id
+        (
+            await db_session.execute(
+                select(GraphRelationshipType).where(
+                    GraphRelationshipType.id == result.relationship_type_id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(rows) == 1
     alias_rows = (
-        await db_session.execute(
-            select(RelationshipTypeAlias).where(
-                RelationshipTypeAlias.relationship_type_id == result.relationship_type_id
+        (
+            await db_session.execute(
+                select(RelationshipTypeAlias).where(
+                    RelationshipTypeAlias.relationship_type_id
+                    == result.relationship_type_id
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert {row.alias_type for row in alias_rows} == {"INVOKES"}
 
 
@@ -1541,14 +1556,13 @@ async def test_analyze_collection_graph_projects_context_scaffold_to_concepts(
 
     analysis = await analyze_collection_graph(collection_id)
 
-    assert {
-        node["primary_type"]
-        for node in analysis["node_records"]
-    } == {"CONCEPT_PERSON"}
-    assert {
-        node["name"]
-        for node in analysis["node_records"]
-    } == {"PERSON: Krishna", "PERSON: Arjuna"}
+    assert {node["primary_type"] for node in analysis["node_records"]} == {
+        "CONCEPT_PERSON"
+    }
+    assert {node["name"] for node in analysis["node_records"]} == {
+        "PERSON: Krishna",
+        "PERSON: Arjuna",
+    }
     assert analysis["relationship_records"] == [
         {
             "id": str(semantic_relationship.id),
@@ -1713,6 +1727,208 @@ async def test_collection_understanding_batches_concepts_with_token_budget(monke
         for prompt in provider.prompts
     )
     assert len(understanding["regions"]) == 32
+
+
+@pytest.mark.asyncio
+async def test_llm_query_plan_classifies_procedure_and_supplies_aliases(monkeypatch):
+    provider = _CodeExtractionLLMProvider(
+        {
+            "operation": "describe",
+            "scope": "anchored",
+            "anchors": ["nadi shodhana"],
+            "requested_fields": [
+                "steps",
+                "timing",
+                "conditions",
+                "contraindications",
+            ],
+            "output_shape": "bullets",
+            "reasoning_operator": "procedure",
+            "requested_outputs": [
+                "steps",
+                "timing",
+                "conditions",
+                "contraindications",
+            ],
+            "aliases": ["alternate nostril breathing"],
+            "focus_terms": ["breathing practice"],
+            "competing_terms": ["nadi anatomy"],
+            "goal_terms": ["requires", "recommended time", "contraindicated"],
+            "relation_hints": ["requires", "performed before", "avoid when"],
+            "blocked_relation_hints": ["merely mentions"],
+            "preferred_path_properties": ["temporal"],
+            "max_reasoning_hops": 2,
+        }
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_resolve_llm_provider",
+        AsyncMock(return_value=provider),
+    )
+
+    plan = await graph_rag._plan_graph_query(
+        "How and when to do nadi shodhana?",
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+
+    assert plan.reasoning_operator == "procedure"
+    assert plan.requested_fields[:2] == ["steps", "timing"]
+    assert plan.requested_outputs == [
+        "steps",
+        "timing",
+        "conditions",
+        "contraindications",
+    ]
+    assert plan.aliases == ["alternate nostril breathing"]
+    assert plan.goal_terms == ["requires", "recommended time", "contraindicated"]
+    assert plan.preferred_path_properties == ["temporal"]
+    assert plan.max_reasoning_hops == 2
+    assert "alternate nostril breathing" in graph_rag._planned_retrieval_question(
+        "How and when to do nadi shodhana?",
+        plan,
+    )
+    frame_question = graph_rag._planned_frame_question(
+        "How and when to do nadi shodhana?",
+        plan,
+    )
+    assert "Required answer evidence: steps, timing" in frame_question
+    prompt_count = len(provider.prompts)
+    frame_plan = await graph_rag._plan_graph_query_frame(
+        "How and when to do nadi shodhana?",
+        uuid.uuid4(),
+        uuid.uuid4(),
+        plan,
+    )
+    assert len(provider.prompts) == prompt_count
+    assert frame_plan.focus_terms == ["breathing practice"]
+    assert frame_plan.competing_terms == ["nadi anatomy"]
+    assert frame_plan.relation_hints == [
+        "requires",
+        "performed before",
+        "avoid when",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_grounded_plan_adds_missing_procedure_obligations(monkeypatch):
+    base_plan = graph_rag.GraphQueryPlan(
+        operation="describe",
+        scope="top_k",
+        anchors=[],
+        requested_fields=["steps"],
+        output_shape="prose",
+        reasoning_operator="procedure",
+        requested_outputs=["steps"],
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_plan_graph_query",
+        AsyncMock(return_value=base_plan),
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_resolve_llm_provider",
+        AsyncMock(return_value=graph_rag.LocalEchoLLMProvider()),
+    )
+    collection = SimpleNamespace(
+        namespace_id=uuid.uuid4(),
+        llm_profile_id=uuid.uuid4(),
+    )
+
+    plan = await graph_rag._plan_grounded_graph_query(
+        "How should someone start learning Ayurveda?",
+        collection,
+        document_ids=None,
+    )
+
+    assert plan.requested_outputs == [
+        "steps",
+        "timing",
+        "conditions",
+        "contraindications",
+    ]
+    assert plan.requested_fields == plan.requested_outputs
+
+
+def test_diverse_candidate_retention_preserves_distinct_branches() -> None:
+    candidates = [
+        {"id": "a", "score": 0.9, "text": "Ayurveda course curriculum"},
+        {"id": "b", "score": 0.89, "text": "Ayurveda course syllabus"},
+        {"id": "c", "score": 0.88, "text": "Teacher supervision requirement"},
+    ]
+
+    retained = graph_rag._retain_diverse_candidate_ids(
+        candidates,
+        text_fields=("text",),
+        limit=2,
+    )
+
+    assert retained == ["a", "c"]
+
+
+@pytest.mark.asyncio
+async def test_llm_collection_scope_is_not_vetoed_by_phrase_matching(monkeypatch):
+    provider = _CodeExtractionLLMProvider(
+        {
+            "operation": "inventory",
+            "scope": "collection",
+            "anchors": [],
+            "requested_fields": ["coverage"],
+            "output_shape": "table",
+            "reasoning_operator": "describe",
+            "requested_outputs": ["evidence"],
+            "aliases": [],
+            "focus_terms": ["coverage"],
+            "competing_terms": [],
+            "goal_terms": ["represented by"],
+            "relation_hints": ["represented by"],
+            "blocked_relation_hints": [],
+            "preferred_path_properties": [],
+            "max_reasoning_hops": 2,
+        }
+    )
+    monkeypatch.setattr(
+        graph_rag,
+        "_resolve_llm_provider",
+        AsyncMock(return_value=provider),
+    )
+
+    plan = await graph_rag._plan_graph_query(
+        "Show the thematic coverage.",
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+
+    assert plan.scope == "collection"
+
+
+def test_planned_mix_interpretation_uses_query_plan_without_llm() -> None:
+    plan = graph_rag.GraphQueryPlan(
+        operation="describe",
+        scope="anchored",
+        anchors=["nadi shodhana"],
+        requested_fields=["procedure"],
+        output_shape="prose",
+        goal_terms=["requires", "recommended time"],
+    )
+    interpretation = graph_rag._planned_mix_interpretation(
+        "How and when to do nadi shodhana?",
+        [
+            ("Alternate nostril breathing", "A breathing method", 0.9),
+            ("Pranayama", "Breath regulation", 0.8),
+        ],
+        plan,
+    )
+
+    assert interpretation.selected_entities == [
+        "Alternate nostril breathing",
+        "Pranayama",
+    ]
+    assert (
+        "Required relationship meanings: requires, recommended time"
+        in (interpretation.retrieval_subqueries[0])
+    )
 
 
 @pytest.mark.asyncio
@@ -1948,10 +2164,7 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
         understanding["candidate_region_count"],
         understanding["candidate_region_count"],
     )
-    region_kinds = {
-        entry["region"]["kind"]
-        for entry in understanding["regions"]
-    }
+    region_kinds = {entry["region"]["kind"] for entry in understanding["regions"]}
     assert "referent_facet" in region_kinds
     assert "shared_class" in region_kinds
     assert "role_clique" in region_kinds
@@ -1969,8 +2182,9 @@ async def test_build_collection_understanding_combines_assertion_facets_and_role
         if entry["region"]["kind"] == "shared_class"
     )
     assert shared_class_region["anchor"] == "CATEGORY: Dosha"
-    assert "Vata is one of the three doshas." in (
-        shared_class_region["representative_edges"][0]["description"]
+    assert (
+        "Vata is one of the three doshas."
+        in (shared_class_region["representative_edges"][0]["description"])
     )
     rel_types = {edge["rel_type"] for edge in understanding["edges"]}
     assert "SPECIALIZES" in rel_types
@@ -2217,7 +2431,9 @@ async def test_graph_rag_query_does_not_apply_document_routing_to_meta_collectio
         "_build_graph_query_artifacts",
         _fake_build_graph_query_artifacts,
     )
-    monkeypatch.setattr(graph_rag, "_load_meta_collections", _fake_load_meta_collections)
+    monkeypatch.setattr(
+        graph_rag, "_load_meta_collections", _fake_load_meta_collections
+    )
     monkeypatch.setattr(
         graph_rag,
         "_answer_from_context",

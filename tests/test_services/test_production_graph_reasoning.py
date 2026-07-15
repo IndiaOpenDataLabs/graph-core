@@ -92,6 +92,72 @@ def test_production_goal_ranking_uses_retrieval_score_after_overlap() -> None:
     assert goals[0].predicate == "INFLUENCES"
 
 
+def test_production_goal_compilation_uses_planned_semantics() -> None:
+    nodes = {
+        _id(1): reasoning._Node(_id(1), "METHOD", "Alternate nostril breathing", ""),
+        _id(2): reasoning._Node(_id(2), "FUNCTION", "Nostril blockade", ""),
+    }
+    frames = [
+        reasoning._Frame(
+            _id(3),
+            "REQUIRES",
+            "Alternate nostril breathing requires nostril blockade.",
+            "asserted",
+            (),
+            (
+                ReasoningArgument("subject", entity_id=_id(1)),
+                ReasoningArgument("object", entity_id=_id(2)),
+            ),
+            0.8,
+        ),
+        reasoning._Frame(
+            _id(4),
+            "DISCUSSED_IN",
+            "A nearby anatomy topic is discussed in the same chapter.",
+            "asserted",
+            (),
+            (ReasoningArgument("subject", entity_id=_id(2)),),
+            0.9,
+        ),
+    ]
+
+    goals = reasoning._compile_goals(
+        "Tell me about the practice.",
+        nodes,
+        frames,
+        anchor_terms=["alternate nostril breathing"],
+        goal_terms=["requires"],
+    )
+
+    assert [goal.predicate for goal in goals] == ["REQUIRES"]
+
+
+def test_path_policy_uses_compiled_properties_not_predicate_names() -> None:
+    causal = reasoning._Edge(_id(1), _id(2), "ACTIVATES", {"causal": "causal"})
+    plain = reasoning._Edge(_id(1), _id(3), "CAUSES", {"causal": "unknown"})
+
+    assert reasoning._planned_edge_priority(
+        causal,
+        relation_hints=[],
+        preferred_path_properties=["causal"],
+    ) > reasoning._planned_edge_priority(
+        plain,
+        relation_hints=[],
+        preferred_path_properties=["causal"],
+    )
+    assert reasoning._matches_relation_hint("DISCUSSED_IN", ["discussed in"])
+    assert (
+        reasoning._mechanism_edges(
+            [plain],
+            {
+                _id(1): reasoning._Node(_id(1), "CONCEPT", "A", ""),
+                _id(3): reasoning._Node(_id(3), "CONCEPT", "B", ""),
+            },
+        )
+        == []
+    )
+
+
 def test_production_backward_reasoning_proves_rule_conclusion() -> None:
     nodes = {
         _id(1): reasoning._Node(_id(1), "CONCEPT", "Alpha", ""),
@@ -216,6 +282,48 @@ async def test_activation_blocks_a_rule_when_query_activates_exception(
     assert result["rules"][0]["status"] == "blocked"
     assert result["propositions"][0]["status"] == "blocked"
     assert result["operator"] == "prove_or_disprove"
+
+
+@pytest.mark.asyncio
+async def test_activation_uses_planned_procedure_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposition_id = _id(4)
+    nodes = {
+        proposition_id: reasoning._Node(
+            proposition_id,
+            "PROPOSITION",
+            "Alternate nostril breathing requires alternating nostril blockade",
+            "Block each nostril alternately during practice.",
+        )
+    }
+
+    async def bounded_graph(*args, **kwargs):
+        return nodes, []
+
+    monkeypatch.setattr(reasoning, "_bounded_graph", bounded_graph)
+    result = await activate_reasoning(
+        _id(100),
+        "How and when to do nadi shodhana?",
+        [
+            ReasoningSeed(
+                proposition_id=proposition_id,
+                frame_text="Block each nostril alternately during practice.",
+                argument_ids=(),
+            )
+        ],
+        operator="procedure",
+        requested_outputs=["steps", "timing", "conditions", "exceptions"],
+        aliases=["alternate nostril breathing"],
+    )
+
+    assert result["operator"] == "procedure"
+    assert result["answer_contract"]["requested_outputs"][:2] == [
+        "steps",
+        "timing",
+    ]
+    assert result["answer_contract"]["aliases"] == ["alternate nostril breathing"]
+    assert result["operator_result"]["procedure_evidence"]
 
 
 def test_rule_projection_excludes_semantic_edges() -> None:
