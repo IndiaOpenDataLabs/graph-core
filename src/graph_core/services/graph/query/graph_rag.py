@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Any
 
+import tiktoken
 from sqlalchemy import distinct, func, or_, select, text
 
 from graph_core.config import settings
@@ -80,9 +81,13 @@ _META_PROJECTION_MAX_BASE_RELS = 80
 _CONTEXT_MIX_TOP_K = 40
 _CONTEXT_MIX_MAX_CONTEXTS = 30
 _CONTEXT_MENTION_TOP_K = 40
-_COLLECTION_COVERAGE_MAX_DOCUMENTS = 200
-_COLLECTION_COVERAGE_CONTEXTS_PER_DOCUMENT = 4
-_COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 16
+_COLLECTION_COVERAGE_MAX_DOCUMENTS = 100
+_COLLECTION_COVERAGE_CONTEXTS_PER_DOCUMENT = 1
+_COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 4
+_CONTEXT_TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
+_CONTEXT_TRUNCATION_NOTICE = (
+    "\n\n[Context truncated to the configured graph retrieval budget.]\n\n"
+)
 _MODE_ALIASES = {
     "local": "entity-first",
     "ent": "entity-first",
@@ -2065,7 +2070,29 @@ def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
     ):
         operation = "compare"
         scope = "anchored"
-    if any(
+    if _explicit_collection_scope_requested(question):
+        operation = (
+            "aggregate"
+            if any(
+                marker in lowered
+                for marker in (" how many ", " count ", " total number ")
+            )
+            else "inventory"
+        )
+        scope = "collection"
+
+    return GraphQueryPlan(
+        operation=operation,
+        scope=scope,
+        anchors=[],
+        requested_fields=[],
+        output_shape=output_shape,
+    )
+
+
+def _explicit_collection_scope_requested(question: str) -> bool:
+    lowered = f" {question.casefold()} "
+    return any(
         marker in lowered
         for marker in (
             " all ",
@@ -2075,17 +2102,12 @@ def _fallback_graph_query_plan(question: str) -> GraphQueryPlan:
             " enumerate ",
             " inventory ",
             " coverage ",
+            " across the collection ",
+            " entire collection ",
+            " how many ",
+            " count ",
+            " total number ",
         )
-    ):
-        operation = "inventory"
-        scope = "collection"
-
-    return GraphQueryPlan(
-        operation=operation,
-        scope=scope,
-        anchors=[],
-        requested_fields=[],
-        output_shape=output_shape,
     )
 
 
@@ -2175,6 +2197,8 @@ async def _plan_graph_query(
     requested_fields = _normalise_plan_list(extracted.get("requested_fields"))
     if operation == "compare" and anchors:
         scope = "anchored"
+    if scope == "collection" and not _explicit_collection_scope_requested(question):
+        scope = "anchored" if anchors else "top_k"
 
     plan = GraphQueryPlan(
         operation=operation,
@@ -4281,6 +4305,40 @@ async def _meta_projection_state(
     )
 
 
+def _budget_graph_context(context: str, max_tokens: int) -> tuple[str, int]:
+    """Bound LLM context while retaining evidence and the answer contract."""
+    tokens = _CONTEXT_TOKEN_ENCODING.encode(context)
+    original_tokens = len(tokens)
+    if max_tokens <= 0 or original_tokens <= max_tokens:
+        return context, original_tokens
+
+    notice_tokens = len(_CONTEXT_TOKEN_ENCODING.encode(_CONTEXT_TRUNCATION_NOTICE))
+    usable_tokens = max(1, max_tokens - notice_tokens - 16)
+    contract_marker = "Goal-Directed Answer Contract:"
+    if contract_marker not in context:
+        bounded = (
+            _CONTEXT_TOKEN_ENCODING.decode(tokens[:usable_tokens])
+            + _CONTEXT_TRUNCATION_NOTICE
+        )
+    else:
+        evidence, contract = context.split(contract_marker, 1)
+        contract = contract_marker + contract
+        evidence_tokens = _CONTEXT_TOKEN_ENCODING.encode(evidence)
+        contract_tokens = _CONTEXT_TOKEN_ENCODING.encode(contract)
+        contract_budget = min(len(contract_tokens), max(1, usable_tokens // 2))
+        evidence_budget = max(1, usable_tokens - contract_budget)
+        bounded = (
+            _CONTEXT_TOKEN_ENCODING.decode(evidence_tokens[:evidence_budget])
+            + _CONTEXT_TRUNCATION_NOTICE
+            + _CONTEXT_TOKEN_ENCODING.decode(contract_tokens[:contract_budget])
+        )
+
+    bounded_tokens = _CONTEXT_TOKEN_ENCODING.encode(bounded)
+    if len(bounded_tokens) > max_tokens:
+        bounded = _CONTEXT_TOKEN_ENCODING.decode(bounded_tokens[:max_tokens])
+    return bounded, original_tokens
+
+
 async def _answer_from_context(
     question: str,
     namespace_id: uuid.UUID,
@@ -4294,6 +4352,17 @@ async def _answer_from_context(
     )
     if isinstance(llm_provider, LocalEchoLLMProvider):
         return fallback_text or "No relevant context found."
+    context, original_context_tokens = _budget_graph_context(
+        context,
+        settings.graph_rag_max_context_tokens,
+    )
+    if original_context_tokens > settings.graph_rag_max_context_tokens:
+        logger.warning(
+            "graph_rag context_truncated original_tokens=%d budget=%d final_tokens=%d",
+            original_context_tokens,
+            settings.graph_rag_max_context_tokens,
+            len(_CONTEXT_TOKEN_ENCODING.encode(context)),
+        )
     return await llm_provider.chat([
         {
             "role": "system",
