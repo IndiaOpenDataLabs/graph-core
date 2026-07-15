@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import string
 import time
 import uuid
@@ -87,6 +88,22 @@ _COLLECTION_COVERAGE_ASSERTIONS_PER_CONTEXT = 4
 _CONTEXT_TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
 _CONTEXT_TRUNCATION_NOTICE = (
     "\n\n[Context truncated to the configured graph retrieval budget.]\n\n"
+)
+_CONTEXT_BLOCK_STARTS = (
+    "Context:",
+    "Derived Understanding:",
+    "Entities:",
+    "Relationships By Type:",
+    "Context-Scoped Evidence:",
+    "Collection Coverage Evidence:",
+    "Question-frame evidence:",
+    "Selected retrieved evidence:",
+    "Semantic Proposition Evidence:",
+    "Internal Community Navigation:",
+    "Goal-Directed Answer Contract:",
+    "Supporting Graph Activation (navigation context, not proof):",
+    "Internal Higher-Level Context:",
+    "Primary Evidence:",
 )
 _MODE_ALIASES = {
     "local": "entity-first",
@@ -4305,8 +4322,97 @@ async def _meta_projection_state(
     )
 
 
+@dataclass(frozen=True)
+class _ContextBudgetBlock:
+    text: str
+    order: int
+    priority: float
+    token_count: int
+
+
+def _context_block_priority(text: str) -> float:
+    lowered = text.casefold()
+    if "goal-directed answer contract:" in lowered:
+        base = 1_000.0
+    elif "semantic proposition evidence:" in lowered or "predicate=" in lowered:
+        base = 850.0
+    elif text.startswith("Context ") and "\nAssertions:" in text:
+        base = 800.0
+    elif "primary evidence:" in lowered:
+        base = 775.0
+    elif "relationships by type:" in lowered or " -[" in text:
+        base = 650.0
+    elif "entities:" in lowered:
+        base = 600.0
+    elif "supporting graph activation" in lowered:
+        base = 175.0
+    elif "internal community navigation:" in lowered:
+        base = 125.0
+    elif "internal higher-level context:" in lowered:
+        base = 100.0
+    else:
+        base = 400.0
+
+    score_match = re.search(r"(?:routing score|score)=?:?\s*([0-9.]+)", lowered)
+    if score_match:
+        base += min(1.0, float(score_match.group(1))) * 100.0
+    if any(
+        marker in lowered
+        for marker in (
+            "proved_claims",
+            "conflicts",
+            "conditions:",
+            "exceptions:",
+            '"status": "blocked"',
+        )
+    ):
+        base += 50.0
+    return base
+
+
+def _split_context_budget_blocks(context: str) -> list[_ContextBudgetBlock]:
+    raw_blocks: list[str] = []
+    current: list[str] = []
+    section = ""
+
+    def flush() -> None:
+        if current:
+            text = "\n".join(current).strip()
+            if text:
+                raw_blocks.append(text)
+            current.clear()
+
+    for line in context.splitlines():
+        stripped = line.strip()
+        starts_named_block = stripped in _CONTEXT_BLOCK_STARTS
+        starts_context = bool(re.match(r"^Context \d+:\s*", stripped))
+        starts_section_item = stripped.startswith("- ") and section in {
+            "Semantic Proposition Evidence:",
+            "Internal Community Navigation:",
+        }
+        starts_relationship_type = bool(re.match(r"^[A-Z][A-Z0-9_ -]+:$", stripped)) and (
+            section == "Relationships By Type:"
+        )
+        if starts_named_block or starts_context or starts_section_item or starts_relationship_type:
+            flush()
+        if starts_named_block:
+            section = stripped
+        current.append(line)
+    flush()
+
+    return [
+        _ContextBudgetBlock(
+            text=text,
+            order=order,
+            priority=_context_block_priority(text),
+            token_count=len(_CONTEXT_TOKEN_ENCODING.encode(text)),
+        )
+        for order, text in enumerate(raw_blocks)
+    ]
+
+
 def _budget_graph_context(context: str, max_tokens: int) -> tuple[str, int]:
-    """Bound LLM context while retaining evidence and the answer contract."""
+    """Pack highest-value complete evidence blocks into the LLM budget."""
     tokens = _CONTEXT_TOKEN_ENCODING.encode(context)
     original_tokens = len(tokens)
     if max_tokens <= 0 or original_tokens <= max_tokens:
@@ -4314,23 +4420,42 @@ def _budget_graph_context(context: str, max_tokens: int) -> tuple[str, int]:
 
     notice_tokens = len(_CONTEXT_TOKEN_ENCODING.encode(_CONTEXT_TRUNCATION_NOTICE))
     usable_tokens = max(1, max_tokens - notice_tokens - 16)
-    contract_marker = "Goal-Directed Answer Contract:"
-    if contract_marker not in context:
-        bounded = (
-            _CONTEXT_TOKEN_ENCODING.decode(tokens[:usable_tokens])
-            + _CONTEXT_TRUNCATION_NOTICE
+    blocks = _split_context_budget_blocks(context)
+    contract_budget = max(1, usable_tokens // 2)
+    blocks = [
+        replace(
+            block,
+            text=_CONTEXT_TOKEN_ENCODING.decode(
+                _CONTEXT_TOKEN_ENCODING.encode(block.text)[:contract_budget]
+            ),
+            token_count=contract_budget,
         )
+        if "Goal-Directed Answer Contract:" in block.text
+        and block.token_count > contract_budget
+        else block
+        for block in blocks
+    ]
+    selected: list[_ContextBudgetBlock] = []
+    used_tokens = 0
+    separator_tokens = 2
+    for block in sorted(blocks, key=lambda item: (-item.priority, item.order)):
+        required = block.token_count + (separator_tokens if selected else 0)
+        if used_tokens + required > usable_tokens:
+            continue
+        selected.append(block)
+        used_tokens += required
+
+    if not selected and blocks:
+        highest = max(blocks, key=lambda item: (item.priority, -item.order))
+        clipped = _CONTEXT_TOKEN_ENCODING.decode(
+            _CONTEXT_TOKEN_ENCODING.encode(highest.text)[:usable_tokens]
+        )
+        bounded = clipped + _CONTEXT_TRUNCATION_NOTICE
     else:
-        evidence, contract = context.split(contract_marker, 1)
-        contract = contract_marker + contract
-        evidence_tokens = _CONTEXT_TOKEN_ENCODING.encode(evidence)
-        contract_tokens = _CONTEXT_TOKEN_ENCODING.encode(contract)
-        contract_budget = min(len(contract_tokens), max(1, usable_tokens // 2))
-        evidence_budget = max(1, usable_tokens - contract_budget)
+        selected.sort(key=lambda item: item.order)
         bounded = (
-            _CONTEXT_TOKEN_ENCODING.decode(evidence_tokens[:evidence_budget])
+            "\n\n".join(block.text for block in selected)
             + _CONTEXT_TRUNCATION_NOTICE
-            + _CONTEXT_TOKEN_ENCODING.decode(contract_tokens[:contract_budget])
         )
 
     bounded_tokens = _CONTEXT_TOKEN_ENCODING.encode(bounded)

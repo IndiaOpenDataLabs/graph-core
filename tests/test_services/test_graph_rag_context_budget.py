@@ -69,6 +69,43 @@ def test_context_budget_preserves_goal_contract():
     assert "Goal-Directed Answer Contract:" in bounded
 
 
+def test_context_budget_prefers_later_direct_evidence_over_early_navigation():
+    context = (
+        "Supporting Graph Activation (navigation context, not proof):\n"
+        + ("navigation-only material\n" * 300)
+        + "\n\nSemantic Proposition Evidence:\n"
+        + "- Yoga is disciplined practice [predicate=DEFINES; score=0.9900]\n"
+        + "  Statement: Yoga joins disciplined methods toward integration.\n"
+        + "\n\nGoal-Directed Answer Contract:\n"
+        + '{"proved_claims":["Yoga is disciplined practice"]}'
+    )
+
+    bounded, _ = graph_rag._budget_graph_context(context, 250)
+
+    assert "Yoga joins disciplined methods" in bounded
+    assert "Goal-Directed Answer Contract:" in bounded
+    assert "navigation-only material" not in bounded
+
+
+def test_context_budget_uses_routing_score_between_direct_context_blocks():
+    context = (
+        "Context 1: weak\n"
+        "Routing score: 0.1000\n"
+        "Assertions:\n"
+        + ("- weak peripheral evidence\n" * 120)
+        + "Context 2: strong\n"
+        "Routing score: 0.9500\n"
+        "Assertions:\n"
+        "- direct definition of yoga\n"
+    )
+
+    bounded, _ = graph_rag._budget_graph_context(context, 180)
+
+    assert "Context 2: strong" in bounded
+    assert "direct definition of yoga" in bounded
+    assert "Context 1: weak" not in bounded
+
+
 @pytest.mark.asyncio
 async def test_answer_never_sends_unbounded_context(monkeypatch):
     provider = _CapturingProvider()
