@@ -1,4 +1,4 @@
-# Clean Statement-Centric Graph Reasoning Plan
+# Clean Relationship-Centric Graph Reasoning Plan
 
 > **Status:** Proposed; directed relationship preservation landed in PR #8
 >
@@ -6,8 +6,8 @@
 >
 > **Base:** `main` at `f921e52`
 >
-> **Scope:** Clean implementation of incremental graph ingestion, qualified
-> statements, evidence, retrieval, reasoning, retraction, and versioned derived
+> **Scope:** Clean implementation of incremental graph ingestion, typed
+> relationships, evidence, retrieval, reasoning, retraction, and versioned derived
 > projections
 >
 > **Branch policy:** The `incremental-compiled-graph-reasoning` branch is a
@@ -19,22 +19,23 @@
 Extend the graph from `main` without introducing parallel representations of the
 same fact.
 
-The authoritative semantic object is one directed, qualified statement:
+The authoritative semantic object is one directed, typed relationship:
 
 ```text
-subject concept -- canonical predicate --> object concept
+source entity -- relationship type --> target entity
 ```
 
-The statement owns semantic qualifiers such as polarity, modality, conditions,
-exceptions, scopes, confidence, and predicate properties. Source occurrences are
-linked as evidence. FalkorDB edges, vector rows, query context, analytics edges,
-and compiled reasoning structures are derived projections.
+Conditions, exceptions, scopes, and other meaningful connections use the same
+relationship abstraction and entity-resolution path as every other extracted
+relationship. They are distinguished by `GraphRelationshipType`, not by nested
+qualifier fields or special entity classes. `RelationshipDescription` records
+how the endpoints are related in a source occurrence.
 
 ```text
 source segment
   -> immutable extraction
   -> endpoint resolution
-  -> canonical statement + evidence
+  -> canonical relationships + descriptions/evidence
   -> derived indexes/projections
 ```
 
@@ -51,8 +52,8 @@ may activate only a bounded working graph.
 - `ExtractionResult.entities` is derived from relationship endpoints;
 - `IncrementalEntityResolver` performs exact, alias, and bounded vector
   resolution;
-- `GraphEntity` stores canonical concepts;
-- `GraphRelationship` stores source, predicate, and target;
+- `GraphEntity` stores canonical entities;
+- `GraphRelationship` stores source, relationship type, and target;
 - `RelationshipDescription` stores source-specific descriptions and keywords;
 - chunk, entity, relationship, and centroid vector indexes exist;
 - FalkorDB is a graph projection of canonical SQL entities and relationships;
@@ -60,7 +61,7 @@ may activate only a bounded working graph.
 
 The clean implementation should evolve these objects instead of adding
 `PROPOSITION` entities, `SUBJECT`/`OBJECT` edges, evidence entities, semantic-frame
-truth tables, or condition/rule entities.
+truth tables, condition/rule entities, or a parallel statement model.
 
 ## 3. Baseline Defects and Completed Prerequisites
 
@@ -69,7 +70,7 @@ These concerns are independent of the discarded feature implementation.
 ### 3.1 Direction loss is fixed
 
 PR #8 changed `resolve_relationship()` to reuse a relationship only when its
-predicate and ordered `(source, target)` endpoints match. A regression test
+type and ordered `(source, target)` endpoints match. A regression test
 confirms that ingesting `(A, R, B)` and `(B, R, A)` creates two relationships.
 
 Current behavior:
@@ -78,9 +79,10 @@ Current behavior:
 (A, R, B) != (B, R, A)
 ```
 
-Explicit symmetric-predicate normalization is not implemented yet. It belongs
-with the predicate metadata and canonical statement identity work below; until
-then, all predicates preserve extracted direction.
+Explicit symmetric-type normalization is not implemented yet. It belongs
+with the relationship-type metadata and canonical relationship identity work
+below; until
+then, all relationship types preserve extracted direction.
 
 ### 3.2 Extraction has two drifting views
 
@@ -104,10 +106,10 @@ Changing prompts, schema, domain rules, normalization, or gleaning behavior can
 reuse stale extraction because the uniqueness key does not include an extraction
 contract version.
 
-### 3.5 Canonical concept uniqueness ignores type
+### 3.5 Canonical entity uniqueness ignores type
 
 `GraphEntity` is unique by `(collection_id, canonical_name)`. Two legitimate
-concepts with the same name and different semantic types cannot coexist without
+entities with the same name and different semantic types cannot coexist without
 encoding type into the name or incorrectly merging them.
 
 ### 3.6 IDs and writes are not suitable for deterministic replay
@@ -118,20 +120,25 @@ re-resolve and re-aggregate rather than deterministically replay one chunk delta
 
 ## 4. Non-Negotiable Invariants
 
-### I1 - One semantic source of truth
+### I1 - One relationship abstraction
 
-One SQL statement record is authoritative. No proposition entity, semantic frame,
-or FalkorDB edge independently owns statement semantics.
+`GraphRelationship` is the authoritative semantic edge. Conditions, exceptions,
+and general relationships use the same record, resolver, evidence model, vector
+index, and graph projection. No proposition entity, semantic frame, qualifier
+record, or parallel statement table independently owns relationship semantics.
 
-### I2 - Source objects are not concepts
+### I2 - Source records are not semantic entities
 
-Documents, folders, sections, chunks, evidence, conditions, rules, and scopes do
-not enter `GraphEntity` merely because the graph store supports nodes.
+Documents, folders, sections, chunks, evidence, and arbitrary condition/rule text
+do not enter `GraphEntity` merely because the graph store supports nodes. Entity
+mentions used as endpoints of `CONDITION`, `EXCEPTION`, or any other relationship
+are canonicalized normally.
 
 ### I3 - Directed semantics
 
 Direction survives extraction, resolution, persistence, embedding, projection,
-analytics, and query unless the predicate metadata explicitly declares symmetry.
+analytics, and query unless the relationship-type metadata explicitly declares
+symmetry.
 
 ### I4 - Immutable extraction
 
@@ -149,11 +156,11 @@ document, path, chunk position, and independent evidence.
 Every FalkorDB edge, vector row, compiled rule, analytics edge, and snapshot can
 be rebuilt from canonical SQL records and carries the authoritative object ID.
 
-### I7 - Natural language is not executable logic
+### I7 - Relationship descriptions are not executable logic
 
-Plain-text conditions and exceptions remain qualifiers. They become executable
-only after a typed rule compiler produces validated antecedents, blockers, and
-conclusions.
+`CONDITION` and `EXCEPTION` relationships are queryable semantic edges. Their
+descriptions preserve how the source relates their endpoints, but prose alone
+does not become executable logic. Formal execution requires a typed compiler.
 
 ### I8 - Bounded work
 
@@ -221,7 +228,7 @@ Unique cache key:
 (collection_id, content_hash, contract_version)
 ```
 
-`payload_json` preserves the extractor response in a statement-first schema. It
+`payload_json` preserves the extractor response in a relationship-first schema. It
 does not store document/path provenance.
 
 During migration, existing `RawChunkExtraction` may remain the physical table
@@ -233,20 +240,16 @@ more important than an immediate table rename.
 Use one DTO:
 
 ```text
-ExtractedStatement
+ExtractedRelationship
   local_key
-  subject: EndpointMention
-  predicate
-  object: EndpointMention
+  source: EndpointMention
+  relationship_type
+  target: EndpointMention
   description
   keywords
   weight
-  polarity
-  modality
-  conditions
-  exceptions
-  scopes
-  predicate_properties
+  confidence
+  relationship_type_properties
 
 EndpointMention
   name
@@ -254,16 +257,18 @@ EndpointMention
   description
 ```
 
-`ExtractionResult` contains `statements`. A temporary `entities` property may
-derive unique endpoint mentions for compatibility, but it is never serialized as
-an independent source of truth.
+`ExtractionResult` contains `relationships`. Conditions and exceptions are
+emitted as relationships whose types are `CONDITION` and `EXCEPTION`; they are
+not nested string arrays. A temporary `entities` property may derive unique
+endpoint mentions from every accepted relationship for compatibility, but it is
+never serialized as an independent source of truth.
 
 The extractor assigns `local_key` from canonical serialized content. Response
 array order is not identity.
 
-### 5.4 Canonical concepts
+### 5.4 Canonical entities
 
-Evolve `GraphEntity` as the canonical concept table:
+Evolve `GraphEntity` as the canonical entity table:
 
 ```text
 canonical_name
@@ -280,36 +285,26 @@ New uniqueness contract:
 Do not prefix display names with type. Aliases remain separate and type-aware.
 Unknown type is explicit rather than encoded as an empty string.
 
-Concept resolution remains:
+Entity resolution remains:
 
 1. type-scoped exact canonical match;
 2. type-scoped exact alias match;
 3. bounded type-compatible ANN candidates;
-4. create a new concept.
+4. create a new entity.
 
 All paths have fixed top-k, score threshold, timeout, and retry limits.
 
-### 5.5 Canonical qualified statements
+### 5.5 Canonical relationships
 
-Evolve `GraphRelationship`; do not add a parallel proposition table.
-
-Conceptually rename it `CanonicalStatement`, while retaining the current class and
-table names during compatibility:
+Evolve `GraphRelationship`; do not add a parallel proposition or statement table:
 
 ```text
-GraphRelationship / CanonicalStatement
+GraphRelationship
   id
   collection_id
   source_entity_id
   relationship_type_id
   target_entity_id
-  polarity
-  modality
-  conditions_json
-  exceptions_json
-  scopes_json
-  predicate_properties_json
-  qualifier_hash
   confidence
   aggregate_weight
 ```
@@ -319,28 +314,30 @@ Canonical identity:
 ```text
 UUID(
   collection_id,
-  source concept ID,
-  canonical predicate ID,
-  target concept ID,
-  polarity,
-  modality,
-  semantic qualifier hash
+  source entity ID,
+  canonical relationship type ID,
+  target entity ID
 )
 ```
 
 Database uniqueness enforces the same tuple. Opposite directions remain distinct.
-For a symmetric predicate, normalize endpoint order before computing identity.
+For a symmetric relationship type, normalize endpoint order before computing
+identity.
 
-### 5.6 Statement evidence
+Every meaningful extracted connection uses this identity, including `CONDITION`,
+`EXCEPTION`, and `SCOPE` relationships. The relationship description supplies
+source-specific semantics without changing the canonical endpoint/type identity.
+
+### 5.6 Relationship evidence
 
 Evolve `RelationshipDescription` into the evidence-occurrence record:
 
 ```text
-StatementEvidence
+RelationshipEvidence
   id
-  statement_id
+  relationship_id
   source_segment_id
-  raw_statement_local_key
+  raw_relationship_local_key
   description
   keywords
   extracted_weight
@@ -351,17 +348,17 @@ StatementEvidence
 Identity:
 
 ```text
-UUID(statement_id, source_segment_id, raw_statement_local_key)
+UUID(relationship_id, source_segment_id, raw_relationship_local_key)
 ```
 
-One statement may have many evidence rows. Aggregate weight and consensus fields
+One relationship may have many evidence rows. Aggregate weight and consensus fields
 are derived from active evidence rows, never incremented blindly on retry.
 
 During compatibility the physical table may remain
 `relationship_descriptions`, with new deterministic keys and a
 `source_segment_id` foreign key.
 
-### 5.7 Predicate metadata
+### 5.7 Relationship-type metadata
 
 Evolve `GraphRelationshipType` with explicit, observed properties:
 
@@ -375,7 +372,7 @@ property_votes_json
 observation_count
 ```
 
-Raw predicate labels map to a canonical predicate through a versioned mapping.
+Raw labels map to a canonical relationship type through a versioned mapping.
 Property consensus never changes historical extraction and never silently flips
 existing edge direction.
 
@@ -387,10 +384,10 @@ PostgreSQL owns:
 
 - source segments;
 - immutable extraction payloads;
-- endpoint-to-concept resolution records;
-- canonical concepts and predicates;
-- canonical qualified statements;
-- statement evidence;
+- endpoint-to-entity resolution records;
+- canonical entities and relationship types;
+- canonical relationships;
+- relationship evidence;
 - optional compiled rules;
 - publication/materialization status.
 
@@ -401,9 +398,9 @@ Keep separate typed indexes:
 | Index | Content | Purpose |
 |---|---|---|
 | source segment | original chunk text | source retrieval and citation |
-| concept description | mention-specific concept description | concept resolution/retrieval |
-| concept centroid | aggregate concept semantics | bounded canonical resolution |
-| statement | rendered qualified statement | claim/reasoning retrieval |
+| entity description | mention-specific entity description | entity resolution/retrieval |
+| entity centroid | aggregate entity semantics | bounded canonical resolution |
+| relationship | source, type, target, and description | relationship retrieval |
 
 Do not create vectors for:
 
@@ -411,30 +408,28 @@ Do not create vectors for:
 - folders or raw paths;
 - proposition entities;
 - subject/object structural edges;
-- condition/exception/scope nodes.
+- condition/exception/scope text nodes.
 
-The statement vector is the semantic-frame capability. A semantic frame is a
-rendered DTO over a canonical statement, not another persisted semantic object.
+The relationship vector covers the semantic-frame retrieval capability without
+another persisted semantic object. `CONDITION` and `EXCEPTION` relationships are
+embedded and retrieved through this same index.
 
 ### 6.3 FalkorDB
 
-Project each canonical statement as one direct edge:
+Project each canonical relationship as one direct edge:
 
 ```text
-(subject)-[predicate {
-  statement_id,
-  polarity,
-  modality,
-  confidence,
-  qualifier_hash
-}]->(object)
+(source)-[relationship_type {
+  relationship_id,
+  confidence
+}]->(target)
 ```
 
-FalkorDB concept nodes contain concept identity/display metadata only. Source
-segments and evidence do not become ordinary concept nodes.
+FalkorDB entity nodes contain entity identity/display metadata only. Source
+segments and evidence do not become ordinary semantic entity nodes.
 
 If a query needs evidence traversal, fetch evidence from PostgreSQL by
-`statement_id`. Add a separate named provenance projection only after a measured
+`relationship_id`. Add a separate named provenance projection only after a measured
 graph-traversal requirement.
 
 ### 6.4 Source hierarchy
@@ -453,7 +448,7 @@ Reduce `_ingest_graph_chunk` to an orchestrator:
 ```text
 segment = source_segments.get_or_create(...)
 extraction = extraction_cache.get_or_extract(segment.content, contract)
-resolved = statement_resolver.resolve(extraction.statements)
+resolved = relationship_resolver.resolve(extraction.relationships)
 delta = canonical_writer.upsert(segment, resolved)
 materializers.apply(delta)
 publisher.complete(segment, delta)
@@ -465,7 +460,7 @@ Proposed modules:
 services/graph/ingestion/contracts.py
 services/graph/ingestion/source_segments.py
 services/graph/ingestion/extraction_cache.py
-services/graph/ingestion/statement_resolver.py
+services/graph/ingestion/relationship_resolver.py
 services/graph/ingestion/canonical_writer.py
 services/graph/ingestion/materializer.py
 services/graph/ingestion/publisher.py
@@ -475,9 +470,9 @@ Typed boundaries:
 
 ```text
 ExtractionContract
-ExtractedStatement
+ExtractedRelationship
 ResolvedEndpoint
-ResolvedStatement
+ResolvedRelationship
 CanonicalChunkDelta
 MaterializationResult
 ```
@@ -507,7 +502,7 @@ completed_at
 This is the retry boundary. A completed matching materialization returns without
 LLM, embedding, resolution, SQL semantic, or FalkorDB work.
 
-`delta_manifest_json` lists statement and evidence IDs created/reused for the
+`delta_manifest_json` lists relationship and evidence IDs created/reused for the
 segment. Do not add a general dependency graph until retraction or a compiler has
 a concrete reader for it.
 
@@ -527,23 +522,23 @@ duplicate canonical objects.
 Retraction is evidence-first:
 
 1. Tombstone the source segment.
-2. Mark/remove its active statement-evidence rows.
-3. Recompute affected statement aggregate fields from remaining evidence.
-4. Delete an unsupported statement when no active evidence or explicit derived
+2. Mark/remove its active relationship-evidence rows.
+3. Recompute affected relationship aggregate fields from remaining evidence.
+4. Delete an unsupported relationship when no active evidence or explicit derived
    support remains.
-5. Remove/rebuild its statement vector and FalkorDB edge.
-6. Invalidate only snapshots/compiled rules that list the statement ID.
-7. Garbage-collect unsupported concepts only under an explicit policy.
+5. Remove/rebuild its relationship vector and FalkorDB edge.
+6. Invalidate only snapshots/compiled rules that list the relationship ID.
+7. Garbage-collect unsupported entities only under an explicit policy.
 
 Required fixture:
 
 ```text
 segment A ─┐
-           ├─ supports statement S
+           ├─ supports relationship R
 segment B ─┘
 ```
 
-Retracting A retains S and B's evidence. Retracting B then removes S and its
+Retracting A retains R and B's evidence. Retracting B then removes R and its
 derived projections. Neither operation scans the collection.
 
 ## 10. Query and Retrieval
@@ -552,8 +547,8 @@ Build a bounded query plan:
 
 ```text
 question
-  -> concept seeds
-  -> statement-vector seeds
+  -> entity seeds
+  -> relationship-vector seeds
   -> typed bounded neighborhoods
   -> evidence hydration
   -> bounded working graph
@@ -562,40 +557,43 @@ question
 
 Query paths use authoritative IDs:
 
-- concepts from `GraphEntity`;
-- statements from `GraphRelationship`;
-- qualifiers from statement columns;
-- evidence/citations from `RelationshipDescription`/`StatementEvidence`;
+- entities from `GraphEntity`;
+- relationships from `GraphRelationship`;
+- condition/exception/general semantics from `GraphRelationshipType`;
+- evidence/citations from `RelationshipDescription`/`RelationshipEvidence`;
 - source text from `SourceSegment`;
-- traversal from FalkorDB edges carrying `statement_id`.
+- traversal from FalkorDB edges carrying `relationship_id`.
 
 There is no `ASSERTION` versus `PROPOSITION` vocabulary because neither is a
-concept-node type. The statement is identified by its statement record.
+entity-node type. All semantic edges use the relationship record.
 
 Hard limits:
 
-- concept ANN top-k;
-- statement ANN top-k;
+- entity ANN top-k;
+- relationship ANN top-k;
 - graph hops;
 - nodes and edges;
-- evidence rows per statement;
+- evidence rows per relationship;
 - runtime and memory;
 - optional community/projection expansion count.
 
 ## 11. Reasoning
 
-### 11.1 Qualified-statement reasoning
+### 11.1 Typed-relationship reasoning
 
 Before formal rules exist, reasoning may:
 
-- retrieve statements by semantic similarity;
-- filter/rank by polarity, modality, confidence, scope, and exceptions;
-- traverse typed statement edges;
+- retrieve relationships by semantic similarity;
+- traverse and filter by relationship type, including `CONDITION` and
+  `EXCEPTION`;
+- rank by confidence and source evidence;
 - surface supporting and conflicting evidence;
 - explain paths without claiming formal proof.
 
-Plain-text conditions are rendered as applicability qualifications. They are not
-activated by lexical overlap and do not become graph nodes.
+Condition and exception endpoints are normal canonical entities, so queries about
+those entities retrieve the relationships directly. Relationship descriptions
+are retrieval/evidence text; lexical overlap with a description does not execute
+a formal rule.
 
 ### 11.2 Formal rule compiler
 
@@ -608,14 +606,14 @@ CompiledRule
   collection_id
   antecedent_expression_json
   blocker_expression_json
-  conclusion_statement_id
+  conclusion_relationship_id
   scope_json
   confidence
   compiler_version
-  source_statement_ids
+  source_relationship_ids
 ```
 
-An expression references canonical concepts/statements or typed variables. The
+An expression references canonical entities/relationships or typed variables. The
 compiler rejects unbound or unresolved natural-language clauses.
 
 Rule indexes support:
@@ -631,17 +629,17 @@ projection. It does not require `RULE`, `CONDITION`, or `EXCEPTION`
 
 ### 11.3 Working-graph execution
 
-1. Resolve query concepts and candidate statements.
-2. Activate asserted, applicable statements.
+1. Resolve query entities and candidate relationships.
+2. Activate relevant relationships.
 3. Expand backward from desired conclusions and forward from active facts.
 4. Evaluate typed antecedents and blockers.
 5. Record proof/counterproof dependencies.
 6. Stop at fixed point, answer, conflict, or resource limit.
-7. Return statement, rule, evidence, and source-segment IDs in the trace.
+7. Return relationship, rule, evidence, and source-segment IDs in the trace.
 
 ## 12. Analytics
 
-Analytics runs on named projections of canonical statements:
+Analytics runs on named projections of canonical relationships:
 
 ```text
 semantic_directed
@@ -653,10 +651,10 @@ semantic_affinity_undirected
 
 Each projection declares:
 
-- included predicates and qualifiers;
+- included relationship types;
 - direction/symmetry behavior;
 - confidence/evidence threshold;
-- parallel statement aggregation;
+- parallel relationship aggregation;
 - self-loop policy;
 - weight interpretation.
 
@@ -664,7 +662,7 @@ Source hierarchy, evidence, rule scaffolding, and query-time nodes are excluded
 unless explicitly named.
 
 Global analytics is asynchronous and versioned. It never blocks chunk ingestion.
-Cheap statement/evidence counters may update incrementally.
+Cheap relationship/evidence counters may update incrementally.
 
 ## 13. Delivery Sequence
 
@@ -678,23 +676,24 @@ Cheap statement/evidence counters may update incrementally.
 
 ### PR 1 - Characterize `main` and add explicit symmetry
 
-- add predicate metadata before allowing symmetric normalization;
-- add symmetric-predicate fixtures;
+- add relationship-type metadata before allowing symmetric normalization;
+- add symmetric-type fixtures;
 - add ingestion-to-query contract tests;
 - record current provider calls and SQL/graph writes per chunk.
 
-**Exit:** Direction remains the default, and only predicates explicitly marked
+**Exit:** Direction remains the default, and only relationship types explicitly marked
 symmetric normalize endpoint order.
 
-### PR 2 - Statement-first extraction contract
+### PR 2 - Relationship-first extraction contract
 
-- introduce `EndpointMention` and `ExtractedStatement`;
-- make endpoint entity lists computed compatibility data;
-- add polarity, modality, qualifiers, and predicate properties to schema;
+- introduce `EndpointMention` and `ExtractedRelationship`;
+- emit conditions, exceptions, and scopes as typed relationships;
+- derive the endpoint entity list from all accepted relationships;
 - version the extraction contract;
 - add canonical serialization and order-independent local keys.
 
-**Exit:** One immutable, versioned statement payload drives ingestion.
+**Exit:** One immutable, versioned relationship payload drives ingestion, and
+every relationship endpoint uses the same entity-resolution path.
 
 ### PR 3 - Source segment and extraction split
 
@@ -707,59 +706,61 @@ symmetric normalize endpoint order.
 **Exit:** Identical content in multiple documents has one extraction and multiple
 source/evidence occurrences.
 
-### PR 4 - Type-aware concepts
+### PR 4 - Type-aware entities
 
-- add normalized concept name;
+- add normalized entity name;
 - add type-aware uniqueness and aliases;
 - bound/type-scope every resolution lookup;
-- provide deterministic concept creation under concurrency;
+- provide deterministic entity creation under concurrency;
 - backfill normalized names and types.
 
-**Exit:** Same-name concepts of different types do not collide.
+**Exit:** Same-name entities of different types do not collide.
 
-### PR 5 - Qualified canonical statements and evidence
+### PR 5 - Deterministic canonical relationships and evidence
 
-- add qualifier columns and qualifier hash to `GraphRelationship`;
-- add deterministic directed statement identity;
+- add deterministic directed relationship identity;
 - add source-segment/local-key identity to `RelationshipDescription`;
 - replace blind weight increments with evidence-derived aggregates;
 - batch the canonical writes in one transaction.
 
-**Exit:** One SQL record authoritatively represents each qualified statement.
+**Exit:** One `GraphRelationship` record authoritatively represents each typed
+edge, including conditions and exceptions.
 
 ### PR 6 - Typed materializers
 
-- add statement vector index;
-- project statement IDs into FalkorDB edges;
-- make chunk, concept, and statement materializers independent consumers;
+- add relationship vector index;
+- project relationship IDs into FalkorDB edges;
+- make chunk, entity, and relationship materializers independent consumers;
 - add materialization status/retry boundary;
 - add reconciliation commands for SQL/vector/Falkor parity.
 
 **Exit:** Derived stores are rebuildable and idempotent.
 
-### PR 7 - Query cutover to statements
+### PR 7 - Query cutover to canonical relationships
 
-- retrieve statement embeddings directly;
-- hydrate qualifiers and evidence from SQL;
+- retrieve relationship embeddings directly;
+- hydrate relationship types, descriptions, and evidence from SQL;
 - use source segments for citations;
 - enforce typed search and working-graph budgets;
 - remove any need for proposition/assertion nodes.
 
-**Exit:** End-to-end graph RAG answers use concepts, statements, evidence, and
+**Exit:** End-to-end graph RAG answers use entities, relationships, evidence, and
 source segments only.
 
 ### PR 8 - Retraction
 
 - implement evidence-first source-segment tombstoning;
-- recompute only affected statement aggregates;
+- recompute only affected relationship aggregates;
 - remove/rebuild affected vectors and graph edges;
 - add shared-evidence and retry fixtures.
 
 **Exit:** A changed/deleted source retracts only its affected materialization.
 
-### PR 9 - Qualified reasoning
+### PR 9 - Typed relationship reasoning
 
-- add scope/modality/polarity/confidence-aware retrieval and ranking;
+- retrieve and traverse `CONDITION`, `EXCEPTION`, `SCOPE`, and general
+  relationship types uniformly;
+- add relationship-type/confidence/evidence-aware ranking;
 - expose support/conflict/citation traces;
 - clearly label non-formal reasoning;
 - persist no rule nodes.
@@ -816,7 +817,7 @@ Must be redesigned, not cherry-picked:
 - evidence entity vectors/centroids;
 - semantic frames as a separate authoritative table;
 - `SUBJECT`/`OBJECT` duplication;
-- plain-text condition/rule entities;
+- plain-text condition/rule entities instead of typed relationships;
 - contribution/dependency tables without retraction consumers.
 
 ## 15. Verification Matrix
@@ -825,28 +826,31 @@ Must be redesigned, not cherry-picked:
 
 - `(A, R, B)` and `(B, R, A)` are distinct for directed R;
 - symmetric R normalizes endpoint order;
-- statement IDs survive extraction reorder and retry;
-- same triple with materially different qualifiers remains distinct;
-- identical qualified statements from different segments share a statement ID.
+- relationship IDs survive extraction reorder and retry;
+- identical typed relationships from different segments share a relationship ID;
+- condition and exception relationships use the same identity rules as all
+  other relationships.
 
 ### Extraction and provenance
 
-- endpoint mentions derive from accepted statements only;
+- endpoint mentions derive from all accepted relationships only;
+- entities mentioned by condition and exception relationships are resolved and
+  queryable like every other endpoint;
 - changing contract version creates a new extraction cache entry;
 - identical content in two documents reuses extraction but retains two segments;
 - backfill and retry invoke no historical LLM calls;
 - citations point to the correct segment and document.
 
-### Concepts
+### Entities
 
 - same normalized name and type resolves together;
 - same normalized name with different types remains separate;
 - ANN candidates are type-compatible and bounded;
-- concurrent creation returns one canonical concept.
+- concurrent creation returns one canonical entity.
 
 ### Persistence and materialization
 
-- one retry does not double weight/evidence;
+- one retry does not double relationship weight/evidence;
 - one chunk commits canonical writes atomically;
 - SQL is authoritative when a vector/graph materializer fails;
 - retry repairs only incomplete projections;
@@ -855,18 +859,19 @@ Must be redesigned, not cherry-picked:
 ### Query and reasoning
 
 - fresh ingestion is immediately queryable after publication;
-- statement retrieval returns qualifiers and evidence;
-- source paths never appear as canonical concepts;
-- uncompiled text conditions never fire as facts;
+- relationship retrieval returns its type, descriptions, and evidence;
+- querying an entity returns its condition and exception relationships;
+- source paths never appear as canonical semantic entities;
+- relationship descriptions are never executed as formal rules;
 - compiled rules require typed active antecedents and inactive blockers;
 - every answer trace includes authoritative IDs and citations;
 - working graph respects node, edge, hop, runtime, and memory limits.
 
 ### Retraction and scale
 
-- retracting one of two evidence occurrences retains the statement;
+- retracting one of two evidence occurrences retains the relationship;
 - retracting final support removes affected derived objects;
-- retraction does not scan unrelated statements;
+- retraction does not scan unrelated relationships;
 - fixed-size append lookup/write counts remain bounded as collection size grows;
 - global analytics failure never blocks ingestion or base query.
 
@@ -875,9 +880,9 @@ Must be redesigned, not cherry-picked:
 Record by collection and contract version:
 
 - cache hit/miss and extractor calls;
-- accepted/rejected statements;
-- exact/alias/ANN/new concept resolutions;
-- created/reused statements;
+- accepted/rejected relationships by type;
+- exact/alias/ANN/new entity resolutions;
+- created/reused relationships;
 - evidence occurrences;
 - canonical transaction duration;
 - vector/Falkor materialization status;
@@ -892,19 +897,23 @@ Log IDs and counts, not full source or extracted text by default.
 ## 17. Definition of Done
 
 - `main`'s reverse-edge merge bug remains fixed (landed in PR #8);
-- extraction is statement-first and contract-versioned;
+- extraction is relationship-first and contract-versioned;
 - source occurrence and content-level extraction cache are distinct;
-- canonical concept identity is type-aware without type-prefixed display names;
-- `GraphRelationship` is the sole authoritative qualified statement record;
-- `RelationshipDescription`/evidence links statements to stable source segments;
+- canonical entity identity is type-aware without type-prefixed display names;
+- `GraphRelationship` is the sole authoritative semantic-edge record;
+- `CONDITION`, `EXCEPTION`, and general relationship types share one ingestion,
+  resolution, persistence, embedding, and retrieval path;
+- `RelationshipDescription`/evidence links relationships to stable source
+  segments;
 - retries are deterministic and do not double-count evidence;
 - `_ingest_graph_chunk` is a small typed orchestrator;
-- chunk, concept, and statement vector indexes have distinct responsibilities;
-- FalkorDB contains rebuildable concept/statement projections;
-- source hierarchy is modeled outside the canonical concept graph;
-- no proposition/assertion, subject/object, evidence, qualifier, or rule entities
+- chunk, entity, and relationship vector indexes have distinct responsibilities;
+- FalkorDB contains rebuildable entity/relationship projections;
+- source hierarchy is modeled outside the canonical entity graph;
+- no proposition/assertion, subject/object, evidence, condition, exception, or
+  rule entities
   are required;
-- natural-language qualifiers are not executed as formal rules;
+- relationship descriptions are not executed as formal rules;
 - formal rules, when enabled, use typed expressions and auditable dependencies;
 - retraction is implemented and bounded;
 - query and reasoning operate on bounded working graphs;
@@ -917,7 +926,7 @@ Log IDs and counts, not full source or extracted text by default.
 - preserving prototype internal schemas merely for code reuse;
 - re-running LLM extraction over historical chunks;
 - graphifying every domain object;
-- implementing formal logic from arbitrary text qualifiers;
+- implementing formal logic from arbitrary relationship descriptions;
 - adding dependency/provenance tables without lifecycle readers;
 - running global compilation or analytics in foreground ingestion;
 - renaming every existing SQL table/class before behavior is correct.
