@@ -1,10 +1,10 @@
 # Clean Statement-Centric Graph Reasoning Plan
 
-> **Status:** Proposed
+> **Status:** Proposed; directed relationship preservation landed in PR #8
 >
 > **Date:** 2026-07-26
 >
-> **Base:** `main` at `3eaf917`
+> **Base:** `main` at `f921e52`
 >
 > **Scope:** Clean implementation of incremental graph ingestion, qualified
 > statements, evidence, retrieval, reasoning, retraction, and versioned derived
@@ -62,24 +62,25 @@ The clean implementation should evolve these objects instead of adding
 `PROPOSITION` entities, `SUBJECT`/`OBJECT` edges, evidence entities, semantic-frame
 truth tables, or condition/rule entities.
 
-## 3. Baseline Defects to Fix First
+## 3. Baseline Defects and Completed Prerequisites
 
-These defects exist on `main` independently of the discarded feature
-implementation.
+These concerns are independent of the discarded feature implementation.
 
-### 3.1 Direction is currently lost
+### 3.1 Direction loss is fixed
 
-`resolve_relationship()` searches both `(source, target)` and `(target, source)`
-for the same predicate. It therefore merges opposite directed statements.
+PR #8 changed `resolve_relationship()` to reuse a relationship only when its
+predicate and ordered `(source, target)` endpoints match. A regression test
+confirms that ingesting `(A, R, B)` and `(B, R, A)` creates two relationships.
 
-Required behavior:
+Current behavior:
 
 ```text
 (A, R, B) != (B, R, A)
 ```
 
-Reverse matching is permitted only when the canonical predicate is explicitly
-declared symmetric.
+Explicit symmetric-predicate normalization is not implemented yet. It belongs
+with the predicate metadata and canonical statement identity work below; until
+then, all predicates preserve extracted direction.
 
 ### 3.2 Extraction has two drifting views
 
@@ -667,15 +668,23 @@ Cheap statement/evidence counters may update incrementally.
 
 ## 13. Delivery Sequence
 
-### PR 1 - Characterize `main` and fix direction
+### Completed prerequisite - Preserve extracted direction
 
 - add directed relationship fixtures;
-- add symmetric-predicate fixtures;
 - remove unconditional reverse-edge matching;
+- merge PR #8 into `main`.
+
+**Result:** Opposite directed facts no longer merge accidentally.
+
+### PR 1 - Characterize `main` and add explicit symmetry
+
+- add predicate metadata before allowing symmetric normalization;
+- add symmetric-predicate fixtures;
 - add ingestion-to-query contract tests;
 - record current provider calls and SQL/graph writes per chunk.
 
-**Exit:** Opposite directed facts never merge accidentally.
+**Exit:** Direction remains the default, and only predicates explicitly marked
+symmetric normalize endpoint order.
 
 ### PR 2 - Statement-first extraction contract
 
@@ -882,7 +891,7 @@ Log IDs and counts, not full source or extracted text by default.
 
 ## 17. Definition of Done
 
-- `main`'s reverse-edge merge bug is fixed;
+- `main`'s reverse-edge merge bug remains fixed (landed in PR #8);
 - extraction is statement-first and contract-versioned;
 - source occurrence and content-level extraction cache are distinct;
 - canonical concept identity is type-aware without type-prefixed display names;
