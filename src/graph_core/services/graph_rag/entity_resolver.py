@@ -518,21 +518,13 @@ class IncrementalEntityResolver:
         rel_type_resolution = await self._resolve_rel_type(session, rel_type)
         rel_type = rel_type_resolution.canonical_type
 
-        # Check for existing relationship (bidirectional, scoped to rel_type).
-        # Two rels between the same pair with different rel_types are
-        # distinct edges (multi-dimensional graph) and must not merge.
+        # Relationship direction is semantic. Reuse only the exact
+        # source-predicate-target orientation.
         existing_result = await session.execute(
             select(GraphRelationship).where(
                 GraphRelationship.relationship_type_id == rel_type_resolution.relationship_type_id,
-            ).where(
-                (
-                    (GraphRelationship.source_entity_id == source_entity_id)
-                    & (GraphRelationship.target_entity_id == target_entity_id)
-                )
-                | (
-                    (GraphRelationship.source_entity_id == target_entity_id)
-                    & (GraphRelationship.target_entity_id == source_entity_id)
-                )
+                GraphRelationship.source_entity_id == source_entity_id,
+                GraphRelationship.target_entity_id == target_entity_id,
             )
         )
         existing = existing_result.scalar_one_or_none()
