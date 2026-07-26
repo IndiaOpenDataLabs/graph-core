@@ -923,6 +923,85 @@ async def test_resolve_rel_type_creates_canonical_relationship_type(
 
 
 @pytest.mark.asyncio
+async def test_resolve_relationship_preserves_opposite_directions(
+    db_session,
+    test_graph_rag_collection,
+):
+    source = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Source",
+        primary_type="concept",
+        description_count=0,
+    )
+    target = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Target",
+        primary_type="concept",
+        description_count=0,
+    )
+    rel_type = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="CALLS",
+    )
+    db_session.add_all([source, target, rel_type])
+    await db_session.commit()
+
+    resolver = IncrementalEntityResolver(
+        _FakeEmbeddingProvider(),
+        test_graph_rag_collection.id,
+    )
+    resolver._resolve_rel_type = AsyncMock(
+        return_value=SimpleNamespace(
+            relationship_type_id=rel_type.id,
+            canonical_type=rel_type.canonical_type,
+        )
+    )
+    resolver._vstore.upsert_relationship_embedding = AsyncMock()
+
+    forward = await resolver.resolve_relationship(
+        db_session,
+        source_entity_id=source.id,
+        target_entity_id=target.id,
+        description="Source calls target.",
+        keywords=["call"],
+        weight=1.0,
+        source_chunk_hash="forward-chunk",
+        rel_type="CALLS",
+    )
+    reverse = await resolver.resolve_relationship(
+        db_session,
+        source_entity_id=target.id,
+        target_entity_id=source.id,
+        description="Target calls source.",
+        keywords=["callback"],
+        weight=1.0,
+        source_chunk_hash="reverse-chunk",
+        rel_type="CALLS",
+    )
+
+    relationships = (
+        await db_session.execute(
+            select(GraphRelationship).where(
+                GraphRelationship.relationship_type_id == rel_type.id
+            )
+        )
+    ).scalars().all()
+
+    assert forward.relationship_id != reverse.relationship_id
+    assert len(relationships) == 2
+    assert {
+        (relationship.source_entity_id, relationship.target_entity_id)
+        for relationship in relationships
+    } == {
+        (source.id, target.id),
+        (target.id, source.id),
+    }
+
+
+@pytest.mark.asyncio
 async def test_relationship_type_canonical_is_reelected_by_frequency(
     db_session,
     test_graph_rag_collection,
