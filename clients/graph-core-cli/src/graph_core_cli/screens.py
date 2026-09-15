@@ -1345,11 +1345,8 @@ class ConsoleScreen(Screen):
         action = args[0]
         if action == "list":
             kind = args[1] if len(args) > 1 else "all"
-            if kind == "embedding":
-                self._write(await self._call("list_profiles", {"kind": "embedding"}))
-                return
-            if kind == "llm":
-                self._write(await self._call("list_profiles", {"kind": "llm"}))
+            if kind in ("embedding", "llm"):
+                self._write(await self._call("list_profiles", {"kind": kind}))
                 return
             if kind == "all":
                 embedding = await self._call("list_profiles", {"kind": "embedding"})
@@ -1386,9 +1383,7 @@ class ConsoleScreen(Screen):
                 self._copy_optional_flag(flags, call_args, "distance_metric")
                 if "dimensions" in flags:
                     call_args["dimensions"] = int(str(flags["dimensions"]))
-                self._write(await self._call("create_profile", call_args))
-                return
-            if kind == "llm":
+            if kind in ("embedding", "llm"):
                 self._write(await self._call("create_profile", call_args))
                 return
         raise ValueError(
@@ -1415,28 +1410,18 @@ class ConsoleScreen(Screen):
             _, flags = parse_flag_args(args[2:])
             strategy = str(flags.get("strategy", "vector"))
             embed_target = self._require_flag(flags, "embedding_profile")
-            embedding_profiles = await self._list_profiles("embedding")
-            embedding_profile = self._resolve_entity(
-                embed_target,
-                embedding_profiles,
-                id_key="profile_id",
-                text_keys=["label", "model"],
-            )
             call_args = {
                 "name": name,
                 "strategy": strategy,
-                "embedding_profile_id": embedding_profile["profile_id"],
+                "embedding_profile_id": await self._resolve_profile_id(
+                    "embedding", embed_target
+                ),
             }
             llm_target = flags.get("llm_profile")
             if isinstance(llm_target, str) and llm_target:
-                llm_profiles = await self._list_profiles("llm")
-                llm_profile = self._resolve_entity(
-                    llm_target,
-                    llm_profiles,
-                    id_key="profile_id",
-                    text_keys=["label", "model"],
+                call_args["llm_profile_id"] = await self._resolve_profile_id(
+                    "llm", llm_target
                 )
-                call_args["llm_profile_id"] = llm_profile["profile_id"]
             if isinstance(flags.get("default_query_mode"), str):
                 call_args["default_query_mode"] = str(flags["default_query_mode"])
             if "gleaning_passes" in flags:
@@ -1465,25 +1450,15 @@ class ConsoleScreen(Screen):
             if isinstance(flags.get("strategy"), str):
                 call_args["strategy"] = str(flags["strategy"])
             if isinstance(flags.get("embedding_profile"), str):
-                embedding_profiles = await self._list_profiles("embedding")
-                embedding_profile = self._resolve_entity(
-                    str(flags["embedding_profile"]),
-                    embedding_profiles,
-                    id_key="profile_id",
-                    text_keys=["label", "model"],
+                call_args["embedding_profile_id"] = await self._resolve_profile_id(
+                    "embedding", str(flags["embedding_profile"])
                 )
-                call_args["embedding_profile_id"] = embedding_profile["profile_id"]
             if flags.get("clear_llm_profile") is True:
                 call_args["clear_llm_profile"] = True
             elif isinstance(flags.get("llm_profile"), str):
-                llm_profiles = await self._list_profiles("llm")
-                llm_profile = self._resolve_entity(
-                    str(flags["llm_profile"]),
-                    llm_profiles,
-                    id_key="profile_id",
-                    text_keys=["label", "model"],
+                call_args["llm_profile_id"] = await self._resolve_profile_id(
+                    "llm", str(flags["llm_profile"])
                 )
-                call_args["llm_profile_id"] = llm_profile["profile_id"]
             if flags.get("clear_default_query_mode") is True:
                 call_args["clear_default_query_mode"] = True
             elif isinstance(flags.get("default_query_mode"), str):
@@ -1787,6 +1762,16 @@ class ConsoleScreen(Screen):
     async def _list_profiles(self, kind: str) -> list[dict]:
         text = await self._call("list_profiles", {"kind": kind})
         return parse_profiles(text, kind)
+
+    async def _resolve_profile_id(self, kind: str, target: str) -> str:
+        profiles = await self._list_profiles(kind)
+        profile = self._resolve_entity(
+            target,
+            profiles,
+            id_key="profile_id",
+            text_keys=["label", "model"],
+        )
+        return str(profile["profile_id"])
 
     async def _hydrate_namespace_context(self) -> None:
         cfg = dict(self.app.config)
