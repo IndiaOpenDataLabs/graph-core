@@ -403,6 +403,7 @@ class ProfileCreateScreen(Screen):
             return
 
         args: dict[str, str | int] = {
+            "kind": kind,
             "provider": provider,
             "model": model,
             "secret": secret,
@@ -421,7 +422,7 @@ class ProfileCreateScreen(Screen):
                 )
                 return
 
-        tool_name = "create_llm_profile"
+        tool_name = "create_profile"
         if kind == "embedding":
             if not dimensions:
                 self.notify(
@@ -436,7 +437,6 @@ class ProfileCreateScreen(Screen):
                 return
             if distance_metric:
                 args["distance_metric"] = str(distance_metric)
-            tool_name = "create_embedding_profile"
 
         client = self.app.mcp_client_for_token(
             self.app.namespace_token,
@@ -592,8 +592,8 @@ class CollectionFormScreen(Screen):
         )
         await client.connect()
         try:
-            embedding_text = await client.call("list_embedding_profiles")
-            llm_text = await client.call("list_llm_profiles")
+            embedding_text = await client.call("list_profiles", {"kind": "embedding"})
+            llm_text = await client.call("list_profiles", {"kind": "llm"})
         finally:
             await client.disconnect()
 
@@ -1346,14 +1346,14 @@ class ConsoleScreen(Screen):
         if action == "list":
             kind = args[1] if len(args) > 1 else "all"
             if kind == "embedding":
-                self._write(await self._call("list_embedding_profiles"))
+                self._write(await self._call("list_profiles", {"kind": "embedding"}))
                 return
             if kind == "llm":
-                self._write(await self._call("list_llm_profiles"))
+                self._write(await self._call("list_profiles", {"kind": "llm"}))
                 return
             if kind == "all":
-                embedding = await self._call("list_embedding_profiles")
-                llm = await self._call("list_llm_profiles")
+                embedding = await self._call("list_profiles", {"kind": "embedding"})
+                llm = await self._call("list_profiles", {"kind": "llm"})
                 self._write(f"{embedding}\n\n{llm}")
                 return
             raise ValueError("Usage: /profile list [embedding|llm]")
@@ -1371,6 +1371,7 @@ class ConsoleScreen(Screen):
             model = self._require_flag(flags, "model")
             secret = self._require_flag(flags, "secret")
             call_args = {
+                "kind": kind,
                 "provider": provider,
                 "model": model,
                 "secret": secret,
@@ -1385,10 +1386,10 @@ class ConsoleScreen(Screen):
                 self._copy_optional_flag(flags, call_args, "distance_metric")
                 if "dimensions" in flags:
                     call_args["dimensions"] = int(str(flags["dimensions"]))
-                self._write(await self._call("create_embedding_profile", call_args))
+                self._write(await self._call("create_profile", call_args))
                 return
             if kind == "llm":
-                self._write(await self._call("create_llm_profile", call_args))
+                self._write(await self._call("create_profile", call_args))
                 return
         raise ValueError(
             "Usage: /profile list [embedding|llm] | /profile create embedding|llm ..."
@@ -1784,10 +1785,8 @@ class ConsoleScreen(Screen):
         raise ValueError(f"Query job {job_id} did not complete in time.")
 
     async def _list_profiles(self, kind: str) -> list[dict]:
-        if kind == "embedding":
-            text = await self._call("list_embedding_profiles")
-            return parse_profiles(text, "embedding")
-        return parse_profiles(await self._call("list_llm_profiles"), "llm")
+        text = await self._call("list_profiles", {"kind": kind})
+        return parse_profiles(text, kind)
 
     async def _hydrate_namespace_context(self) -> None:
         cfg = dict(self.app.config)

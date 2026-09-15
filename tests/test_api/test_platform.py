@@ -50,8 +50,17 @@ async def test_create_and_list_profiles(async_client):
     )
     assert profile_resp.status_code == 200
 
-    list_resp = await async_client.get("/platform/embedding-profiles")
+    list_resp = await async_client.get(
+        "/platform/profiles", params={"kind": "embedding"}
+    )
     assert list_resp.status_code == 200
     profiles = list_resp.json()
     assert len(profiles) == 1
     assert profiles[0]["provider"] == "local_hash"
+
+    llm_resp = await async_client.get("/platform/profiles", params={"kind": "llm"})
+    assert llm_resp.status_code == 200
+    assert llm_resp.json() == []
+
+    bad_resp = await async_client.get("/platform/profiles", params={"kind": "bogus"})
+    assert bad_resp.status_code == 422

@@ -1,15 +1,17 @@
 """FastAPI router — platform control plane (credentials, profiles, capabilities)."""
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from graph_core.api.auth import get_namespace_id
 from graph_core.models.collection import Collection
 from graph_core.services.platform import PlatformService
 from graph_core.services.sanitizer import MAX_CHUNK_SIZE
+
+ProfileKind = Literal["embedding", "llm"]
 
 
 class RegisterCredentialRequest(BaseModel):
@@ -60,23 +62,9 @@ async def get_capabilities(
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
 ) -> dict:
     """Discover platform capabilities for dynamic clients."""
-    embedding_profiles = await service.list_profiles(
-        namespace_id=namespace_id,
-        kind="embedding",
-    )
-    llm_profiles = await service.list_profiles(
-        namespace_id=namespace_id,
-        kind="llm",
-    )
     return {
-        "embedding_profiles": [
-            _to_profile_response(profile).model_dump()
-            for profile in embedding_profiles
-        ],
-        "llm_profiles": [
-            _to_profile_response(profile).model_dump()
-            for profile in llm_profiles
-        ],
+        "embedding_profiles": await _profile_dicts(namespace_id, "embedding"),
+        "llm_profiles": await _profile_dicts(namespace_id, "llm"),
         "retrieval_strategies": list(Collection.strategy.type.enums),
         "max_chunk_size": MAX_CHUNK_SIZE,
     }
@@ -126,26 +114,23 @@ async def create_profile(
         raise HTTPException(status_code=404, detail=str(exc))
 
 
-@router.get("/embedding-profiles", response_model=list[ProfileResponse])
-async def list_embedding_profiles(
+@router.get("/profiles", response_model=list[ProfileResponse])
+async def list_profiles(
     namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+    kind: Annotated[ProfileKind, Query()],
 ) -> list[ProfileResponse]:
     profiles = await service.list_profiles(
         namespace_id=namespace_id,
-        kind="embedding",
+        kind=kind,
     )
     return [_to_profile_response(profile) for profile in profiles]
 
 
-@router.get("/llm-profiles", response_model=list[ProfileResponse])
-async def list_llm_profiles(
-    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
-) -> list[ProfileResponse]:
-    profiles = await service.list_profiles(
-        namespace_id=namespace_id,
-        kind="llm",
-    )
-    return [_to_profile_response(profile) for profile in profiles]
+async def _profile_dicts(
+    namespace_id: uuid.UUID, kind: ProfileKind
+) -> list[dict[str, Any]]:
+    profiles = await service.list_profiles(namespace_id=namespace_id, kind=kind)
+    return [_to_profile_response(profile).model_dump() for profile in profiles]
 
 
 def _to_profile_response(profile) -> ProfileResponse:
