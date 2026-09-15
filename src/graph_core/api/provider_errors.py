@@ -1,7 +1,29 @@
 """Helpers for turning provider connectivity failures into API errors."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from fastapi import HTTPException
 from openai import APIConnectionError, AuthenticationError
+
+
+@contextmanager
+def service_http_errors() -> Iterator[None]:
+    """Translate service-layer exceptions into HTTP errors.
+
+    PermissionError -> 403, ValueError -> 404, known provider failures -> 502.
+    """
+    try:
+        yield
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise_provider_http_error(exc)
+        raise
 
 
 def raise_provider_http_error(exc: Exception) -> None:

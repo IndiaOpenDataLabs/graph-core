@@ -403,6 +403,7 @@ class ProfileCreateScreen(Screen):
             return
 
         args: dict[str, str | int] = {
+            "kind": kind,
             "provider": provider,
             "model": model,
             "secret": secret,
@@ -421,7 +422,7 @@ class ProfileCreateScreen(Screen):
                 )
                 return
 
-        tool_name = "create_llm_profile"
+        tool_name = "create_profile"
         if kind == "embedding":
             if not dimensions:
                 self.notify(
@@ -436,7 +437,6 @@ class ProfileCreateScreen(Screen):
                 return
             if distance_metric:
                 args["distance_metric"] = str(distance_metric)
-            tool_name = "create_embedding_profile"
 
         client = self.app.mcp_client_for_token(
             self.app.namespace_token,
@@ -592,8 +592,8 @@ class CollectionFormScreen(Screen):
         )
         await client.connect()
         try:
-            embedding_text = await client.call("list_embedding_profiles")
-            llm_text = await client.call("list_llm_profiles")
+            embedding_text = await client.call("list_profiles", {"kind": "embedding"})
+            llm_text = await client.call("list_profiles", {"kind": "llm"})
         finally:
             await client.disconnect()
 
@@ -1345,15 +1345,12 @@ class ConsoleScreen(Screen):
         action = args[0]
         if action == "list":
             kind = args[1] if len(args) > 1 else "all"
-            if kind == "embedding":
-                self._write(await self._call("list_embedding_profiles"))
-                return
-            if kind == "llm":
-                self._write(await self._call("list_llm_profiles"))
+            if kind in ("embedding", "llm"):
+                self._write(await self._call("list_profiles", {"kind": kind}))
                 return
             if kind == "all":
-                embedding = await self._call("list_embedding_profiles")
-                llm = await self._call("list_llm_profiles")
+                embedding = await self._call("list_profiles", {"kind": "embedding"})
+                llm = await self._call("list_profiles", {"kind": "llm"})
                 self._write(f"{embedding}\n\n{llm}")
                 return
             raise ValueError("Usage: /profile list [embedding|llm]")
@@ -1371,6 +1368,7 @@ class ConsoleScreen(Screen):
             model = self._require_flag(flags, "model")
             secret = self._require_flag(flags, "secret")
             call_args = {
+                "kind": kind,
                 "provider": provider,
                 "model": model,
                 "secret": secret,
@@ -1385,10 +1383,8 @@ class ConsoleScreen(Screen):
                 self._copy_optional_flag(flags, call_args, "distance_metric")
                 if "dimensions" in flags:
                     call_args["dimensions"] = int(str(flags["dimensions"]))
-                self._write(await self._call("create_embedding_profile", call_args))
-                return
-            if kind == "llm":
-                self._write(await self._call("create_llm_profile", call_args))
+            if kind in ("embedding", "llm"):
+                self._write(await self._call("create_profile", call_args))
                 return
         raise ValueError(
             "Usage: /profile list [embedding|llm] | /profile create embedding|llm ..."
@@ -1414,28 +1410,18 @@ class ConsoleScreen(Screen):
             _, flags = parse_flag_args(args[2:])
             strategy = str(flags.get("strategy", "vector"))
             embed_target = self._require_flag(flags, "embedding_profile")
-            embedding_profiles = await self._list_profiles("embedding")
-            embedding_profile = self._resolve_entity(
-                embed_target,
-                embedding_profiles,
-                id_key="profile_id",
-                text_keys=["label", "model"],
-            )
             call_args = {
                 "name": name,
                 "strategy": strategy,
-                "embedding_profile_id": embedding_profile["profile_id"],
+                "embedding_profile_id": await self._resolve_profile_id(
+                    "embedding", embed_target
+                ),
             }
             llm_target = flags.get("llm_profile")
             if isinstance(llm_target, str) and llm_target:
-                llm_profiles = await self._list_profiles("llm")
-                llm_profile = self._resolve_entity(
-                    llm_target,
-                    llm_profiles,
-                    id_key="profile_id",
-                    text_keys=["label", "model"],
+                call_args["llm_profile_id"] = await self._resolve_profile_id(
+                    "llm", llm_target
                 )
-                call_args["llm_profile_id"] = llm_profile["profile_id"]
             if isinstance(flags.get("default_query_mode"), str):
                 call_args["default_query_mode"] = str(flags["default_query_mode"])
             if "gleaning_passes" in flags:
@@ -1464,25 +1450,15 @@ class ConsoleScreen(Screen):
             if isinstance(flags.get("strategy"), str):
                 call_args["strategy"] = str(flags["strategy"])
             if isinstance(flags.get("embedding_profile"), str):
-                embedding_profiles = await self._list_profiles("embedding")
-                embedding_profile = self._resolve_entity(
-                    str(flags["embedding_profile"]),
-                    embedding_profiles,
-                    id_key="profile_id",
-                    text_keys=["label", "model"],
+                call_args["embedding_profile_id"] = await self._resolve_profile_id(
+                    "embedding", str(flags["embedding_profile"])
                 )
-                call_args["embedding_profile_id"] = embedding_profile["profile_id"]
             if flags.get("clear_llm_profile") is True:
                 call_args["clear_llm_profile"] = True
             elif isinstance(flags.get("llm_profile"), str):
-                llm_profiles = await self._list_profiles("llm")
-                llm_profile = self._resolve_entity(
-                    str(flags["llm_profile"]),
-                    llm_profiles,
-                    id_key="profile_id",
-                    text_keys=["label", "model"],
+                call_args["llm_profile_id"] = await self._resolve_profile_id(
+                    "llm", str(flags["llm_profile"])
                 )
-                call_args["llm_profile_id"] = llm_profile["profile_id"]
             if flags.get("clear_default_query_mode") is True:
                 call_args["clear_default_query_mode"] = True
             elif isinstance(flags.get("default_query_mode"), str):
@@ -1784,10 +1760,18 @@ class ConsoleScreen(Screen):
         raise ValueError(f"Query job {job_id} did not complete in time.")
 
     async def _list_profiles(self, kind: str) -> list[dict]:
-        if kind == "embedding":
-            text = await self._call("list_embedding_profiles")
-            return parse_profiles(text, "embedding")
-        return parse_profiles(await self._call("list_llm_profiles"), "llm")
+        text = await self._call("list_profiles", {"kind": kind})
+        return parse_profiles(text, kind)
+
+    async def _resolve_profile_id(self, kind: str, target: str) -> str:
+        profiles = await self._list_profiles(kind)
+        profile = self._resolve_entity(
+            target,
+            profiles,
+            id_key="profile_id",
+            text_keys=["label", "model"],
+        )
+        return str(profile["profile_id"])
 
     async def _hydrate_namespace_context(self) -> None:
         cfg = dict(self.app.config)

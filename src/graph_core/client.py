@@ -310,11 +310,8 @@ class GraphCoreClient:
             body["max_concurrent_calls"] = max_concurrent_calls
         return await self._request("POST", "/platform/profiles", json=body)
 
-    async def list_embedding_profiles(self) -> list[dict[str, Any]]:
-        return await self._request("GET", "/platform/embedding-profiles")
-
-    async def list_llm_profiles(self) -> list[dict[str, Any]]:
-        return await self._request("GET", "/platform/llm-profiles")
+    async def list_profiles(self, kind: str) -> list[dict[str, Any]]:
+        return await self._request("GET", "/platform/profiles", params={"kind": kind})
 
 
 class GraphCoreAPIError(Exception):

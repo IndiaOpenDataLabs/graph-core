@@ -194,10 +194,8 @@ uv run graph-core-admin-jwt --subject my-mcp-client
 | `list_namespaces`      | List all namespaces (admin)        |
 | `get_current_namespace`| Get current namespace info         |
 | `issue_user_token`     | Mint a namespace-scoped user JWT (admin) |
-| `create_embedding_profile` | Create an embedding profile     |
-| `create_llm_profile`   | Create an LLM profile              |
-| `list_embedding_profiles` | List embedding profiles         |
-| `list_llm_profiles`    | List LLM profiles                  |
+| `create_profile`       | Create an embedding or LLM profile (`kind=embedding|llm`) |
+| `list_profiles`        | List embedding or LLM profiles (`kind=embedding|llm`) |
 | `create_collection`    | Create a collection                |
 | `list_collections`     | List collections in namespace      |
 | `ingest_chunk`         | Ingest a text chunk (sync)         |
