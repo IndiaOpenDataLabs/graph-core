@@ -337,6 +337,16 @@ class RawChunkExtraction(Base):
     entities_json = Column(JSON, nullable=True)
     relationships_json = Column(JSON, nullable=True)
     extraction_model = Column(String(128), nullable=True)
+    # Prompt/schema family that produced this payload, so a cached extraction is
+    # only reused by the contract that wrote it. Values live in
+    # services/graph_rag/contracts.py; the literal server default is duplicated
+    # on purpose so this model never imports from services and stays in step
+    # with the migration backfill.
+    extraction_contract = Column(
+        String(64),
+        nullable=False,
+        server_default="generic-endpoints-v0",
+    )
     gleaning_passes = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -344,7 +354,8 @@ class RawChunkExtraction(Base):
         UniqueConstraint(
             "chunk_content_hash",
             "collection_id",
-            name="uq_raw_chunk_extractions_hash_collection",
+            "extraction_contract",
+            name="uq_raw_chunk_extractions_hash_collection_contract",
         ),
     )
 

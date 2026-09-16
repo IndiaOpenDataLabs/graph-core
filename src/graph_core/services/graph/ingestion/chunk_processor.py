@@ -5,6 +5,7 @@ for vector, custom_graph_rag, and light_rag strategies.
 """
 
 import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
 
@@ -30,6 +31,7 @@ from graph_core.services.document_identity import document_id_for_chunk
 from graph_core.services.document_identity import document_id_for_path
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.entity_name_cache import EntityNameCache
+from graph_core.services.graph_rag.contracts import extraction_contract_for
 from graph_core.services.graph_rag.entity_resolver import (
     IncrementalEntityResolver,
 )
@@ -41,6 +43,8 @@ from graph_core.services.sanitizer import TextSanitizer
 from graph_core.storage.graph_names import collection_graph_name
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
 from graph_core.storage.vector_store import VectorStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -400,16 +404,31 @@ async def _ingest_graph_chunk(
                 or await name_cache.get(rel.target_name)
             )
 
-            for is_source, name in [
-                (True, rel.source_name),
-                (False, rel.target_name),
+            for is_source, name, endpoint_description in [
+                (True, rel.source_name, rel.source_description),
+                (False, rel.target_name, rel.target_description),
             ]:
                 if (source_id if is_source else target_id) is None:
+                    # Repair path: a relationship endpoint that is not in the
+                    # extracted entity inventory. Carry the endpoint's own
+                    # description through, because an entity resolved with an
+                    # empty description gets no EntityDescription row and no
+                    # embedding, and is therefore neither a retrieval seed nor
+                    # renderable in an answer context.
+                    logger.warning(
+                        "relationship endpoint missing from entity inventory, "
+                        "creating entity chunk_hash=%s collection_id=%s "
+                        "endpoint=%r has_description=%s",
+                        chunk_hash,
+                        collection.id,
+                        name,
+                        bool(endpoint_description),
+                    )
                     synthetic = await resolver.resolve_entity(
                         session=session,
                         name=name,
                         entity_type="",
-                        description="",
+                        description=endpoint_description,
                         source_chunk_hash=chunk_hash,
                         document_id=document_id,
                         document_path=document_path,
@@ -715,6 +734,7 @@ async def _save_raw_extraction(
     document_path: str | None = None,
 ) -> None:
     """Persist raw LLM extraction to the database for deduplication."""
+    contract = extraction_contract_for(domain)
     async with AsyncSessionLocal() as session:
         record = RawChunkExtraction(
             chunk_content_hash=chunk_hash,
@@ -732,7 +752,9 @@ async def _save_raw_extraction(
             relationships_json=[
                 {
                     "source_name": r.source_name,
+                    "source_description": r.source_description,
                     "target_name": r.target_name,
+                    "target_description": r.target_description,
                     "description": r.description,
                     "keywords": r.keywords,
                     "weight": r.weight,
@@ -741,48 +763,90 @@ async def _save_raw_extraction(
                 for r in extraction.relationships
             ],
             extraction_model=(f"domain:{domain}" if domain else None),
+            extraction_contract=contract,
         )
         session.add(record)
         try:
             await session.commit()
         except Exception:
             await session.rollback()
+            # Never fail ingestion over a cache write, but never lose it
+            # silently either: a row that cannot be written means this chunk
+            # will be re-extracted on the next run, and previously the only
+            # trace of that was a missing row.
+            logger.exception(
+                "raw extraction cache write failed "
+                "chunk_hash=%s collection_id=%s contract=%s",
+                chunk_hash,
+                collection_id,
+                contract,
+            )
 
 
 async def _get_raw_extraction(
     chunk_hash: str, collection_id: uuid.UUID, domain: str | None = None
 ) -> ExtractionResult | None:
-    """Retrieve a cached extraction by chunk hash, or None if not found."""
+    """Retrieve a cached extraction for this chunk under the active contract.
+
+    A row written by a different prompt/schema family is a miss, not a hit: the
+    payload may be missing whole arrays that the running contract requires, and
+    serving it would degrade extraction instead of failing.
+    """
     from graph_core.services.graph_rag.extractor import (
         ExtractedEntity,
         ExtractedRelationship,
     )
 
+    contract = extraction_contract_for(domain)
     async with AsyncSessionLocal() as session:
+        # One read for every cached payload of this chunk. The result set is
+        # bounded by the number of contracts ever shipped, and reading them all
+        # keeps a contract mismatch visible without a second query on the hot
+        # first-ingestion path.
         result = await session.execute(
-            select(RawChunkExtraction).where(
+            select(RawChunkExtraction)
+            .where(
                 RawChunkExtraction.chunk_content_hash == chunk_hash,
                 RawChunkExtraction.collection_id == collection_id,
                 RawChunkExtraction.extraction_model
                 == (f"domain:{domain}" if domain else None),
             )
+            .order_by(RawChunkExtraction.created_at.desc())
         )
-        record = result.scalar_one_or_none()
-        if not record:
+        rows = result.scalars().all()
+        record = next(
+            (row for row in rows if row.extraction_contract == contract),
+            None,
+        )
+        if record is None:
+            cached_contracts = sorted(
+                {row.extraction_contract for row in rows} - {contract}
+            )
+            if cached_contracts:
+                logger.info(
+                    "raw extraction cache miss under active contract "
+                    "chunk_hash=%s collection_id=%s active=%s cached=%s",
+                    chunk_hash,
+                    collection_id,
+                    contract,
+                    cached_contracts,
+                )
             return None
 
         entities = [
             ExtractedEntity(
                 name=e["name"],
-                entity_type=e["type"],
-                description=e["description"],
+                entity_type=e.get("type") or "UNKNOWN",
+                description=e.get("description", ""),
             )
             for e in (record.entities_json or [])
         ]
         relationships = [
             ExtractedRelationship(
                 source_name=r["source_name"],
+                source_description=r.get("source_description", ""),
                 target_name=r["target_name"],
+                target_description=r.get("target_description", ""),
                 description=r["description"],
                 keywords=r.get("keywords", []),
                 weight=r.get("weight", 1.0),

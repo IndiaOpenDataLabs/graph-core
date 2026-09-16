@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from graph_core.llm.interface import LLMProvider
@@ -39,6 +39,8 @@ class ExtractedRelationship:
     keywords: list[str]
     weight: float
     rel_type: str = DEFAULT_REL_TYPE
+    source_description: str = ""
+    target_description: str = ""
 
 
 @dataclass
@@ -834,8 +836,8 @@ Only output the structured relationships object.
             target_endpoint = _parse_relationship_endpoint(rel.get("target"))
             if not (source_endpoint and target_endpoint):
                 continue
-            source, _source_description = source_endpoint
-            target, _target_description = target_endpoint
+            source, source_description = source_endpoint
+            target, target_description = target_endpoint
             rel_description = rel.get("description", "")
             rel_keywords = cls._parse_relationship_keywords(
                 rel.get("keywords", []),
@@ -858,7 +860,9 @@ Only output the structured relationships object.
                 extracted.append(
                     ExtractedRelationship(
                         source_name=source,
+                        source_description=source_description,
                         target_name=target,
+                        target_description=target_description,
                         description=entry["description"],
                         keywords=list(entry["keywords"]),
                         weight=entry["weight"],
@@ -902,8 +906,8 @@ Only output the structured relationships object.
                     target_endpoint = _parse_code_endpoint(item.get("target"))
                     if not (source_endpoint and target_endpoint):
                         continue
-                    source, _source_description = source_endpoint
-                    target, _target_description = target_endpoint
+                    source, source_description = source_endpoint
+                    target, target_description = target_endpoint
                     description = item.get("description", "")
                     if not isinstance(description, str):
                         description = ""
@@ -920,7 +924,9 @@ Only output the structured relationships object.
                     extracted.append(
                         ExtractedRelationship(
                             source_name=source,
+                            source_description=source_description,
                             target_name=target,
+                            target_description=target_description,
                             description=description,
                             keywords=keywords,
                             weight=weight,
@@ -981,7 +987,21 @@ Only output the structured relationships object.
         added = 0
         for rel in additions:
             key = (rel.source_name, rel.target_name, rel.rel_type)
-            if key not in merged:
+            existing = merged.get(key)
+            if existing is not None:
+                # The gleaned version corrects the edge, but a gleaned endpoint
+                # may arrive as a bare name. Never let that erase an endpoint
+                # description already recovered from the first pass.
+                rel = replace(
+                    rel,
+                    source_description=(
+                        rel.source_description or existing.source_description
+                    ),
+                    target_description=(
+                        rel.target_description or existing.target_description
+                    ),
+                )
+            else:
                 order.append(key)
                 added += 1
             merged[key] = rel
