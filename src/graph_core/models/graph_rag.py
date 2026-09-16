@@ -337,6 +337,25 @@ class RawChunkExtraction(Base):
     entities_json = Column(JSON, nullable=True)
     relationships_json = Column(JSON, nullable=True)
     extraction_model = Column(String(128), nullable=True)
+    # Prompt/schema family that produced this payload. Values live in
+    # services/graph_rag/contracts.py; the literal server defaults are duplicated
+    # on purpose so this model never imports from services and stays in step with
+    # the migration's backfill.
+    extraction_contract = Column(
+        String(64),
+        nullable=False,
+        server_default="generic-endpoints-v0",
+    )
+    # Fingerprint of the domain configuration the run resolved: the relationship
+    # vocabulary and guidance strings that reach the prompt. With the contract this
+    # is the cache identity, because a domain label alone cannot be one: domain
+    # configuration is mutable at runtime and distinct domains resolve to distinct
+    # prompts.
+    prompt_fingerprint = Column(
+        String(32),
+        nullable=False,
+        server_default="legacy",
+    )
     gleaning_passes = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -344,7 +363,9 @@ class RawChunkExtraction(Base):
         UniqueConstraint(
             "chunk_content_hash",
             "collection_id",
-            name="uq_raw_chunk_extractions_hash_collection",
+            "extraction_contract",
+            "prompt_fingerprint",
+            name="uq_raw_chunk_extractions_identity",
         ),
     )
 
