@@ -31,7 +31,7 @@ from graph_core.services.document_identity import document_id_for_chunk
 from graph_core.services.document_identity import document_id_for_path
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.entity_name_cache import EntityNameCache
-from graph_core.services.graph_rag.contracts import extraction_contract_for
+from graph_core.services.graph_rag.contracts import extraction_identity_for
 from graph_core.services.graph_rag.entity_resolver import (
     IncrementalEntityResolver,
 )
@@ -734,7 +734,7 @@ async def _save_raw_extraction(
     document_path: str | None = None,
 ) -> None:
     """Persist raw LLM extraction to the database for deduplication."""
-    contract = extraction_contract_for(domain)
+    contract, fingerprint = extraction_identity_for(domain)
     async with AsyncSessionLocal() as session:
         record = RawChunkExtraction(
             chunk_content_hash=chunk_hash,
@@ -762,8 +762,12 @@ async def _save_raw_extraction(
                 }
                 for r in extraction.relationships
             ],
+            # Informational only since this revision: the domain label is not part
+            # of the identity, because distinct labels can resolve to the same
+            # prompt and one label can resolve to different prompts over time.
             extraction_model=(f"domain:{domain}" if domain else None),
             extraction_contract=contract,
+            prompt_fingerprint=fingerprint,
         )
         session.add(record)
         try:
@@ -776,60 +780,71 @@ async def _save_raw_extraction(
             # trace of that was a missing row.
             logger.exception(
                 "raw extraction cache write failed "
-                "chunk_hash=%s collection_id=%s contract=%s",
+                "chunk_hash=%s collection_id=%s contract=%s fingerprint=%s",
                 chunk_hash,
                 collection_id,
                 contract,
+                fingerprint,
             )
 
 
 async def _get_raw_extraction(
     chunk_hash: str, collection_id: uuid.UUID, domain: str | None = None
 ) -> ExtractionResult | None:
-    """Retrieve a cached extraction for this chunk under the active contract.
+    """Retrieve a cached extraction for this chunk under the active identity.
 
-    A row written by a different prompt/schema family is a miss, not a hit: the
-    payload may be missing whole arrays that the running contract requires, and
-    serving it would degrade extraction instead of failing.
+    A row whose contract or prompt fingerprint differs from the active one is a
+    miss, not a hit: the payload may be missing whole arrays the running schema
+    requires, or may have been produced by a different prompt, and serving it
+    would degrade extraction instead of failing.
+
+    The read predicate is exactly the table's unique identity. Filtering on
+    anything else, such as the domain label, reintroduces the failure this
+    removes: a row that can never be stored because it collides with another
+    domain's row, and a lookup that misses its own content forever.
     """
     from graph_core.services.graph_rag.extractor import (
         ExtractedEntity,
         ExtractedRelationship,
     )
 
-    contract = extraction_contract_for(domain)
+    contract, fingerprint = extraction_identity_for(domain)
     async with AsyncSessionLocal() as session:
         # One read for every cached payload of this chunk. The result set is
-        # bounded by the number of contracts ever shipped, and reading them all
-        # keeps a contract mismatch visible without a second query on the hot
-        # first-ingestion path.
+        # bounded by the number of distinct prompt identities a chunk has seen,
+        # and reading them all keeps an identity mismatch visible without a
+        # second query on the hot first-ingestion path.
         result = await session.execute(
             select(RawChunkExtraction)
             .where(
                 RawChunkExtraction.chunk_content_hash == chunk_hash,
                 RawChunkExtraction.collection_id == collection_id,
-                RawChunkExtraction.extraction_model
-                == (f"domain:{domain}" if domain else None),
             )
             .order_by(RawChunkExtraction.created_at.desc())
         )
         rows = result.scalars().all()
         record = next(
-            (row for row in rows if row.extraction_contract == contract),
+            (
+                row
+                for row in rows
+                if row.extraction_contract == contract
+                and row.prompt_fingerprint == fingerprint
+            ),
             None,
         )
         if record is None:
-            cached_contracts = sorted(
-                {row.extraction_contract for row in rows} - {contract}
-            )
-            if cached_contracts:
+            if rows:
+                cached_identities = sorted(
+                    {(r.extraction_contract, r.prompt_fingerprint) for r in rows}
+                )
                 logger.info(
-                    "raw extraction cache miss under active contract "
-                    "chunk_hash=%s collection_id=%s active=%s cached=%s",
+                    "raw extraction cache miss under active identity "
+                    "chunk_hash=%s collection_id=%s active=(%s, %s) cached=%s",
                     chunk_hash,
                     collection_id,
                     contract,
-                    cached_contracts,
+                    fingerprint,
+                    cached_identities,
                 )
             return None
 
