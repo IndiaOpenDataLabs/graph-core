@@ -11,9 +11,10 @@
 > unchanged.
 >
 > **Review note:** the 2026-09-15 revision records verification against the
-> current code. Sections 1.1, 4, 4.3, 5, 6, 6.1, 7, 8, 10, 11 and 12 contain the
-> corrections and preconditions. The section 8 cache fix and the section 1.1
-> description loss are being landed first on
+> current code, including one correction of an earlier revision of this document
+> (section 1.1). Sections 1.1, 4, 4.3, 5, 6, 6.1, 7, 8, 10, 11 and 12 contain the
+> corrections and preconditions. The section 8 cache contract work, and the
+> section 1.1 repair-path description fix, are landing first on
 > `fix/extraction-contract-and-endpoint-descriptions`, independently of this
 > plan.
 
@@ -46,31 +47,53 @@ The endpoint-based contract was useful for code extraction, where concrete code
 objects are naturally exposed by typed operations. Applying it to all generic
 content made the graph's node vocabulary depend on the edge extractor's choices.
 
-### 1.1 The current cost is larger than an absent node
+### 1.1 What is and is not actually lost today
 
-Verified against `main` (`32a3976`), the generic path does not merely fail to
-create a node for a concept. It asks for the concept's description and then
-discards it:
+An earlier revision of this section claimed the generic path asks for endpoint
+descriptions and throws them away. That was wrong, and correcting it matters for
+how this plan's benefit should be estimated. Verified against `main`
+(`32a3976`):
 
-- `_EXTRACTION_SYSTEM_PROMPT` requires endpoint objects
-  `source: {name, description}` and states "The endpoint descriptions are entity
-  descriptions." The LLM therefore returns an entity description for every
-  endpoint, and it is billed for.
-- `_collect_generic_entities()` reads only `name`, hardcodes
-  `entity_type="UNKNOWN"`, and leaves `source_description` empty. The code
-  counterpart, `_collect_code_entities()`, does use `endpoint[1]` as
-  `source_description`.
-- The relationship ingestion loop in `chunk_processor.py` resolves endpoints by
-  name only and never falls back to `rel.source_description`, so the description
-  never reaches the resolver on that path either.
-- Because the parser only ever produces endpoint-derived entities, the
-  "compatibility repair" in this plan (create an `UNKNOWN` entity, record a
-  metric) is not an edge case in today's code: every relationship endpoint is
-  already an unnamed-type repair. Restoring the independent array is partly the
-  work of recovering information that is already in the response.
+- `_collect_generic_entities()` does use the endpoint description. It keeps the
+  longest description per normalized name and stores it as
+  `ExtractedEntity.description`.
+- `_ingest_graph_chunk()` passes that description into
+  `IncrementalEntityResolver.resolve_entity()`. An endpoint that survives
+  extraction therefore reaches the resolver with a description and becomes an
+  embeddable, searchable entity.
+- `ExtractedEntity` has exactly `name`, `entity_type`, and `description`. There
+  is no endpoint-provenance field, and `_collect_code_entities()` does not
+  populate one either. The two collectors differ only in the hardcoded type.
 
-This sharpens the objective. The change recovers paid-for descriptions and types
-instead of only adding nodes.
+Two real losses remain, both smaller than the missing-node problem:
+
+- every generic entity is created with `entity_type="UNKNOWN"`. The resolver's
+  type check short-circuits only on an empty type and otherwise rejects just three
+  incompatible pairs (`person/place`, `person/object`, `place/concept`). `UNKNOWN`
+  is in none of them, so every pair involving it passes and the guard does no work
+  for generic content. A typed independent array restores a check that currently
+  never rejects anything.
+- endpoint descriptions are discarded at relationship-parse time, and the
+  ingestion repair path that creates an entity for a relationship endpoint
+  missing from the entity inventory therefore creates it with an empty
+  description. `_add_description_and_update_centroid()` returns early on an empty
+  description, so such an entity gets no `EntityDescription` row, no embedding,
+  and no centroid contribution: it exists in the graph and is invisible to every
+  retrieval path. That path is effectively unreachable on `main`, because entities
+  are endpoint-derived and the gleaning pass merges gleaned entities collected
+  from gleaned endpoints, so the two name sets always coincide. It becomes a live
+  path exactly when this plan makes the entity array independent, and the
+  exact-name binding in section 4 then decides how often it fires.
+
+Both are fixed on `fix/extraction-contract-and-endpoint-descriptions`, with a
+warning log added at the repair site. That site is also where the exact-name
+binding in section 4 will land, so read it before implementing: it is the one
+place where a name mismatch becomes a permanently invisible node rather than a
+dropped edge.
+
+The core claim of section 1 stands. A concept the model did not choose as a
+relationship endpoint does not exist in the graph at all, under any name, with or
+without a description.
 
 ## 2. Objective
 
@@ -275,11 +298,16 @@ strings, because the answer changes retrieval:
   the `entities` array. Note the parser tolerates plain strings but
   `_extract_generic_relationships()` drops any item whose endpoints do not parse,
   so a string endpoint must be handled there too.
-- If endpoints stay nested objects, state which description wins when the
-  endpoint description and the `entities` entry description differ for the same
-  name. Do not keep both in the payload without a winner; today the endpoint
-  description is silently dropped, which is the failure mode described in
-  section 1.1.
+- If endpoints stay nested objects, name the winner when the endpoint
+  description and the `entities` entry description differ for the same name.
+  Today there is only one source, so the question does not arise:
+  `_collect_generic_entities()` takes the longest endpoint description and that
+  becomes the entity description. Adding an independent `entities` array creates
+  a second source, and without a stated rule the two coexist and the ingestion
+  loop's choice decides retrieval. The fix branch makes the entities array the
+  winner and the endpoint description a repair fallback only (section 1.1);
+  section 4 already states that endpoints refer to names in the `entities` array,
+  which is the same rule.
 
 Whatever is chosen, the gleaning prompts must change with the schema. They
 currently say "Output requirements: 1. Return structured JSON with one object:
@@ -341,11 +369,11 @@ For generic, chat, and dynamically classified prose domains:
 6. Stop using `_collect_generic_entities()` as the normal source of entities.
 7. Keep the current ingestion loops. `chunk_processor.py` already runs
    `IncrementalEntityResolver` over `extraction.entities` before the relationship
-   loop, so a non-empty independent array does reach the resolver without new
-   wiring. It is not true today that entities "already flow through" with
-   descriptions and types: the only reason that set is non-empty is endpoint
-   derivation, and `_collect_generic_entities()` gives every one of them type
-   `UNKNOWN` and no description.
+   loop, so a non-empty independent array reaches the resolver without new
+   wiring. Two caveats: the set is non-empty today only because of endpoint
+   derivation, and every member has `entity_type="UNKNOWN"`, which disables the
+   resolver's type guard for generic content (see section 1.1). Descriptions do
+   survive today, so switching the source of the array must not regress them.
 8. Preserve directed relationship resolution from PR #8.
 9. Persist and re-hydrate the independent array. `_save_raw_extraction()` writes
    `entities_json` and `_get_raw_extraction()` rebuilds `ExtractedEntity` from it
@@ -361,8 +389,12 @@ For generic, chat, and dynamically classified prose domains:
     is invisible to retrieval, which is the exact outcome this plan is trying to
     avoid. The prompt must make descriptions mandatory, and the parser should
     reject or fill empty ones rather than persist silent placeholders.
-11. Preserve `source_description` end to end. `ExtractedEntity` already has the
-    field and the code path populates it; the generic path must too.
+11. Keep the repair path described in section 1.1 correct under the new contract.
+    Endpoint descriptions now survive parsing, the cache round-trip, and the
+    gleaning merge, and the ingestion repair path uses them instead of an empty
+    string. That fixes today's invisible-node case; it does not remove the need
+    for item 4, because a description cannot repair a name that should have
+    matched an existing inventory entry.
 
 The code-domain schema and fixed taxonomy remain endpoint-derived for now. Code
 can adopt the independent contract later only if code-specific fixtures show a
@@ -379,9 +411,8 @@ Raising entity recall moves more abstract compound concepts through
 - centroid similarity merges above 0.8 with no name check, merges between 0.65
   and 0.8 only when a `difflib` name ratio clears 0.8, and otherwise creates a
   new entity;
-- the entity-type guard is effectively disabled for generic content, because the
-  generic extractor types everything `UNKNOWN` and the compatibility check passes
-  `UNKNOWN` against anything.
+- the entity-type guard does no work for generic content, because the generic
+  extractor types everything `UNKNOWN` (see section 1.1).
 
 Two failure modes follow, and both get worse with the change as planned:
 
@@ -472,22 +503,31 @@ Verified against `main`:
 - The lookup uses `scalar_one_or_none()`, which raises `MultipleResultsFound` if
   duplicate rows ever appear for the key it reads.
 
-Required shape of the fix, landed separately from this plan so the plan inherits
-a working cache:
+Shape of the fix, implemented on `fix/extraction-contract-and-endpoint-descriptions`
+(migration `0028_add_raw_extraction_contract`) so this plan inherits a working
+cache:
 
-1. Add a non-null `extraction_contract` column with an Alembic migration,
-   backfilling existing rows with the contract that produced them
-   (`generic-endpoints-v0` for prose domains, `code-taxonomy-v0` for code).
+1. Add a non-null `extraction_contract` column, backfilled from `extraction_model`
+   so existing rows resolve under the contract that produced them
+   (`code-taxonomy-v0` for `domain:code` rows, `generic-endpoints-v0` otherwise).
+   Backfilling from `extraction_model` matters: the alternative, a single blanket
+   default, would make every cached code-domain chunk look like a miss and force a
+   full LLM re-extraction on the next ingest.
 2. Replace `uq_raw_chunk_extractions_hash_collection` with
    `(chunk_content_hash, collection_id, extraction_contract)`.
-3. Filter the lookup by contract and treat "row exists under a different
-   contract" as a miss, not an error.
-4. Read with `.limit(1)` or `scalars().first()` instead of `scalar_one_or_none()`,
-   and log or re-raise a failed save instead of swallowing it.
+3. Treat "row exists under a different contract" as a miss, not an error, and log
+   the contracts that are cached when it happens. The values live in
+   `services/graph_rag/contracts.py`, whose docstring states the bump procedure.
+4. Read all cached payloads for the chunk in one query and select the matching
+   contract in Python, rather than `scalar_one_or_none()` plus a second
+   contract-mismatch query. The result set is bounded by the number of contracts
+   ever shipped, and the first-ingestion path stays a single read. A failed cache
+   write is logged instead of silently rolled back.
 
 Existing cached payloads then stay readable under their own contract, and no
 historical LLM re-extraction occurs unless that content is explicitly ingested
-under the new contract.
+under the new contract. Bumping the contract is now a one-line change in
+`contracts.py`; this plan needs to do exactly that.
 
 ## 9. Associative Density
 
@@ -624,12 +664,16 @@ Separate change set, landed on its own so quality movement is attributable:
 8. make gleaning opt-in for new collections, changing the Python default, the
    server default, and the API default together.
 
-Already landed as a precondition of this plan, and required regardless of whether
-this plan proceeds:
+Already on `fix/extraction-contract-and-endpoint-descriptions`, as preconditions:
 
-- the contract-versioned raw extraction cache in section 8. Without it, every
-  already-ingested chunk silently keeps serving the relationship-only payload and
-  the new code path never runs.
+- the contract-versioned raw extraction cache in section 8. Required whether or not
+  this plan proceeds: without it, every already-ingested chunk silently keeps
+  serving the payload written under the previous contract, so this plan's new code
+  path never runs for existing content.
+- endpoint descriptions carried through parsing, the cache round-trip, and the
+  gleaning merge, plus the repair path using one instead of an empty string, and a
+  warning log there. Only meaningful once this plan lands; harmless before it,
+  since the path is unreachable while entities are endpoint-derived.
 
 ## 13. Non-Goals
 
