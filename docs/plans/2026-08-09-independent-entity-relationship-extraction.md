@@ -41,6 +41,10 @@ classified prose. Code-domain extraction remains endpoint-derived and unchanged.
 - The generic cache contract is now `generic-independent-entities-v1`; the code
   contract is unchanged. Regression tests cover independent concepts, gleaning,
   normalized binding, repairs, description rejection, and the cache round-trip.
+- Custom Graph RAG upserts every resolved inventory entity into graph storage,
+  independently of relationships, using canonical names and deduplicating by ID.
+  Ingestion regressions cover standalone entities, mixed chunks, aliases, and
+  both raw-extraction and entity-name cache hits without external services.
 
 Still pending: the evaluation harness and measured baseline/deltas in section 11,
 standalone-entity ingestion-to-query coverage by mode and resolver measurements,
