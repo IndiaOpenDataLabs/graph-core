@@ -1,6 +1,8 @@
 # Independent Entity and Relationship Extraction Plan
 
-> **Status:** Proposed, reviewed against `main` at `32a3976`
+> **Status:** Partially implemented: independent generic extraction contract,
+> prompts, endpoint validation, and non-empty entity descriptions. Reviewed
+> against `main` at `32a3976` before implementation.
 >
 > **Date:** 2026-08-09, revised 2026-09-15
 >
@@ -17,6 +19,34 @@
 > section 1.1 repair-path description fix, are landing first on
 > `fix/extraction-contract-and-endpoint-descriptions`, independently of this
 > plan.
+
+## Implementation progress
+
+The first implementation restores independent generic entities and selective
+relationships in the same structured call, including chat and dynamically
+classified prose. Code-domain extraction remains endpoint-derived and unchanged.
+
+- Both arrays are required by the generic schema and requested by extraction and
+  gleaning prompts. Directed relationships and coherent standalone concepts are
+  preserved; gleaning accepts references to the combined existing/new inventory.
+- Generic endpoints remain nested objects. Independent entity descriptions are
+  authoritative; endpoint descriptions are used only for missing-inventory repair.
+- Endpoint names bind to inventory spelling after whitespace/length normalization
+  and case-insensitive matching. Missing entries become `UNKNOWN` repairs, counted
+  in a per-chunk structured validation log with the contract and array counts.
+- Empty or invalid independent descriptions are rejected. Compatibility repairs
+  use the richest endpoint description, or the exact source passage as an excerpt
+  for legacy bare-name endpoints. An edge with no usable description source is
+  rejected rather than creating an invisible empty-description entity.
+- The generic cache contract is now `generic-independent-entities-v1`; the code
+  contract is unchanged. Regression tests cover independent concepts, gleaning,
+  normalized binding, repairs, description rejection, and the cache round-trip.
+
+Still pending: the evaluation harness and measured baseline/deltas in section 11,
+standalone-entity ingestion-to-query coverage by mode and resolver measurements,
+and the separate gleaning-default change. Collection defaults remain unchanged.
+The sections below retain the original rationale and pre-implementation review;
+statements about the then-current code describe that baseline, not this progress.
 
 ## 1. Problem
 

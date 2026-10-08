@@ -32,6 +32,7 @@ from graph_core.services.graph.ingestion.chunk_processor import (
 from graph_core.services.graph_rag.contracts import (
     CODE_TAXONOMY_V0,
     GENERIC_ENDPOINTS_V0,
+    GENERIC_INDEPENDENT_ENTITIES_V1,
     LEGACY_FINGERPRINT,
     extraction_contract_for,
     extraction_identity_for,
@@ -112,8 +113,8 @@ def _extraction(description: str) -> ExtractionResult:
 def test_contract_is_chosen_by_domain() -> None:
     assert extraction_contract_for("code") == CODE_TAXONOMY_V0
     assert extraction_contract_for(" Code ") == CODE_TAXONOMY_V0
-    assert extraction_contract_for(None) == GENERIC_ENDPOINTS_V0
-    assert extraction_contract_for("general") == GENERIC_ENDPOINTS_V0
+    assert extraction_contract_for(None) == GENERIC_INDEPENDENT_ENTITIES_V1
+    assert extraction_contract_for("general") == GENERIC_INDEPENDENT_ENTITIES_V1
 
 
 def test_distinct_prompts_under_one_label_are_distinct_identities() -> None:

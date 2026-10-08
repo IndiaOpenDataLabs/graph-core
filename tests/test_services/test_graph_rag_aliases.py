@@ -403,7 +403,7 @@ async def test_generic_extractor_uses_relationship_endpoint_objects():
     )
 
     assert len(llm.schemas) == 1
-    assert llm.schemas[0]["title"] == "graph_rag_relationship_extraction"
+    assert llm.schemas[0]["title"] == "graph_rag_entity_relationship_extraction"
     assert result.entities[0].name == "Arjuna"
     assert result.entities[0].description == "The primary recipient of the teaching."
     assert result.relationships[0].source_name == "Arjuna"

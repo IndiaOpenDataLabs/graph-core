@@ -56,8 +56,11 @@ from graph_core.models.domain_config import DomainConfig, get_domain_config
 CODE_DOMAIN = "code"
 
 #: Relationships-only response with entities derived from relationship
-#: endpoints. This is the contract every existing row was written under.
+#: endpoints. Retained for historical rows and migration backfills.
 GENERIC_ENDPOINTS_V0 = "generic-endpoints-v0"
+
+#: Independent typed entity inventory plus selective directed relationships.
+GENERIC_INDEPENDENT_ENTITIES_V1 = "generic-independent-entities-v1"
 
 #: Fixed code taxonomy with endpoints as typed code objects.
 CODE_TAXONOMY_V0 = "code-taxonomy-v0"
@@ -90,7 +93,7 @@ def extraction_contract_for(domain: str | None) -> str:
     """
     if (domain or "").strip().lower() == CODE_DOMAIN:
         return CODE_TAXONOMY_V0
-    return GENERIC_ENDPOINTS_V0
+    return GENERIC_INDEPENDENT_ENTITIES_V1
 
 
 def prompt_inputs(config: DomainConfig) -> dict[str, Any]:
