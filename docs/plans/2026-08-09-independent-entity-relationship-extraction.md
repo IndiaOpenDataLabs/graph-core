@@ -1,6 +1,8 @@
 # Independent Entity and Relationship Extraction Plan
 
-> **Status:** Proposed, reviewed against `main` at `32a3976`
+> **Status:** Partially implemented: independent generic extraction contract,
+> prompts, endpoint validation, and non-empty entity descriptions. Reviewed
+> against `main` at `32a3976` before implementation.
 >
 > **Date:** 2026-08-09, revised 2026-09-15
 >
@@ -17,6 +19,39 @@
 > section 1.1 repair-path description fix, are landing first on
 > `fix/extraction-contract-and-endpoint-descriptions`, independently of this
 > plan.
+
+## Implementation progress
+
+The first implementation restores independent generic entities and selective
+relationships in the same structured call, including chat and dynamically
+classified prose. Code-domain extraction remains endpoint-derived and unchanged.
+
+- Both arrays are required by the generic schema and requested by extraction and
+  gleaning prompts. Directed relationships and coherent standalone concepts are
+  preserved; gleaning accepts references to the combined existing/new inventory.
+- Generic endpoints remain nested objects. Independent entity descriptions are
+  authoritative; endpoint descriptions are used only for missing-inventory repair.
+- Endpoint names bind to inventory spelling after whitespace/length normalization
+  and case-insensitive matching. Missing entries become `UNKNOWN` repairs, counted
+  in a per-chunk structured validation log with the contract and array counts.
+- Both arrays are mandatory: relationship-only responses are rejected rather
+  than treated as an alternate extraction format. Empty or invalid independent
+  descriptions are rejected. A missing inventory entry can use its endpoint
+  description; without one, the edge is rejected. There is no source-text excerpt
+  fallback for older output formats.
+- There is one generic cache contract, `generic-entities-relationships`; the code
+  contract is unchanged. Regression tests cover independent concepts, gleaning,
+  normalized binding, repairs, description rejection, and the cache round-trip.
+- Custom Graph RAG upserts every resolved inventory entity into graph storage,
+  independently of relationships, using canonical names and deduplicating by ID.
+  Ingestion regressions cover standalone entities, mixed chunks, aliases, and
+  both raw-extraction and entity-name cache hits without external services.
+
+Still pending: the evaluation harness and measured baseline/deltas in section 11,
+standalone-entity ingestion-to-query coverage by mode and resolver measurements,
+and the separate gleaning-default change. Collection defaults remain unchanged.
+The sections below retain the original rationale and pre-implementation review;
+statements about the then-current code describe that baseline, not this progress.
 
 ## 1. Problem
 
@@ -164,8 +199,14 @@ Restore a generic response with two independent arrays:
   ],
   "relationships": [
     {
-      "source": "Krishna",
-      "target": "Arjuna",
+      "source": {
+        "name": "Krishna",
+        "description": "The teacher addressing Arjuna."
+      },
+      "target": {
+        "name": "Arjuna",
+        "description": "The recipient of Krishna's teaching."
+      },
       "description": "Krishna teaches Arjuna how duty should be performed.",
       "keywords": ["teaching", "duty", "guidance"],
       "weight": 0.95,
@@ -191,10 +232,10 @@ endpoint()` accepts an endpoint object or string and `_extract_generic_
 relationships()` only drops items whose endpoints fail to parse. Enforcing the
 invariant requires a new step after both arrays are parsed.
 
-A relationship may introduce an endpoint missing from `entities` only as a
-compatibility fallback. The parser creates an `UNKNOWN` entity and records a
-validation metric; accepted extractor output should normally have zero such
-repairs.
+A relationship whose endpoint is missing from `entities` is an inventory
+validation error, not an alternate output format. A non-empty endpoint description
+allows an `UNKNOWN` repair, recorded in the validation metric; otherwise the edge
+is rejected. Accepted extractor output should normally have zero such repairs.
 
 Two constraints on that repair, verified against `main`:
 
@@ -365,7 +406,8 @@ For generic, chat, and dynamically classified prose domains:
 2. Parse entities directly with `_extract_entities()`.
 3. Parse relationships using source/target entity names.
 4. Validate that relationship endpoints exist in the entity inventory.
-5. Retain a compatibility repair for missing endpoint entities, with metrics.
+5. Repair missing endpoint inventory entries with descriptions and metrics;
+   reject edges whose missing endpoints have no usable description.
 6. Stop using `_collect_generic_entities()` as the normal source of entities.
 7. Keep the current ingestion loops. `chunk_processor.py` already runs
    `IncrementalEntityResolver` over `extraction.entities` before the relationship
@@ -466,68 +508,21 @@ Three corrections:
   retrieval quality at the same time, and bundling it makes any quality movement
   after the contract change unattributable.
 
-## 8. Extraction Contract Version
+## 8. Single Generic Extraction Contract
 
-The prompt/schema change must not silently reuse relationship-only cached
-extractions.
+This change has not gone to production and there is no historical extraction
+payload to preserve. Support exactly one generic response shape: independent
+`entities` and selective `relationships`. Do not add backup types, versioned
+alternatives, or compatibility extraction paths without an explicit requirement.
 
-Add a contract key such as:
+The existing raw-extraction cache uses `GENERIC_EXTRACTION_CONTRACT`, whose value
+is `generic-entities-relationships`, plus the resolved domain prompt fingerprint.
+The model and existing migration use that same generic default. No separate
+old-data migration is needed.
 
-```text
-generic-independent-entities-v1
-```
-
-and include it in raw extraction cache identity.
-
-This is not implementable as a cache-key edit, and it is load-bearing: without
-it, this plan's new behavior is silently bypassed for every chunk that has ever
-been ingested.
-
-Verified against `main`:
-
-- `RawChunkExtraction` has no version field. `gleaning_passes` exists on the
-  model and is never written or read. `extraction_model` is already occupied
-  with the string `domain:{domain}` and is part of the lookup predicate, which is
-  why the code path and generic path get separate rows.
-- The table's unique constraint is `(chunk_content_hash, collection_id)`. There
-  can only ever be one cached row per chunk and collection, so old and new
-  contracts cannot coexist.
-- `_get_raw_extraction()` selects on hash, collection, and domain only. After the
-  contract change, re-ingesting an already-seen chunk returns the
-  relationship-only row with `entities_json = []`. The plan would then create
-  `UNKNOWN` entities from those stale rows instead of the restored ones, on
-  exactly the retry path section 10 claims to verify.
-- `_save_raw_extraction()` commits inside `except Exception: rollback`. Writing a
-  second row for the same key raises the unique violation and is swallowed with no
-  log, so the failure is invisible.
-- The lookup uses `scalar_one_or_none()`, which raises `MultipleResultsFound` if
-  duplicate rows ever appear for the key it reads.
-
-Shape of the fix, implemented on `fix/extraction-contract-and-endpoint-descriptions`
-(migration `0028_add_raw_extraction_contract`) so this plan inherits a working
-cache:
-
-1. Add a non-null `extraction_contract` column, backfilled from `extraction_model`
-   so existing rows resolve under the contract that produced them
-   (`code-taxonomy-v0` for `domain:code` rows, `generic-endpoints-v0` otherwise).
-   Backfilling from `extraction_model` matters: the alternative, a single blanket
-   default, would make every cached code-domain chunk look like a miss and force a
-   full LLM re-extraction on the next ingest.
-2. Replace `uq_raw_chunk_extractions_hash_collection` with
-   `(chunk_content_hash, collection_id, extraction_contract)`.
-3. Treat "row exists under a different contract" as a miss, not an error, and log
-   the contracts that are cached when it happens. The values live in
-   `services/graph_rag/contracts.py`, whose docstring states the bump procedure.
-4. Read all cached payloads for the chunk in one query and select the matching
-   contract in Python, rather than `scalar_one_or_none()` plus a second
-   contract-mismatch query. The result set is bounded by the number of contracts
-   ever shipped, and the first-ingestion path stays a single read. A failed cache
-   write is logged instead of silently rolled back.
-
-Existing cached payloads then stay readable under their own contract, and no
-historical LLM re-extraction occurs unless that content is explicitly ingested
-under the new contract. Bumping the contract is now a one-line change in
-`contracts.py`; this plan needs to do exactly that.
+The cache identity still distinguishes the unchanged code-domain taxonomy from
+generic prose and distinguishes mutable domain prompt inputs. An unrecognized
+identity is a cache miss, never a fallback to a different extractor.
 
 ## 9. Associative Density
 

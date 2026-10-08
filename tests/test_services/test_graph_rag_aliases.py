@@ -370,6 +370,18 @@ async def test_code_domain_gleaning_keeps_taxonomy_schema():
 @pytest.mark.asyncio
 async def test_generic_extractor_uses_relationship_endpoint_objects():
     response = {
+        "entities": [
+            {
+                "name": "Arjuna",
+                "type": "Person",
+                "description": "The primary recipient of the teaching.",
+            },
+            {
+                "name": "Krishna",
+                "type": "Person",
+                "description": "The teacher in the passage.",
+            },
+        ],
         "relationships": [
             {
                 "source": {
@@ -403,7 +415,7 @@ async def test_generic_extractor_uses_relationship_endpoint_objects():
     )
 
     assert len(llm.schemas) == 1
-    assert llm.schemas[0]["title"] == "graph_rag_relationship_extraction"
+    assert llm.schemas[0]["title"] == "graph_rag_entity_relationship_extraction"
     assert result.entities[0].name == "Arjuna"
     assert result.entities[0].description == "The primary recipient of the teaching."
     assert result.relationships[0].source_name == "Arjuna"
@@ -454,11 +466,19 @@ def _generic_rel(source: str, target: str, rel_type: str) -> dict:
     }
 
 
+def _generic_payload(relationships: list[dict]) -> dict:
+    entities = {}
+    for rel in relationships:
+        for endpoint in (rel["source"], rel["target"]):
+            entities[endpoint["name"]] = {**endpoint, "type": "Concept"}
+    return {"entities": list(entities.values()), "relationships": relationships}
+
+
 @pytest.mark.asyncio
 async def test_generic_gleaning_is_additive_and_never_drops_first_pass_edges():
-    first_pass = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    first_pass = _generic_payload([_generic_rel("Arjuna", "Krishna", "RELATES_TO")])
     # The gleaning pass omits the first-pass edge entirely and adds a new one.
-    gleaning_pass = {"relationships": [_generic_rel("Krishna", "Dharma", "EXPLAINS")]}
+    gleaning_pass = _generic_payload([_generic_rel("Krishna", "Dharma", "EXPLAINS")])
     llm = _SequencedLLMProvider([first_pass, gleaning_pass])
     extractor = LLMGraphExtractor(llm)
 
@@ -478,10 +498,10 @@ async def test_generic_gleaning_is_additive_and_never_drops_first_pass_edges():
 
 @pytest.mark.asyncio
 async def test_generic_gleaning_corrects_existing_edge_in_place():
-    first_pass = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    first_pass = _generic_payload([_generic_rel("Arjuna", "Krishna", "RELATES_TO")])
     corrected = _generic_rel("Arjuna", "Krishna", "RELATES_TO")
     corrected["description"] = "Corrected: Arjuna is counseled by Krishna."
-    gleaning_pass = {"relationships": [corrected]}
+    gleaning_pass = {"entities": [], "relationships": [corrected]}
     llm = _SequencedLLMProvider([first_pass, gleaning_pass])
     extractor = LLMGraphExtractor(llm)
 
@@ -504,7 +524,7 @@ async def test_generic_gleaning_corrects_existing_edge_in_place():
 
 @pytest.mark.asyncio
 async def test_generic_gleaning_stops_when_no_new_edges_added():
-    same = {"relationships": [_generic_rel("Arjuna", "Krishna", "RELATES_TO")]}
+    same = _generic_payload([_generic_rel("Arjuna", "Krishna", "RELATES_TO")])
     # Three identical responses available; loop should stop after the first
     # gleaning pass adds nothing new.
     llm = _SequencedLLMProvider([same, same, same])

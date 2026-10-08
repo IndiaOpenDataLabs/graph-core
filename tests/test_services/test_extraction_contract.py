@@ -31,7 +31,7 @@ from graph_core.services.graph.ingestion.chunk_processor import (
 )
 from graph_core.services.graph_rag.contracts import (
     CODE_TAXONOMY_V0,
-    GENERIC_ENDPOINTS_V0,
+    GENERIC_EXTRACTION_CONTRACT,
     LEGACY_FINGERPRINT,
     extraction_contract_for,
     extraction_identity_for,
@@ -42,9 +42,6 @@ from graph_core.services.graph_rag.extractor import (
     ExtractionResult,
     LLMGraphExtractor,
 )
-
-OLD_CONTRACT = GENERIC_ENDPOINTS_V0
-NEW_CONTRACT = "generic-independent-entities-v1"
 
 
 @pytest.fixture(autouse=True)
@@ -112,8 +109,8 @@ def _extraction(description: str) -> ExtractionResult:
 def test_contract_is_chosen_by_domain() -> None:
     assert extraction_contract_for("code") == CODE_TAXONOMY_V0
     assert extraction_contract_for(" Code ") == CODE_TAXONOMY_V0
-    assert extraction_contract_for(None) == GENERIC_ENDPOINTS_V0
-    assert extraction_contract_for("general") == GENERIC_ENDPOINTS_V0
+    assert extraction_contract_for(None) == GENERIC_EXTRACTION_CONTRACT
+    assert extraction_contract_for("general") == GENERIC_EXTRACTION_CONTRACT
 
 
 def test_distinct_prompts_under_one_label_are_distinct_identities() -> None:
@@ -164,20 +161,15 @@ async def test_payload_from_another_contract_is_not_served(
     chunk_hash = "a" * 64
     collection_id = uuid.uuid4()
 
-    _patch_identity(monkeypatch, NEW_CONTRACT)
+    _patch_identity(monkeypatch, "unrecognized-contract")
     await _save_raw_extraction(
         chunk_hash=chunk_hash,
         collection_id=collection_id,
-        extraction=_extraction("written under the new contract"),
+        extraction=_extraction("incompatible payload"),
     )
 
-    _patch_identity(monkeypatch, OLD_CONTRACT)
+    _use_real_identity(monkeypatch)
     assert await _get_raw_extraction(chunk_hash, collection_id) is None
-
-    _patch_identity(monkeypatch, NEW_CONTRACT)
-    cached = await _get_raw_extraction(chunk_hash, collection_id)
-    assert cached is not None
-    assert cached.entities[0].description == "written under the new contract"
 
 
 async def test_legacy_fingerprint_never_matches_a_computed_one(
@@ -186,7 +178,7 @@ async def test_legacy_fingerprint_never_matches_a_computed_one(
     chunk_hash = "e" * 64
     collection_id = uuid.uuid4()
 
-    _patch_identity(monkeypatch, OLD_CONTRACT, LEGACY_FINGERPRINT)
+    _patch_identity(monkeypatch, GENERIC_EXTRACTION_CONTRACT, LEGACY_FINGERPRINT)
     await _save_raw_extraction(
         chunk_hash=chunk_hash,
         collection_id=collection_id,
@@ -243,9 +235,7 @@ async def test_reclassified_domain_does_not_read_the_old_prompt(
     )
 
     _register_domain("poetry", relationship_guidance="Emphasise meter and rhyme.")
-    assert (
-        await _get_raw_extraction(chunk_hash, collection_id, domain="poetry") is None
-    )
+    assert await _get_raw_extraction(chunk_hash, collection_id, domain="poetry") is None
 
     _register_domain("poetry", relationship_guidance="Emphasise imagery.")
     cached = await _get_raw_extraction(chunk_hash, collection_id, domain="poetry")
@@ -259,14 +249,14 @@ async def test_identity_mismatch_is_reported(
     chunk_hash = "c" * 64
     collection_id = uuid.uuid4()
 
-    _patch_identity(monkeypatch, OLD_CONTRACT, "cached-fingerprint")
+    _patch_identity(monkeypatch, GENERIC_EXTRACTION_CONTRACT, "cached-fingerprint")
     await _save_raw_extraction(
         chunk_hash=chunk_hash,
         collection_id=collection_id,
         extraction=_extraction("stale payload"),
     )
 
-    _patch_identity(monkeypatch, OLD_CONTRACT, "active-fingerprint")
+    _patch_identity(monkeypatch, GENERIC_EXTRACTION_CONTRACT, "active-fingerprint")
     with caplog.at_level(logging.INFO, logger=chunk_processor.__name__):
         assert await _get_raw_extraction(chunk_hash, collection_id) is None
 
@@ -351,8 +341,8 @@ def test_gleaning_cannot_erase_first_pass_endpoint_descriptions() -> None:
     additions = LLMGraphExtractor._extract_generic_relationships(
         [
             {
-                "source": "Krishna",
-                "target": "Arjuna",
+                "source": {"name": "Krishna", "description": ""},
+                "target": {"name": "Arjuna", "description": ""},
                 "description": "Krishna instructs Arjuna on duty.",
                 "keywords": ["teaching", "duty"],
                 "weight": 1.0,

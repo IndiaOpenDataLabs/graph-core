@@ -389,7 +389,22 @@ async def _ingest_graph_chunk(
                 for entity_row in entity_rows.scalars().all()
             }
 
-        nodes_to_upsert = []
+        # Project the resolved inventory independently of edges. Standalone
+        # concepts (including raw/name-cache hits) must exist in graph storage,
+        # not only in Postgres. Deduplicate resolved aliases with endpoint nodes
+        # below by ID, and preserve the resolver's canonical spelling.
+        nodes_to_upsert = [
+            {
+                "id": str(resolved_entity_ids[entity.name]),
+                "name": canonical_name_by_id.get(
+                    resolved_entity_ids[entity.name], entity.name
+                ),
+                "collection_id": str(collection.id),
+                "document_id": str(document_id) if document_id else None,
+                "document_path": document_path,
+            }
+            for entity in extraction.entities
+        ]
         edges_to_upsert = []
 
         for rel in extraction.relationships:
