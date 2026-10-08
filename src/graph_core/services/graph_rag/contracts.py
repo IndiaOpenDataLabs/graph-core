@@ -11,7 +11,8 @@ Two identities are recorded, because they fail in different ways:
 ``extraction_contract``
     The prompt and structured-schema family shipped by the code. It can be
     inferred for historical rows, because it is a property of the deployed code
-    rather than of the input, and it is bumped by hand (see "Bumping a contract").
+    rather than of the input. There is one supported generic extraction shape;
+    this identifier is cache metadata, not a selector for backup extractors.
 
 ``prompt_fingerprint``
     A fingerprint of the domain configuration actually resolved when the payload
@@ -29,19 +30,10 @@ Keying on resolved inputs rather than labels is deliberate: two domain labels wh
 resolved configuration is identical produce identical prompts, and sharing one
 payload between them is correct rather than a collision.
 
-Bumping a contract
-------------------
-
-When the extraction prompt, the structured schema, or the shape of
-``ExtractionResult`` changes:
-
-1. add a new constant with the next version suffix and make
-   ``extraction_contract_for`` return it;
-2. leave the previous constant in place until those rows are no longer served,
-   so existing rows keep resolving to the contract that produced them;
-3. ship the constant change with no other behavioral coupling: old rows stay
-   readable under their own contract and are only re-extracted when the content
-   is ingested again under the new one.
+There is no registry of previous generic contracts and no fallback to them.
+Unrecognized cached identities are misses. If the generic schema changes again,
+update its single identifier to invalidate incompatible payloads; do not add
+alternate extraction types.
 """
 
 from __future__ import annotations
@@ -55,12 +47,8 @@ from graph_core.models.domain_config import DomainConfig, get_domain_config
 #: Domain whose extractor uses the fixed code taxonomy schema.
 CODE_DOMAIN = "code"
 
-#: Relationships-only response with entities derived from relationship
-#: endpoints. Retained for historical rows and migration backfills.
-GENERIC_ENDPOINTS_V0 = "generic-endpoints-v0"
-
-#: Independent typed entity inventory plus selective directed relationships.
-GENERIC_INDEPENDENT_ENTITIES_V1 = "generic-independent-entities-v1"
+#: The only generic response: typed entities plus selective relationships.
+GENERIC_EXTRACTION_CONTRACT = "generic-entities-relationships"
 
 #: Fixed code taxonomy with endpoints as typed code objects.
 CODE_TAXONOMY_V0 = "code-taxonomy-v0"
@@ -93,7 +81,7 @@ def extraction_contract_for(domain: str | None) -> str:
     """
     if (domain or "").strip().lower() == CODE_DOMAIN:
         return CODE_TAXONOMY_V0
-    return GENERIC_INDEPENDENT_ENTITIES_V1
+    return GENERIC_EXTRACTION_CONTRACT
 
 
 def prompt_inputs(config: DomainConfig) -> dict[str, Any]:

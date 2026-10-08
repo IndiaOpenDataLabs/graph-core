@@ -90,7 +90,7 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
 }
 
 
-# Generic endpoints remain objects for compatibility and repair descriptions.
+# Generic endpoints carry descriptions for inventory validation repairs.
 # Never mutate the shared item: the code taxonomy must remain endpoint-derived.
 _GENERIC_RELATIONSHIP_ITEM_SCHEMA = deepcopy(_RELATIONSHIP_ITEM_SCHEMA)
 
@@ -860,6 +860,12 @@ Only output the structured relationships object.
         for rel in relationships:
             if not isinstance(rel, dict):
                 continue
+            # The generic schema has one endpoint shape: named objects.
+            # Leave the code-domain strict-vocabulary adapter unchanged.
+            if not strict_vocab and not all(
+                isinstance(rel.get(key), dict) for key in ("source", "target")
+            ):
+                continue
             source_endpoint = _parse_relationship_endpoint(rel.get("source"))
             target_endpoint = _parse_relationship_endpoint(rel.get("target"))
             if not (source_endpoint and target_endpoint):
@@ -1127,12 +1133,11 @@ Only output the structured relationships object.
         domain: str | None,
         phase: str,
     ) -> ExtractionResult:
-        """Bind endpoints to inventory names, repairing legacy missing entries.
+        """Bind endpoints to inventory names and repair incomplete inventories.
 
-        Independent descriptions win over endpoint descriptions. For a missing
-        entry, use the richest endpoint description, or the source passage as a
-        grounded excerpt for legacy string endpoints. Never persist an empty
-        description; without even source text, reject the affected edge instead.
+        Independent descriptions win over endpoint descriptions. A missing entry
+        can use the richest endpoint description. Without a usable description,
+        reject the affected edge rather than persist an invisible entity.
         """
         inventory = {
             cls._normalize_entity_name(entity.name).casefold(): entity
@@ -1151,15 +1156,9 @@ Only output the structured relationships object.
                     endpoint_descriptions[key] = (name, description.strip())
 
         repairs = 0
-        excerpt_repairs = 0
         for key, (name, description) in endpoint_descriptions.items():
-            if key in inventory or not name:
+            if key in inventory or not name or not description:
                 continue
-            if not description:
-                description = text.strip()
-                if not description:
-                    continue
-                excerpt_repairs += 1
             inventory[key] = ExtractedEntity(name, "UNKNOWN", description)
             repairs += 1
 
@@ -1177,18 +1176,29 @@ Only output the structured relationships object.
 
         logger.info(
             "generic extraction validation chunk_hash=%s contract=%s phase=%s "
-            "repairs=%d entities=%d relationships=%d "
-            "excerpt_repairs=%d dropped_relationships=%d",
+            "repairs=%d entities=%d relationships=%d dropped_relationships=%d",
             hashlib.md5(text.encode()).hexdigest(),
             extraction_contract_for(domain),
             phase,
             repairs,
             len(inventory),
             len(bound),
-            excerpt_repairs,
             len(relationships) - len(bound),
         )
         return ExtractionResult(entities=list(inventory.values()), relationships=bound)
+
+    @staticmethod
+    def _has_generic_arrays(payload: Any) -> bool:
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("entities"), list)
+            and isinstance(payload.get("relationships"), list)
+        ):
+            return True
+        logger.warning(
+            "Rejecting generic output: entities and relationships arrays are required"
+        )
+        return False
 
     async def extract(
         self,
@@ -1245,6 +1255,8 @@ Only output the structured relationships object.
                 domain=domain,
             )
         else:
+            if not self._has_generic_arrays(result):
+                return ExtractionResult(entities=[], relationships=[])
             relationships_payload = result.get("relationships")
             entities, _ = self._merge_generic_entities(
                 [], self._extract_entities(result.get("entities"))
@@ -1333,6 +1345,8 @@ Only output the structured relationships object.
                     domain=domain,
                 )
             else:
+                if not self._has_generic_arrays(gleamed):
+                    break
                 relationships_payload = gleamed.get("relationships")
                 gleaned_entities, added_entities = self._merge_generic_entities(
                     current_entities,

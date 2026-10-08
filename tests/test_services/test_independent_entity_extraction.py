@@ -13,8 +13,7 @@ from graph_core.services.graph.ingestion.chunk_processor import (
     _save_raw_extraction,
 )
 from graph_core.services.graph_rag.contracts import (
-    GENERIC_ENDPOINTS_V0,
-    GENERIC_INDEPENDENT_ENTITIES_V1,
+    GENERIC_EXTRACTION_CONTRACT,
 )
 from graph_core.services.graph_rag.extractor import (
     _CODE_EXTRACTION_SCHEMA,
@@ -130,7 +129,7 @@ async def test_independent_concepts_survive_one_structured_call(
     assert "Preserve source-to-target direction" in prompt
     assert "Treat relationships as undirected" not in prompt
     assert "repairs=0 entities=4 relationships=1" in caplog.text
-    assert f"contract={GENERIC_INDEPENDENT_ENTITIES_V1}" in caplog.text
+    assert f"contract={GENERIC_EXTRACTION_CONTRACT}" in caplog.text
 
 
 def test_schema_requires_independent_descriptions_without_mutating_code_contract():
@@ -204,20 +203,19 @@ async def test_missing_endpoint_repaired_once_with_richest_description(caplog):
     assert "repairs=1 entities=2 relationships=2" in caplog.text
 
 
-async def test_legacy_string_endpoints_use_grounded_excerpt(caplog):
-    rel = relationship()
-    rel["source"] = "Krishna"
-    rel["target"] = "Arjuna"
-    with caplog.at_level(logging.INFO):
-        result = await LLMGraphExtractor(
-            RecordingLLM([{"relationships": [rel]}])
-        ).extract(TEXT)
-    assert len(result.entities) == 2
-    assert all(
-        e.entity_type == "UNKNOWN" and e.description == TEXT for e in result.entities
-    )
-    assert "repairs=2" in caplog.text
-    assert "excerpt_repairs=2" in caplog.text
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"relationships": [relationship()]},
+        {"entities": []},
+        {"entities": None, "relationships": []},
+    ],
+)
+async def test_generic_output_requires_both_arrays(response, caplog):
+    result = await LLMGraphExtractor(RecordingLLM([response])).extract(TEXT)
+    assert result.entities == []
+    assert result.relationships == []
+    assert "entities and relationships arrays are required" in caplog.text
 
 
 @pytest.mark.parametrize("description", ["", " \n ", None, 42, {}, []])
@@ -244,15 +242,33 @@ async def test_rejected_description_can_be_repaired_from_endpoint():
     assert repaired.description == "Endpoint teacher description."
 
 
-async def test_no_description_or_source_text_drops_edge_instead_of_empty_node(caplog):
+async def test_missing_endpoint_description_drops_edge_without_text_fallback(caplog):
     rel = relationship()
-    rel["target"] = "Arjuna"
+    rel["target"]["description"] = " "
     response = {"entities": [entity("Krishna", "Person")], "relationships": [rel]}
     with caplog.at_level(logging.INFO):
-        result = await LLMGraphExtractor(RecordingLLM([response])).extract(" ")
+        result = await LLMGraphExtractor(RecordingLLM([response])).extract(TEXT)
     assert [e.name for e in result.entities] == ["Krishna"]
     assert result.relationships == []
     assert "dropped_relationships=1" in caplog.text
+
+
+async def test_generic_endpoints_must_use_the_declared_object_shape():
+    response = payload()
+    response["relationships"][0]["source"] = "Krishna"
+    response["relationships"][0]["target"] = "Arjuna"
+    result = await LLMGraphExtractor(RecordingLLM([response])).extract(TEXT)
+    assert len(result.entities) == 4
+    assert result.relationships == []
+
+
+async def test_invalid_gleaning_response_does_not_replace_the_inventory(caplog):
+    llm = RecordingLLM([payload(), {"relationships": [relationship()]}])
+    result = await LLMGraphExtractor(llm).extract_with_gleaning(TEXT, max_gleaning=2)
+    assert len(llm.prompts) == 2
+    assert len(result.entities) == 4
+    assert len(result.relationships) == 1
+    assert "entities and relationships arrays are required" in caplog.text
 
 
 async def test_entity_only_first_pass_and_gleaning_preserve_independent_inventory(
@@ -322,11 +338,7 @@ async def test_gleaning_corrects_existing_type_and_shortens_description():
     assert result.entities[0].description == "Obligation."
 
 
-async def test_independent_inventory_round_trips_and_old_contract_misses(
-    test_graph_rag_collection, monkeypatch
-):
-    from graph_core.services.graph.ingestion import chunk_processor
-
+async def test_independent_inventory_round_trips(test_graph_rag_collection):
     collection_id = test_graph_rag_collection.id
     chunk_hash = "a" * 64
     llm = RecordingLLM([payload()])
@@ -334,10 +346,3 @@ async def test_independent_inventory_round_trips_and_old_contract_misses(
     await _save_raw_extraction(chunk_hash, collection_id, fresh)
     assert await _get_raw_extraction(chunk_hash, collection_id) == fresh
     assert len(llm.prompts) == 1
-    identity = chunk_processor.extraction_identity_for(None)
-    monkeypatch.setattr(
-        chunk_processor,
-        "extraction_identity_for",
-        lambda _: (GENERIC_ENDPOINTS_V0, identity[1]),
-    )
-    assert await _get_raw_extraction(chunk_hash, collection_id) is None

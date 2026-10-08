@@ -339,12 +339,12 @@ class RawChunkExtraction(Base):
     extraction_model = Column(String(128), nullable=True)
     # Prompt/schema family that produced this payload. Values live in
     # services/graph_rag/contracts.py; the literal server defaults are duplicated
-    # on purpose so this model never imports from services and stays in step with
-    # the migration's backfill.
+    # on purpose so this model never imports from services and uses the same
+    # generic default as the migration.
     extraction_contract = Column(
         String(64),
         nullable=False,
-        server_default="generic-endpoints-v0",
+        server_default="generic-entities-relationships",
     )
     # Fingerprint of the domain configuration the run resolved: the relationship
     # vocabulary and guidance strings that reach the prompt. With the contract this
