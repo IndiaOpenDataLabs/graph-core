@@ -7,21 +7,21 @@ from sqlalchemy import select
 
 from graph_core.llm.interface import LLMProvider
 from graph_core.models.collection import Collection
+from graph_core.models.domain_config import CODE_REL_TYPE_TAXONOMY, get_domain_config
 from graph_core.models.graph_rag import (
     GraphEntity,
     GraphRelationship,
     GraphRelationshipType,
     RelationshipTypeAlias,
 )
-from graph_core.models.domain_config import CODE_REL_TYPE_TAXONOMY, get_domain_config
 from graph_core.models.rel_types import DEFAULT_REL_TYPE
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.analytics import (
-    analyze_collection_graph,
-    build_collection_understanding,
     NodeRecord,
     RelationshipRecord,
     _build_role_similarity_groups,
+    analyze_collection_graph,
+    build_collection_understanding,
 )
 from graph_core.services.graph.query import graph_rag
 from graph_core.services.graph.query.graph_rag import (
@@ -118,7 +118,7 @@ async def test_resolve_entity_reuses_case_insensitive_canonical_match(
         _FakeEmbeddingProvider(),
         test_graph_rag_collection.id,
     )
-    resolver._add_description_and_update_centroid = AsyncMock()
+    resolver._ingestion_batch.flush = AsyncMock()
     resolver._add_or_increment_type = AsyncMock()
 
     result = await resolver.resolve_entity(
@@ -191,7 +191,7 @@ async def test_code_domain_resolver_keeps_distinct_symbol_names_separate(
         test_graph_rag_collection.id,
         domain="code",
     )
-    resolver._add_description_and_update_centroid = AsyncMock()
+    resolver._ingestion_batch.flush = AsyncMock()
     resolver._add_or_increment_type = AsyncMock()
     resolver._vstore.search_entity_centroids = AsyncMock(
         return_value=[
@@ -981,9 +981,10 @@ async def test_resolve_relationship_preserves_opposite_directions(
     )
     resolver._vstore.upsert_relationship_embedding = AsyncMock()
     from graph_core.decisions import Decision
-    resolver._decisions = SimpleNamespace(support=AsyncMock(return_value=Decision(
-        "supported", {"supported": 0.9, "contradicted": 0.05, "uncertain": 0.05}
-    )))
+    async def support_many(items):
+        return {item["id"]: Decision("supported", {"supported": 0.9, "contradicted": 0.05, "uncertain": 0.05})
+                for item in items}
+    resolver._decisions = SimpleNamespace(support_many=AsyncMock(side_effect=support_many))
 
     forward = await resolver.resolve_relationship(
         db_session,
@@ -991,7 +992,6 @@ async def test_resolve_relationship_preserves_opposite_directions(
         target_entity_id=target.id,
         description="Source calls target.",
         keywords=["call"],
-        weight=1.0,
         source_chunk_hash="forward-chunk",
         rel_type="CALLS",
     )
@@ -1001,7 +1001,6 @@ async def test_resolve_relationship_preserves_opposite_directions(
         target_entity_id=source.id,
         description="Target calls source.",
         keywords=["callback"],
-        weight=1.0,
         source_chunk_hash="reverse-chunk",
         rel_type="CALLS",
     )

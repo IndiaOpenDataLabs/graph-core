@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from graph_core.decisions.batching import (
+    decide_batches,
+    identity_record,
+    support_record,
+)
 from graph_core.decisions.systemone import Decision, SystemOneDecisionProvider
 
 IDENTITY_MIN_PROBABILITY = 0.95
@@ -13,6 +18,19 @@ BATCH_SIZE = 8
 class GraphDecisions:
     def __init__(self, provider: SystemOneDecisionProvider | None = None):
         self.provider = provider or SystemOneDecisionProvider()
+
+    async def identity_many(
+        self, pairs: list[dict[str, Any]], source: str
+    ) -> dict[str, Decision]:
+        return await decide_batches(
+            self.provider,
+            pairs,
+            lambda batch: identity_record(batch, source),
+            "identity",
+        )
+
+    async def support_many(self, claims: list[dict[str, Any]]) -> dict[str, Decision]:
+        return await decide_batches(self.provider, claims, support_record, "support")
 
     async def identity(
         self, incoming: dict[str, Any], candidate: dict[str, Any], source: str

@@ -38,6 +38,7 @@ from graph_core.services.graph_rag.entity_resolver import (
     IncrementalEntityResolver,
 )
 from graph_core.services.graph_rag.extractor import (
+    ExtractedEntity,
     ExtractionResult,
     LLMGraphExtractor,
 )
@@ -142,9 +143,7 @@ async def resolve_llm_provider_from_collection(
 
 def deterministic_uuid(collection_id: uuid.UUID, name: str) -> uuid.UUID:
     """Generate a deterministic UUID scoped to a collection."""
-    return uuid.UUID(
-        hashlib.md5(f"{collection_id}:{name}".encode()).hexdigest()
-    )
+    return uuid.UUID(hashlib.md5(f"{collection_id}:{name}".encode()).hexdigest())
 
 
 def _enforce_namespace(collection: Collection, namespace_id: uuid.UUID) -> None:
@@ -329,7 +328,9 @@ async def _ingest_graph_chunk(
 
     if not extraction.entities and not extraction.relationships:
         return ChunkIngestionResult(
-            chunk_hash=chunk_hash, entity_count=0, relationship_count=0,
+            chunk_hash=chunk_hash,
+            entity_count=0,
+            relationship_count=0,
         )
 
     resolver = IncrementalEntityResolver(
@@ -346,18 +347,27 @@ async def _ingest_graph_chunk(
     pending_cache: list[tuple[list[str], uuid.UUID]] = []
 
     async with AsyncSessionLocal() as session:
-        for entity in extraction.entities:
-            # Cross-chunk caches must not bypass identity or source-support
-            # decisions, particularly for aliases created by older resolvers.
-            result = await resolver.resolve_entity(
-                session=session,
-                name=entity.name,
-                entity_type=entity.entity_type,
-                description=entity.description,
-                source_chunk_hash=chunk_hash,
-                document_id=document_id,
-                document_path=document_path,
-            )
+        # Include repair endpoints before planning, rather than issuing singleton
+        # decisions while walking relationships later.
+        inventory = list(extraction.entities)
+        inventory_names = {entity.name for entity in inventory}
+        for rel in extraction.relationships:
+            for name, description in [
+                (rel.source_name, rel.source_description),
+                (rel.target_name, rel.target_description),
+            ]:
+                if name not in inventory_names:
+                    inventory.append(ExtractedEntity(name, "UNKNOWN", description))
+                    inventory_names.add(name)
+        entity_results = await resolver.resolve_entities(
+            session,
+            inventory,
+            chunk_hash,
+            document_id,
+            document_path,
+            defer_support=True,
+        )
+        for entity, result in zip(inventory, entity_results):
             resolved_entity_ids[entity.name] = result.entity_id
 
             if result.is_new:
@@ -404,69 +414,33 @@ async def _ingest_graph_chunk(
             for entity in extraction.entities
         ]
         edges_to_upsert = []
+        relationship_results = await resolver.resolve_relationships(
+            session,
+            [
+                {
+                    "source_entity_id": resolved_entity_ids[rel.source_name],
+                    "target_entity_id": resolved_entity_ids[rel.target_name],
+                    "description": rel.description,
+                    "keywords": rel.keywords,
+                    "original_source_name": rel.source_name,
+                    "original_target_name": rel.target_name,
+                    "rel_type": rel.rel_type,
+                }
+                for rel in extraction.relationships
+            ],
+            chunk_hash,
+            document_id,
+            document_path,
+            defer_support=True,
+        )
+        # One bounded support stage covers entities, passages, descriptions, and
+        # relationship aggregates. No inference occurs inside persistence locks.
+        await resolver.flush_support(session)
 
-        for rel in extraction.relationships:
-            # Only already-verified exact spellings can reuse a chunk-local ID.
-            source_id = resolved_entity_ids.get(rel.source_name)
-            target_id = resolved_entity_ids.get(rel.target_name)
+        for rel, rel_result in zip(extraction.relationships, relationship_results):
+            source_id = resolved_entity_ids[rel.source_name]
+            target_id = resolved_entity_ids[rel.target_name]
 
-            for is_source, name, endpoint_description in [
-                (True, rel.source_name, rel.source_description),
-                (False, rel.target_name, rel.target_description),
-            ]:
-                if (source_id if is_source else target_id) is None:
-                    # Repair path: a relationship endpoint that is not in the
-                    # extracted entity inventory. Carry the endpoint's own
-                    # description through, because an entity resolved with an
-                    # empty description gets no EntityDescription row and no
-                    # embedding, and is therefore neither a retrieval seed nor
-                    # renderable in an answer context.
-                    logger.warning(
-                        "relationship endpoint missing from entity inventory, "
-                        "creating entity chunk_hash=%s collection_id=%s "
-                        "endpoint=%r has_description=%s",
-                        chunk_hash,
-                        collection.id,
-                        name,
-                        bool(endpoint_description),
-                    )
-                    synthetic = await resolver.resolve_entity(
-                        session=session,
-                        name=name,
-                        entity_type="",
-                        description=endpoint_description,
-                        source_chunk_hash=chunk_hash,
-                        document_id=document_id,
-                        document_path=document_path,
-                    )
-                    await session.commit()
-                    await name_cache.set_many(
-                        [name, name.strip().title(), synthetic.canonical_name],
-                        synthetic.entity_id,
-                    )
-                    resolved_entity_ids[name] = synthetic.entity_id
-                    canonical_name_by_id[synthetic.entity_id] = synthetic.canonical_name
-                    if is_source:
-                        source_id = synthetic.entity_id
-                    else:
-                        target_id = synthetic.entity_id
-
-            if not source_id or not target_id:
-                continue
-
-            rel_result = await resolver.resolve_relationship(
-                session=session,
-                source_entity_id=source_id,
-                target_entity_id=target_id,
-                description=rel.description,
-                keywords=rel.keywords,
-                original_source_name=rel.source_name,
-                original_target_name=rel.target_name,
-                source_chunk_hash=chunk_hash,
-                rel_type=rel.rel_type,
-                document_id=document_id,
-                document_path=document_path,
-            )
             persisted_rel = await session.get(
                 GraphRelationship,
                 rel_result.relationship_id,
@@ -479,37 +453,45 @@ async def _ingest_graph_chunk(
             target_name = canonical_name_by_id.get(
                 target_id, rel.target_name.strip().title()
             )
-            nodes_to_upsert.append({
-                "id": str(source_id),
-                "name": source_name,
-                "collection_id": str(collection.id),
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-            })
-            nodes_to_upsert.append({
-                "id": str(target_id),
-                "name": target_name,
-                "collection_id": str(collection.id),
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-            })
-            edges_to_upsert.append({
-                "source_id": str(source_id),
-                "target_id": str(target_id),
-                "id": str(rel_result.relationship_id),
-                "weight": int(persisted_rel.weight if persisted_rel else 0),
-                "confidence": persisted_rel.confidence if persisted_rel else None,
-                "support_count": persisted_rel.support_count if persisted_rel else None,
-                "keywords": (
-                    persisted_rel.keywords if persisted_rel else rel.keywords
-                ),
-                "rel_type": (
-                    persisted_rel.rel_type if persisted_rel else rel.rel_type
-                ),
-                "collection_id": str(collection.id),
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-            })
+            nodes_to_upsert.append(
+                {
+                    "id": str(source_id),
+                    "name": source_name,
+                    "collection_id": str(collection.id),
+                    "document_id": str(document_id) if document_id else None,
+                    "document_path": document_path,
+                }
+            )
+            nodes_to_upsert.append(
+                {
+                    "id": str(target_id),
+                    "name": target_name,
+                    "collection_id": str(collection.id),
+                    "document_id": str(document_id) if document_id else None,
+                    "document_path": document_path,
+                }
+            )
+            edges_to_upsert.append(
+                {
+                    "source_id": str(source_id),
+                    "target_id": str(target_id),
+                    "id": str(rel_result.relationship_id),
+                    "weight": int(persisted_rel.weight if persisted_rel else 0),
+                    "confidence": persisted_rel.confidence if persisted_rel else None,
+                    "support_count": persisted_rel.support_count
+                    if persisted_rel
+                    else None,
+                    "keywords": (
+                        persisted_rel.keywords if persisted_rel else rel.keywords
+                    ),
+                    "rel_type": (
+                        persisted_rel.rel_type if persisted_rel else rel.rel_type
+                    ),
+                    "collection_id": str(collection.id),
+                    "document_id": str(document_id) if document_id else None,
+                    "document_path": document_path,
+                }
+            )
 
     unique_nodes = {n["id"]: n for n in nodes_to_upsert}.values()
 
@@ -580,7 +562,9 @@ async def _ingest_lightrag_chunk(
 
     if not extraction.entities and not extraction.relationships:
         return ChunkIngestionResult(
-            chunk_hash=chunk_hash, entity_count=0, relationship_count=0,
+            chunk_hash=chunk_hash,
+            entity_count=0,
+            relationship_count=0,
         )
 
     collection_id_str = str(collection.id)
@@ -606,9 +590,7 @@ async def _ingest_lightrag_chunk(
                 },
             )
         else:
-            existing = await graph_storage.get_lightrag_node(
-                name, collection_id_str
-            )
+            existing = await graph_storage.get_lightrag_node(name, collection_id_str)
             if existing:
                 source_ids = existing.get("source_ids") or []
                 if chunk_hash not in source_ids:
@@ -647,12 +629,8 @@ async def _ingest_lightrag_chunk(
             )
             await session.commit()
 
-        desc_embedding = await embedding_provider.embed_query(
-            entity.description
-        )
-        desc_id = deterministic_uuid(
-            collection.id, f"desc:{name}:{chunk_hash}"
-        )
+        desc_embedding = await embedding_provider.embed_query(entity.description)
+        desc_id = deterministic_uuid(collection.id, f"desc:{name}:{chunk_hash}")
         await _graph_rag_vectors.upsert_entity_embedding(
             entity_id=entity_uuid,
             collection_id=collection.id,
@@ -665,28 +643,46 @@ async def _ingest_lightrag_chunk(
         )
 
     resolver = IncrementalEntityResolver(
-        embedding_provider, collection.id, domain=domain, source_text=text,
+        embedding_provider,
+        collection.id,
+        domain=domain,
+        source_text=text,
     )
-    for rel in extraction.relationships:
-        source_name = rel.source_name
-        target_name = rel.target_name
-
-        if (
-            source_name not in entity_ids_resolved
-            or target_name not in entity_ids_resolved
-        ):
-            continue
-
-        source_entity_uuid = deterministic_uuid(collection.id, source_name)
-        target_entity_uuid = deterministic_uuid(collection.id, target_name)
+    relationships = [
+        rel
+        for rel in extraction.relationships
+        if rel.source_name in entity_ids_resolved
+        and rel.target_name in entity_ids_resolved
+    ]
+    async with AsyncSessionLocal() as session:
+        resolutions = await resolver.resolve_relationships(
+            session,
+            [
+                {
+                    "source_entity_id": deterministic_uuid(
+                        collection.id, rel.source_name
+                    ),
+                    "target_entity_id": deterministic_uuid(
+                        collection.id, rel.target_name
+                    ),
+                    "description": rel.description,
+                    "keywords": rel.keywords,
+                    "rel_type": rel.rel_type,
+                    "original_source_name": rel.source_name,
+                    "original_target_name": rel.target_name,
+                }
+                for rel in relationships
+            ],
+            chunk_hash,
+            document_id,
+            document_path,
+        )
+    for rel, resolution in zip(relationships, resolutions):
+        source_name, target_name = rel.source_name, rel.target_name
         async with AsyncSessionLocal() as session:
-            resolution = await resolver.resolve_relationship(
-                session, source_entity_uuid, target_entity_uuid,
-                rel.description, rel.keywords, chunk_hash, rel_type=rel.rel_type,
-                document_id=document_id, document_path=document_path,
-                original_source_name=rel.source_name, original_target_name=rel.target_name,
+            persisted_rel = await session.get(
+                GraphRelationship, resolution.relationship_id
             )
-            persisted_rel = await session.get(GraphRelationship, resolution.relationship_id)
             rel_id_str = str(resolution.relationship_id)
             confidence = persisted_rel.confidence
             support_count = persisted_rel.support_count
@@ -733,7 +729,9 @@ async def _save_raw_extraction(
             chunk_content_hash=chunk_hash,
             collection_id=collection_id,
             document_id=document_id,
-            document_path=normalize_document_path(document_path) if document_path else None,
+            document_path=normalize_document_path(document_path)
+            if document_path
+            else None,
             entities_json=[
                 {
                     "name": e.name,
@@ -880,7 +878,9 @@ async def _write_ledger(
             collection_id=collection.id,
             chunk_hash=chunk_hash,
             document_id=document_id,
-            document_path=normalize_document_path(document_path) if document_path else None,
+            document_path=normalize_document_path(document_path)
+            if document_path
+            else None,
             strategy=collection.strategy,
             entity_count=result.entity_count,
             relationship_count=result.relationship_count,

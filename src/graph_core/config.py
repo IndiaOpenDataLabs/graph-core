@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     llm_max_concurrent_calls: int = 1
     embedding_max_concurrent_calls: int = 10
     decision_model_max_concurrent_calls: int = Field(default=1, ge=1)
+    # Leave head/template overhead below an 8K SystemOne context. This is an
+    # estimate using cl100k_base, not the decision model's own tokenizer.
+    decision_model_batch_token_budget: int = Field(default=6000, ge=256)
+    decision_model_batch_max_questions: int = Field(default=64, ge=1)
     provider_semaphore_lease_seconds: int = 1800
     provider_semaphore_poll_interval_ms: int = 100
     provider_semaphore_acquire_timeout_seconds: float = 600

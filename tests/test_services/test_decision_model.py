@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -10,7 +11,6 @@ import pytest
 from sqlalchemy import select
 
 from graph_core.decisions import (
-    Decision,
     DecisionError,
     GraphDecisions,
     SystemOneDecisionProvider,
@@ -28,6 +28,15 @@ from graph_core.services.graph.query.decision_context import build_context
 from graph_core.services.graph.query.graph_rag import GraphQueryState
 from graph_core.services.graph_rag.entity_resolver import IncrementalEntityResolver
 from graph_core.services.graph_rag.extractor import ExtractedEntity, LLMGraphExtractor
+
+
+@pytest.fixture(autouse=True)
+def offline_decision_slots(monkeypatch):
+    @asynccontextmanager
+    async def slot():
+        yield
+
+    monkeypatch.setattr("graph_core.decisions.systemone.decision_model_call_slot", slot)
 
 
 def native_provider(choose, calls, probability=0.9):
@@ -143,7 +152,7 @@ async def test_high_embedding_similarity_cannot_merge_varuna_into_indra(
     calls = []
     scorer = GraphDecisions(native_provider(lambda *_: "different", calls))
     resolver = IncrementalEntityResolver(
-        SimpleNamespace(dimensions=256),
+        SimpleNamespace(dimensions=256, embed_query=AsyncMock(return_value=[0.1])),
         test_graph_rag_collection.id,
         decisions=scorer,
         source_text="Varuna and Indra are distinct deities.",
@@ -156,20 +165,16 @@ async def test_high_embedding_similarity_cannot_merge_varuna_into_indra(
             )
         ]
     )
-    match = await resolver._find_similar_entity(
-        db_session,
-        [0.1],
-        "Varuna",
-        "deity",
-        description="Varuna governs order.",
-        source_chunk_hash="chunk",
+    match = await resolver.resolve_entity(
+        db_session, "Varuna", "deity", "", source_chunk_hash="chunk",
     )
-    assert match is None
+    assert match.entity_id != candidate.id
     await db_session.commit()
     audit = (await db_session.execute(select(EntityResolutionDecision))).scalars().one()
     assert audit.incoming_name == "Varuna"
     assert audit.decision["accepted"] is False
-    assert not (await db_session.execute(select(EntityAlias))).scalars().all()
+    aliases = (await db_session.execute(select(EntityAlias))).scalars().all()
+    assert all(alias.entity_id != candidate.id for alias in aliases)
 
 
 @pytest.mark.asyncio
@@ -184,20 +189,16 @@ async def test_only_high_probability_identity_decision_allows_alias(
     )
     db_session.add(candidate)
     await db_session.commit()
-    scorer = SimpleNamespace(
-        identity=AsyncMock(
-            return_value=Decision(
-                "same", {"same": 0.99, "different": 0.005, "uncertain": 0.005}
-            )
-        )
-    )
+    scorer = GraphDecisions(native_provider(lambda *_: "same", [], probability=0.99))
     resolver = IncrementalEntityResolver(
-        SimpleNamespace(), test_graph_rag_collection.id, decisions=scorer
+        SimpleNamespace(dimensions=256, embed_query=AsyncMock(return_value=[0.1])),
+        test_graph_rag_collection.id, decisions=scorer,
     )
-    assert await resolver._same_entity(
-        db_session, "Varuna", "deity", "order", candidate, "chunk"
-    )
-    await resolver._add_alias(db_session, candidate.id, "Varuna", "chunk")
+    resolver._vstore.search_entity_centroids = AsyncMock(return_value=[
+        SimpleNamespace(distance=0.001, metadata={"entity_id": str(candidate.id)})
+    ])
+    result = await resolver.resolve_entity(db_session, "Varuna", "deity", "", "chunk")
+    assert result.entity_id == candidate.id
     await db_session.commit()
     alias = (await db_session.execute(select(EntityAlias))).scalars().one()
     assert alias.entity_id == candidate.id
@@ -245,7 +246,6 @@ async def test_confidence_and_support_count_never_share_units(
         target_entity_id=target.id,
         description="Agni symbolizes fire.",
         keywords=["fire"],
-        weight=0.01,
         rel_type="SYMBOLIZES",
         original_source_name="Agni",
         original_target_name="Fire",
@@ -302,9 +302,9 @@ async def test_query_filters_noise_even_with_high_legacy_weight(
     await db_session.flush()
     db_session.add_all(
         [
-            EntityDescription(entity_id=agni.id, description="Agni is sacred fire."),
-            EntityDescription(entity_id=sun.id, description="Sun manifests as itself."),
-            EntityDescription(entity_id=agni.id, description="Sarasvati is a river."),
+            EntityDescription(entity_id=agni.id, description="Agni is sacred fire.", score_metadata={"choice": "supported"}),
+            EntityDescription(entity_id=sun.id, description="Sun manifests as itself.", score_metadata={"choice": "supported"}),
+            EntityDescription(entity_id=agni.id, description="Sarasvati is a river.", score_metadata={"choice": "supported"}),
             RelationshipDescription(
                 relationship_id=noise.id, description="Sun manifests as itself."
             ),
@@ -371,7 +371,7 @@ async def test_corrupt_exact_alias_is_not_identity_authority(db_session, test_gr
     await db_session.commit()
     calls = []
     scorer = GraphDecisions(native_provider(
-        lambda body, *_: "same" if body["state"]["candidate"]["name"] == "Varuṇa" else "different",
+        lambda body, key, _: "same" if body["state"]["candidate_entities"][next(pair for pair in body["state"]["pairs"] if pair["id"] == key)["candidate_id"]]["name"] == "Varuṇa" else "different",
         calls, probability=0.99,
     ))
     resolver = IncrementalEntityResolver(SimpleNamespace(dimensions=256, embed_query=AsyncMock(return_value=[0.1])),
@@ -380,7 +380,7 @@ async def test_corrupt_exact_alias_is_not_identity_authority(db_session, test_gr
     resolver._vstore.search_entity_centroids = AsyncMock(return_value=[SimpleNamespace(
         distance=0.001, metadata={"entity_id": str(varuna.id)}
     )])
-    resolver._add_description_and_update_centroid = AsyncMock()
+    resolver._ingestion_batch.flush = AsyncMock()
     resolver._add_or_increment_type = AsyncMock()
     result = await resolver.resolve_entity(db_session, "Varuna", "deity", "Varuna governs order.", "new")
     assert result.entity_id == varuna.id
@@ -399,16 +399,17 @@ async def test_collective_confidence_does_not_count_contradictory_passage_as_sup
     db_session.add_all([source, target, kind]); await db_session.commit()
     calls = []
     def choose(body, *_):
-        passages = body["state"]["source_evidence"]
+        claim = next(item for item in body["state"]["claims"] if item["id"] == _[0])
+        passages = claim["source_evidence"]
         assert all("support_confidence" not in p and "support_assessment" not in p for p in passages)
-        return "contradicted" if all(p["source_passage"] == "Not a fire symbol." for p in passages) else "supported"
+        return "contradicted" if all(body["state"]["source_passages"][p["source_passage_id"]] == "Not a fire symbol." for p in passages) else "supported"
     resolver = IncrementalEntityResolver(SimpleNamespace(embed_query=AsyncMock(return_value=[0.1])),
                                         test_graph_rag_collection.id,
                                         decisions=GraphDecisions(native_provider(choose, calls)),
                                         source_text="Not a fire symbol.")
     resolver._resolve_rel_type = AsyncMock(return_value=SimpleNamespace(relationship_type_id=kind.id, canonical_type=kind.canonical_type))
     resolver._vstore.upsert_relationship_embedding = AsyncMock()
-    args = dict(source_entity_id=source.id, target_entity_id=target.id, description="Agni symbolizes fire.", keywords=[], weight=10, rel_type="SYMBOLIZES")
+    args = dict(source_entity_id=source.id, target_entity_id=target.id, description="Agni symbolizes fire.", keywords=[], rel_type="SYMBOLIZES")
     result = await resolver.resolve_relationship(db_session, source_chunk_hash="contradiction", **args)
     resolver._source_text = "Agni symbolizes fire."
     await resolver.resolve_relationship(db_session, source_chunk_hash="support", **args)

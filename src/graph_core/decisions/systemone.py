@@ -15,7 +15,7 @@ SYSTEMONE_ENDPOINT = (
     normalize_provider_base_url("http://localhost:8081/v1/systemone")
     or "http://localhost:8081/v1/systemone"
 )
-SCHEMA_VERSION = "graph-decisions-v1"
+SCHEMA_VERSION = "graph-decisions-v2"
 
 
 class DecisionError(RuntimeError):

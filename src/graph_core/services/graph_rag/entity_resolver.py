@@ -5,38 +5,37 @@ Text generation lives in the extractor. Similarity is never proof of identity.
 
 from __future__ import annotations
 
-import asyncio
 import difflib
 import hashlib
 import logging
-import random
 import re
 import unicodedata
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from graph_core.services.graph_rag.ingestion_batch import (
+        EntityInput,
+        RelationshipInput,
+    )
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from graph_core.database import AsyncSessionLocal
 from graph_core.decisions import GraphDecisions
-from graph_core.decisions.graph import IDENTITY_MIN_PROBABILITY
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.models.domain_config import get_domain_config
 from graph_core.models.graph_rag import (
     EntityAlias,
-    EntityDescription,
-    EntityResolutionDecision,
     EntityType,
-    GraphEntity,
     GraphRelationship,
     GraphRelationshipType,
-    RelationshipDescription,
     RelationshipTypeAlias,
 )
-from graph_core.models.rel_types import normalize_rel_type, relationship_embedding_text
+from graph_core.models.rel_types import normalize_rel_type
 from graph_core.storage.graph_names import (
     collection_graph_name,
     legacy_collection_graph_name,
@@ -105,6 +104,46 @@ class IncrementalEntityResolver:
             graph_name,
             namespace_id=namespace_id,
         )
+        from graph_core.services.graph_rag.ingestion_batch import IngestionDecisionBatch
+
+        self._ingestion_batch = IngestionDecisionBatch(self)
+
+    async def resolve_entities(
+        self,
+        session: AsyncSession,
+        entities: Sequence[EntityInput],
+        source_chunk_hash: str,
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
+        *,
+        defer_support: bool = False,
+    ) -> list[EntityResolutionResult]:
+        results = await self._ingestion_batch.resolve_entities(
+            session, entities, source_chunk_hash, document_id, document_path
+        )
+        if not defer_support:
+            await self.flush_support(session)
+        return results
+
+    async def resolve_relationships(
+        self,
+        session: AsyncSession,
+        relationships: Sequence[RelationshipInput],
+        source_chunk_hash: str,
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
+        *,
+        defer_support: bool = False,
+    ) -> list[RelationshipResolutionResult]:
+        results = await self._ingestion_batch.resolve_relationships(
+            session, relationships, source_chunk_hash, document_id, document_path
+        )
+        if not defer_support:
+            await self.flush_support(session)
+        return results
+
+    async def flush_support(self, session: AsyncSession) -> None:
+        await self._ingestion_batch.flush(session)
 
     async def _resolve_rel_type(
         self,
@@ -245,388 +284,21 @@ class IncrementalEntityResolver:
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
     ) -> EntityResolutionResult:
-        """Commit one entity at a time; never carry its locks to the next entity.
+        """Single-item compatibility API; chunk ingestion uses resolve_entities."""
+        from types import SimpleNamespace
 
-        Flush caller-owned work first (e.g. extra concept aliases), then use an
-        independent session on the same engine for each attempt. A deadlock
-        rollback cannot discard that work or expire the caller's ORM objects.
-        """
-        await session.commit()
-        original_traces = dict(self._identity_traces)
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                async with AsyncSessionLocal(bind=session.bind) as entity_session:
-                    try:
-                        result = await self._resolve_entity_once(
-                            entity_session,
-                            name,
-                            entity_type,
-                            description,
-                            source_chunk_hash,
-                            document_id,
-                            document_path,
-                        )
-                        await entity_session.commit()
-                    except Exception:
-                        await entity_session.rollback()
-                        raise
-                return result
-            except DBAPIError as exc:
-                self._identity_traces = dict(original_traces)
-                sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(
-                    exc.orig, "pgcode", None
+        results = await self.resolve_entities(
+            session,
+            [
+                SimpleNamespace(
+                    name=name, entity_type=entity_type, description=description
                 )
-                if sqlstate != "40P01" or attempt + 1 == max_attempts:
-                    raise
-                logger.warning(
-                    "Entity resolution deadlock; retrying collection=%s name=%r attempt=%d/%d",
-                    self._collection_id,
-                    name,
-                    attempt + 1,
-                    max_attempts,
-                )
-                await asyncio.sleep(random.uniform(0.1, 0.2) * (2**attempt))
-        raise RuntimeError("Entity resolution retry attempts exhausted")
-
-    async def _resolve_entity_once(
-        self,
-        session: AsyncSession,
-        name: str,
-        entity_type: str,
-        description: str,
-        source_chunk_hash: str,
-        document_id: uuid.UUID | None = None,
-        document_path: str | None = None,
-    ) -> EntityResolutionResult:
-        normalized_name = self._normalize_entity_name(name)
-        exact_resolution = (
-            entity_type == "base_entity_ref"
-            or self._requires_exact_name_resolution(
-                normalized_name,
-                entity_type,
-            )
+            ],
+            source_chunk_hash,
+            document_id,
+            document_path,
         )
-
-        if exact_resolution:
-            existing_result = await session.execute(
-                select(GraphEntity).where(
-                    GraphEntity.canonical_name == normalized_name,
-                    GraphEntity.collection_id == self._collection_id,
-                )
-            )
-            existing = existing_result.scalar_one_or_none()
-            if existing:
-                logger.debug("Exact canonical match: %s", normalized_name)
-                search_text = f"{normalized_name}: {description}"
-                context_embedding = await self._embedding.embed_query(search_text)
-                await self._add_description_and_update_centroid(
-                    session,
-                    existing.id,
-                    existing,
-                    description,
-                    source_chunk_hash,
-                    context_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(session, existing.id, entity_type)
-                return EntityResolutionResult(
-                    is_new=False,
-                    entity_id=existing.id,
-                    canonical_name=existing.canonical_name,
-                )
-
-            new_id = uuid.uuid4()
-            stmt = (
-                pg_insert(GraphEntity)
-                .values(
-                    id=new_id,
-                    canonical_name=normalized_name,
-                    primary_type=entity_type,
-                    description_count=0,
-                    collection_id=self._collection_id,
-                )
-                .on_conflict_do_nothing(
-                    constraint="uq_graph_entities_canonical_name_collection_id"
-                )
-                .returning(GraphEntity.id)
-            )
-            result = await session.execute(stmt)
-            row = result.fetchone()
-            if row:
-                entity_id = row[0]
-                entity = await session.get(GraphEntity, entity_id)
-                search_text = f"{normalized_name}: {description}"
-                context_embedding = await self._embedding.embed_query(search_text)
-                await self._add_alias(
-                    session,
-                    entity_id,
-                    normalized_name,
-                    source_chunk_hash,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_description_and_update_centroid(
-                    session,
-                    entity_id,
-                    entity,
-                    description,
-                    source_chunk_hash,
-                    context_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(session, entity_id, entity_type)
-                return EntityResolutionResult(
-                    is_new=True, entity_id=entity_id, canonical_name=normalized_name
-                )
-
-            existing_result = await session.execute(
-                select(GraphEntity).where(
-                    GraphEntity.canonical_name == normalized_name,
-                    GraphEntity.collection_id == self._collection_id,
-                )
-            )
-            existing = existing_result.scalar_one_or_none()
-            if existing:
-                search_text = f"{normalized_name}: {description}"
-                context_embedding = await self._embedding.embed_query(search_text)
-                await self._add_description_and_update_centroid(
-                    session,
-                    existing.id,
-                    existing,
-                    description,
-                    source_chunk_hash,
-                    context_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(session, existing.id, entity_type)
-                return EntityResolutionResult(
-                    is_new=False,
-                    entity_id=existing.id,
-                    canonical_name=existing.canonical_name,
-                )
-
-            # ON CONFLICT fired but entity is now gone — collection likely
-            # deleted mid-ingestion.  Abort gracefully.
-            logger.warning(
-                "Exact resolution race: entity %r vanished from collection %s "
-                "(collection likely deleted mid-ingestion)",
-                normalized_name,
-                self._collection_id,
-            )
-            raise RuntimeError(
-                f"Entity {normalized_name!r} could not be resolved: "
-                f"collection {self._collection_id} may have been deleted"
-            )
-
-        # Step 1: Exact alias lookup
-        alias_result = await session.execute(
-            select(EntityAlias).where(
-                EntityAlias.alias_name == normalized_name,
-                EntityAlias.collection_id == self._collection_id,
-            )
-        )
-        alias = alias_result.scalar_one_or_none()
-        if alias:
-            entity_result = await session.get(GraphEntity, alias.entity_id)
-            if entity_result and (
-                entity_result.canonical_name == normalized_name
-                or await self._same_entity(
-                    session,
-                    normalized_name,
-                    entity_type,
-                    description,
-                    entity_result,
-                    source_chunk_hash,
-                )
-            ):
-                logger.debug(
-                    "Alias match: %s -> %s",
-                    normalized_name,
-                    entity_result.canonical_name,
-                )
-                search_text = f"{normalized_name}: {description}"
-                context_embedding = await self._embedding.embed_query(search_text)
-                await self._add_description_and_update_centroid(
-                    session,
-                    entity_result.id,
-                    entity_result,
-                    description,
-                    source_chunk_hash,
-                    context_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(
-                    session, entity_result.id, entity_type
-                )
-                return EntityResolutionResult(
-                    is_new=False,
-                    entity_id=entity_result.id,
-                    canonical_name=entity_result.canonical_name,
-                )
-
-        # Check canonical name directly
-        existing_result = await session.execute(
-            select(GraphEntity).where(
-                GraphEntity.canonical_name == normalized_name,
-                GraphEntity.collection_id == self._collection_id,
-            )
-        )
-        existing = existing_result.scalar_one_or_none()
-        if existing:
-            logger.debug("Canonical match: %s", normalized_name)
-            search_text = f"{normalized_name}: {description}"
-            context_embedding = await self._embedding.embed_query(search_text)
-            await self._add_description_and_update_centroid(
-                session,
-                existing.id,
-                existing,
-                description,
-                source_chunk_hash,
-                context_embedding,
-                document_id=document_id,
-                document_path=document_path,
-            )
-            await self._add_or_increment_type(session, existing.id, entity_type)
-            return EntityResolutionResult(
-                is_new=False,
-                entity_id=existing.id,
-                canonical_name=existing.canonical_name,
-            )
-
-        # Step 2: Embedding similarity (if embedding is real, not hash-based)
-        search_text = f"{normalized_name}: {description}"
-        query_embedding = await self._embedding.embed_query(search_text)
-
-        # For now, skip centroid search if using hash embeddings (dimensions < 100)
-        if (
-            self._embedding.dimensions >= 100
-            and not self._requires_exact_name_resolution(
-                normalized_name,
-                entity_type,
-            )
-        ):
-            entity_match = await self._find_similar_entity(
-                session,
-                query_embedding,
-                normalized_name,
-                entity_type,
-                description=description,
-                source_chunk_hash=source_chunk_hash,
-            )
-            if entity_match:
-                logger.debug(
-                    "Embedding match: %s -> %s",
-                    normalized_name,
-                    entity_match.canonical_name,
-                )
-                await self._add_alias(
-                    session,
-                    entity_match.id,
-                    normalized_name,
-                    source_chunk_hash,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_description_and_update_centroid(
-                    session,
-                    entity_match.id,
-                    entity_match,
-                    description,
-                    source_chunk_hash,
-                    query_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(session, entity_match.id, entity_type)
-                return EntityResolutionResult(
-                    is_new=False,
-                    entity_id=entity_match.id,
-                    canonical_name=entity_match.canonical_name,
-                )
-
-        # Step 3: Create new entity (atomic upsert)
-        for _attempt in range(3):
-            new_id = uuid.uuid4()
-            stmt = (
-                pg_insert(GraphEntity)
-                .values(
-                    id=new_id,
-                    canonical_name=normalized_name,
-                    primary_type=entity_type,
-                    description_count=0,
-                    collection_id=self._collection_id,
-                )
-                .on_conflict_do_nothing(
-                    constraint="uq_graph_entities_canonical_name_collection_id"
-                )
-                .returning(GraphEntity.id)
-            )
-            result = await session.execute(stmt)
-            row = result.fetchone()
-            if row:
-                entity_id = row[0]
-                entity = await session.get(GraphEntity, entity_id)
-                await self._add_alias(
-                    session,
-                    entity_id,
-                    normalized_name,
-                    source_chunk_hash,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_description_and_update_centroid(
-                    session,
-                    entity_id,
-                    entity,
-                    description,
-                    source_chunk_hash,
-                    query_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(session, entity_id, entity_type)
-                logger.info(
-                    "New entity created: %s (type=%s)", normalized_name, entity_type
-                )
-                return EntityResolutionResult(
-                    is_new=True, entity_id=entity_id, canonical_name=normalized_name
-                )
-
-            # Conflict — another worker inserted it
-            existing_result = await session.execute(
-                select(GraphEntity).where(
-                    GraphEntity.canonical_name == normalized_name,
-                    GraphEntity.collection_id == self._collection_id,
-                )
-            )
-            existing = existing_result.scalar_one_or_none()
-            if existing:
-                logger.debug(
-                    "Concurrent entity creation, using existing: %s", normalized_name
-                )
-                await self._add_description_and_update_centroid(
-                    session,
-                    existing.id,
-                    existing,
-                    description,
-                    source_chunk_hash,
-                    query_embedding,
-                    document_id=document_id,
-                    document_path=document_path,
-                )
-                await self._add_or_increment_type(session, existing.id, entity_type)
-                return EntityResolutionResult(
-                    is_new=False,
-                    entity_id=existing.id,
-                    canonical_name=existing.canonical_name,
-                )
-
-        raise RuntimeError(f"Failed to resolve entity after retries: {normalized_name}")
+        return results[0]
 
     async def resolve_relationship(
         self,
@@ -642,337 +314,25 @@ class IncrementalEntityResolver:
         original_source_name: str | None = None,
         original_target_name: str | None = None,
     ) -> RelationshipResolutionResult:
-        # Normalize rel_type using alias table
-        rel_type_resolution = await self._resolve_rel_type(session, rel_type)
-        rel_type = rel_type_resolution.canonical_type
-
-        # Relationship direction is semantic. Reuse only the exact
-        # source-predicate-target orientation.
-        existing_result = await session.execute(
-            select(GraphRelationship).where(
-                GraphRelationship.relationship_type_id
-                == rel_type_resolution.relationship_type_id,
-                GraphRelationship.source_entity_id == source_entity_id,
-                GraphRelationship.target_entity_id == target_entity_id,
-            )
-        )
-        existing = existing_result.scalar_one_or_none()
-        src_entity = await session.get(GraphEntity, source_entity_id)
-        tgt_entity = await session.get(GraphEntity, target_entity_id)
-        src_name = src_entity.canonical_name if src_entity else ""
-        tgt_name = tgt_entity.canonical_name if tgt_entity else ""
-        rel = existing or GraphRelationship(
-            id=uuid.uuid4(),
-            source_entity_id=source_entity_id,
-            target_entity_id=target_entity_id,
-            weight=0,
-            keywords=[],
-            relationship_type_id=rel_type_resolution.relationship_type_id,
-            rel_type=rel_type,
-            collection_id=self._collection_id,
-        )
-        if existing is None:
-            session.add(rel)
-        await session.flush()
-        claim = {"source": src_name, "target": tgt_name, "predicate": rel_type}
-        evidence = {
-            "chunk_hash": source_chunk_hash,
-            "document_id": str(document_id) if document_id else None,
-            "document_path": document_path,
-            "source_passage": self._source_text,
-            "original_source_name": original_source_name or src_name,
-            "original_target_name": original_target_name or tgt_name,
-            "extracted_description": description,
-        }
-        await self._add_relationship_description(
+        """Single-item compatibility API; chunk ingestion batches relationships."""
+        results = await self.resolve_relationships(
             session,
-            rel.id,
-            description,
-            keywords,
+            [
+                {
+                    "source_entity_id": source_entity_id,
+                    "target_entity_id": target_entity_id,
+                    "description": description,
+                    "keywords": keywords,
+                    "rel_type": rel_type,
+                    "original_source_name": original_source_name,
+                    "original_target_name": original_target_name,
+                }
+            ],
             source_chunk_hash,
-            source_name=src_name,
-            target_name=tgt_name,
-            rel_type=rel_type,
-            document_id=document_id,
-            document_path=document_path,
-            evidence=evidence,
-            claim=claim,
+            document_id,
+            document_path,
         )
-        await session.flush()
-        descriptions = (
-            (
-                await session.execute(
-                    select(RelationshipDescription).where(
-                        RelationshipDescription.relationship_id == rel.id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        # Deduplicate evidence independently of description wording.
-        evidence_by_key = {}
-        supported_keys = set()
-        for desc in descriptions:
-            for item in desc.source_evidence or []:
-                key = (item.get("document_id"), item["chunk_hash"])
-                evidence_by_key[key] = item
-                # A collective high confidence does not mean every passage
-                # individually supports the claim.
-                if (item.get("support_assessment") or {}).get("choice") == "supported":
-                    supported_keys.add(key)
-        decision = await self._decisions.support(claim, list(evidence_by_key.values()))
-        rel.confidence = decision.probabilities["supported"]
-        rel.support_count = len(supported_keys)
-        rel.score_metadata = {
-            **decision.trace("relationship_support"),
-            "claim": claim,
-            "evidence_keys": [list(key) for key in evidence_by_key],
-        }
-        rel.keywords = sorted(set(rel.keywords or []) | set(keywords))
-        # Graph projection weight is always confidence in fixed 0..100 units;
-        # support_count is an independent count of supporting passages.
-        rel.weight = round(rel.confidence * 100)
-        await session.commit()
-        return RelationshipResolutionResult(
-            is_new=existing is None, relationship_id=rel.id
-        )
-
-    async def _find_similar_entity(
-        self,
-        session: AsyncSession,
-        query_embedding: list[float],
-        name: str,
-        entity_type: str,
-        description: str = "",
-        source_chunk_hash: str = "",
-    ) -> GraphEntity | None:
-        """Propose candidates with embeddings; accept only decision-model identity decisions."""
-        centroid_hits = await self._vstore.search_entity_centroids(
-            collection_id=self._collection_id,
-            query_embedding=query_embedding,
-            top_k=5,
-        )
-
-        for hit in centroid_hits:
-            entity_id_str = hit.metadata.get("entity_id")
-            if not entity_id_str:
-                continue
-            try:
-                entity_id = uuid.UUID(entity_id_str)
-            except ValueError:
-                continue
-
-            entity = await session.get(GraphEntity, entity_id)
-            if not entity:
-                continue
-
-            similarity = 1.0 - hit.distance
-            if similarity < self.MEDIUM_CONFIDENCE_SIMILARITY:
-                break
-            if not self._types_compatible(entity_type, entity.primary_type or ""):
-                continue
-            if await self._same_entity(
-                session, name, entity_type, description, entity, source_chunk_hash
-            ):
-                return entity
-
-        # Fallback: fuzzy name matching against all entities in collection
-        entities_result = await session.execute(
-            select(GraphEntity).where(GraphEntity.collection_id == self._collection_id)
-        )
-        candidates = entities_result.scalars().all()
-        for candidate in candidates:
-            if self._fuzzy_match(name, candidate.canonical_name):
-                if not self._types_compatible(
-                    entity_type, candidate.primary_type or ""
-                ):
-                    continue
-                if await self._same_entity(
-                    session,
-                    name,
-                    entity_type,
-                    description,
-                    candidate,
-                    source_chunk_hash,
-                ):
-                    return candidate
-        return None
-
-    async def _same_entity(
-        self,
-        session: AsyncSession,
-        name: str,
-        entity_type: str,
-        description: str,
-        candidate: GraphEntity,
-        source_chunk_hash: str,
-    ) -> bool:
-        descriptions = (
-            (
-                await session.execute(
-                    select(EntityDescription.description)
-                    .where(EntityDescription.entity_id == candidate.id)
-                    .limit(5)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        incoming = {"name": name, "type": entity_type, "description": description}
-        existing = {
-            "name": candidate.canonical_name,
-            "type": candidate.primary_type,
-            "descriptions": list(descriptions),
-        }
-        decision = await self._decisions.identity(incoming, existing, self._source_text)
-        trace = decision.trace("entity_identity")
-        accepted = (
-            decision.choice == "same"
-            and decision.probabilities["same"] >= IDENTITY_MIN_PROBABILITY
-        )
-        trace["accepted"] = accepted
-        session.add(
-            EntityResolutionDecision(
-                collection_id=self._collection_id,
-                candidate_id=candidate.id,
-                incoming_name=name,
-                source_chunk_hash=source_chunk_hash,
-                source_evidence={
-                    "incoming": incoming,
-                    "candidate": existing,
-                    "source_passage": self._source_text,
-                },
-                decision=trace,
-            )
-        )
-        if accepted:
-            self._identity_traces[name] = trace
-        return accepted
-
-    async def _add_description_and_update_centroid(
-        self,
-        session: AsyncSession,
-        entity_id: uuid.UUID,
-        entity: GraphEntity | None,
-        description: str,
-        source_chunk_hash: str,
-        context_embedding: list[float],
-        document_id: uuid.UUID | None = None,
-        document_path: str | None = None,
-    ) -> None:
-        if not description:
-            return
-
-        if entity is None:
-            entity = await session.get(GraphEntity, entity_id)
-        if entity is None:
-            return
-
-        await self._acquire_entity_lock(session, entity_id)
-        # The entity may have been loaded before waiting for another writer.
-        # Read its current centroid count/name/type only after taking the lock.
-        await session.refresh(entity)
-        # Similar descriptions can contain different facts. Only exact text is
-        # deduplicated, and every distinct source passage is retained.
-        existing_desc = (
-            await session.execute(
-                select(EntityDescription)
-                .where(
-                    EntityDescription.entity_id == entity_id,
-                    EntityDescription.document_id == document_id,
-                    EntityDescription.description == description,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        evidence = list(existing_desc.source_evidence or []) if existing_desc else []
-        if any(item["chunk_hash"] == source_chunk_hash for item in evidence):
-            return
-        evidence.append(
-            {
-                "chunk_hash": source_chunk_hash,
-                "document_id": str(document_id) if document_id else None,
-                "document_path": document_path,
-                "source_passage": self._source_text,
-            }
-        )
-        decision = await self._decisions.support(
-            {"entity": entity.canonical_name, "description": description}, evidence
-        )
-        if existing_desc:
-            existing_desc.source_evidence = evidence
-            existing_desc.source_chunk_hashes = sorted(
-                {item["chunk_hash"] for item in evidence}
-            )
-            existing_desc.confidence = decision.probabilities["supported"]
-            existing_desc.score_metadata = decision.trace("entity_description_support")
-            existing_desc.weight = len(evidence)
-            return
-        desc = EntityDescription(
-            id=uuid.uuid4(),
-            entity_id=entity_id,
-            description=description,
-            weight=1,
-            confidence=decision.probabilities["supported"],
-            score_metadata=decision.trace("entity_description_support"),
-            source_evidence=evidence,
-            source_chunk_hashes=[source_chunk_hash],
-            document_id=document_id,
-            document_path=document_path,
-        )
-        desc_id = desc.id
-        session.add(desc)
-        if decision.choice != "supported":
-            return  # Retain the assessment, but do not contaminate the centroid.
-        embedding = await self._embedding.embed_query(
-            f"{entity.canonical_name}: {description}"
-        )
-
-        n = entity.description_count or 0
-
-        # Hebbian learning: new_centroid = (old_centroid * n + new) / (n + 1)
-        old_centroid = await self._vstore.get_entity_centroid(
-            entity_id, self._collection_id
-        )
-        if old_centroid:
-            new_centroid = [
-                (old_c * n + new_c) / (n + 1)
-                for old_c, new_c in zip(old_centroid, context_embedding)
-            ]
-        else:
-            new_centroid = list(context_embedding)
-
-        canonical_name = entity.canonical_name
-        primary_type = entity.primary_type
-
-        await self._vstore.upsert_entity_embedding(
-            entity_id=entity_id,
-            collection_id=self._collection_id,
-            name=canonical_name,
-            description=description,
-            description_id=desc_id,
-            embedding=embedding,
-            document_id=document_id,
-            document_path=document_path,
-            session=session,
-        )
-
-        await self._vstore.upsert_entity_centroid(
-            entity_id=entity_id,
-            collection_id=self._collection_id,
-            canonical_name=canonical_name,
-            primary_type=primary_type,
-            description_count=n + 1,
-            embedding=new_centroid,
-            session=session,
-        )
-
-        await session.execute(
-            update(GraphEntity)
-            .where(GraphEntity.id == entity_id)
-            .values(description_count=GraphEntity.description_count + 1)
-        )
+        return results[0]
 
     async def _acquire_entity_lock(
         self,
@@ -991,116 +351,6 @@ class IncrementalEntityResolver:
         await session.execute(
             text("SELECT pg_advisory_xact_lock(:lock_key)"),
             {"lock_key": lock_key},
-        )
-
-    async def _add_relationship_description(
-        self,
-        session: AsyncSession,
-        relationship_id: uuid.UUID,
-        description: str,
-        keywords: list[str],
-        source_chunk_hash: str,
-        source_name: str = "",
-        target_name: str = "",
-        rel_type: str = "RELATES_TO",
-        document_id: uuid.UUID | None = None,
-        document_path: str | None = None,
-        evidence: dict | None = None,
-        claim: dict | None = None,
-    ) -> None:
-        existing_desc = (
-            await session.execute(
-                select(RelationshipDescription)
-                .where(
-                    RelationshipDescription.relationship_id == relationship_id,
-                    RelationshipDescription.document_id == document_id,
-                    RelationshipDescription.description == description,
-                )
-                .with_for_update()
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        evidence = evidence or {
-            "chunk_hash": source_chunk_hash,
-            "document_id": str(document_id) if document_id else None,
-            "source_passage": self._source_text,
-        }
-        source_evidence = (
-            list(existing_desc.source_evidence or []) if existing_desc else []
-        )
-        key = (evidence.get("document_id"), evidence["chunk_hash"])
-        if any(
-            (item.get("document_id"), item["chunk_hash"]) == key
-            for item in source_evidence
-        ):
-            return  # Reprocessing the same passage is not new evidence.
-        claim = {
-            **(
-                claim
-                or {"source": source_name, "target": target_name, "predicate": rel_type}
-            ),
-            "description": description,
-        }
-        passage_decision = await self._decisions.support(claim, [evidence])
-        evidence = {
-            **evidence,
-            "support_confidence": passage_decision.probabilities["supported"],
-            "support_assessment": passage_decision.trace(
-                "relationship_passage_support"
-            ),
-        }
-        source_evidence.append(evidence)
-        decision = (
-            await self._decisions.support(claim, source_evidence)
-            if len(source_evidence) > 1
-            else passage_decision
-        )
-        if existing_desc:
-            existing_desc.source_evidence = source_evidence
-            existing_desc.source_chunk_hashes = sorted(
-                {item["chunk_hash"] for item in source_evidence}
-            )
-            existing_desc.confidence = decision.probabilities["supported"]
-            existing_desc.score_metadata = decision.trace(
-                "relationship_description_support"
-            )
-            existing_desc.weight = len(source_evidence)
-            return
-
-        embed_text = relationship_embedding_text(
-            source_name,
-            target_name,
-            rel_type,
-            description,
-            keywords,
-        )
-        embedding = await self._embedding.embed_query(embed_text)
-
-        desc = RelationshipDescription(
-            id=uuid.uuid4(),
-            relationship_id=relationship_id,
-            description=description,
-            keywords=keywords,
-            weight=1,
-            confidence=decision.probabilities["supported"],
-            score_metadata=decision.trace("relationship_description_support"),
-            source_evidence=source_evidence,
-            source_chunk_hashes=[source_chunk_hash],
-            document_id=document_id,
-            document_path=document_path,
-        )
-        session.add(desc)
-
-        await self._vstore.upsert_relationship_embedding(
-            relationship_id=relationship_id,
-            collection_id=self._collection_id,
-            source_name=source_name,
-            target_name=target_name,
-            description=description,
-            embedding=embedding,
-            document_id=document_id,
-            document_path=document_path,
-            session=session,
         )
 
     async def _resolve_or_create_relationship_type(

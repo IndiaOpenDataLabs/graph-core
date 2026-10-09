@@ -18,6 +18,7 @@ from graph_core.services.graph_rag.extractor import (
 @pytest.mark.parametrize("raw_cache_hit", [False, True])
 @pytest.mark.parametrize("name_cache_hit", [False, True])
 @pytest.mark.parametrize("with_relationship", [False, True])
+@pytest.mark.parametrize("missing_endpoint", [False, True])
 async def test_inventory_nodes_upserted_independently_of_edges(
     db_session,
     test_graph_rag_collection,
@@ -25,6 +26,7 @@ async def test_inventory_nodes_upserted_independently_of_edges(
     raw_cache_hit,
     name_cache_hit,
     with_relationship,
+    missing_endpoint,
 ):
     collection = test_graph_rag_collection
     document_id = uuid.uuid4()
@@ -45,14 +47,16 @@ async def test_inventory_nodes_upserted_independently_of_edges(
             entity_id = uuid.uuid4()
             names_by_id[entity_id] = name
             ids_by_name[name] = entity_id
-            entities.append(ExtractedEntity(name, "PERSON", f"The participant {name}."))
+            if not (missing_endpoint and name == "Arjuna"):
+                entities.append(ExtractedEntity(name, "PERSON", f"The participant {name}."))
         relationships.append(
             ExtractedRelationship(
                 source_name="Krishna",
                 target_name="Arjuna",
+                source_description="The participant Krishna.",
+                target_description="The participant Arjuna.",
                 description="Krishna teaches Arjuna about duty.",
                 keywords=["teaching"],
-                weight=0.9,
                 rel_type="TEACHES",
             )
         )
@@ -69,21 +73,16 @@ async def test_inventory_nodes_upserted_independently_of_edges(
     await db_session.commit()
     extraction = ExtractionResult(entities, relationships)
 
-    async def resolve_entity(**kwargs):
-        entity_id = ids_by_name[kwargs["name"]]
-        return SimpleNamespace(
-            entity_id=entity_id,
-            canonical_name=names_by_id[entity_id],
-            is_new=False,
-        )
+    async def resolve_entities(session, inventory, *args, **kwargs):
+        return [SimpleNamespace(entity_id=ids_by_name[entity.name],
+                                canonical_name=names_by_id[ids_by_name[entity.name]], is_new=False)
+                for entity in inventory]
 
     resolver = SimpleNamespace(
-        resolve_entity=AsyncMock(side_effect=resolve_entity),
-        resolve_relationship=AsyncMock(
-            return_value=SimpleNamespace(
-                relationship_id=uuid.uuid4(),
-            )
-        ),
+        resolve_entities=AsyncMock(side_effect=resolve_entities),
+        resolve_relationships=AsyncMock(return_value=[SimpleNamespace(relationship_id=uuid.uuid4())
+                                                     for _ in relationships]),
+        flush_support=AsyncMock(),
     )
     name_cache = SimpleNamespace(
         get=AsyncMock(
@@ -137,9 +136,12 @@ async def test_inventory_nodes_upserted_independently_of_edges(
     assert result.entity_count == len(entities)
     assert result.relationship_count == len(relationships)
     # Cache hits are hints, never an identity authorization bypass.
-    assert resolver.resolve_entity.await_count == len(entities)
-    for call in resolver.resolve_entity.await_args_list:
-        assert call.kwargs["source_chunk_hash"] == chunk_hash
+    resolver.resolve_entities.assert_awaited_once()
+    assert resolver.resolve_entities.await_args.args[2] == chunk_hash
+    resolver.flush_support.assert_awaited_once()
+    if with_relationship and missing_endpoint:
+        planned = resolver.resolve_entities.await_args.args[1]
+        assert next(entity for entity in planned if entity.name == "Arjuna").description == "The participant Arjuna."
     assert extractor.extract_with_gleaning.await_count == (0 if raw_cache_hit else 1)
     if with_relationship:
         storage.upsert_edges.assert_awaited_once()
@@ -149,5 +151,5 @@ async def test_inventory_nodes_upserted_independently_of_edges(
         assert edges[0]["target_id"] == str(ids_by_name["Arjuna"])
         assert edges[0]["rel_type"] == "TEACHES"
     else:
-        resolver.resolve_relationship.assert_not_awaited()
+        assert resolver.resolve_relationships.await_args.args[1] == []
         storage.upsert_edges.assert_not_awaited()

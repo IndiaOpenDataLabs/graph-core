@@ -393,15 +393,17 @@ class GraphRAGVectorStore:
             ]
 
     async def get_entity_centroid(
-        self, entity_id: uuid.UUID, collection_id: uuid.UUID
+        self, entity_id: uuid.UUID, collection_id: uuid.UUID,
+        session: AsyncSession | None = None,
     ) -> list[float] | None:
+        """Use the caller's transaction to see earlier centroid updates in a batch."""
         tbl = table_name(collection_id, "entity_centroids")
-        async with AsyncSessionLocal() as session:
+        owns_session = session is None
+        if session is None:
+            session = AsyncSessionLocal()
+        try:
             result = await session.execute(
-                text(
-                    f"SELECT embedding::text FROM {tbl} "
-                    f"WHERE entity_id = :eid"
-                ),
+                text(f"SELECT embedding::text FROM {tbl} WHERE entity_id = :eid"),
                 {"eid": _uuid_for_sql(entity_id)},
             )
             row = result.one_or_none()
@@ -409,6 +411,9 @@ class GraphRAGVectorStore:
                 return None
             raw = row[0].strip("[]")
             return [float(v) for v in raw.split(",")]
+        finally:
+            if owns_session:
+                await session.close()
 
     # ── Chunk Embeddings ──
 
