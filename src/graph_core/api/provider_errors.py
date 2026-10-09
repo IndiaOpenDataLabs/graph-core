@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from fastapi import HTTPException
 from openai import APIConnectionError, AuthenticationError
 
+from graph_core.decisions import DecisionError
+
 
 @contextmanager
 def service_http_errors() -> Iterator[None]:
@@ -28,6 +30,8 @@ def service_http_errors() -> Iterator[None]:
 
 def raise_provider_http_error(exc: Exception) -> None:
     """Raise a user-facing HTTP error for known provider failures."""
+    if isinstance(exc, DecisionError):
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if isinstance(exc, AuthenticationError):
         raise HTTPException(
             status_code=502,

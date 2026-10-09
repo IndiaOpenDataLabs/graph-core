@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Float,
     Index,
     Integer,
     JSON,
@@ -78,6 +79,9 @@ class EntityDescription(Base):
         index=True,
     )
     description = Column(Text, nullable=False)
+    confidence = Column(Float, nullable=True)
+    score_metadata = Column(JSON, nullable=True)
+    source_evidence = Column(JSON, nullable=True)
     weight = Column(Integer, default=1)
     source_chunk_hashes = Column(JSON, nullable=True)
     document_id = Column(UUIDType(as_uuid=True), nullable=True)
@@ -112,6 +116,8 @@ class EntityAlias(Base):
     document_path = Column(String(1024), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    identity_decision = Column(JSON, nullable=True)
+
     entity = relationship("GraphEntity", back_populates="aliases")
 
     __table_args__ = (
@@ -124,6 +130,24 @@ class EntityAlias(Base):
 
     def __repr__(self) -> str:
         return f"<EntityAlias {self.alias_name}>"
+
+
+class EntityResolutionDecision(Base):
+    """Append-only evidence of accepted/rejected cross-name identity decisions."""
+
+    __tablename__ = "entity_resolution_decisions"
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collection_id = Column(
+        UUIDType(as_uuid=True), ForeignKey("collections.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # Keep the snapshot even if a candidate is subsequently removed.
+    candidate_id = Column(UUIDType(as_uuid=True), nullable=False)
+    incoming_name = Column(String(256), nullable=False)
+    source_chunk_hash = Column(String(64), nullable=True)
+    source_evidence = Column(JSON, nullable=False)
+    decision = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class RelationshipTypeAlias(Base):
@@ -247,7 +271,11 @@ class GraphRelationship(Base):
         nullable=False,
         index=True,
     )
-    weight = Column(Integer, default=1)
+    # Native source-support confidence and evidence counts have distinct units.
+    confidence = Column(Float, nullable=True)
+    support_count = Column(Integer, nullable=True)
+    score_metadata = Column(JSON, nullable=True)
+    weight = Column(Integer, default=1)  # legacy graph projection, not confidence
     keywords = Column(JSON, nullable=True)
     relationship_type_id = Column(
         UUIDType(as_uuid=True),
@@ -309,7 +337,10 @@ class RelationshipDescription(Base):
     )
     description = Column(Text, nullable=False)
     keywords = Column(JSON, nullable=True)
-    weight = Column(Integer, default=1)
+    confidence = Column(Float, nullable=True)
+    score_metadata = Column(JSON, nullable=True)
+    source_evidence = Column(JSON, nullable=True)
+    weight = Column(Integer, default=1)  # distinct source support, never confidence
     source_chunk_hashes = Column(JSON, nullable=True)
     document_id = Column(UUIDType(as_uuid=True), nullable=True)
     document_path = Column(String(1024), nullable=True)

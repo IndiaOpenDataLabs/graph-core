@@ -26,10 +26,12 @@ from graph_core.models.graph_rag import (
 )
 from graph_core.models.ingestion import IngestionRecord
 from graph_core.models.profile import Profile
-from graph_core.services.document_identity import normalize_document_path
-from graph_core.services.document_identity import document_id_for_chunk
-from graph_core.services.document_identity import document_id_for_path
 from graph_core.services.crypto import CredentialCrypto
+from graph_core.services.document_identity import (
+    document_id_for_chunk,
+    document_id_for_path,
+    normalize_document_path,
+)
 from graph_core.services.entity_name_cache import EntityNameCache
 from graph_core.services.graph_rag.contracts import extraction_identity_for
 from graph_core.services.graph_rag.entity_resolver import (
@@ -336,6 +338,7 @@ async def _ingest_graph_chunk(
         namespace_id=collection.namespace_id,
         domain=domain,
         collection_name=collection.name,
+        source_text=text,
     )
     name_cache = EntityNameCache(str(collection.id))
 
@@ -344,12 +347,8 @@ async def _ingest_graph_chunk(
 
     async with AsyncSessionLocal() as session:
         for entity in extraction.entities:
-            cached_id = await name_cache.get(entity.name)
-            if cached_id:
-                resolved_entity_ids[entity.name] = cached_id
-                resolved_entity_ids[entity.name.strip().title()] = cached_id
-                continue
-
+            # Cross-chunk caches must not bypass identity or source-support
+            # decisions, particularly for aliases created by older resolvers.
             result = await resolver.resolve_entity(
                 session=session,
                 name=entity.name,
@@ -360,7 +359,6 @@ async def _ingest_graph_chunk(
                 document_path=document_path,
             )
             resolved_entity_ids[entity.name] = result.entity_id
-            resolved_entity_ids[entity.name.strip().title()] = result.entity_id
 
             if result.is_new:
                 pending_cache.append(
@@ -408,16 +406,9 @@ async def _ingest_graph_chunk(
         edges_to_upsert = []
 
         for rel in extraction.relationships:
-            source_id = (
-                resolved_entity_ids.get(rel.source_name)
-                or resolved_entity_ids.get(rel.source_name.strip().title())
-                or await name_cache.get(rel.source_name)
-            )
-            target_id = (
-                resolved_entity_ids.get(rel.target_name)
-                or resolved_entity_ids.get(rel.target_name.strip().title())
-                or await name_cache.get(rel.target_name)
-            )
+            # Only already-verified exact spellings can reuse a chunk-local ID.
+            source_id = resolved_entity_ids.get(rel.source_name)
+            target_id = resolved_entity_ids.get(rel.target_name)
 
             for is_source, name, endpoint_description in [
                 (True, rel.source_name, rel.source_description),
@@ -454,7 +445,6 @@ async def _ingest_graph_chunk(
                         synthetic.entity_id,
                     )
                     resolved_entity_ids[name] = synthetic.entity_id
-                    resolved_entity_ids[name.strip().title()] = synthetic.entity_id
                     canonical_name_by_id[synthetic.entity_id] = synthetic.canonical_name
                     if is_source:
                         source_id = synthetic.entity_id
@@ -470,7 +460,8 @@ async def _ingest_graph_chunk(
                 target_entity_id=target_id,
                 description=rel.description,
                 keywords=rel.keywords,
-                weight=rel.weight,
+                original_source_name=rel.source_name,
+                original_target_name=rel.target_name,
                 source_chunk_hash=chunk_hash,
                 rel_type=rel.rel_type,
                 document_id=document_id,
@@ -506,9 +497,9 @@ async def _ingest_graph_chunk(
                 "source_id": str(source_id),
                 "target_id": str(target_id),
                 "id": str(rel_result.relationship_id),
-                "weight": int(
-                    persisted_rel.weight if persisted_rel else int(rel.weight * 10)
-                ),
+                "weight": int(persisted_rel.weight if persisted_rel else 0),
+                "confidence": persisted_rel.confidence if persisted_rel else None,
+                "support_count": persisted_rel.support_count if persisted_rel else None,
                 "keywords": (
                     persisted_rel.keywords if persisted_rel else rel.keywords
                 ),
@@ -673,6 +664,9 @@ async def _ingest_lightrag_chunk(
             document_path=document_path,
         )
 
+    resolver = IncrementalEntityResolver(
+        embedding_provider, collection.id, domain=domain, source_text=text,
+    )
     for rel in extraction.relationships:
         source_name = rel.source_name
         target_name = rel.target_name
@@ -683,37 +677,19 @@ async def _ingest_lightrag_chunk(
         ):
             continue
 
-        rel_id_str = f"{source_name}__{target_name}"
-        rel_uuid = deterministic_uuid(collection.id, rel_id_str)
         source_entity_uuid = deterministic_uuid(collection.id, source_name)
         target_entity_uuid = deterministic_uuid(collection.id, target_name)
-
         async with AsyncSessionLocal() as session:
-            await session.execute(
-                pg_insert(GraphRelationship)
-                .values(
-                    id=rel_uuid,
-                    source_entity_id=source_entity_uuid,
-                    target_entity_id=target_entity_uuid,
-                    weight=int(rel.weight * 10),
-                    keywords=rel.keywords,
-                    collection_id=collection.id,
-                )
-                .on_conflict_do_nothing(index_elements=["id"])
+            resolution = await resolver.resolve_relationship(
+                session, source_entity_uuid, target_entity_uuid,
+                rel.description, rel.keywords, chunk_hash, rel_type=rel.rel_type,
+                document_id=document_id, document_path=document_path,
+                original_source_name=rel.source_name, original_target_name=rel.target_name,
             )
-            await session.commit()
-
-        rel_embedding = await embedding_provider.embed_query(rel.description)
-        await _graph_rag_vectors.upsert_relationship_embedding(
-            relationship_id=rel_uuid,
-            collection_id=collection.id,
-            source_name=source_name,
-            target_name=target_name,
-            description=rel.description,
-            embedding=rel_embedding,
-            document_id=document_id,
-            document_path=document_path,
-        )
+            persisted_rel = await session.get(GraphRelationship, resolution.relationship_id)
+            rel_id_str = str(resolution.relationship_id)
+            confidence = persisted_rel.confidence
+            support_count = persisted_rel.support_count
 
         await graph_storage.upsert_lightrag_edge(
             source_name=source_name,
@@ -723,7 +699,9 @@ async def _ingest_lightrag_chunk(
                 "id": rel_id_str,
                 "description": rel.description,
                 "keywords": rel.keywords,
-                "weight": int(rel.weight * 10),
+                "weight": round(confidence * 100),
+                "confidence": confidence,
+                "support_count": support_count,
                 "source_ids": [chunk_hash],
                 "document_id": str(document_id) if document_id else None,
                 "document_path": document_path,
@@ -772,7 +750,6 @@ async def _save_raw_extraction(
                     "target_description": r.target_description,
                     "description": r.description,
                     "keywords": r.keywords,
-                    "weight": r.weight,
                     "rel_type": r.rel_type,
                 }
                 for r in extraction.relationships
@@ -879,8 +856,7 @@ async def _get_raw_extraction(
                 target_description=r.get("target_description", ""),
                 description=r["description"],
                 keywords=r.get("keywords", []),
-                weight=r.get("weight", 1.0),
-                rel_type=r.get("rel_type", "RELATES_TO"),
+                rel_type=r["rel_type"],
             )
             for r in (record.relationships_json or [])
         ]

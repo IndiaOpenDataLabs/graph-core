@@ -39,7 +39,6 @@ class ExtractedRelationship:
     target_name: str
     description: str
     keywords: list[str]
-    weight: float
     rel_type: str = DEFAULT_REL_TYPE
     source_description: str = ""
     target_description: str = ""
@@ -78,14 +77,12 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
         },
-        "weight": {"type": "number"},
     },
     "required": [
         "source",
         "target",
         "description",
         "keywords",
-        "weight",
     ],
 }
 
@@ -130,7 +127,6 @@ _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
                                     "type": "array",
                                     "items": {"type": "string"},
                                 },
-                                "weight": {"type": "number"},
                             },
                             "required": ["name"],
                         },
@@ -142,7 +138,6 @@ _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
                     "target",
                     "description",
                     "keywords",
-                    "weight",
                     "rel_type",
                 ],
             },
@@ -237,14 +232,13 @@ meaningful entities and explicitly supported relationships from input text.
      source of truth, and endpoint descriptions are only a repair fallback.
    - Each relationship must also have top-level:
        description (string),
-       keywords    (array of strings),
-       weight      (float 0..1)
+       keywords    (array of strings)
+   - Generate textual claims only. Do not assign confidence or numeric scores.
    - "rel_type" is a list of one or more objects, each with:
        name        (string)
        description (string, role-specific: explains the connection in
                     the semantic role of THIS rel_type entry)
        keywords    (array of strings, role-specific)
-       weight      (float 0..1, role-specific confidence)
      {domain_rel_type_guidance}
    - Emit every distinct rel_type that is genuinely supported for the
      pair. Multi-entry rel_type lists are expected when the same pair
@@ -303,7 +297,7 @@ entities and relationships from source code.
        target      (endpoint object)
        description (string)
        keywords    (array of strings)
-       weight      (float 0..1)
+   - Generate textual claims only; confidence is assigned by the decision model.
    - A rel_type array may be empty when the chunk does not support that
      operation.
    - {domain_rel_type_guidance}
@@ -324,7 +318,7 @@ extraction so the graph fully captures the logic of the source code.
    relationships. Identify what is missing to recreate that logic.
 3. Emit only the additional relationships needed to recreate the logic,
    plus corrected versions of existing relationships whose description,
-   keywords, weight, or endpoints do not yet match the code.
+   keywords or endpoints do not yet match the code.
 4. Do not repeat relationships that were already extracted correctly.
 5. Keep naming consistent with the previously extracted endpoints so that
    corrections attach to the same (source, target, rel_type) edges.
@@ -407,8 +401,7 @@ def _format_code_candidate_graph(
         for rel in relationships:
             lines.append(
                 f"- {rel.source_name} -[{rel.rel_type}]-> {rel.target_name}: "
-                f"{rel.description} | keywords={', '.join(rel.keywords)} "
-                f"| weight={rel.weight}"
+                f"{rel.description} | keywords={', '.join(rel.keywords)}"
             )
     else:
         lines.append("- (none)")
@@ -516,7 +509,7 @@ rather than grammatical fragments. Do not connect every entity pair.
 2. Focus on:
    - relationships needed to recreate the passage's logic that the first
      pass missed
-   - relationships that need a corrected description, keywords, weight, or
+   - relationships that need a corrected description, keywords, or
      rel_type to match the required structure or the passage's meaning
 3. Keep naming consistent with the previously extracted endpoints so that
    corrections attach to the same (source, target, rel_type) edges.
@@ -575,46 +568,14 @@ class LLMGraphExtractor:
         value: Any,
         fallback_description: str,
         fallback_keywords: list[str],
-        fallback_weight: float,
         vocab: list[str] | None = None,
         domain: str | None = None,
         strict_vocab: bool = False,
     ) -> list[dict[str, Any]]:
-        """Normalize the LLM's ``rel_type`` field into a list of per-edge
-        dicts, each carrying its own validated name, description,
-        keywords, and weight.
-
-        Accepts (in order of preference):
-        1. List of objects: ``[{name, description, keywords, weight}, ...]``
-        2. List of strings: ``["EXPLAINS", "CAUSES"]`` (back-compat;
-           each entry inherits the relationship-level description,
-           keywords, and weight)
-        3. A single string (very old shape): wrapped into a single entry
-
-        Each entry's name is normalized (uppercase, snake_case,
-        alpha-leading) and optionally validated against the active
-        domain vocab. Unknown normalized rel_types are accepted when
-        the existing set is not expressive enough unless ``strict_vocab``
-        is true.
-
-        Returns at least one entry for non-strict callers; the fallback
-        is ``[{"name": DEFAULT_REL_TYPE, ...}]`` when the LLM emitted
-        nothing usable. Strict callers receive an empty list when the
-        input does not match the active vocabulary.
-        """
-        if value is None:
-            value = []
-        if isinstance(value, str):
-            raw_entries: list[Any] = [{"name": value}]
-        elif isinstance(value, list):
-            raw_entries = []
-            for item in value:
-                if isinstance(item, str):
-                    raw_entries.append({"name": item})
-                elif isinstance(item, dict):
-                    raw_entries.append(item)
-        else:
-            raw_entries = [{"name": str(value)}]
+        """Read the current schema's per-predicate textual claim objects."""
+        if not isinstance(value, list):
+            return []
+        raw_entries = value
 
         vocab_set = {v.upper() for v in vocab} if vocab else None
         out: list[dict[str, Any]] = []
@@ -664,27 +625,12 @@ class LLMGraphExtractor:
             else:
                 keywords = list(fallback_keywords)
 
-            weight_value = entry.get("weight", fallback_weight)
-            try:
-                weight = float(weight_value)
-                weight = max(0.0, min(1.0, weight))
-            except (ValueError, TypeError):
-                weight = fallback_weight
-
             out.append({
                 "rel_type": name,
                 "description": description,
                 "keywords": keywords,
-                "weight": weight,
             })
 
-        if not out and not strict_vocab:
-            out.append({
-                "rel_type": DEFAULT_REL_TYPE,
-                "description": fallback_description,
-                "keywords": list(fallback_keywords),
-                "weight": fallback_weight,
-            })
         return out
 
     @staticmethod
@@ -877,16 +823,10 @@ Only output the structured relationships object.
                 rel.get("keywords", []),
                 fallback=[],
             )
-            try:
-                rel_weight = float(rel.get("weight", 1.0))
-                rel_weight = max(0.0, min(1.0, rel_weight))
-            except (ValueError, TypeError):
-                rel_weight = 1.0
             for entry in cls._coerce_rel_type_entries(
                 rel.get("rel_type"),
                 fallback_description=rel_description,
                 fallback_keywords=rel_keywords,
-                fallback_weight=rel_weight,
                 vocab=rel_vocab,
                 domain=domain,
                 strict_vocab=strict_vocab,
@@ -899,7 +839,6 @@ Only output the structured relationships object.
                         target_description=target_description,
                         description=entry["description"],
                         keywords=list(entry["keywords"]),
-                        weight=entry["weight"],
                         rel_type=entry["rel_type"],
                     )
                 )
@@ -950,11 +889,6 @@ Only output the structured relationships object.
                         item.get("keywords", []),
                         fallback=[],
                     )
-                    try:
-                        weight = float(item.get("weight", 1.0))
-                        weight = max(0.0, min(1.0, weight))
-                    except (ValueError, TypeError):
-                        weight = 1.0
                     extracted.append(
                         ExtractedRelationship(
                             source_name=source,
@@ -963,7 +897,6 @@ Only output the structured relationships object.
                             target_description=target_description,
                             description=description,
                             keywords=keywords,
-                            weight=weight,
                             rel_type=rel_key,
                         )
                     )
@@ -1006,7 +939,7 @@ Only output the structured relationships object.
 
         New ``(source, target, rel_type)`` edges are appended. When an
         edge already exists, the gleaned version replaces it in place so
-        descriptions/keywords/weights can be corrected — but no existing
+        descriptions/keywords can be corrected — but no existing
         edge is ever dropped. Returns the merged list and the count of
         newly added edges.
         """
@@ -1047,8 +980,8 @@ Only output the structured relationships object.
         current: list[ExtractedEntity],
         additions: list[ExtractedEntity],
     ) -> tuple[list[ExtractedEntity], int]:
-        """Additively merge entities by name, preferring the richer
-        (longer) description and never dropping an existing entity.
+        """Additively merge entities by exact name, preserving distinct descriptions
+        instead of replacing a shorter description and losing its facts.
         Returns the merged list and the count of newly added entities.
         """
         merged: dict[str, ExtractedEntity] = {}
@@ -1066,11 +999,13 @@ Only output the structured relationships object.
                 merged[ent.name] = ent
                 added += 1
                 continue
-            if len(ent.description or "") > len(existing.description or ""):
+            if ent.description and ent.description != existing.description:
                 merged[ent.name] = ExtractedEntity(
                     name=existing.name,
                     entity_type=existing.entity_type or ent.entity_type,
-                    description=ent.description,
+                    description="\n".join(dict.fromkeys(
+                        [text for text in (existing.description, ent.description) if text]
+                    )),
                 )
 
         return [merged[name] for name in order], added

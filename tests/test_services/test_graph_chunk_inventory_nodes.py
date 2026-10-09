@@ -136,9 +136,10 @@ async def test_inventory_nodes_upserted_independently_of_edges(
     assert all(node["document_path"] == document_path for node in nodes)
     assert result.entity_count == len(entities)
     assert result.relationship_count == len(relationships)
-    assert resolver.resolve_entity.await_count == (
-        0 if name_cache_hit else len(entities)
-    )
+    # Cache hits are hints, never an identity authorization bypass.
+    assert resolver.resolve_entity.await_count == len(entities)
+    for call in resolver.resolve_entity.await_args_list:
+        assert call.kwargs["source_chunk_hash"] == chunk_hash
     assert extractor.extract_with_gleaning.await_count == (0 if raw_cache_hit else 1)
     if with_relationship:
         storage.upsert_edges.assert_awaited_once()

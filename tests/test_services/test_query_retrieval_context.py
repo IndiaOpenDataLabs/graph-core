@@ -26,11 +26,13 @@ async def test_graph_context_matches_generation_input(
         relationships_used=["Ada -> wrote -> Notes"],
         rel_context="Ada wrote Notes",
         route_profile=SimpleNamespace(primary_route="entities"),
+        state=SimpleNamespace(relevance_decisions=[{"name": "Ada", "included": True}]),
     )
     meta = SimpleNamespace(
         context="Context:\nDerived understanding: history of mathematics",
         entities_used=["Mathematics"],
         relationships_used=[],
+        state=SimpleNamespace(relevance_decisions=[]),
     )
     monkeypatch.setattr(
         graph_rag,
@@ -128,6 +130,7 @@ async def test_query_job_persists_context_and_exposes_it_via_rest(
         ["Ada -> wrote -> Notes"],
         mode="mix",
         retrieval_context="Entities:\nAda: mathematician",
+        relevance_scores=[{"provider": "systemone", "name": "Ada", "included": True}],
     )
     monkeypatch.setattr(service, "query", AsyncMock(return_value=result))
     async with AsyncSessionLocal() as session:
@@ -148,4 +151,5 @@ async def test_query_job_persists_context_and_exposes_it_via_rest(
     assert payload["status"] == "completed"
     assert payload["result"]["response"] == "Answer"
     assert payload["result"]["retrieval_context"] == result.retrieval_context
+    assert payload["result"]["relevance_scores"] == result.relevance_scores
     assert payload["payload"]["question"] == "Who is Ada?"

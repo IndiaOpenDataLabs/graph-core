@@ -1,7 +1,7 @@
 """Vector query functions extracted from GraphService."""
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -26,6 +26,7 @@ class QueryResult:
     mode: str | None = None
     chat_id: str | None = None
     retrieval_context: str = ""
+    relevance_scores: list[dict] = field(default_factory=list)
 
 
 # ── Module-level singleton dependencies ──

@@ -1,18 +1,13 @@
-"""Incremental entity resolver — zero-LLM entity resolution.
+"""Canonical resolution: embeddings propose candidates; the decision model decides identity.
 
-Three-tier pipeline:
-1. Exact alias lookup in EntityAlias table
-2. Embedding similarity against entity centroids
-3. Fuzzy name matching
+Text generation lives in the extractor. Similarity is never proof of identity.
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import difflib
+import hashlib
 import logging
-import random
 import re
 import unicodedata
 import uuid
@@ -20,16 +15,16 @@ from dataclasses import dataclass
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from graph_core.config import settings
-from graph_core.database import AsyncSessionLocal
+from graph_core.decisions import GraphDecisions
+from graph_core.decisions.graph import IDENTITY_MIN_PROBABILITY
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.models.domain_config import get_domain_config
 from graph_core.models.graph_rag import (
     EntityAlias,
     EntityDescription,
+    EntityResolutionDecision,
     EntityType,
     GraphEntity,
     GraphRelationship,
@@ -82,7 +77,12 @@ class IncrementalEntityResolver:
         domain: str | None = None,
         namespace_id: uuid.UUID | None = None,
         collection_name: str | None = None,
+        source_text: str = "",
+        decisions: GraphDecisions | None = None,
     ) -> None:
+        self._decisions = decisions or GraphDecisions()
+        self._source_text = source_text
+        self._identity_traces: dict[str, dict] = {}
         self._embedding = embedding_provider
         self._collection_id = collection_id
         self._domain = (domain or "").strip().lower() or None
@@ -241,54 +241,13 @@ class IncrementalEntityResolver:
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
     ) -> EntityResolutionResult:
-        """Commit each entity independently and retry PostgreSQL deadlocks.
-
-        Commit caller-owned work first, so rollback of a failed entity attempt
-        cannot discard prior entities or aliases or expire the caller's objects.
-        Each retry uses a fresh session on the caller's engine.
-        """
-        await session.commit()
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                async with AsyncSessionLocal(bind=session.bind) as entity_session:
-                    try:
-                        result = await self._resolve_entity_once(
-                            entity_session, name, entity_type, description,
-                            source_chunk_hash, document_id, document_path,
-                        )
-                        await entity_session.commit()
-                    except Exception:
-                        await entity_session.rollback()
-                        raise
-                return result
-            except DBAPIError as exc:
-                sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(
-                    exc.orig, "pgcode", None
-                )
-                if sqlstate != "40P01" or attempt + 1 == max_attempts:
-                    raise
-                logger.warning(
-                    "Entity resolution deadlock; retrying collection=%s name=%r attempt=%d/%d",
-                    self._collection_id, name, attempt + 1, max_attempts,
-                )
-                await asyncio.sleep(random.uniform(0.1, 0.2) * (2**attempt))
-        raise RuntimeError("Entity resolution retry attempts exhausted")
-
-    async def _resolve_entity_once(
-        self,
-        session: AsyncSession,
-        name: str,
-        entity_type: str,
-        description: str,
-        source_chunk_hash: str,
-        document_id: uuid.UUID | None = None,
-        document_path: str | None = None,
-    ) -> EntityResolutionResult:
         normalized_name = self._normalize_entity_name(name)
-        exact_resolution = entity_type == "base_entity_ref" or self._requires_exact_name_resolution(
-            normalized_name,
-            entity_type,
+        exact_resolution = (
+            entity_type == "base_entity_ref"
+            or self._requires_exact_name_resolution(
+                normalized_name,
+                entity_type,
+            )
         )
 
         if exact_resolution:
@@ -315,7 +274,9 @@ class IncrementalEntityResolver:
                 )
                 await self._add_or_increment_type(session, existing.id, entity_type)
                 return EntityResolutionResult(
-                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                    is_new=False,
+                    entity_id=existing.id,
+                    canonical_name=existing.canonical_name,
                 )
 
             new_id = uuid.uuid4()
@@ -385,7 +346,9 @@ class IncrementalEntityResolver:
                 )
                 await self._add_or_increment_type(session, existing.id, entity_type)
                 return EntityResolutionResult(
-                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                    is_new=False,
+                    entity_id=existing.id,
+                    canonical_name=existing.canonical_name,
                 )
 
             # ON CONFLICT fired but entity is now gone — collection likely
@@ -403,8 +366,7 @@ class IncrementalEntityResolver:
 
         # Step 1: Exact alias lookup
         alias_result = await session.execute(
-            select(EntityAlias)
-            .where(
+            select(EntityAlias).where(
                 EntityAlias.alias_name == normalized_name,
                 EntityAlias.collection_id == self._collection_id,
             )
@@ -412,19 +374,41 @@ class IncrementalEntityResolver:
         alias = alias_result.scalar_one_or_none()
         if alias:
             entity_result = await session.get(GraphEntity, alias.entity_id)
-            if entity_result:
-                logger.debug("Alias match: %s -> %s", normalized_name, entity_result.canonical_name)
+            if entity_result and (
+                entity_result.canonical_name == normalized_name
+                or await self._same_entity(
+                    session,
+                    normalized_name,
+                    entity_type,
+                    description,
+                    entity_result,
+                    source_chunk_hash,
+                )
+            ):
+                logger.debug(
+                    "Alias match: %s -> %s",
+                    normalized_name,
+                    entity_result.canonical_name,
+                )
                 search_text = f"{normalized_name}: {description}"
                 context_embedding = await self._embedding.embed_query(search_text)
                 await self._add_description_and_update_centroid(
-                    session, entity_result.id, entity_result, description,
-                    source_chunk_hash, context_embedding,
+                    session,
+                    entity_result.id,
+                    entity_result,
+                    description,
+                    source_chunk_hash,
+                    context_embedding,
                     document_id=document_id,
                     document_path=document_path,
                 )
-                await self._add_or_increment_type(session, entity_result.id, entity_type)
+                await self._add_or_increment_type(
+                    session, entity_result.id, entity_type
+                )
                 return EntityResolutionResult(
-                    is_new=False, entity_id=entity_result.id, canonical_name=entity_result.canonical_name
+                    is_new=False,
+                    entity_id=entity_result.id,
+                    canonical_name=entity_result.canonical_name,
                 )
 
         # Check canonical name directly
@@ -440,13 +424,20 @@ class IncrementalEntityResolver:
             search_text = f"{normalized_name}: {description}"
             context_embedding = await self._embedding.embed_query(search_text)
             await self._add_description_and_update_centroid(
-                session, existing.id, existing, description, source_chunk_hash, context_embedding,
+                session,
+                existing.id,
+                existing,
+                description,
+                source_chunk_hash,
+                context_embedding,
                 document_id=document_id,
                 document_path=document_path,
             )
             await self._add_or_increment_type(session, existing.id, entity_type)
             return EntityResolutionResult(
-                is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                is_new=False,
+                entity_id=existing.id,
+                canonical_name=existing.canonical_name,
             )
 
         # Step 2: Embedding similarity (if embedding is real, not hash-based)
@@ -462,10 +453,19 @@ class IncrementalEntityResolver:
             )
         ):
             entity_match = await self._find_similar_entity(
-                session, query_embedding, normalized_name, entity_type
+                session,
+                query_embedding,
+                normalized_name,
+                entity_type,
+                description=description,
+                source_chunk_hash=source_chunk_hash,
             )
             if entity_match:
-                logger.debug("Embedding match: %s -> %s", normalized_name, entity_match.canonical_name)
+                logger.debug(
+                    "Embedding match: %s -> %s",
+                    normalized_name,
+                    entity_match.canonical_name,
+                )
                 await self._add_alias(
                     session,
                     entity_match.id,
@@ -475,13 +475,20 @@ class IncrementalEntityResolver:
                     document_path=document_path,
                 )
                 await self._add_description_and_update_centroid(
-                    session, entity_match.id, entity_match, description, source_chunk_hash, query_embedding,
+                    session,
+                    entity_match.id,
+                    entity_match,
+                    description,
+                    source_chunk_hash,
+                    query_embedding,
                     document_id=document_id,
                     document_path=document_path,
                 )
                 await self._add_or_increment_type(session, entity_match.id, entity_type)
                 return EntityResolutionResult(
-                    is_new=False, entity_id=entity_match.id, canonical_name=entity_match.canonical_name
+                    is_new=False,
+                    entity_id=entity_match.id,
+                    canonical_name=entity_match.canonical_name,
                 )
 
         # Step 3: Create new entity (atomic upsert)
@@ -507,7 +514,10 @@ class IncrementalEntityResolver:
                 entity_id = row[0]
                 entity = await session.get(GraphEntity, entity_id)
                 await self._add_alias(
-                    session, entity_id, normalized_name, source_chunk_hash,
+                    session,
+                    entity_id,
+                    normalized_name,
+                    source_chunk_hash,
                     document_id=document_id,
                     document_path=document_path,
                 )
@@ -522,7 +532,9 @@ class IncrementalEntityResolver:
                     document_path=document_path,
                 )
                 await self._add_or_increment_type(session, entity_id, entity_type)
-                logger.info("New entity created: %s (type=%s)", normalized_name, entity_type)
+                logger.info(
+                    "New entity created: %s (type=%s)", normalized_name, entity_type
+                )
                 return EntityResolutionResult(
                     is_new=True, entity_id=entity_id, canonical_name=normalized_name
                 )
@@ -536,15 +548,24 @@ class IncrementalEntityResolver:
             )
             existing = existing_result.scalar_one_or_none()
             if existing:
-                logger.debug("Concurrent entity creation, using existing: %s", normalized_name)
+                logger.debug(
+                    "Concurrent entity creation, using existing: %s", normalized_name
+                )
                 await self._add_description_and_update_centroid(
-                    session, existing.id, existing, description, source_chunk_hash, query_embedding,
+                    session,
+                    existing.id,
+                    existing,
+                    description,
+                    source_chunk_hash,
+                    query_embedding,
                     document_id=document_id,
                     document_path=document_path,
                 )
                 await self._add_or_increment_type(session, existing.id, entity_type)
                 return EntityResolutionResult(
-                    is_new=False, entity_id=existing.id, canonical_name=existing.canonical_name
+                    is_new=False,
+                    entity_id=existing.id,
+                    canonical_name=existing.canonical_name,
                 )
 
         raise RuntimeError(f"Failed to resolve entity after retries: {normalized_name}")
@@ -556,11 +577,12 @@ class IncrementalEntityResolver:
         target_entity_id: uuid.UUID,
         description: str,
         keywords: list[str],
-        weight: float,
         source_chunk_hash: str,
         rel_type: str = "RELATES_TO",
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
+        original_source_name: str | None = None,
+        original_target_name: str | None = None,
     ) -> RelationshipResolutionResult:
         # Normalize rel_type using alias table
         rel_type_resolution = await self._resolve_rel_type(session, rel_type)
@@ -570,100 +592,93 @@ class IncrementalEntityResolver:
         # source-predicate-target orientation.
         existing_result = await session.execute(
             select(GraphRelationship).where(
-                GraphRelationship.relationship_type_id == rel_type_resolution.relationship_type_id,
+                GraphRelationship.relationship_type_id
+                == rel_type_resolution.relationship_type_id,
                 GraphRelationship.source_entity_id == source_entity_id,
                 GraphRelationship.target_entity_id == target_entity_id,
             )
         )
         existing = existing_result.scalar_one_or_none()
-
-        if existing:
-            # Fetch source/target names
-            src_entity = await session.get(GraphEntity, existing.source_entity_id)
-            tgt_entity = await session.get(GraphEntity, existing.target_entity_id)
-            src_name = src_entity.canonical_name if src_entity else ""
-            tgt_name = tgt_entity.canonical_name if tgt_entity else ""
-            await self._add_relationship_description(
-                session, existing.id, description, keywords, source_chunk_hash,
-                source_name=src_name, target_name=tgt_name,
-                rel_type=rel_type,
-                document_id=document_id,
-                document_path=document_path,
-            )
-            new_kw = list(set(existing.keywords or []) | set(keywords))
-            max_weight = settings.graph_rag_max_relationship_weight
-            await session.execute(
-                text(
-                    "UPDATE graph_relationships SET"
-                    " keywords = CAST(:kw AS json),"
-                    " weight = LEAST("
-                    "   (SELECT COALESCE(SUM(weight), 0) FROM relationship_descriptions"
-                    "    WHERE relationship_id = :rel_id),"
-                    "   :max_weight"
-                    " ) WHERE id = :rel_id"
-                ),
-                {"kw": str(new_kw).replace("'", '"'), "rel_id": existing.id, "max_weight": max_weight},
-            )
-            return RelationshipResolutionResult(is_new=False, relationship_id=existing.id)
-
-        new_rel_id = uuid.uuid4()
-        rel = GraphRelationship(
-            id=new_rel_id,
-            source_entity_id=source_entity_id,
-            target_entity_id=target_entity_id,
-            weight=int(weight * 10),
-            keywords=keywords,
-            relationship_type_id=rel_type_resolution.relationship_type_id,
-            rel_type=rel_type,
-            collection_id=self._collection_id,
-        )
-        session.add(rel)
-
-        # Fetch source/target names for embedding
         src_entity = await session.get(GraphEntity, source_entity_id)
         tgt_entity = await session.get(GraphEntity, target_entity_id)
         src_name = src_entity.canonical_name if src_entity else ""
         tgt_name = tgt_entity.canonical_name if tgt_entity else ""
-
-        desc = RelationshipDescription(
+        rel = existing or GraphRelationship(
             id=uuid.uuid4(),
-            relationship_id=new_rel_id,
-            description=description,
-            keywords=keywords,
-            weight=1,
-            source_chunk_hashes=[source_chunk_hash],
-            document_id=document_id,
-            document_path=document_path,
+            source_entity_id=source_entity_id,
+            target_entity_id=target_entity_id,
+            weight=0,
+            keywords=[],
+            relationship_type_id=rel_type_resolution.relationship_type_id,
+            rel_type=rel_type,
+            collection_id=self._collection_id,
         )
-        session.add(desc)
-        await session.commit()
-
-        # Write relationship embedding
-        embed_text = relationship_embedding_text(
-            src_name,
-            tgt_name,
-            rel_type,
+        if existing is None:
+            session.add(rel)
+        await session.flush()
+        claim = {"source": src_name, "target": tgt_name, "predicate": rel_type}
+        evidence = {
+            "chunk_hash": source_chunk_hash,
+            "document_id": str(document_id) if document_id else None,
+            "document_path": document_path,
+            "source_passage": self._source_text,
+            "original_source_name": original_source_name or src_name,
+            "original_target_name": original_target_name or tgt_name,
+            "extracted_description": description,
+        }
+        await self._add_relationship_description(
+            session,
+            rel.id,
             description,
             keywords,
-        )
-        embedding = await self._embedding.embed_query(embed_text)
-        await self._vstore.upsert_relationship_embedding(
-            relationship_id=new_rel_id,
-            collection_id=self._collection_id,
+            source_chunk_hash,
             source_name=src_name,
             target_name=tgt_name,
-            description=description,
-            embedding=embedding,
+            rel_type=rel_type,
             document_id=document_id,
             document_path=document_path,
-            session=session,
+            evidence=evidence,
+            claim=claim,
         )
-        # This path historically committed its new relationship and embedding.
-        # The vector store no longer commits a caller-owned session, so finish
-        # the embedding write here before returning.
+        await session.flush()
+        descriptions = (
+            (
+                await session.execute(
+                    select(RelationshipDescription).where(
+                        RelationshipDescription.relationship_id == rel.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Deduplicate evidence independently of description wording.
+        evidence_by_key = {}
+        supported_keys = set()
+        for desc in descriptions:
+            for item in desc.source_evidence or []:
+                key = (item.get("document_id"), item["chunk_hash"])
+                evidence_by_key[key] = item
+                # A collective high confidence does not mean every passage
+                # individually supports the claim.
+                if item.get("support_confidence", 0) >= 0.5:
+                    supported_keys.add(key)
+        decision = await self._decisions.support(claim, list(evidence_by_key.values()))
+        rel.confidence = decision.probabilities["supported"]
+        rel.support_count = len(supported_keys)
+        rel.score_metadata = {
+            **decision.trace("relationship_support"),
+            "claim": claim,
+            "evidence_keys": [list(key) for key in evidence_by_key],
+        }
+        rel.keywords = sorted(set(rel.keywords or []) | set(keywords))
+        # Graph projection weight is always confidence in fixed 0..100 units;
+        # support_count is an independent count of supporting passages.
+        rel.weight = round(rel.confidence * 100)
         await session.commit()
-
-        return RelationshipResolutionResult(is_new=True, relationship_id=new_rel_id)
+        return RelationshipResolutionResult(
+            is_new=existing is None, relationship_id=rel.id
+        )
 
     async def _find_similar_entity(
         self,
@@ -671,8 +686,10 @@ class IncrementalEntityResolver:
         query_embedding: list[float],
         name: str,
         entity_type: str,
+        description: str = "",
+        source_chunk_hash: str = "",
     ) -> GraphEntity | None:
-        """Search for similar entities using centroid proximity via pgvector."""
+        """Propose candidates with embeddings; accept only decision-model identity decisions."""
         centroid_hits = await self._vstore.search_entity_centroids(
             collection_id=self._collection_id,
             query_embedding=query_embedding,
@@ -693,17 +710,14 @@ class IncrementalEntityResolver:
                 continue
 
             similarity = 1.0 - hit.distance
-            if similarity >= self.HIGH_CONFIDENCE_SIMILARITY:
-                if not self._types_compatible(entity_type, entity.primary_type or ""):
-                    continue
-                return entity
-            elif similarity >= self.MEDIUM_CONFIDENCE_SIMILARITY:
-                if not self._types_compatible(entity_type, entity.primary_type or ""):
-                    continue
-                if self._fuzzy_match(name, hit.metadata.get("canonical_name", "")):
-                    return entity
-            else:
+            if similarity < self.MEDIUM_CONFIDENCE_SIMILARITY:
                 break
+            if not self._types_compatible(entity_type, entity.primary_type or ""):
+                continue
+            if await self._same_entity(
+                session, name, entity_type, description, entity, source_chunk_hash
+            ):
+                return entity
 
         # Fallback: fuzzy name matching against all entities in collection
         entities_result = await session.execute(
@@ -712,10 +726,71 @@ class IncrementalEntityResolver:
         candidates = entities_result.scalars().all()
         for candidate in candidates:
             if self._fuzzy_match(name, candidate.canonical_name):
-                if not self._types_compatible(entity_type, candidate.primary_type or ""):
+                if not self._types_compatible(
+                    entity_type, candidate.primary_type or ""
+                ):
                     continue
-                return candidate
+                if await self._same_entity(
+                    session,
+                    name,
+                    entity_type,
+                    description,
+                    candidate,
+                    source_chunk_hash,
+                ):
+                    return candidate
         return None
+
+    async def _same_entity(
+        self,
+        session: AsyncSession,
+        name: str,
+        entity_type: str,
+        description: str,
+        candidate: GraphEntity,
+        source_chunk_hash: str,
+    ) -> bool:
+        descriptions = (
+            (
+                await session.execute(
+                    select(EntityDescription.description)
+                    .where(EntityDescription.entity_id == candidate.id)
+                    .limit(5)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        incoming = {"name": name, "type": entity_type, "description": description}
+        existing = {
+            "name": candidate.canonical_name,
+            "type": candidate.primary_type,
+            "descriptions": list(descriptions),
+        }
+        decision = await self._decisions.identity(incoming, existing, self._source_text)
+        trace = decision.trace("entity_identity")
+        accepted = (
+            decision.choice == "same"
+            and decision.probabilities["same"] >= IDENTITY_MIN_PROBABILITY
+        )
+        trace["accepted"] = accepted
+        session.add(
+            EntityResolutionDecision(
+                collection_id=self._collection_id,
+                candidate_id=candidate.id,
+                incoming_name=name,
+                source_chunk_hash=source_chunk_hash,
+                source_evidence={
+                    "incoming": incoming,
+                    "candidate": existing,
+                    "source_passage": self._source_text,
+                },
+                decision=trace,
+            )
+        )
+        if accepted:
+            self._identity_traces[name] = trace
+        return accepted
 
     async def _add_description_and_update_centroid(
         self,
@@ -737,59 +812,68 @@ class IncrementalEntityResolver:
             return
 
         await self._acquire_entity_lock(session, entity_id)
-
-        embed_text = f"{entity.canonical_name}: {description}"
-        embedding = await self._embedding.embed_query(embed_text)
-
-        existing_descs = await self._vstore.search_entity_embeddings(
-            collection_id=self._collection_id,
-            query_embedding=embedding,
-            top_k=1,
-            entity_id=entity_id,
+        # Similar descriptions can contain different facts. Only exact text is
+        # deduplicated, and every distinct source passage is retained.
+        existing_desc = (
+            await session.execute(
+                select(EntityDescription)
+                .where(
+                    EntityDescription.entity_id == entity_id,
+                    EntityDescription.document_id == document_id,
+                    EntityDescription.description == description,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        evidence = list(existing_desc.source_evidence or []) if existing_desc else []
+        if any(item["chunk_hash"] == source_chunk_hash for item in evidence):
+            return
+        evidence.append(
+            {
+                "chunk_hash": source_chunk_hash,
+                "document_id": str(document_id) if document_id else None,
+                "document_path": document_path,
+                "source_passage": self._source_text,
+            }
         )
-        if existing_descs:
-            best_match = existing_descs[0]
-            cosine_sim = 1.0 - best_match.distance
-            if cosine_sim >= self.DESCRIPTION_SIMILARITY_THRESHOLD:
-                desc_id = best_match.metadata.get("description_id")
-                if desc_id:
-                    try:
-                        existing_desc_id = uuid.UUID(desc_id)
-                    except ValueError:
-                        existing_desc_id = None
-                    if existing_desc_id:
-                        existing_desc = await session.get(
-                            EntityDescription, existing_desc_id
-                        )
-                        hashes = list(existing_desc.source_chunk_hashes or []) if existing_desc else []
-                        if source_chunk_hash not in hashes:
-                            hashes.append(source_chunk_hash)
-                        await session.execute(
-                            update(EntityDescription)
-                            .where(EntityDescription.id == existing_desc_id)
-                            .values(
-                                weight=EntityDescription.weight + 1,
-                                source_chunk_hashes=hashes,
-                            )
-                        )
-                        return
-
+        decision = await self._decisions.support(
+            {"entity": entity.canonical_name, "description": description}, evidence
+        )
+        if existing_desc:
+            existing_desc.source_evidence = evidence
+            existing_desc.source_chunk_hashes = sorted(
+                {item["chunk_hash"] for item in evidence}
+            )
+            existing_desc.confidence = decision.probabilities["supported"]
+            existing_desc.score_metadata = decision.trace("entity_description_support")
+            existing_desc.weight = len(evidence)
+            return
         desc = EntityDescription(
             id=uuid.uuid4(),
             entity_id=entity_id,
             description=description,
             weight=1,
+            confidence=decision.probabilities["supported"],
+            score_metadata=decision.trace("entity_description_support"),
+            source_evidence=evidence,
             source_chunk_hashes=[source_chunk_hash],
             document_id=document_id,
             document_path=document_path,
         )
         desc_id = desc.id
         session.add(desc)
+        if decision.probabilities["supported"] < 0.5:
+            return  # Retain the assessment, but do not contaminate the centroid.
+        embedding = await self._embedding.embed_query(
+            f"{entity.canonical_name}: {description}"
+        )
 
         n = entity.description_count or 0
 
         # Hebbian learning: new_centroid = (old_centroid * n + new) / (n + 1)
-        old_centroid = await self._vstore.get_entity_centroid(entity_id, self._collection_id)
+        old_centroid = await self._vstore.get_entity_centroid(
+            entity_id, self._collection_id
+        )
         if old_centroid:
             new_centroid = [
                 (old_c * n + new_c) / (n + 1)
@@ -860,30 +944,67 @@ class IncrementalEntityResolver:
         rel_type: str = "RELATES_TO",
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
+        evidence: dict | None = None,
+        claim: dict | None = None,
     ) -> None:
-        # Check for exact (relationship_id, document_id) match
-        if document_id:
-            existing_exact = await session.execute(
-                select(RelationshipDescription).where(
+        existing_desc = (
+            await session.execute(
+                select(RelationshipDescription)
+                .where(
                     RelationshipDescription.relationship_id == relationship_id,
                     RelationshipDescription.document_id == document_id,
-                ).limit(1)
-            )
-            existing_desc = existing_exact.scalar_one_or_none()
-            if existing_desc:
-                # Update existing description, don't create duplicate
-                hashes = list(existing_desc.source_chunk_hashes or [])
-                if source_chunk_hash not in hashes:
-                    hashes.append(source_chunk_hash)
-                await session.execute(
-                    update(RelationshipDescription)
-                    .where(RelationshipDescription.id == existing_desc.id)
-                    .values(
-                        weight=RelationshipDescription.weight + 1,
-                        source_chunk_hashes=hashes,
-                    )
+                    RelationshipDescription.description == description,
                 )
-                return
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        evidence = evidence or {
+            "chunk_hash": source_chunk_hash,
+            "document_id": str(document_id) if document_id else None,
+            "source_passage": self._source_text,
+        }
+        source_evidence = (
+            list(existing_desc.source_evidence or []) if existing_desc else []
+        )
+        key = (evidence.get("document_id"), evidence["chunk_hash"])
+        if any(
+            (item.get("document_id"), item["chunk_hash"]) == key
+            for item in source_evidence
+        ):
+            return  # Reprocessing the same passage is not new evidence.
+        claim = {
+            **(
+                claim
+                or {"source": source_name, "target": target_name, "predicate": rel_type}
+            ),
+            "description": description,
+        }
+        passage_decision = await self._decisions.support(claim, [evidence])
+        evidence = {
+            **evidence,
+            "support_confidence": passage_decision.probabilities["supported"],
+            "support_assessment": passage_decision.trace(
+                "relationship_passage_support"
+            ),
+        }
+        source_evidence.append(evidence)
+        decision = (
+            await self._decisions.support(claim, source_evidence)
+            if len(source_evidence) > 1
+            else passage_decision
+        )
+        if existing_desc:
+            existing_desc.source_evidence = source_evidence
+            existing_desc.source_chunk_hashes = sorted(
+                {item["chunk_hash"] for item in source_evidence}
+            )
+            existing_desc.confidence = decision.probabilities["supported"]
+            existing_desc.score_metadata = decision.trace(
+                "relationship_description_support"
+            )
+            existing_desc.weight = len(source_evidence)
+            return
 
         embed_text = relationship_embedding_text(
             source_name,
@@ -900,6 +1021,9 @@ class IncrementalEntityResolver:
             description=description,
             keywords=keywords,
             weight=1,
+            confidence=decision.probabilities["supported"],
+            score_metadata=decision.trace("relationship_description_support"),
+            source_evidence=source_evidence,
             source_chunk_hashes=[source_chunk_hash],
             document_id=document_id,
             document_path=document_path,
@@ -915,7 +1039,6 @@ class IncrementalEntityResolver:
             embedding=embedding,
             document_id=document_id,
             document_path=document_path,
-            session=session,
         )
 
     async def _resolve_or_create_relationship_type(
@@ -1075,12 +1198,16 @@ class IncrementalEntityResolver:
         )
 
         rel_rows = (
-            await session.execute(
-                select(GraphRelationship).where(
-                    GraphRelationship.relationship_type_id == relationship_type.id
+            (
+                await session.execute(
+                    select(GraphRelationship).where(
+                        GraphRelationship.relationship_type_id == relationship_type.id
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
         await session.execute(
             update(GraphRelationship)
@@ -1128,6 +1255,7 @@ class IncrementalEntityResolver:
                 source_chunk_hash=source_chunk_hash,
                 document_id=document_id,
                 document_path=document_path,
+                identity_decision=self._identity_traces.get(alias_name),
             )
             .on_conflict_do_nothing()
         )
@@ -1140,7 +1268,9 @@ class IncrementalEntityResolver:
             return
         stmt = (
             pg_insert(EntityType)
-            .values(id=uuid.uuid4(), entity_id=entity_id, type_name=type_name, frequency=1)
+            .values(
+                id=uuid.uuid4(), entity_id=entity_id, type_name=type_name, frequency=1
+            )
             .on_conflict_do_update(
                 constraint="uq_entity_types_entity_type",
                 set_={"frequency": EntityType.frequency + 1},
@@ -1164,7 +1294,8 @@ class IncrementalEntityResolver:
     @staticmethod
     def _strip_diacritics(text: str) -> str:
         return "".join(
-            c for c in unicodedata.normalize("NFKD", text)
+            c
+            for c in unicodedata.normalize("NFKD", text)
             if not unicodedata.combining(c)
         )
 
@@ -1187,8 +1318,12 @@ class IncrementalEntityResolver:
     def _fuzzy_match(self, name1: str, name2: str) -> bool:
         if not name1 or not name2:
             return False
-        if self._requires_exact_name_resolution(name1) or self._requires_exact_name_resolution(name2):
-            return self._normalize_for_comparison(name1) == self._normalize_for_comparison(name2)
+        if self._requires_exact_name_resolution(
+            name1
+        ) or self._requires_exact_name_resolution(name2):
+            return self._normalize_for_comparison(
+                name1
+            ) == self._normalize_for_comparison(name2)
         n1 = self._normalize_for_comparison(name1)
         n2 = self._normalize_for_comparison(name2)
         if n1 == n2:

@@ -8,7 +8,7 @@ import string
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from typing import Any
 
@@ -16,6 +16,8 @@ from sqlalchemy import distinct, func, or_, select
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
+from graph_core.decisions import GraphDecisions
+from graph_core.decisions.graph import relevance_score, relevant
 from graph_core.embedding import get_embedding_provider
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
@@ -39,6 +41,9 @@ from graph_core.models.rel_types import (
     relationship_embedding_text,
 )
 from graph_core.services.crypto import CredentialCrypto
+from graph_core.services.graph.query.decision_context import (
+    build_context as build_decision_context,
+)
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_names import collection_graph_name
 from graph_core.storage.graph_rag_vectors import GraphRAGVectorStore
@@ -61,7 +66,7 @@ _RELATIONSHIP_RETRIEVAL_INSTRUCTION = (
     "especially causes, mechanisms, tensions, and energy depletion."
 )
 _MIX_REWRITE_MIN_SCORE = 0.3
-_REL_ENDPOINT_ENTITY_SCORE_MIN = 0.0
+_REL_ENDPOINT_ENTITY_SCORE_MIN = 0.3
 _META_PROJECTION_ENTITY_SCORE = 0.96
 _META_PROJECTION_EDGE_BASE_SCORE = 0.72
 _META_PROJECTION_MAX_BASE_REFS = 40
@@ -386,6 +391,7 @@ class GraphQueryState:
     traversed_rel_ids: list[str]
     rel_score_cache: dict[str, float]
     rel_combined_score_cache: dict[str, float]
+    relevance_decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -845,68 +851,18 @@ async def _resolve_document_routing(
     if not candidates:
         return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
 
-    llm_provider = await _resolve_llm_provider(
-        namespace_id=namespace_id,
-        llm_profile_id=llm_profile_id,
-    )
-    if isinstance(llm_provider, LocalEchoLLMProvider):
+    records = [{"id": f"document_{i}", "document_id": candidate.document_id,
+                "name": candidate.document_path or candidate.document_id,
+                "descriptions": candidate.matched_entities}
+               for i, candidate in enumerate(candidates[:20])]
+    scorer = GraphDecisions()
+    scope = await scorer.document_scope(question, records)
+    if scope.choice != "documents" or scope.probabilities["documents"] < 0.8:
         return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
-
-    candidate_lines = []
-    for index, candidate in enumerate(candidates[:20], start=1):
-        label = candidate.document_path or candidate.document_id
-        entity_summary = ", ".join(candidate.matched_entities[:5]) or "none"
-        candidate_lines.append(
-            f"{index}. {label} | document_id={candidate.document_id} | "
-            f"entities={entity_summary} | score={candidate.best_score:.3f}"
-        )
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "route": {
-                "type": "string",
-                "enum": ["all", "documents"],
-            },
-            "document_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-        },
-        "required": ["route", "document_ids"],
-    }
-
-    prompt = (
-        "You are routing a knowledge-graph question to the most relevant source documents.\n"
-        "Choose 'documents' only when the question clearly refers to one or more specific files, sources, or document subsets.\n"
-        "Otherwise choose 'all'.\n"
-        "Return only document_ids from the candidate list.\n"
-        "If the question is broad, comparative across the whole collection, or the target document is unclear, choose all.\n\n"
-        f"User question:\n{question}\n\n"
-        "Candidate documents:\n"
-        f"{chr(10).join(candidate_lines)}"
-    )
-
-    try:
-        result = await llm_provider.structured_extract(prompt=prompt, schema=schema)
-    except Exception:
-        return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
-
-    route = str(result.get("route") or "all").strip().lower()
-    selected_ids: list[uuid.UUID] = []
-    if route == "documents":
-        allowed_ids = {candidate.document_id for candidate in candidates}
-        for value in result.get("document_ids", []):
-            value_str = _maybe_uuid_string(str(value))
-            if value_str and value_str in allowed_ids:
-                try:
-                    selected_ids.append(uuid.UUID(value_str))
-                except ValueError:
-                    continue
-        selected_ids = list(dict.fromkeys(selected_ids))
-    if not selected_ids:
-        return DocumentRoutingDecision(use_all_documents=True, document_ids=[])
-    return DocumentRoutingDecision(use_all_documents=False, document_ids=selected_ids)
+    decisions = await scorer.relevance(question, records)
+    selected_ids = [uuid.UUID(record["document_id"]) for record in records
+                    if relevant(decisions[record["id"]])]
+    return DocumentRoutingDecision(use_all_documents=not bool(selected_ids), document_ids=selected_ids)
 
 
 async def _search_entity_seeds(
@@ -1073,12 +1029,10 @@ def _combined_edge_score(
     keyword_ratio = settings.graph_rag_keyword_score_ratio
     if not edge_props:
         return cos
-    raw_weight = edge_props.get("weight")
-    try:
-        max_weight = max(1, int(settings.graph_rag_max_relationship_weight))
-        weight_norm = min(int(raw_weight or 0), max_weight) / float(max_weight)
-    except (TypeError, ValueError):
-        weight_norm = 0.0
+    # Ingestion confidence has fixed units. Never reinterpret legacy mixed-unit
+    # weights (or occurrence counts) as confidence or question relevance.
+    confidence = edge_props.get("confidence")
+    weight_norm = float(confidence) if isinstance(confidence, (int, float)) and 0 <= confidence <= 1 else 0.0
     kws = edge_props.get("keywords") or []
     if not isinstance(kws, list):
         kws = []
@@ -1644,13 +1598,13 @@ async def _entity_anchor_state(
     for rel in rel_rows:
         rel_id = str(rel.id)
         edge_props = {
-            "weight": rel.weight or 1,
+            "confidence": rel.confidence,
             "keywords": rel.keywords or [],
             "rel_type": rel.rel_type,
         }
-        combined = _combined_edge_score(0.95, edge_props, query_tokens)
+        combined = _combined_edge_score(0.0, edge_props, query_tokens)
         traversed_rel_ids.append(rel_id)
-        rel_score_cache[rel_id] = 0.95
+        rel_score_cache[rel_id] = 0.0
         rel_combined_score_cache[rel_id] = combined
         for endpoint_id in (str(rel.source_entity_id), str(rel.target_entity_id)):
             discovered_entity_ids.add(endpoint_id)
@@ -1769,37 +1723,7 @@ async def _filter_relationship_state_by_entity_score(
                             state.rel_combined_score_cache[rel_id_str]
                         )
 
-        kept_rel_rows = await session.execute(
-            select(GraphRelationship).where(
-                GraphRelationship.collection_id == collection.id,
-                GraphRelationship.source_entity_id.in_(
-                    [uuid.UUID(entity_id) for entity_id in kept_entity_ids]
-                ),
-                GraphRelationship.target_entity_id.in_(
-                    [uuid.UUID(entity_id) for entity_id in kept_entity_ids]
-                ),
-            )
-        )
-        for rel in kept_rel_rows.scalars().all():
-            if document_ids:
-                rel_desc_result = await session.execute(
-                    select(RelationshipDescription.document_id).where(
-                        RelationshipDescription.relationship_id == rel.id,
-                        RelationshipDescription.document_id.in_(document_ids),
-                    )
-                )
-                if rel_desc_result.scalar_one_or_none() is None:
-                    continue
-            rel_id_str = str(rel.id)
-            if rel_id_str in filtered_rel_ids:
-                continue
-            filtered_rel_ids.append(rel_id_str)
-            filtered_rel_score_cache[rel_id_str] = state.rel_score_cache.get(
-                rel_id_str, 0.0
-            )
-            filtered_rel_combined_score_cache[rel_id_str] = (
-                state.rel_combined_score_cache.get(rel_id_str, 0.0)
-            )
+        # Do not add unscored edges merely because both endpoints survived.
 
     filtered_entity_relevance = {
         entity_id: max(
@@ -1912,6 +1836,15 @@ async def _interpret_mix_queries(
         question,
         [(name, round(score, 6)) for name, _, score in candidates[:12]],
     )
+    records = [{"id": f"candidate_{i}", "name": name, "descriptions": [description]}
+               for i, (name, description, _) in enumerate(candidates[:20])]
+    decisions = await GraphDecisions().relevance(question, records)
+    selected = sorted((record for record in records if relevant(decisions[record["id"]])),
+                      key=lambda record: relevance_score(decisions[record["id"]]), reverse=True)[:8]
+    candidates = [(record["name"], record["descriptions"][0], relevance_score(decisions[record["id"]]))
+                  for record in selected]
+    if not candidates:
+        return MixInterpretation(selected_entities=[], retrieval_subqueries=[question])
     if isinstance(llm_provider, LocalEchoLLMProvider):
         return _fallback_mix_interpretation(candidates)
 
@@ -1923,16 +1856,12 @@ async def _interpret_mix_queries(
     schema = {
         "type": "object",
         "properties": {
-            "selected_entities": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
             "retrieval_subqueries": {
                 "type": "array",
                 "items": {"type": "string"},
             },
         },
-        "required": ["selected_entities", "retrieval_subqueries"],
+        "required": ["retrieval_subqueries"],
     }
 
     prompt = (
@@ -1941,8 +1870,8 @@ async def _interpret_mix_queries(
         "The original question may not mention any graph entities by name.\n"
         "Your job is to reformulate it using the candidate entity names so the "
         "graph's stored relationships are more likely to match.\n\n"
-        "Select up to 8 relevant entities from the candidate list.\n"
-        "Then produce 2 to 4 retrieval subqueries.\n"
+        "The decision model has already selected the relevant entity names.\n"
+        "Generate 2 to 4 retrieval subquery TEXTS using only these names.\n"
         "Each subquery must use selected entity names and be focused on the "
         "topic of the original question. Use entity names exactly as they "
         "appear in the candidate list.\n"
@@ -1958,11 +1887,7 @@ async def _interpret_mix_queries(
     except Exception:
         return _fallback_mix_interpretation(candidates)
 
-    selected_entities = [
-        str(value).strip()
-        for value in result.get("selected_entities", [])
-        if str(value).strip()
-    ]
+    selected_entities = [name for name, _, _ in candidates]
     retrieval_subqueries = [
         str(value).strip()
         for value in result.get("retrieval_subqueries", [])
@@ -2306,106 +2231,14 @@ async def _build_context(
     state: GraphQueryState,
     collection: Collection,
     *,
+    question: str,
     derived_context: str = "",
     document_ids: list[uuid.UUID] | None = None,
 ) -> tuple[str, list[str], list[str], str]:
-    max_entities = 10
-    max_entity_descs = 4
-    max_rel_descs = 4
-
-    async with AsyncSessionLocal() as session:
-        ranked_entity_ids = sorted(
-            state.discovered_entity_ids,
-            key=lambda eid: state.entity_relevance.get(eid, 0.0),
-            reverse=True,
-        )
-
-        entity_context_parts: list[str] = []
-        entities_used: list[str] = []
-        for eid_str in ranked_entity_ids[:max_entities]:
-            try:
-                eid = uuid.UUID(eid_str)
-            except ValueError:
-                continue
-            entity = await session.get(GraphEntity, eid)
-            if not entity:
-                continue
-            entity_conditions = [EntityDescription.entity_id == eid]
-            if document_ids:
-                entity_conditions.append(EntityDescription.document_id.in_(document_ids))
-            descs_result = await session.execute(
-                select(EntityDescription)
-                .where(*entity_conditions)
-                .order_by(EntityDescription.weight.desc())
-                .limit(max_entity_descs)
-            )
-            descs = descs_result.scalars().all()
-            if descs:
-                desc_texts = " | ".join(
-                    description.description for description in descs
-                )
-                entity_context_parts.append(
-                    f"{entity.canonical_name} ({entity.primary_type or 'unknown'}): "
-                    f"{desc_texts}"
-                )
-                entities_used.append(entity.canonical_name)
-
-        rel_context_parts_by_type: dict[str, list[tuple[float, str]]] = {}
-        relationships_used: list[str] = []
-        for rel_id_str in state.traversed_rel_ids[:50]:
-            try:
-                rel_uuid = uuid.UUID(rel_id_str)
-            except ValueError:
-                continue
-            rel = await session.get(GraphRelationship, rel_uuid)
-            if not rel:
-                continue
-            src_entity = await session.get(GraphEntity, rel.source_entity_id)
-            tgt_entity = await session.get(GraphEntity, rel.target_entity_id)
-            src_name = src_entity.canonical_name if src_entity else "?"
-            tgt_name = tgt_entity.canonical_name if tgt_entity else "?"
-            rel_conditions = [RelationshipDescription.relationship_id == rel_uuid]
-            if document_ids:
-                rel_conditions.append(
-                    RelationshipDescription.document_id.in_(document_ids)
-                )
-            descs_result = await session.execute(
-                select(RelationshipDescription)
-                .where(*rel_conditions)
-                .order_by(RelationshipDescription.weight.desc())
-                .limit(max_rel_descs)
-            )
-            descs = descs_result.scalars().all()
-            sim = state.rel_combined_score_cache.get(rel_id_str, 0.0)
-            rel_type = rel.rel_type or "RELATES_TO"
-            for description in descs:
-                rel_text = (
-                    f"{src_name} -[{rel_type}]-> {tgt_name}: {description.description}"
-                )
-                rel_context_parts_by_type.setdefault(rel_type, []).append(
-                    (sim, rel_text)
-                )
-                relationships_used.append(f"{src_name} -[{rel_type}]-> {tgt_name}")
-
-    entity_context = "\n".join(entity_context_parts)
-    rel_sections: list[tuple[float, str]] = []
-    for rel_type, items in rel_context_parts_by_type.items():
-        items.sort(key=lambda item: item[0], reverse=True)
-        section_text = "\n".join(text for _, text in items)
-        section_score = items[0][0] if items else 0.0
-        rel_sections.append((section_score, f"{rel_type}:\n{section_text}"))
-    rel_sections.sort(key=lambda item: item[0], reverse=True)
-    rel_context = "\n\n".join(text for _, text in rel_sections)
-    context = "Context:\n"
-    if derived_context:
-        context += f"Derived Understanding:\n{derived_context}\n"
-    context += (
-        "Entities:\n"
-        f"{entity_context or '(none)'}\n"
-        "Relationships By Type:\n"
-        f"{rel_context or '(none)'}"
+    return await build_decision_context(
+        state, collection, question, derived_context=derived_context,
+        document_ids=document_ids,
     )
-    return context, entities_used, list(dict.fromkeys(relationships_used)), rel_context
 
 
 async def _meta_base_ref_names_from_artifacts(
@@ -2799,12 +2632,13 @@ async def _build_graph_query_artifacts(
     if effective_mode not in ("relationship-first", "mix", "hybrid"):
         effective_mode = "entity-first"
 
-    route_profile = await _derive_route_profile(collection, state)
     context, entities_used, relationships_used, rel_context = await _build_context(
         state,
         collection,
+        question=question,
         document_ids=document_ids,
     )
+    route_profile = await _derive_route_profile(collection, state)
     logger.info(
         "graph_rag artifacts collection=%s mode=%s route=%s entities_used=%s relationships_used=%s",
         collection.name,
@@ -2893,6 +2727,7 @@ async def graph_rag_query(
             ) = await _build_context(
                 projected_base_state,
                 collection,
+                question=question,
                 document_ids=document_ids,
             )
             base = replace(
@@ -2972,4 +2807,10 @@ async def graph_rag_query(
         ),
         mode=_MODE_ALIASES.get((mode or "mix").lower(), "mix"),
         retrieval_context=context,
+        relevance_scores=(
+            base.state.relevance_decisions + [
+                trace for _, artifacts in meta_artifacts
+                for trace in artifacts.state.relevance_decisions
+            ]
+        ),
     )

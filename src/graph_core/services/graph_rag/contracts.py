@@ -48,10 +48,10 @@ from graph_core.models.domain_config import DomainConfig, get_domain_config
 CODE_DOMAIN = "code"
 
 #: The only generic response: typed entities plus selective relationships.
-GENERIC_EXTRACTION_CONTRACT = "generic-entities-relationships"
+GENERIC_EXTRACTION_CONTRACT = "generic-text-claims-v2"
 
 #: Fixed code taxonomy with endpoints as typed code objects.
-CODE_TAXONOMY_V0 = "code-taxonomy-v0"
+CODE_TAXONOMY_V0 = "code-text-claims-v1"
 
 #: Fingerprint recorded for rows written before fingerprints existed. Nothing
 #: about the configuration those runs resolved can be reconstructed, so those

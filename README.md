@@ -403,6 +403,10 @@ curl -X POST http://localhost:8001/collections/<collection-uuid>/query \
   }'
 ```
 
+## Decision Model
+
+Graph extraction produces text only. The decision model handles identity and source-support decisions; custom Graph RAG also uses the decision model for query-time passage relevance. See [decision model setup and score semantics](docs/decision-model.md). Docker uses the existing host URL normalizer to reach port 8081.
+
 ## Current Behavior
 
 - `local_hash` embeddings are deterministic and offline-safe. They are useful for

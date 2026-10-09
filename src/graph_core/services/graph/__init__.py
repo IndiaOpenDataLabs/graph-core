@@ -1275,7 +1275,6 @@ class GraphService:
                     target_entity_id=ref_id.entity_id,
                     description=f"Concept {label} is evidenced by entity {name}.",
                     keywords=[],
-                    weight=1.0,
                     source_chunk_hash=source_chunk_hash,
                     rel_type="EVIDENCED_BY",
                 )
@@ -1381,10 +1380,6 @@ class GraphService:
                 keywords = edge.get("keywords")
                 if not isinstance(keywords, list):
                     keywords = []
-                try:
-                    weight = float(edge.get("weight") or 1)
-                except (TypeError, ValueError):
-                    weight = 1.0
                 description = str(edge.get("description") or "").strip() or rel_type
                 source_ids = edge.get("source_ids")
                 if not isinstance(source_ids, list):
@@ -1410,7 +1405,6 @@ class GraphService:
                     target_entity_id=target_entity_id,
                     description=description,
                     keywords=keywords,
-                    weight=weight,
                     source_chunk_hash=source_chunk_hash,
                     rel_type=rel_type,
                 )
@@ -1427,7 +1421,9 @@ class GraphService:
                             "source_id": str(persisted_rel.source_entity_id),
                             "target_id": str(persisted_rel.target_entity_id),
                             "id": str(rel_result.relationship_id),
-                            "weight": int(persisted_rel.weight or 1),
+                            "weight": persisted_rel.weight,
+                            "confidence": persisted_rel.confidence,
+                            "support_count": persisted_rel.support_count,
                             "keywords": persisted_rel.keywords or [],
                             "rel_type": persisted_rel.rel_type,
                             "collection_id": str(meta_collection.id),
@@ -1969,6 +1965,7 @@ class GraphService:
                         "mode": result.mode,
                         "chat_id": result.chat_id,
                         "retrieval_context": result.retrieval_context,
+                        "relevance_scores": result.relevance_scores,
                     },
                 },
             )
@@ -1983,6 +1980,7 @@ class GraphService:
                     "mode": result.mode,
                     "chat_id": result.chat_id,
                     "retrieval_context": result.retrieval_context,
+                    "relevance_scores": result.relevance_scores,
                 },
             )
         except ValueError as e:
@@ -2225,7 +2223,6 @@ class GraphService:
                             target_entity_id=ref_id.entity_id,
                             description=f"Concept {label} is evidenced by entity {name}.",
                             keywords=[],
-                            weight=1.0,
                             source_chunk_hash=source_chunk_hash,
                             rel_type="EVIDENCED_BY",
                         )
@@ -2347,7 +2344,6 @@ class GraphService:
                         target_entity_id=target_entity_id,
                         description=description,
                         keywords=keywords,
-                        weight=weight,
                         source_chunk_hash=source_chunk_hash,
                         rel_type=rel_type,
                     )
@@ -2470,7 +2466,6 @@ class GraphService:
                     target_entity_id=target_entity_id,
                     description=description,
                     keywords=keywords,
-                    weight=weight,
                     source_chunk_hash=source_chunk_hash,
                     rel_type=rel_type,
                 )
@@ -2487,7 +2482,9 @@ class GraphService:
                             "source_id": str(persisted_rel.source_entity_id),
                             "target_id": str(persisted_rel.target_entity_id),
                             "id": str(rel_result.relationship_id),
-                            "weight": int(persisted_rel.weight or 1),
+                            "weight": persisted_rel.weight,
+                            "confidence": persisted_rel.confidence,
+                            "support_count": persisted_rel.support_count,
                             "keywords": persisted_rel.keywords or [],
                             "rel_type": persisted_rel.rel_type,
                             "collection_id": str(meta_collection.id),
