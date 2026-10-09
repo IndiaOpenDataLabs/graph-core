@@ -41,7 +41,7 @@ export interface Job {
   error?: string | null;
   collection_id?: string;
   document_path?: string | null;
-  payload?: { result?: QueryResult };
+  payload?: { question?: string; result?: QueryResult };
 }
 
 export class Api {

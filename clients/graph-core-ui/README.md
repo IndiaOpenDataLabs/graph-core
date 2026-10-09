@@ -48,7 +48,8 @@ proxy configuration, not a client-side secret. No CORS changes are needed.
 4. **Query explorer**: select a collection, ask a question, optionally override the
    retrieval mode or answer-model profile. The UI polls the durable job until it
    completes; worker/provider failures are shown without fabricating an answer.
-5. **Activity**: monitor recent namespace jobs and reopen completed query results.
+5. **Activity**: see the original question first for each query job, followed by
+   collection details and status, and reopen completed query results.
 
 Switching namespace clears the workspace. Switching tabs or collections stops
 local polling but does **not** cancel an already-enqueued backend job. Activity
@@ -82,9 +83,16 @@ uv run pytest tests/test_services/test_query_retrieval_context.py -q
 
 ## Security and deployment
 
-- JWTs exist only in React memory, never local/session storage or URLs. Reloading
-  requires reconnecting. Provider secrets are sent to the API for encrypted
-  registration; they are cleared from the form after success.
+- JWTs and the active namespace are saved in this tab's `sessionStorage`, so a
+  page refresh restores the connection. They are not saved in `localStorage` or
+  URLs. Sign out clears saved credentials; disconnecting clears the namespace
+  connection while retaining admin login for namespace switching. Closing the
+  tab ends the browser session (browser session-restore behavior may vary).
+  Treat same-origin scripts as trusted: session storage is readable by them.
+  JWT expiry still applies. If browser storage is blocked, login works in memory
+  and the sidebar warns that refresh will require signing in.
+- Provider secrets are sent to the API for encrypted registration; they are
+  cleared from the form after success and are not stored by the browser client.
 - Text, answers, and raw results are rendered as escaped text, not HTML.
 - The dev/preview servers bind loopback only. They are local-development tools,
   not production authentication gateways.

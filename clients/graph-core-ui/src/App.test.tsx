@@ -1,6 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "./App";
+import { connectionKey } from "./connection";
+import type { Job } from "./api";
 
 const namespace = {
   id: "12345678-1234-1234-1234-123456789abc",
@@ -25,7 +27,7 @@ const calls: {
   token: string | undefined;
   body: Record<string, unknown> | undefined;
 }[] = [];
-function mockApi() {
+function mockApi(jobs: Job[] = []) {
   calls.length = 0;
   vi.stubGlobal(
     "fetch",
@@ -56,7 +58,7 @@ function mockApi() {
           retrieval_strategies: ["vector", "light_rag", "custom_graph_rag"],
           max_chunk_size: 5000,
         };
-      else if (path === "/api/jobs/?limit=30") data = [];
+      else if (path === "/api/jobs/?limit=30") data = jobs;
       else if (path.endsWith("/query") || path.endsWith("/ingest/doc"))
         data = { job_id: "job-one", status: "queued" };
       else if (path === "/api/jobs/job-one")
@@ -69,7 +71,11 @@ function mockApi() {
     }),
   );
 }
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  sessionStorage.clear();
+  localStorage.clear();
+});
 async function connectUser() {
   fireEvent.change(screen.getByLabelText("Token type"), {
     target: { value: "user" },
@@ -205,6 +211,91 @@ it("rejects a user token belonging to another namespace", async () => {
   );
   expect(screen.queryByLabelText("Your question")).not.toBeInTheDocument();
   expect(calls.some((c) => c.path === "/api/collections/")).toBe(false);
+});
+
+it("restores a user connection after refresh and clears it on sign out", async () => {
+  mockApi();
+  const first = render(<App />);
+  await connectUser();
+  await waitFor(() =>
+    expect(
+      JSON.parse(sessionStorage.getItem(connectionKey)!).session.token,
+    ).toBe("user-token"),
+  );
+  first.unmount();
+  calls.length = 0;
+  const refreshed = render(<App />);
+  await screen.findByLabelText("Your question");
+  expect(screen.queryByLabelText("JWT bearer token")).not.toBeInTheDocument();
+  expect(calls.find((c) => c.path === "/api/collections/")?.token).toBe(
+    "Bearer user-token",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+  await waitFor(() => expect(sessionStorage.getItem(connectionKey)).toBeNull());
+  refreshed.unmount();
+  render(<App />);
+  expect(screen.getByLabelText("JWT bearer token")).toBeInTheDocument();
+});
+
+it("restores admin login and namespace switching after refresh", async () => {
+  mockApi();
+  const first = render(<App />);
+  fireEvent.change(screen.getByLabelText("JWT bearer token"), {
+    target: { value: "admin-token" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  await screen.findByRole("button", { name: "Open workspace →" });
+  first.unmount();
+  const adminRefresh = render(<App />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Open workspace →" }),
+  );
+  await screen.findByLabelText("Your question");
+  adminRefresh.unmount();
+  render(<App />);
+  await screen.findByLabelText("Your question");
+  fireEvent.click(screen.getByRole("button", { name: "Switch namespace" }));
+  await screen.findByRole("button", { name: "Open workspace →" });
+  expect(JSON.parse(sessionStorage.getItem(connectionKey)!)).toEqual({
+    adminToken: "admin-token",
+    session: null,
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+  await waitFor(() => expect(sessionStorage.getItem(connectionKey)).toBeNull());
+});
+
+it("shows stored questions first in Activity, with collection details below", async () => {
+  mockApi([
+    {
+      id: "job-one",
+      type: "query",
+      status: "completed",
+      collection_id: collection.id,
+      payload: { question: "Who is Ada?", result },
+    },
+    {
+      id: "job-two",
+      type: "query",
+      status: "pending",
+      collection_id: collection.id,
+      payload: { question: "What did Ada write?" },
+    },
+    {
+      id: "legacy-job",
+      type: "query",
+      status: "failed",
+      collection_id: collection.id,
+    },
+  ]);
+  render(<App />);
+  await connectUser();
+  fireEvent.click(screen.getByRole("button", { name: "Activity" }));
+  expect(screen.getByText("Who is Ada?").tagName).toBe("STRONG");
+  expect(screen.getByText("What did Ada write?").tagName).toBe("STRONG");
+  expect(screen.getAllByText("query · Notes")[0].tagName).toBe("SMALL");
+  expect(screen.getByText("Query (question unavailable)")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Inspect result" }));
+  expect(await screen.findByText("Graph-backed answer")).toBeInTheDocument();
 });
 
 it("renders API errors without connecting to a namespace", async () => {

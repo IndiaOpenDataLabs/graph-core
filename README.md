@@ -121,8 +121,8 @@ make ui
 
 Open `http://localhost:5173`. Generate a token with `uv run graph-core-admin-jwt`
 and paste it into the admin connection form, then open a namespace. Alternatively,
-connect directly with a namespace-scoped user JWT. Tokens remain in memory;
-reloading signs you out.
+connect directly with a namespace-scoped user JWT. The connection is saved in
+this tab's session storage so refreshing keeps you signed in. Sign out clears it.
 
 The Vite proxy forwards `/api` to `http://127.0.0.1:8001` (override using
 `GRAPH_CORE_API_URL`). The query explorer separates the answer from retrieved

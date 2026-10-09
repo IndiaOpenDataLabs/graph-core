@@ -18,7 +18,7 @@ import {
   type QueryResult,
 } from "./api";
 
-type Session = { namespace: Namespace; token: string };
+import { loadConnection, saveConnection, type Session } from "./connection";
 const namespaceIdPattern =
   "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 type Tab = "query" | "data" | "collections" | "profiles" | "jobs";
@@ -102,11 +102,37 @@ export default function App() {
   const [mode, setMode] = useState<"admin" | "user">("admin");
   const [token, setToken] = useState("");
   const [namespaceId, setNamespaceId] = useState("");
-  const [adminApi, setAdminApi] = useState<Api | null>(null);
+  const [saved] = useState(loadConnection);
+  const [adminToken, setAdminToken] = useState<string | null>(saved.adminToken);
+  const adminApi = useMemo(
+    () => (adminToken ? new Api(adminToken) : null),
+    [adminToken],
+  );
   const [namespaces, setNamespaces] = useState<Namespace[]>([]);
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession] = useState<Session | null>(saved.session);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [storageAvailable, setStorageAvailable] = useState(true);
+
+  useEffect(() => {
+    setStorageAvailable(saveConnection({ adminToken, session }));
+  }, [adminToken, session]);
+
+  useEffect(() => {
+    if (!adminApi || session) return;
+    const controller = new AbortController();
+    void adminApi
+      .request<Namespace[]>(
+        "/platform/namespaces/",
+        undefined,
+        controller.signal,
+      )
+      .then(setNamespaces)
+      .catch((e) => {
+        if (!controller.signal.aborted) setError(e.message);
+      });
+    return () => controller.abort();
+  }, [adminApi, session]);
 
   async function perform(task: () => Promise<void>) {
     setBusy(true);
@@ -127,7 +153,7 @@ export default function App() {
       if (mode === "admin") {
         const list = await api.request<Namespace[]>("/platform/namespaces/");
         setNamespaces(list);
-        setAdminApi(api);
+        setAdminToken(token.trim());
       } else {
         if (!new RegExp(`^${namespaceIdPattern}$`).test(requestedId)) {
           throw new Error("Enter a valid namespace ID (UUID).");
@@ -170,7 +196,7 @@ export default function App() {
   }
   function signOut() {
     disconnect();
-    setAdminApi(null);
+    setAdminToken(null);
     setNamespaces([]);
     setToken("");
     setNamespaceId("");
@@ -193,9 +219,19 @@ export default function App() {
         <div className="sidebar-bottom">
           <span className="connection-dot" /> REST API · via local proxy
           <p>
-            Tokens stay in memory.
-            <br />
-            Reloading signs you out.
+            {storageAvailable ? (
+              <>
+                Connection saved for this tab.
+                <br />
+                Refresh keeps you signed in.
+              </>
+            ) : (
+              <>
+                Browser storage unavailable.
+                <br />
+                Refresh will require signing in.
+              </>
+            )}
           </p>
           {(session || adminApi) && (
             <button className="secondary" onClick={signOut}>
@@ -961,7 +997,10 @@ function Workspace({
                   <div className="list-row" key={job.id}>
                     <div>
                       <strong>
-                        {job.type}{" "}
+                        {job.type === "query"
+                          ? job.payload?.question ||
+                            "Query (question unavailable)"
+                          : job.type}{" "}
                         <span
                           className={`badge ${job.status === "failed" ? "failed" : ""}`}
                         >
@@ -969,6 +1008,7 @@ function Workspace({
                         </span>
                       </strong>
                       <small>
+                        {job.type === "query" && "query · "}
                         {collections.find((c) => c.id === job.collection_id)
                           ?.name || job.collection_id}{" "}
                         {job.document_path && `· ${job.document_path}`}
