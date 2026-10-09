@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -20,6 +21,7 @@ from graph_core.models.rel_types import (
     DEFAULT_REL_TYPE,
     normalize_rel_type,
 )
+from graph_core.services.graph_rag.contracts import extraction_contract_for
 
 logger = logging.getLogger(__name__)
 
@@ -88,17 +90,34 @@ _RELATIONSHIP_ITEM_SCHEMA: dict[str, Any] = {
 }
 
 
+# Generic endpoints carry descriptions for inventory validation repairs.
+# Never mutate the shared item: the code taxonomy must remain endpoint-derived.
+_GENERIC_RELATIONSHIP_ITEM_SCHEMA = deepcopy(_RELATIONSHIP_ITEM_SCHEMA)
+
 _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
-    "title": "graph_rag_relationship_extraction",
+    "title": "graph_rag_entity_relationship_extraction",
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "type": {"type": "string", "minLength": 1},
+                    "description": {"type": "string", "minLength": 1},
+                },
+                "required": ["name", "type", "description"],
+            },
+        },
         "relationships": {
             "type": "array",
             "items": {
-                **_RELATIONSHIP_ITEM_SCHEMA,
+                **_GENERIC_RELATIONSHIP_ITEM_SCHEMA,
                 "properties": {
-                    **_RELATIONSHIP_ITEM_SCHEMA["properties"],
+                    **_GENERIC_RELATIONSHIP_ITEM_SCHEMA["properties"],
                     "rel_type": {
                         "type": "array",
                         "items": {
@@ -129,7 +148,7 @@ _GENERIC_EXTRACTION_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["relationships"],
+    "required": ["entities", "relationships"],
 }
 
 
@@ -171,29 +190,51 @@ _CODE_EXTRACTION_SCHEMA = _build_code_taxonomy_schema()
 
 
 _EXTRACTION_SYSTEM_PROMPT = """---Role---
-You are a Knowledge Graph Specialist responsible for extracting
-relationships from input text.
+You are a Knowledge Graph Specialist responsible for independently extracting
+meaningful entities and explicitly supported relationships from input text.
 
 ---Instructions---
-1. Relationship extraction:
-   - Identify direct relationships between concrete entities or concepts
-     that are explicitly supported by the text.
-   - For N-ary relationships, decompose them into binary pairs.
-   - For each relationship, extract: source, target, description, keywords,
-     weight, rel_type.
+1. Entity extraction:
+   - First identify concrete participants, objects, places, organizations,
+     works, systems, and salient concepts, processes, states, events or teachings.
+   - Include useful retrieval anchors even when they have no relationship
+     in this chunk. An entity does not require an edge.
+   - Prefer coherent compound concepts such as "Non-Attachment To Results";
+     do not blindly split every noun unless each is independently meaningful.
+   - Do not extract filler nouns, known-reference pronouns, every modifier,
+     or arbitrary fragments created only to satisfy a relationship schema.
+   - Each entity must have name, type, and a non-empty, source-grounded
+     description. Use concise semantic types such as Person, Place,
+     Organization, Object, Concept, Process, State, Event, Work or System.
+     Suggested types: {entity_types}.
+   - Domain naming guidance: {domain_entity_guidance}
+   - Domain guidance refines naming, but must not suppress salient independent
+     entities or require them to participate in a relationship.
+
+2. Relationship extraction:
+   - Identify only selective, explicitly supported connections between entities
+     in the inventory. Do not evaluate or connect every possible pair.
+   - Source and target names must exactly match names in the entities array.
+   - Preserve source-to-target direction when the text expresses direction;
+     never reorder endpoints to alphabetize or make a directed edge undirected.
+   - Prefer stable, reusable types such as TEACHES, QUALIFIES, CONTRASTS_WITH,
+     PART_OF, CAUSES or ABOUT. Avoid sentence-specific grammatical labels
+     such as PERFORMED_WITHOUT or DIRECTED_TOWARD_IN_THIS_SENTENCE.
+   - Put precise local meaning in descriptions and keywords, not in a new
+     predicate name for every verb, modifier or preposition.
    - Relationship descriptions must explain the nature of the connection,
      the context in which it holds, and why it matters.
-   - Treat relationships as undirected unless the text clearly indicates
-     direction.
-   - Avoid duplicate relationships.
+   - Avoid duplicate relationships and unsupported pairwise cliques.
 
-2. Output requirements:
-   - Return structured JSON with one object: "relationships".
+3. Output requirements:
+   - Return one structured JSON object containing "entities" and "relationships"
+     arrays in the same response. Do not invent unsupported items.
    - Each relationship item must use endpoint objects for source and target:
        source: {{name (string), description (string)}}
        target: {{name (string), description (string)}}
-   - Keep source and target descriptions separate from the relationship
-     description. The endpoint descriptions are entity descriptions.
+   - Keep endpoint descriptions separate from the relationship description.
+     Copy them from the matching entities entries: the entities array is the
+     source of truth, and endpoint descriptions are only a repair fallback.
    - Each relationship must also have top-level:
        description (string),
        keywords    (array of strings),
@@ -219,13 +260,13 @@ relationships from input text.
 """
 
 
-_EXTRACTION_USER_PROMPT = """Extract all relationships
-from the following text.
+_EXTRACTION_USER_PROMPT = """Extract the meaningful entities and explicitly
+supported relationships from the following text.
 
 Text:
 {text}
 
-Return only the structured relationships object.
+Return only the structured entities and relationships object.
 """
 
 
@@ -446,7 +487,9 @@ def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
                         entity_order.append(name)
                         entity_descriptions[name] = description
                         continue
-                    if description and len(description) > len(entity_descriptions[name]):
+                    if description and len(description) > len(
+                        entity_descriptions[name]
+                    ):
                         entity_descriptions[name] = description
 
     return [
@@ -459,48 +502,17 @@ def _collect_code_entities(relationships: Any) -> list[ExtractedEntity]:
     ]
 
 
-def _collect_generic_entities(relationships: Any) -> list[ExtractedEntity]:
-    if not isinstance(relationships, list):
-        return []
-
-    entity_descriptions: dict[str, str] = {}
-    entity_order: list[str] = []
-    for rel in relationships:
-        if not isinstance(rel, dict):
-            continue
-        for endpoint_key in ("source", "target"):
-            parsed = _parse_relationship_endpoint(rel.get(endpoint_key))
-            if parsed is None:
-                continue
-            name, description = parsed
-            if name not in entity_descriptions:
-                entity_order.append(name)
-                entity_descriptions[name] = description
-                continue
-            if description and len(description) > len(entity_descriptions[name]):
-                entity_descriptions[name] = description
-
-    return [
-        ExtractedEntity(
-            name=name,
-            entity_type="UNKNOWN",
-            description=entity_descriptions.get(name, ""),
-        )
-        for name in entity_order
-    ]
-
-
 _GLEANING_SYSTEM_PROMPT = """---Role---
-You are a Knowledge Graph Specialist completing a first-pass relationship
-graph so it fully captures the logic of the source passage.
+You are a Knowledge Graph Specialist completing an independently extracted
+entity inventory and selective relationship graph for the source passage.
 
 ---Instructions---
-Read the source passage and the relationships already extracted from it.
-Ask yourself: using only the extracted relationships, could a reader
-reconstruct the meaning and logic of the passage? Identify what is missing
-to recreate that logic, and emit only those additions or corrections.
+Read the source passage and the entities and relationships already extracted.
+Identify missed or corrected entities and explicitly supported relationships.
+Include salient concepts even without edges; prefer coherent compound concepts
+rather than grammatical fragments. Do not connect every entity pair.
 
-1. Do not repeat relationships that were already extracted correctly.
+1. Do not repeat entities or relationships already extracted correctly.
 2. Focus on:
    - relationships needed to recreate the passage's logic that the first
      pass missed
@@ -517,26 +529,28 @@ to recreate that logic, and emit only those additions or corrections.
 6. Preserve multiple genuinely distinct rel_type entries for the same
    source/target pair when the text supports them; do not collapse them
    to one generic edge unless the evidence really supports only one.
-7. Return only new or corrected relationships, not the whole graph. The
-   additions are merged into the existing graph; nothing you omit is
-   deleted.
-8. Do not emit an entities section. The ingestion adapter will derive
-   entities from the relationship endpoints after parsing.
-9. {domain_entity_guidance}
-10. Only include items explicitly supported by the text.
+7. Return one object with entities and relationships arrays containing only
+   missed or corrected items, not the whole graph. Omitted items are not deleted.
+8. Every new or corrected entity needs name, type and a non-empty source-grounded
+   description. Endpoint names must exactly match the combined existing and new
+   entity inventory; do not repeat an unchanged entity just to reference it.
+   Use endpoint objects with name and description copied from the entity entry.
+9. Domain naming guidance: {domain_entity_guidance}
+   This guidance must not suppress salient independent entities.
+10. Only include items explicitly supported by the text. Preserve direction;
+    use reusable relationship labels, not sentence-specific grammatical types.
 """
 
 
-_GLEANING_USER_PROMPT = """Previously extracted relationships:
+_GLEANING_USER_PROMPT = """Previously extracted entities and relationships:
 {existing_info}
 
-Identify what is still missing to recreate the logic of the passage, then
-extract those additional or corrected relationships from:
+Extract only missed or corrected entities and explicitly supported
+relationships from:
 
 {text}
 
-Only output new or corrected relationships in the structured relationships
-object.
+Return the structured entities and relationships object with both arrays.
 """
 
 
@@ -621,7 +635,8 @@ class LLMGraphExtractor:
                     )
                     continue
                 logger.info(
-                    "LLM emitted new rel_type=%r outside active %s vocab; accepting normalized type %s",
+                    "LLM emitted new rel_type=%r outside active %s vocab; "
+                    "accepting normalized type %s",
                     raw_name,
                     domain,
                     name,
@@ -805,14 +820,27 @@ Only output the structured relationships object.
         for ent in entities:
             if not isinstance(ent, dict):
                 continue
-            name = cls._normalize_entity_name(ent.get("name", ""))
+            raw_name = ent.get("name")
+            if not isinstance(raw_name, str):
+                continue
+            name = cls._normalize_entity_name(raw_name)
             if not name:
                 continue
+            description = ent.get("description")
+            if not isinstance(description, str) or not description.strip():
+                logger.warning("Rejecting entity with empty description name=%r", name)
+                continue
+            raw_type = ent.get("type")
+            entity_type = (
+                raw_type.strip().upper()
+                if isinstance(raw_type, str) and raw_type.strip()
+                else "UNKNOWN"
+            )
             extracted.append(
                 ExtractedEntity(
                     name=name,
-                    entity_type=str(ent.get("type", "UNKNOWN")).upper(),
-                    description=str(ent.get("description", "") or ""),
+                    entity_type=entity_type,
+                    description=description.strip(),
                 )
             )
         return extracted
@@ -831,6 +859,12 @@ Only output the structured relationships object.
 
         for rel in relationships:
             if not isinstance(rel, dict):
+                continue
+            # The generic schema has one endpoint shape: named objects.
+            # Leave the code-domain strict-vocabulary adapter unchanged.
+            if not strict_vocab and not all(
+                isinstance(rel.get(key), dict) for key in ("source", "target")
+            ):
                 continue
             source_endpoint = _parse_relationship_endpoint(rel.get("source"))
             target_endpoint = _parse_relationship_endpoint(rel.get("target"))
@@ -1041,6 +1075,131 @@ Only output the structured relationships object.
 
         return [merged[name] for name in order], added
 
+    @classmethod
+    def _merge_generic_entities(
+        cls,
+        current: list[ExtractedEntity],
+        additions: list[ExtractedEntity],
+        *,
+        corrections: bool = False,
+    ) -> tuple[list[ExtractedEntity], int]:
+        """Deduplicate normalized names while retaining the inventory's spelling.
+
+        Prefer richer descriptions when deduplicating one response. Gleaning
+        corrections replace descriptions even when shorter, and may correct a
+        type without downgrading a known type to UNKNOWN. Code merging is unchanged.
+        """
+        merged: dict[str, ExtractedEntity] = {}
+        for entity in current:
+            key = cls._normalize_entity_name(entity.name).casefold()
+            merged[key] = entity
+        added = 0
+        for entity in additions:
+            name = cls._normalize_entity_name(entity.name)
+            key = name.casefold()
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = replace(entity, name=name)
+                added += 1
+                continue
+            promoted = (
+                existing.entity_type == "UNKNOWN" and entity.entity_type != "UNKNOWN"
+            )
+            merged[key] = ExtractedEntity(
+                name=existing.name,
+                entity_type=(
+                    entity.entity_type
+                    if promoted or (corrections and entity.entity_type != "UNKNOWN")
+                    else existing.entity_type
+                ),
+                description=(
+                    entity.description
+                    if (
+                        corrections or promoted
+                        or len(entity.description) > len(existing.description)
+                    )
+                    else existing.description
+                ),
+            )
+        return list(merged.values()), added
+
+    @classmethod
+    def _validate_generic_inventory(
+        cls,
+        entities: list[ExtractedEntity],
+        relationships: list[ExtractedRelationship],
+        *,
+        text: str,
+        domain: str | None,
+        phase: str,
+    ) -> ExtractionResult:
+        """Bind endpoints to inventory names and repair incomplete inventories.
+
+        Independent descriptions win over endpoint descriptions. A missing entry
+        can use the richest endpoint description. Without a usable description,
+        reject the affected edge rather than persist an invisible entity.
+        """
+        inventory = {
+            cls._normalize_entity_name(entity.name).casefold(): entity
+            for entity in entities
+        }
+        endpoint_descriptions: dict[str, tuple[str, str]] = {}
+        for rel in relationships:
+            for name, description in (
+                (rel.source_name, rel.source_description),
+                (rel.target_name, rel.target_description),
+            ):
+                name = cls._normalize_entity_name(name)
+                key = name.casefold()
+                existing = endpoint_descriptions.get(key)
+                if existing is None or len(description.strip()) > len(existing[1]):
+                    endpoint_descriptions[key] = (name, description.strip())
+
+        repairs = 0
+        for key, (name, description) in endpoint_descriptions.items():
+            if key in inventory or not name or not description:
+                continue
+            inventory[key] = ExtractedEntity(name, "UNKNOWN", description)
+            repairs += 1
+
+        bound: list[ExtractedRelationship] = []
+        for rel in relationships:
+            source = inventory.get(
+                cls._normalize_entity_name(rel.source_name).casefold()
+            )
+            target = inventory.get(
+                cls._normalize_entity_name(rel.target_name).casefold()
+            )
+            if source is None or target is None:
+                continue
+            bound.append(replace(rel, source_name=source.name, target_name=target.name))
+
+        logger.info(
+            "generic extraction validation chunk_hash=%s contract=%s phase=%s "
+            "repairs=%d entities=%d relationships=%d dropped_relationships=%d",
+            hashlib.md5(text.encode()).hexdigest(),
+            extraction_contract_for(domain),
+            phase,
+            repairs,
+            len(inventory),
+            len(bound),
+            len(relationships) - len(bound),
+        )
+        return ExtractionResult(entities=list(inventory.values()), relationships=bound)
+
+    @staticmethod
+    def _has_generic_arrays(payload: Any) -> bool:
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("entities"), list)
+            and isinstance(payload.get("relationships"), list)
+        ):
+            return True
+        logger.warning(
+            "Rejecting generic output: entities and relationships arrays are required"
+        )
+        return False
+
     async def extract(
         self,
         text: str,
@@ -1096,14 +1255,22 @@ Only output the structured relationships object.
                 domain=domain,
             )
         else:
+            if not self._has_generic_arrays(result):
+                return ExtractionResult(entities=[], relationships=[])
             relationships_payload = result.get("relationships")
-            entities = _collect_generic_entities(relationships_payload)
+            entities, _ = self._merge_generic_entities(
+                [], self._extract_entities(result.get("entities"))
+            )
             relationships = self._extract_relationships(
                 relationships_payload,
                 rel_vocab=rel_vocab,
                 domain=domain,
                 is_code_domain=is_code_domain,
             )
+            validated = self._validate_generic_inventory(
+                entities, relationships, text=text, domain=domain, phase="extraction"
+            )
+            entities, relationships = validated.entities, validated.relationships
 
         extraction_result = ExtractionResult(
             entities=entities,
@@ -1178,23 +1345,40 @@ Only output the structured relationships object.
                     domain=domain,
                 )
             else:
+                if not self._has_generic_arrays(gleamed):
+                    break
                 relationships_payload = gleamed.get("relationships")
-                gleaned_entities = _collect_generic_entities(relationships_payload)
+                gleaned_entities, added_entities = self._merge_generic_entities(
+                    current_entities,
+                    self._extract_entities(gleamed.get("entities")),
+                    corrections=True,
+                )
                 gleaned_relationships = self._extract_relationships(
                     relationships_payload,
                     rel_vocab=rel_vocab,
                     domain=domain,
                     is_code_domain=False,
                 )
+                validated = self._validate_generic_inventory(
+                    gleaned_entities,
+                    gleaned_relationships,
+                    text=text,
+                    domain=domain,
+                    phase=f"gleaning-{gleaning_pass + 1}",
+                )
+                added_entities += len(validated.entities) - len(gleaned_entities)
+                current_entities = validated.entities
+                gleaned_relationships = validated.relationships
 
             current_relationships, added_rels = self._merge_relationships(
                 current_relationships,
                 gleaned_relationships,
             )
-            current_entities, added_entities = self._merge_entities(
-                current_entities,
-                gleaned_entities,
-            )
+            if is_code_domain:
+                current_entities, added_entities = self._merge_entities(
+                    current_entities,
+                    gleaned_entities,
+                )
 
             # Stop once a pass introduces nothing new. Corrections to
             # existing edges still take effect because merging happens

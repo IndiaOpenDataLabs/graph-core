@@ -41,7 +41,7 @@ down_revision = "0027_add_chunk_cancelled_status"
 branch_labels = None
 depends_on = None
 
-GENERIC_CONTRACT = "generic-endpoints-v0"
+GENERIC_CONTRACT = "generic-entities-relationships"
 CODE_CONTRACT = "code-taxonomy-v0"
 LEGACY_FINGERPRINT = "legacy"
 
