@@ -30,9 +30,9 @@ Custom Graph RAG ingestion plans identity decisions per chunk, not per entity:
 
 LightRAG relationship ingestion also persists descriptions and provenance without source-support assessments. Single-entity/relationship resolver APIs remain available for other callers, but chunk ingestion uses the bulk APIs. Query-time relevance remains a separate task.
 
-`DECISION_MODEL_BATCH_TOKEN_BUDGET` defaults to **6000** estimated input tokens. The estimate uses `cl100k_base`, not Clef's tokenizer: tune it conservatively for your model, source language, server context and physical batch capacity. `DECISION_MODEL_BATCH_MAX_QUESTIONS` defaults to **64**. Both limits split identity requests without dropping questions or truncating source passages. If even one item exceeds the budget, the job fails explicitly; reduce chunk size or increase the budget only when the server allows it.
+`DECISION_MODEL_BATCH_TOKEN_BUDGET` defaults to **6000** estimated input tokens. The estimate uses `cl100k_base`, not Clef's tokenizer: tune it conservatively for your model, source language, server context and physical batch capacity. `DECISION_MODEL_BATCH_MAX_QUESTIONS` defaults to **64**. Both limits split identity and query-relevance requests without dropping questions or truncating source passages/descriptions. If even one item exceeds the budget, the job fails explicitly; reduce chunk size or increase the budget only when the server allows it.
 
-The global concurrency limit remains **1** by default: each slot processes many identity decisions. `decision_batch` logs report task, question count, estimated tokens and request duration without logging source contents.
+The global concurrency limit remains **1** by default: each slot processes many decisions. `decision_batch` logs report task (`identity` or `query_relevance`), question count, estimated tokens and request duration without logging source contents. Query relevance uses these token-aware limits instead of a fixed eight-candidate batch. Document routing, anchor selection, retrieval expansion and final relevance filtering are unchanged.
 
 ## Score semantics
 

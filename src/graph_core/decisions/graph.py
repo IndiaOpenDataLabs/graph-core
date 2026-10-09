@@ -12,7 +12,6 @@ from graph_core.decisions.batching import (
 from graph_core.decisions.systemone import Decision, SystemOneDecisionProvider
 
 IDENTITY_MIN_PROBABILITY = 0.95
-BATCH_SIZE = 8
 
 
 class GraphDecisions:
@@ -117,9 +116,7 @@ class GraphDecisions:
         self, question: str, candidates: list[dict[str, Any]]
     ) -> dict[str, Decision]:
         """Called only at query time, always against the original question."""
-        results = {}
-        for offset in range(0, len(candidates), BATCH_SIZE):
-            batch = candidates[offset : offset + BATCH_SIZE]
+        def build(batch: list[dict[str, Any]]) -> dict[str, Any]:
             questions = {
                 candidate["id"]: {
                     "type": "choice",
@@ -138,12 +135,12 @@ class GraphDecisions:
                 }
                 for candidate in batch
             }
-            results.update(
-                await self.provider.decide(
-                    {"original_question": question, "candidates": batch}, questions
-                )
-            )
-        return results
+            return {
+                "state": {"original_question": question, "candidates": batch},
+                "questions": questions,
+            }
+
+        return await decide_batches(self.provider, candidates, build, "query_relevance")
 
 
 def relevant(decision: Decision) -> bool:
