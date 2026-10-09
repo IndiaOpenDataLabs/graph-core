@@ -116,13 +116,13 @@ class IncrementalEntityResolver:
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
         *,
-        defer_support: bool = False,
+        defer_descriptions: bool = False,
     ) -> list[EntityResolutionResult]:
         results = await self._ingestion_batch.resolve_entities(
             session, entities, source_chunk_hash, document_id, document_path
         )
-        if not defer_support:
-            await self.flush_support(session)
+        if not defer_descriptions:
+            await self.flush_descriptions(session)
         return results
 
     async def resolve_relationships(
@@ -133,16 +133,16 @@ class IncrementalEntityResolver:
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
         *,
-        defer_support: bool = False,
+        defer_descriptions: bool = False,
     ) -> list[RelationshipResolutionResult]:
         results = await self._ingestion_batch.resolve_relationships(
             session, relationships, source_chunk_hash, document_id, document_path
         )
-        if not defer_support:
-            await self.flush_support(session)
+        if not defer_descriptions:
+            await self.flush_descriptions(session)
         return results
 
-    async def flush_support(self, session: AsyncSession) -> None:
+    async def flush_descriptions(self, session: AsyncSession) -> None:
         await self._ingestion_batch.flush(session)
 
     async def _resolve_rel_type(

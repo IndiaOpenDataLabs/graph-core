@@ -252,7 +252,7 @@ async def test_within_chunk_candidates_remain_bounded(
 
 
 @pytest.mark.asyncio
-async def test_chunk_scores_entities_and_relationships_together_without_live_locks(
+async def test_chunk_persists_entities_and_relationships_without_source_validation(
     db_session, test_graph_rag_collection
 ):
     calls, lock_sessions = [], []
@@ -261,6 +261,9 @@ async def test_chunk_scores_entities_and_relationships_together_without_live_loc
         assert all(not session.in_transaction() for session in lock_sessions)
 
     resolver = resolver_for(test_graph_rag_collection, calls, before_request=unlocked)
+    resolver._decisions.support_many = AsyncMock(
+        side_effect=AssertionError("Ingestion must not validate source support")
+    )
 
     async def lock(session, *_):
         lock_sessions.append(session)
@@ -285,7 +288,7 @@ async def test_chunk_scores_entities_and_relationships_together_without_live_loc
             ExtractedEntity("Fire", "concept", "Fire is an element."),
         ],
         "chunk",
-        defer_support=True,
+        defer_descriptions=True,
     )
     identity_calls = len(calls)
     relations = [
@@ -298,32 +301,34 @@ async def test_chunk_scores_entities_and_relationships_together_without_live_loc
         }
     ]
     rels = await resolver.resolve_relationships(
-        db_session, relations, "chunk", defer_support=True
+        db_session, relations, "chunk", defer_descriptions=True
     )
     assert len(calls) == identity_calls
-    await resolver.flush_support(db_session)
-    assert len(calls) == identity_calls + 1
-    support = calls[-1]
-    assert (
-        len(support["questions"]) == 4
-    )  # Two entities, passage/description, overall relationship.
-    assert len(support["state"]["source_passages"]) == 1
+    await resolver.flush_descriptions(db_session)
+    assert len(calls) == identity_calls
+    resolver._decisions.support_many.assert_not_awaited()
     rel = await db_session.get(GraphRelationship, rels[0].relationship_id)
-    assert rel.confidence == 0.99
-    assert rel.weight == 99
-    assert rel.support_count == 1
+    assert rel.confidence is None
+    assert rel.weight == 1
+    assert rel.support_count is None
+    assert rel.score_metadata["source_count"] == 1
     descs = (await db_session.execute(select(EntityDescription))).scalars().all()
     assert len(descs) == 2
-    assert all(desc.confidence == 0.99 for desc in descs)
-    count = len(calls)
+    assert all(desc.confidence is None for desc in descs)
+    assert all(desc.score_metadata is None for desc in descs)
+    assert all(
+        desc.source_evidence[0]["source_passage"] == resolver._source_text
+        for desc in descs
+    )
+    assert resolver._vstore.upsert_entity_embedding.await_count == 2
+    assert resolver._vstore.upsert_relationship_embedding.await_count == 1
     await resolver.resolve_relationships(db_session, relations, "chunk")
-    assert (
-        len(calls) == count
-    )  # Replaying an already-scored passage incurs NO inference.
+    assert len(calls) == identity_calls
+    assert resolver._vstore.upsert_relationship_embedding.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_concurrent_evidence_change_is_rescored_not_overwritten(
+async def test_concurrent_evidence_change_is_merged_without_model_validation(
     db_session, test_graph_rag_collection
 ):
     entity = GraphEntity(
@@ -340,14 +345,15 @@ async def test_concurrent_evidence_change_is_rescored_not_overwritten(
         db_session,
         [ExtractedEntity("Agni", "deity", "Agni is fire.")],
         "chunk",
-        defer_support=True,
+        defer_descriptions=True,
     )
-    real_support = resolver._decisions.support_many
+    batch = resolver._ingestion_batch
+    real_embed = batch._embed_changes
     injected = False
 
-    async def concurrent_support(items):
+    async def concurrent_embed(plans):
         nonlocal injected
-        result = await real_support(items)
+        await real_embed(plans)
         if not injected:
             injected = True
             async with AsyncSessionLocal(bind=db_session.bind) as writer:
@@ -365,12 +371,11 @@ async def test_concurrent_evidence_change_is_rescored_not_overwritten(
                     )
                 )
                 await writer.commit()
-        return result
 
-    resolver._decisions.support_many = concurrent_support
-    await resolver.flush_support(db_session)
-    assert len(calls) == 2
-    assert len(calls[1]["state"]["source_passages"]) == 2
+    batch._embed_changes = AsyncMock(side_effect=concurrent_embed)
+    await resolver.flush_descriptions(db_session)
+    assert not calls
+    assert batch._embed_changes.await_count == 2
     desc = (await db_session.execute(select(EntityDescription))).scalars().one()
     assert {item["chunk_hash"] for item in desc.source_evidence} == {
         "chunk",
@@ -380,7 +385,7 @@ async def test_concurrent_evidence_change_is_rescored_not_overwritten(
 
 
 @pytest.mark.asyncio
-async def test_contradicted_entity_does_not_update_centroid(
+async def test_extracted_entity_is_indexed_without_consulting_source_validator(
     db_session, test_graph_rag_collection
 ):
     calls = []
@@ -390,10 +395,14 @@ async def test_contradicted_entity_does_not_update_centroid(
     await resolver.resolve_entities(
         db_session, [ExtractedEntity("Agni", "deity", "Incorrect claim.")], "chunk"
     )
-    resolver._vstore.upsert_entity_centroid.assert_not_awaited()
-    resolver._vstore.upsert_entity_embedding.assert_not_awaited()
+    assert not calls
+    resolver._vstore.upsert_entity_centroid.assert_awaited_once()
+    resolver._vstore.upsert_entity_embedding.assert_awaited_once()
     desc = (await db_session.execute(select(EntityDescription))).scalars().one()
-    assert desc.score_metadata["choice"] == "contradicted"
+    assert desc.confidence is None
+    assert desc.score_metadata is None
+    assert desc.description == "Incorrect claim."
+    assert desc.source_evidence[0]["source_passage"] == resolver._source_text
 
 
 @pytest.mark.asyncio
@@ -441,7 +450,7 @@ async def test_multiple_descriptions_for_one_entity_share_transactional_centroid
     assert sessions[0] is sessions[1]
     entity = await db_session.get(GraphEntity, resolved[0].entity_id)
     assert entity.description_count == 2
-    assert len(calls) == 2  # One identity stage, one joint support stage.
+    assert len(calls) == 1  # Identity only; neither description is revalidated.
 
 
 @pytest.mark.asyncio

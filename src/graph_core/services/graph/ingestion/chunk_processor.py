@@ -365,7 +365,7 @@ async def _ingest_graph_chunk(
             chunk_hash,
             document_id,
             document_path,
-            defer_support=True,
+            defer_descriptions=True,
         )
         for entity, result in zip(inventory, entity_results):
             resolved_entity_ids[entity.name] = result.entity_id
@@ -431,11 +431,11 @@ async def _ingest_graph_chunk(
             chunk_hash,
             document_id,
             document_path,
-            defer_support=True,
+            defer_descriptions=True,
         )
-        # One bounded support stage covers entities, passages, descriptions, and
-        # relationship aggregates. No inference occurs inside persistence locks.
-        await resolver.flush_support(session)
+        # Persist extracted descriptions and provenance without source validation.
+        # Embedding inference still occurs outside persistence locks.
+        await resolver.flush_descriptions(session)
 
         for rel, rel_result in zip(extraction.relationships, relationship_results):
             source_id = resolved_entity_ids[rel.source_name]
@@ -686,6 +686,7 @@ async def _ingest_lightrag_chunk(
             rel_id_str = str(resolution.relationship_id)
             confidence = persisted_rel.confidence
             support_count = persisted_rel.support_count
+            weight = persisted_rel.weight
 
         await graph_storage.upsert_lightrag_edge(
             source_name=source_name,
@@ -695,7 +696,7 @@ async def _ingest_lightrag_chunk(
                 "id": rel_id_str,
                 "description": rel.description,
                 "keywords": rel.keywords,
-                "weight": round(confidence * 100),
+                "weight": weight,
                 "confidence": confidence,
                 "support_count": support_count,
                 "source_ids": [chunk_hash],

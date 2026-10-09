@@ -1,7 +1,7 @@
-"""Plan decisions on snapshots, infer in batches, then persist under short locks.
+"""Batch identity decisions and persist extracted facts under short locks.
 
-The resolver owns one instance per chunk. Pending description work can span the
-entity and relationship stages, so both share the same support forward passes.
+The resolver owns one instance per chunk. Entity and relationship descriptions
+retain their source provenance without further source-support validation.
 """
 
 from __future__ import annotations
@@ -495,30 +495,24 @@ class IngestionDecisionBatch:
         return results
 
     async def flush(self, session: AsyncSession) -> None:
-        """Score entity descriptions and all relationship assessments jointly.
+        """Persist extracted descriptions and provenance without model validation.
 
-        Recheck evidence under the write lock. A concurrent new passage triggers a
-        fresh snapshot and re-score, never a score attached to unseen evidence.
-        Successfully applied groups are removed before retrying changed groups.
+        Recheck the snapshot under the write lock so concurrent passages are
+        merged rather than overwritten. Embeddings are prepared outside locks.
         """
         await session.commit()
         for attempt in range(3):
-            plans, questions = await self._support_plans(session.bind)
+            plans = await self._description_plans(session.bind)
             if not plans:
                 self.entities.clear()
                 self.relationships.clear()
                 return
-            decisions = (
-                await self.resolver._decisions.support_many(questions)
-                if questions
-                else {}
-            )
-            await self._embed_changes(plans, decisions)
+            await self._embed_changes(plans)
             remaining_entities, remaining_relationships = [], []
             for plan in plans:
                 r = self.resolver
 
-                async def persist_support(writer):
+                async def persist_descriptions(writer):
                     await r._acquire_entity_lock(writer, plan["id"])
                     model = (
                         EntityDescription
@@ -537,10 +531,10 @@ class IngestionDecisionBatch:
                     )
                     if snapshot(rows) != plan["snapshot"]:
                         return False
-                    await self._apply_support(writer, plan, rows, decisions)
+                    await self._apply_descriptions(writer, plan, rows)
                     return True
 
-                if not await persist_transaction(session.bind, persist_support):
+                if not await persist_transaction(session.bind, persist_descriptions):
                     if plan["kind"] == "entity":
                         remaining_entities.extend(plan["work"])
                     else:
@@ -552,10 +546,10 @@ class IngestionDecisionBatch:
             if not self.entities and not self.relationships:
                 return
         raise RuntimeError(
-            "Source evidence kept changing while scoring; retry the chunk"
+            "Source evidence kept changing while persisting; retry the chunk"
         )
 
-    async def _embed_changes(self, plans, decisions):
+    async def _embed_changes(self, plans):
         """Reuse entity vectors; batch remaining embeddings outside locks."""
         from graph_core.models.rel_types import relationship_embedding_text
 
@@ -565,8 +559,6 @@ class IngestionDecisionBatch:
                 if not change["new"] or "embedding" in change:
                     continue
                 if plan["kind"] == "entity":
-                    if decisions[change["question_id"]].choice != "supported":
-                        continue
                     text = f"{plan['canonical_name']}: {change['description']}"
                 else:
                     text = relationship_embedding_text(
@@ -593,8 +585,8 @@ class IngestionDecisionBatch:
         for change, embedding in zip(targets, embeddings):
             change["embedding"] = embedding
 
-    async def _support_plans(self, bind):
-        plans, questions = [], []
+    async def _description_plans(self, bind):
+        plans = []
         groups = defaultdict(list)
         for work in self.entities:
             groups[("entity", work["entity_id"])].append(work)
@@ -637,15 +629,6 @@ class IngestionDecisionBatch:
                         in {"canonical_name", "source_name", "target_name", "rel_type"}
                     },
                 }
-                claim = (
-                    {"entity": plan["canonical_name"]}
-                    if kind == "entity"
-                    else {
-                        "source": plan["source_name"],
-                        "target": plan["target_name"],
-                        "predicate": plan["rel_type"],
-                    }
-                )
                 for work in work_items:
                     if kind == "entity" and not work["description"]:
                         continue
@@ -689,82 +672,17 @@ class IngestionDecisionBatch:
                     ):
                         continue
                     changed.add(key)
-                    if kind == "relationship":
-                        question_id = f"support_{len(questions)}"
-                        questions.append(
-                            {
-                                "id": question_id,
-                                "claim": {**claim, "description": work["description"]},
-                                "evidence": [evidence],
-                            }
-                        )
-                        # Remove this internal pointer before submitting evidence.
-                        evidence["_passage_question_id"] = question_id
                     state["evidence"].append(evidence)
-                for key in changed:
-                    state = states[key]
-                    question_id = (
-                        state["evidence"][0]["_passage_question_id"]
-                        if kind == "relationship" and len(state["evidence"]) == 1
-                        else f"support_{len(questions)}"
-                    )
-                    if kind == "entity" or len(state["evidence"]) > 1:
-                        questions.append(
-                            {
-                                "id": question_id,
-                                "claim": {**claim, "description": state["description"]},
-                                "evidence": state["evidence"],
-                            }
-                        )
-                    plan["changes"].append({**state, "question_id": question_id})
-                if kind == "relationship":
-                    rel = await reader.get(GraphRelationship, owner_id)
-                    if changed or rel.confidence is None:
-                        unique = {
-                            evidence_key(item): item
-                            for state in states.values()
-                            for item in state["evidence"]
-                        }
-                        plan["question_id"] = f"support_{len(questions)}"
-                        questions.append(
-                            {
-                                "id": plan["question_id"],
-                                "claim": claim,
-                                "evidence": list(unique.values()),
-                            }
-                        )
-                if plan["changes"] or "question_id" in plan:
+                plan["changes"] = [states[key] for key in changed]
+                if plan["changes"] or kind == "relationship":
                     plans.append(plan)
-        # Evidence snapshots have no model scores (or internal question pointers).
-        for question in questions:
-            question["evidence"] = [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key != "_passage_question_id"
-                }
-                for item in question["evidence"]
-            ]
-        return plans, questions
+        return plans
 
-    async def _apply_support(self, writer, plan, rows, decisions):
+    async def _apply_descriptions(self, writer, plan, rows):
         r = self.resolver
         by_id = {row.id: row for row in rows}
         for change in plan["changes"]:
-            decision = decisions[change["question_id"]]
-            evidence = []
-            for original in change["evidence"]:
-                item = dict(original)
-                passage_id = item.pop("_passage_question_id", None)
-                if passage_id is not None:
-                    passage = decisions[passage_id]
-                    item.update(
-                        support_confidence=passage.probabilities["supported"],
-                        support_assessment=passage.trace(
-                            "relationship_passage_support"
-                        ),
-                    )
-                evidence.append(item)
+            evidence = change["evidence"]
             model = (
                 EntityDescription
                 if plan["kind"] == "entity"
@@ -787,8 +705,10 @@ class IngestionDecisionBatch:
             row.source_evidence = evidence
             row.source_chunk_hashes = sorted({item["chunk_hash"] for item in evidence})
             row.weight = len(evidence)
-            row.confidence = decision.probabilities["supported"]
-            row.score_metadata = decision.trace(f"{plan['kind']}_description_support")
+            # No model assessment was requested. Do not fabricate confidence or
+            # retain a stale aggregate assessment after adding new observations.
+            row.confidence = None
+            row.score_metadata = None
             if plan["kind"] == "relationship":
                 row.keywords = change["keywords"]
                 if change["new"]:
@@ -803,10 +723,10 @@ class IngestionDecisionBatch:
                         document_path=change["document_path"],
                         session=writer,
                     )
-            elif change["new"] and decision.choice == "supported":
+            elif change["new"]:
                 entity = await writer.get(GraphEntity, plan["id"])
                 if entity is None:
-                    raise RuntimeError("Entity disappeared while scoring")
+                    raise RuntimeError("Entity disappeared while persisting")
                 count = entity.description_count or 0
                 old = await r._vstore.get_entity_centroid(
                     entity.id, r._collection_id, session=writer
@@ -847,18 +767,13 @@ class IngestionDecisionBatch:
             }
             rel = await writer.get(GraphRelationship, plan["id"])
             if rel is None:
-                raise RuntimeError("Relationship disappeared while scoring")
-            decision = decisions[plan["question_id"]]
-            rel.confidence = decision.probabilities["supported"]
-            supported = {
-                evidence_key(item)
-                for row in rows
-                for item in row.source_evidence or []
-                if (item.get("support_assessment") or {}).get("choice") == "supported"
-            }
-            rel.support_count = len(supported)
+                raise RuntimeError("Relationship disappeared while persisting")
+            # Observations are provenance, not verified support. Keep the
+            # assessment fields unset and count observations separately.
+            rel.confidence = None
+            rel.support_count = None
             rel.score_metadata = {
-                **decision.trace("relationship_support"),
+                "source_count": len(unique),
                 "claim": {
                     "source": plan["source_name"],
                     "target": plan["target_name"],
@@ -866,7 +781,7 @@ class IngestionDecisionBatch:
                 },
                 "evidence_keys": [list(key) for key in unique],
             }
-            rel.weight = round(rel.confidence * 100)
+            rel.weight = 1  # Neutral structural edge, not a confidence score.
             rel.keywords = sorted(
                 set(rel.keywords or [])
                 | {keyword for item in plan["work"] for keyword in item["keywords"]}

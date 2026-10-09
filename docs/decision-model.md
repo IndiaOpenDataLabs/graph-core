@@ -1,6 +1,6 @@
 # Decision model
 
-Text-generating LLMs extract entities, descriptions, predicates and keywords, generate query variants, and write answers. They do not generate weights or confidence scores. Entity identity, source support and custom Graph RAG query relevance use the decision model's native `POST /v1/systemone` API—not chat completions.
+Text-generating LLMs extract entities, descriptions, predicates and keywords, generate query variants, and write answers. They do not generate weights or confidence scores. Entity identity and custom Graph RAG query relevance use the decision model's native `POST /v1/systemone` API—not chat completions. Ingestion does **not** revalidate extracted descriptions or relationships against their source passages.
 
 ## Run locally
 
@@ -21,26 +21,26 @@ SystemOne calls use the existing Redis semaphore infrastructure with a separate 
 
 ## Batched ingestion
 
-Custom Graph RAG ingestion plans decisions per chunk, not per entity:
+Custom Graph RAG ingestion plans identity decisions per chunk, not per entity:
 
 1. Propose identity pairs from aliases, bounded embedding candidates and fuzzy names. Deduplicate pairs across these paths; include earlier entities from the same chunk. Score multiple pairs jointly with the source passage supplied once per request.
 2. Apply identity decisions and persist canonical entity/relationship identities in short transactions.
-3. Jointly assess entity descriptions, individual relationship passages, accumulated descriptions and relationship-level support. Shared original passages are stored once in each request and referenced by claim IDs. Passage support and aggregate confidence remain separate questions, not separate forward passes.
-4. Persist scores after checking the evidence snapshot under a write lock. If another chunk added evidence during inference, re-score the changed group outside the lock. Deadlock retries repeat only the rolled-back write, not decision inference or previously committed entities.
+3. Persist extracted descriptions and their original passages, document references, chunk hashes and relationship endpoint names. New descriptions are embedded without a source-support acceptance gate.
+4. Check the description snapshot under a write lock. If another chunk added evidence while embeddings were prepared, merge against a fresh snapshot rather than overwriting it. Deadlock retries repeat only the rolled-back write, not identity inference or previously committed entities.
 
-LightRAG batches its relationship support assessments too. Single-entity/relationship resolver APIs remain available for other callers, but chunk ingestion uses the bulk APIs. Query-time relevance remains a separate task.
+LightRAG relationship ingestion also persists descriptions and provenance without source-support assessments. Single-entity/relationship resolver APIs remain available for other callers, but chunk ingestion uses the bulk APIs. Query-time relevance remains a separate task.
 
-`DECISION_MODEL_BATCH_TOKEN_BUDGET` defaults to **6000** estimated input tokens, leaving head/template overhead for an 8K server context. The estimate uses `cl100k_base`, not Clef's tokenizer: tune it conservatively for your model and source language. `DECISION_MODEL_BATCH_MAX_QUESTIONS` defaults to **64**. Both limits split requests without dropping questions or truncating source evidence. If even one item exceeds the budget, the job fails explicitly; reduce chunk size or increase the budget only when the server context allows it. Long accumulated evidence may also require a larger context.
+`DECISION_MODEL_BATCH_TOKEN_BUDGET` defaults to **6000** estimated input tokens. The estimate uses `cl100k_base`, not Clef's tokenizer: tune it conservatively for your model, source language, server context and physical batch capacity. `DECISION_MODEL_BATCH_MAX_QUESTIONS` defaults to **64**. Both limits split identity requests without dropping questions or truncating source passages. If even one item exceeds the budget, the job fails explicitly; reduce chunk size or increase the budget only when the server allows it.
 
-The global concurrency limit remains **1** by default: each slot now processes many decisions, rather than repeatedly evaluating the same source for one decision. `decision_batch` logs report task, question count, estimated tokens and request duration without logging source contents.
+The global concurrency limit remains **1** by default: each slot processes many identity decisions. `decision_batch` logs report task, question count, estimated tokens and request duration without logging source contents.
 
 ## Score semantics
 
 - **Identity:** embeddings propose candidates; cross-name reuse requires the decision model's `same` probability ≥ 0.95. Cache hits and title-cased names cannot authorize merges.
-- **Confidence:** native probability that the source supports the claim, in 0–1 units. Source acceptance uses SystemOne's `supported` decision, not a probability cutoff. `contradicted` and `uncertain` claims are excluded. Original passages and endpoint names are retained.
-- **Support count:** distinct `(document_id, chunk_hash)` passages independently classified as `supported` by SystemOne. Reprocessing does not increment this count. Graph projection weight is confidence × 100, never a passage count.
-- **Relevance:** assessed only at query time against the question, passage by passage. SystemOne's `direct` and `contextual` decisions are accepted; `irrelevant` is excluded. Probabilities rank accepted passages, with no relevance cutoff. Embeddings propose bounded candidates without similarity or endpoint-score rejection. Unrelated descriptions and unscored induced edges cannot enter final custom Graph RAG context. Decision traces are stored in query job results as `relevance_scores`.
+- **Source confidence and verified support count:** not computed during ingestion. New/updated description assessments and relationship confidence/support-count fields are left unset, rather than fabricating probabilities or declaring every extraction `supported`.
+- **Observations:** description weight counts distinct `(document_id, chunk_hash)` source observations. Relationship metadata records their union as `source_count`; reprocessing the same observation does not increment it. This is provenance, not verified support. Relationship graph projection weight is a neutral structural **1**, not a confidence score.
+- **Relevance:** assessed only at query time against the original question, description by description. SystemOne's `direct` and `contextual` decisions are accepted; `irrelevant` is excluded. Probabilities rank accepted descriptions, with no relevance cutoff. Descriptions and relationships do not need an ingestion support assessment to become candidates. Unrelated descriptions and edges cannot enter final custom Graph RAG context merely because they exist or have a high legacy weight. Decision traces are stored in query job results as `relevance_scores`.
 
-An unavailable decision model or invalid native probabilities fail the operation explicitly; there is no generative scoring fallback. Long accumulated evidence can require a larger llama.cpp context window.
+An unavailable decision model or invalid native probabilities fail identity/relevance operations explicitly; there is no generative scoring fallback. Description persistence does not call the decision model.
 
-Existing graph rows are not automatically assigned confidence, and incorrect aliases/endpoints are not automatically rewritten. Unassessed descriptions are excluded from custom Graph RAG context. For validation, start with a fresh collection and ingest the original sources; copying old weights into confidence would preserve the original problem.
+Existing graph rows are not automatically assigned confidence, re-embedded, or revalidated, and incorrect aliases/endpoints are not automatically rewritten. Existing descriptions are eligible for query relevance selection regardless of any historical support assessment. No data migration or ingestion restart is required for the code change itself.

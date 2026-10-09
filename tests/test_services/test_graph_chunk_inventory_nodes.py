@@ -82,7 +82,7 @@ async def test_inventory_nodes_upserted_independently_of_edges(
         resolve_entities=AsyncMock(side_effect=resolve_entities),
         resolve_relationships=AsyncMock(return_value=[SimpleNamespace(relationship_id=uuid.uuid4())
                                                      for _ in relationships]),
-        flush_support=AsyncMock(),
+        flush_descriptions=AsyncMock(),
     )
     name_cache = SimpleNamespace(
         get=AsyncMock(
@@ -138,7 +138,7 @@ async def test_inventory_nodes_upserted_independently_of_edges(
     # Cache hits are hints, never an identity authorization bypass.
     resolver.resolve_entities.assert_awaited_once()
     assert resolver.resolve_entities.await_args.args[2] == chunk_hash
-    resolver.flush_support.assert_awaited_once()
+    resolver.flush_descriptions.assert_awaited_once()
     if with_relationship and missing_endpoint:
         planned = resolver.resolve_entities.await_args.args[1]
         assert next(entity for entity in planned if entity.name == "Arjuna").description == "The participant Arjuna."
@@ -153,3 +153,85 @@ async def test_inventory_nodes_upserted_independently_of_edges(
     else:
         assert resolver.resolve_relationships.await_args.args[1] == []
         storage.upsert_edges.assert_not_awaited()
+
+
+async def test_lightrag_projects_relationship_without_support_confidence(
+    test_graph_rag_collection, monkeypatch
+):
+    extraction = ExtractionResult(
+        [
+            ExtractedEntity("Agni", "deity", "Agni is sacred fire."),
+            ExtractedEntity("Fire", "concept", "Fire is an element."),
+        ],
+        [
+            ExtractedRelationship(
+                source_name="Agni",
+                target_name="Fire",
+                source_description="Agni is sacred fire.",
+                target_description="Fire is an element.",
+                description="Agni symbolizes fire.",
+                keywords=["fire"],
+                rel_type="SYMBOLIZES",
+            )
+        ],
+    )
+    relationship_id = uuid.uuid4()
+    resolver = SimpleNamespace(
+        resolve_relationships=AsyncMock(
+            return_value=[SimpleNamespace(relationship_id=relationship_id)]
+        )
+    )
+    storage = SimpleNamespace(
+        has_lightrag_node=AsyncMock(return_value=False),
+        upsert_lightrag_node=AsyncMock(),
+        upsert_lightrag_edge=AsyncMock(),
+    )
+    session = SimpleNamespace(
+        execute=AsyncMock(),
+        commit=AsyncMock(),
+        get=AsyncMock(
+            return_value=SimpleNamespace(
+                confidence=None,
+                support_count=None,
+                weight=1,
+            )
+        ),
+    )
+    session_context = AsyncMock()
+    session_context.__aenter__.return_value = session
+    monkeypatch.setattr(chunk_processor, "AsyncSessionLocal", lambda: session_context)
+    monkeypatch.setattr(
+        chunk_processor, "_get_raw_extraction", AsyncMock(return_value=extraction)
+    )
+    monkeypatch.setattr(chunk_processor, "resolve_llm_provider", AsyncMock())
+    monkeypatch.setattr(
+        chunk_processor,
+        "_resolve_embedding_provider",
+        AsyncMock(
+            return_value=SimpleNamespace(embed_query=AsyncMock(return_value=[0.1, 0.2]))
+        ),
+    )
+    monkeypatch.setattr(chunk_processor, "get_graph_storage", lambda _: storage)
+    monkeypatch.setattr(
+        chunk_processor, "IncrementalEntityResolver", lambda *_, **__: resolver
+    )
+    monkeypatch.setattr(
+        chunk_processor._graph_rag_vectors, "upsert_chunk_embedding", AsyncMock()
+    )
+    monkeypatch.setattr(
+        chunk_processor._graph_rag_vectors, "upsert_entity_embedding", AsyncMock()
+    )
+    result = await chunk_processor._ingest_lightrag_chunk(
+        text="Agni symbolizes fire.",
+        collection=test_graph_rag_collection,
+        chunk_hash="chunk",
+        report=None,
+    )
+    assert result.relationship_count == 1
+    storage.upsert_lightrag_edge.assert_awaited_once()
+    properties = storage.upsert_lightrag_edge.await_args.kwargs["properties"]
+    assert properties["weight"] == 1
+    assert properties["confidence"] is None
+    assert properties["support_count"] is None
+    assert properties["description"] == "Agni symbolizes fire."
+    assert properties["source_ids"] == ["chunk"]

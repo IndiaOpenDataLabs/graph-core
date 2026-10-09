@@ -206,7 +206,7 @@ async def test_only_high_probability_identity_decision_allows_alias(
 
 
 @pytest.mark.asyncio
-async def test_confidence_and_support_count_never_share_units(
+async def test_relationship_observations_do_not_fabricate_support_scores(
     db_session, test_graph_rag_collection
 ):
     source = GraphEntity(
@@ -256,14 +256,18 @@ async def test_confidence_and_support_count_never_share_units(
     for chunk in ["two", "two"]:
         await resolver.resolve_relationship(db_session, source_chunk_hash=chunk, **args)
     rel = await db_session.get(GraphRelationship, first.relationship_id)
-    assert rel.confidence == 0.9  # Not the text model's 0.01 and not the count 2.
-    assert rel.weight == 90
-    assert rel.support_count == 2
+    assert rel.confidence is None
+    assert rel.weight == 1
+    assert rel.support_count is None
+    assert rel.score_metadata["source_count"] == 2
     desc = (await db_session.execute(select(RelationshipDescription))).scalars().one()
     assert desc.weight == 2
     assert len(desc.source_evidence) == 2
     assert desc.source_evidence[0]["original_target_name"] == "Fire"
-    assert all("original_question" not in c["state"] for c in calls)
+    assert not calls
+    assert desc.confidence is None
+    assert desc.score_metadata is None
+    assert all("support_assessment" not in item for item in desc.source_evidence)
 
 
 @pytest.mark.asyncio
@@ -302,7 +306,7 @@ async def test_query_filters_noise_even_with_high_legacy_weight(
     await db_session.flush()
     db_session.add_all(
         [
-            EntityDescription(entity_id=agni.id, description="Agni is sacred fire.", score_metadata={"choice": "supported"}),
+            EntityDescription(entity_id=agni.id, description="Agni is sacred fire."),
             EntityDescription(entity_id=sun.id, description="Sun manifests as itself.", score_metadata={"choice": "supported"}),
             EntityDescription(entity_id=agni.id, description="Sarasvati is a river.", score_metadata={"choice": "supported"}),
             RelationshipDescription(
@@ -346,6 +350,90 @@ async def test_query_filters_noise_even_with_high_legacy_weight(
     assert all(c["state"]["original_question"] == "What is Agni?" for c in calls)
     assert any(
         t["name"] == "Sun" and not t["included"] for t in state.relevance_decisions
+    )
+    assert any(
+        t["kind"] == "relationship" and not t["included"]
+        for t in state.relevance_decisions
+    )  # Unassessed edges reach relevance scoring, but irrelevant ones stay out.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_assessment", [None, "uncertain", "contradicted"])
+async def test_query_accepts_relevant_facts_without_ingestion_support_gate(
+    db_session, test_graph_rag_collection, monkeypatch, previous_assessment
+):
+    metadata = {"choice": previous_assessment} if previous_assessment else None
+    source = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Agni",
+        primary_type="deity",
+    )
+    target = GraphEntity(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_name="Fire",
+        primary_type="concept",
+    )
+    kind = GraphRelationshipType(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        canonical_type="SYMBOLIZES",
+    )
+    db_session.add_all([source, target, kind])
+    await db_session.flush()
+    relationship = GraphRelationship(
+        id=uuid.uuid4(),
+        collection_id=test_graph_rag_collection.id,
+        source_entity_id=source.id,
+        target_entity_id=target.id,
+        relationship_type_id=kind.id,
+        rel_type=kind.canonical_type,
+        score_metadata=metadata,
+    )
+    db_session.add(relationship)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            EntityDescription(
+                entity_id=source.id,
+                description="Agni is sacred fire.",
+                score_metadata=metadata,
+            ),
+            RelationshipDescription(
+                relationship_id=relationship.id,
+                description="Agni symbolizes fire.",
+                score_metadata=metadata,
+            ),
+        ]
+    )
+    await db_session.commit()
+    calls = []
+    scorer = GraphDecisions(native_provider(lambda *_: "direct", calls))
+    monkeypatch.setattr(
+        "graph_core.services.graph.query.decision_context.GraphDecisions",
+        lambda: scorer,
+    )
+    state = GraphQueryState(
+        {str(source.id)},
+        {str(source.id): 0.1},
+        [str(relationship.id)],
+        {},
+        {},
+    )
+    context, entities, relationships, _ = await build_context(
+        state, test_graph_rag_collection, "What does Agni symbolize?"
+    )
+    assert entities == ["Agni"]
+    assert relationships == ["Agni -[SYMBOLIZES]-> Fire"]
+    assert "Agni is sacred fire." in context
+    assert "Agni symbolizes fire." in context
+    assert len(state.relevance_decisions) == 2
+    assert all(item["included"] for item in state.relevance_decisions)
+    assert all(item["source_confidence"] is None for item in state.relevance_decisions)
+    assert all(
+        call["state"]["original_question"] == "What does Agni symbolize?"
+        for call in calls
     )
 
 
@@ -392,17 +480,14 @@ async def test_corrupt_exact_alias_is_not_identity_authority(db_session, test_gr
 
 
 @pytest.mark.asyncio
-async def test_collective_confidence_does_not_count_contradictory_passage_as_support(db_session, test_graph_rag_collection):
+async def test_relationship_keeps_all_source_passages_without_revalidating_them(db_session, test_graph_rag_collection):
     source = GraphEntity(id=uuid.uuid4(), collection_id=test_graph_rag_collection.id, canonical_name="Agni")
     target = GraphEntity(id=uuid.uuid4(), collection_id=test_graph_rag_collection.id, canonical_name="Fire")
     kind = GraphRelationshipType(id=uuid.uuid4(), collection_id=test_graph_rag_collection.id, canonical_type="SYMBOLIZES")
     db_session.add_all([source, target, kind]); await db_session.commit()
     calls = []
-    def choose(body, *_):
-        claim = next(item for item in body["state"]["claims"] if item["id"] == _[0])
-        passages = claim["source_evidence"]
-        assert all("support_confidence" not in p and "support_assessment" not in p for p in passages)
-        return "contradicted" if all(body["state"]["source_passages"][p["source_passage_id"]] == "Not a fire symbol." for p in passages) else "supported"
+    def choose(*_):
+        raise AssertionError("Ingestion must not validate description against passage")
     resolver = IncrementalEntityResolver(SimpleNamespace(embed_query=AsyncMock(return_value=[0.1])),
                                         test_graph_rag_collection.id,
                                         decisions=GraphDecisions(native_provider(choose, calls)),
@@ -414,10 +499,16 @@ async def test_collective_confidence_does_not_count_contradictory_passage_as_sup
     resolver._source_text = "Agni symbolizes fire."
     await resolver.resolve_relationship(db_session, source_chunk_hash="support", **args)
     rel = await db_session.get(GraphRelationship, result.relationship_id)
-    assert rel.confidence == 0.9
-    assert rel.support_count == 1
+    assert not calls
+    assert rel.confidence is None
+    assert rel.support_count is None
+    assert rel.score_metadata["source_count"] == 2
     desc = (await db_session.execute(select(RelationshipDescription))).scalars().one()
-    assert desc.weight == 2  # Two observed passages, only one supporting passage.
+    assert desc.weight == 2  # Observations, not model-validated support.
+    assert {item["source_passage"] for item in desc.source_evidence} == {
+        "Not a fire symbol.", "Agni symbolizes fire."
+    }
+    assert all("support_confidence" not in item for item in desc.source_evidence)
 
 
 @pytest.mark.asyncio

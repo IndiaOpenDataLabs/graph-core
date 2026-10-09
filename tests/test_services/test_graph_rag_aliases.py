@@ -980,11 +980,11 @@ async def test_resolve_relationship_preserves_opposite_directions(
         )
     )
     resolver._vstore.upsert_relationship_embedding = AsyncMock()
-    from graph_core.decisions import Decision
-    async def support_many(items):
-        return {item["id"]: Decision("supported", {"supported": 0.9, "contradicted": 0.05, "uncertain": 0.05})
-                for item in items}
-    resolver._decisions = SimpleNamespace(support_many=AsyncMock(side_effect=support_many))
+    resolver._decisions = SimpleNamespace(
+        support_many=AsyncMock(
+            side_effect=AssertionError("Relationship ingestion must not validate support")
+        )
+    )
 
     forward = await resolver.resolve_relationship(
         db_session,
