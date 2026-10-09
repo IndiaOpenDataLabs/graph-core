@@ -58,7 +58,6 @@ class Settings(BaseSettings):
     graph_rag_fuzzy_name_threshold: float = 0.8
     graph_rag_description_similarity_threshold: float = 0.90
     graph_rag_max_relationship_weight: int = 100
-    graph_rag_min_edge_similarity: float = 0.3
     graph_rag_edge_weight_score_ratio: float = 0.3
     graph_rag_keyword_score_ratio: float = 0.2
     graph_rag_active_dimensions: list[str] = []  # empty = all

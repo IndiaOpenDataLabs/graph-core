@@ -7,7 +7,6 @@ from typing import Any
 from graph_core.decisions.systemone import Decision, SystemOneDecisionProvider
 
 IDENTITY_MIN_PROBABILITY = 0.95
-RELEVANCE_MIN_PROBABILITY = 0.6
 BATCH_SIZE = 8
 
 
@@ -130,12 +129,8 @@ class GraphDecisions:
 
 
 def relevant(decision: Decision) -> bool:
-    return (
-        decision.choice != "irrelevant"
-        and decision.probabilities["direct"] + decision.probabilities["contextual"]
-        >= RELEVANCE_MIN_PROBABILITY
-    )
+    return decision.choice in {"direct", "contextual"}
 
 
 def relevance_score(decision: Decision) -> float:
-    return decision.probabilities["direct"] + 0.5 * decision.probabilities["contextual"]
+    return decision.probabilities["direct"] + decision.probabilities["contextual"]

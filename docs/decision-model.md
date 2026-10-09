@@ -22,9 +22,9 @@ SystemOne calls use the existing Redis semaphore infrastructure with a separate 
 ## Score semantics
 
 - **Identity:** embeddings propose candidates; cross-name reuse requires the decision model's `same` probability ≥ 0.95. Cache hits and title-cased names cannot authorize merges.
-- **Confidence:** native probability that the source supports the claim, in 0–1 units. Original passages and endpoint names are retained.
-- **Support count:** distinct `(document_id, chunk_hash)` passages independently assessed as supporting the claim. Reprocessing does not increment this count. Graph projection weight is confidence × 100, never a passage count.
-- **Relevance:** assessed only at query time against the question, passage by passage. Unrelated descriptions and unscored induced edges cannot enter final custom Graph RAG context. Decision traces are stored in query job results as `relevance_scores`.
+- **Confidence:** native probability that the source supports the claim, in 0–1 units. Source acceptance uses SystemOne's `supported` decision, not a probability cutoff. `contradicted` and `uncertain` claims are excluded. Original passages and endpoint names are retained.
+- **Support count:** distinct `(document_id, chunk_hash)` passages independently classified as `supported` by SystemOne. Reprocessing does not increment this count. Graph projection weight is confidence × 100, never a passage count.
+- **Relevance:** assessed only at query time against the question, passage by passage. SystemOne's `direct` and `contextual` decisions are accepted; `irrelevant` is excluded. Probabilities rank accepted passages, with no relevance cutoff. Embeddings propose bounded candidates without similarity or endpoint-score rejection. Unrelated descriptions and unscored induced edges cannot enter final custom Graph RAG context. Decision traces are stored in query job results as `relevance_scores`.
 
 An unavailable decision model or invalid native probabilities fail the operation explicitly; there is no generative scoring fallback. Long accumulated evidence can require a larger llama.cpp context window.
 

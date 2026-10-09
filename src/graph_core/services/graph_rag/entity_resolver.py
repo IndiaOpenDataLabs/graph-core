@@ -661,7 +661,7 @@ class IncrementalEntityResolver:
                 evidence_by_key[key] = item
                 # A collective high confidence does not mean every passage
                 # individually supports the claim.
-                if item.get("support_confidence", 0) >= 0.5:
+                if (item.get("support_assessment") or {}).get("choice") == "supported":
                     supported_keys.add(key)
         decision = await self._decisions.support(claim, list(evidence_by_key.values()))
         rel.confidence = decision.probabilities["supported"]
@@ -862,7 +862,7 @@ class IncrementalEntityResolver:
         )
         desc_id = desc.id
         session.add(desc)
-        if decision.probabilities["supported"] < 0.5:
+        if decision.choice != "supported":
             return  # Retain the assessment, but do not contaminate the centroid.
         embedding = await self._embedding.embed_query(
             f"{entity.canonical_name}: {description}"

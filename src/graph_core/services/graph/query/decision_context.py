@@ -50,7 +50,7 @@ async def build_context(
                 continue
             conditions = [
                 EntityDescription.entity_id == entity.id,
-                EntityDescription.confidence >= 0.5,
+                EntityDescription.score_metadata["choice"].as_string() == "supported",
             ]
             if document_ids:
                 conditions.append(EntityDescription.document_id.in_(document_ids))
@@ -96,7 +96,7 @@ async def build_context(
             rel = await session.get(GraphRelationship, relationship_id)
             if rel is None or rel.collection_id != collection.id:
                 continue
-            if rel.confidence is None or rel.confidence < 0.5:
+            if (rel.score_metadata or {}).get("choice") != "supported":
                 continue
             src = await session.get(GraphEntity, rel.source_entity_id)
             tgt = await session.get(GraphEntity, rel.target_entity_id)
@@ -104,7 +104,7 @@ async def build_context(
                 continue
             conditions = [
                 RelationshipDescription.relationship_id == rel.id,
-                RelationshipDescription.confidence >= 0.5,
+                RelationshipDescription.score_metadata["choice"].as_string() == "supported",
             ]
             if document_ids:
                 conditions.append(RelationshipDescription.document_id.in_(document_ids))
