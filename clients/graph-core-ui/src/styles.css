@@ -388,10 +388,108 @@ header p {
   margin-top: 24px;
 }
 .prose {
-  white-space: pre-wrap;
-  line-height: 1.9;
+  line-height: 1.8;
   font-size: 14px;
   overflow-wrap: anywhere;
+}
+.prose > :first-child {
+  margin-top: 0;
+}
+.prose > :last-child {
+  margin-bottom: 0;
+}
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4,
+.prose h5,
+.prose h6 {
+  line-height: 1.35;
+  margin: 1.3em 0 0.6em;
+}
+.prose h1 {
+  font-size: 24px;
+}
+.prose h2 {
+  font-size: 21px;
+}
+.prose h3 {
+  font-size: 18px;
+}
+.prose h4,
+.prose h5,
+.prose h6 {
+  font-size: 15px;
+}
+.prose p {
+  margin: 0.8em 0;
+}
+.prose ul,
+.prose ol {
+  padding-left: 1.6em;
+}
+.prose li {
+  margin: 0.35em 0;
+}
+.prose li > p {
+  margin: 0.3em 0;
+}
+.prose a {
+  color: #246c58;
+  text-decoration: underline;
+}
+.prose blockquote {
+  margin: 1em 0;
+  padding: 0.1em 1em;
+  border-left: 3px solid #6cab9a;
+  background: #f7f9fb;
+  color: #526175;
+}
+.prose code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.15em 0.35em;
+  background: #eef2f6;
+  border-radius: 4px;
+}
+.prose pre {
+  overflow-x: auto;
+  padding: 14px;
+  border-radius: 8px;
+  background: #f7f9fb;
+  border: 1px solid #e7ecf1;
+  line-height: 1.6;
+}
+.prose pre code {
+  background: none;
+  padding: 0;
+}
+.prose table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 1em 0;
+}
+.prose th,
+.prose td {
+  padding: 8px 12px;
+  border: 1px solid #dce2e9;
+}
+.prose th {
+  background: #f7f9fb;
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid #dce2e9;
+  margin: 1.5em 0;
+}
+.prose img {
+  max-width: 100%;
+  height: auto;
+}
+.prose input[type="checkbox"] {
+  width: auto;
+  margin-right: 0.5em;
 }
 .context {
   white-space: pre-wrap;

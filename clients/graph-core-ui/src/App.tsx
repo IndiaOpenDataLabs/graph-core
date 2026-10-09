@@ -18,6 +18,9 @@ import {
   type QueryResult,
 } from "./api";
 
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
 import { loadConnection, saveConnection, type Session } from "./connection";
 const namespaceIdPattern =
   "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
@@ -53,8 +56,20 @@ function Result({ result }: { result: QueryResult }) {
           <span className="badge">{result.mode || "default"}</span>
         </div>
         <div className="prose">
-          {result.response ||
-            "No answer returned. Try adding data or a different question."}
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            skipHtml
+            components={{
+              a: ({ children, href }) => (
+                <a href={href} target="_blank" rel="noopener noreferrer">
+                  {children}
+                </a>
+              ),
+            }}
+          >
+            {result.response ||
+              "No answer returned. Try adding data or a different question."}
+          </ReactMarkdown>
         </div>
       </section>
       <section className="panel">
