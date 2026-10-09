@@ -8,3 +8,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .opencode/opencode.json
+node_modules/
+*.tsbuildinfo
+clients/graph-core-ui/.env.local
+clients/graph-core-ui/.env.*.local

@@ -105,7 +105,32 @@ Current implementation note:
 
 ## Clients
 
-The platform supports three ways to connect:
+The platform supports four ways to connect:
+
+### Web UI (Vite + React)
+
+The browser workspace lives in `clients/graph-core-ui/`. It supports namespace
+selection/creation, provider credentials, embedding/LLM profiles, collections,
+text/file ingestion, and asynchronous queries with retrieved-content inspection.
+
+```bash
+make docker-up
+make ui-install
+make ui
+```
+
+Open `http://localhost:5173`. Generate a token with `uv run graph-core-admin-jwt`
+and paste it into the admin connection form, then open a namespace. Alternatively,
+connect directly with a namespace-scoped user JWT. Tokens remain in memory;
+reloading signs you out.
+
+The Vite proxy forwards `/api` to `http://127.0.0.1:8001` (override using
+`GRAPH_CORE_API_URL`). The query explorer separates the answer from retrieved
+content, entity/relationship identifiers, and raw JSON. Completed queries can be
+reopened from Activity. Requires the API **and worker** to be running.
+
+See [`clients/graph-core-ui/README.md`](clients/graph-core-ui/README.md) for setup,
+tests, and deployment notes.
 
 ### Terminal UI (TUI)
 

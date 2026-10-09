@@ -25,6 +25,7 @@ class QueryResult:
     relationships_used: list[str]
     mode: str | None = None
     chat_id: str | None = None
+    retrieval_context: str = ""
 
 
 # ── Module-level singleton dependencies ──
@@ -122,6 +123,9 @@ async def vector_query(
     )
     return QueryResult(
         response=response, entities_used=[], relationships_used=[], mode=mode,
+        retrieval_context="\n\n".join(
+            f"Chunk {i + 1}:\n{content}" for i, content in enumerate(chunks)
+        ),
     )
 
 

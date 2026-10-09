@@ -2,7 +2,7 @@
 	docker-up docker-down docker-logs docker-clean docker-ps \
 	docker-logs-app docker-logs-worker \
 	db-migrate db-revision db-current db-stamp db-downgrade \
-	infra-check seed smoke-test tui
+	infra-check seed smoke-test tui ui ui-install ui-build ui-test
 
 # ─── Project ──────────────────────────────────────────────────────────────────
 
@@ -108,3 +108,15 @@ smoke-test-local:     ## Run smoke test against local LLM/embedding servers
 
 tui:                  ## Run the terminal UI client
 	cd clients/graph-core-cli && uv run python -m graph_core_cli
+
+ui-install:           ## Install the Vite UI dependencies (Node 22.12+ or 24 LTS)
+	npm --prefix clients/graph-core-ui ci
+
+ui:                   ## Run the Vite UI at http://localhost:5173 (requires ui-install)
+	npm --prefix clients/graph-core-ui run dev
+
+ui-build:             ## Type-check and build the Vite UI
+	npm --prefix clients/graph-core-ui run build
+
+ui-test:              ## Run the Vite UI tests
+	npm --prefix clients/graph-core-ui test

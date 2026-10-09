@@ -2971,4 +2971,5 @@ async def graph_rag_query(
             )
         ),
         mode=_MODE_ALIASES.get((mode or "mix").lower(), "mix"),
+        retrieval_context=context,
     )

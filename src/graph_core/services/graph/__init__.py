@@ -1968,6 +1968,7 @@ class GraphService:
                         "relationships_used": result.relationships_used,
                         "mode": result.mode,
                         "chat_id": result.chat_id,
+                        "retrieval_context": result.retrieval_context,
                     },
                 },
             )
@@ -1981,6 +1982,7 @@ class GraphService:
                     "relationships_used": result.relationships_used,
                     "mode": result.mode,
                     "chat_id": result.chat_id,
+                    "retrieval_context": result.retrieval_context,
                 },
             )
         except ValueError as e:

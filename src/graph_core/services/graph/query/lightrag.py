@@ -252,6 +252,9 @@ async def _lightrag_query_naive(
         response = chunks[0] if chunks else ""
     return QueryResult(
         response=response, entities_used=[], relationships_used=[], mode="naive",
+        retrieval_context="\n\n".join(
+            f"Chunk {i + 1}:\n{content}" for i, content in enumerate(chunks)
+        ),
     )
 
 
@@ -355,6 +358,7 @@ Source Text:
         entities_used=entities_used,
         relationships_used=rels_used,
         mode="local",
+        retrieval_context=context,
     )
 
 
@@ -453,6 +457,7 @@ Source Text:
         entities_used=entities_used,
         relationships_used=rels_used,
         mode="global",
+        retrieval_context=context,
     )
 
 
@@ -486,6 +491,10 @@ async def _lightrag_query_hybrid(
         entities_used=merged_entities,
         relationships_used=merged_rels,
         mode="hybrid",
+        retrieval_context=(
+            f"Local retrieval:\n{local_result.retrieval_context}\n\n"
+            f"Global retrieval:\n{global_result.retrieval_context}"
+        ),
     )
 
 
@@ -527,6 +536,11 @@ async def _lightrag_query_mix(
         entities_used=merged_entities,
         relationships_used=merged_rels,
         mode="mix",
+        retrieval_context=(
+            f"Local retrieval:\n{local_result.retrieval_context}\n\n"
+            f"Global retrieval:\n{global_result.retrieval_context}\n\n"
+            f"Naive retrieval:\n{naive_result.retrieval_context}"
+        ),
     )
 
 
