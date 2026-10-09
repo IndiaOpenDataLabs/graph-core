@@ -5,9 +5,11 @@ Text generation lives in the extractor. Similarity is never proof of identity.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import logging
+import random
 import re
 import unicodedata
 import uuid
@@ -15,8 +17,10 @@ from dataclasses import dataclass
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from graph_core.database import AsyncSessionLocal
 from graph_core.decisions import GraphDecisions
 from graph_core.decisions.graph import IDENTITY_MIN_PROBABILITY
 from graph_core.embedding.interface import EmbeddingProvider
@@ -232,6 +236,60 @@ class IncrementalEntityResolver:
         )
 
     async def resolve_entity(
+        self,
+        session: AsyncSession,
+        name: str,
+        entity_type: str,
+        description: str,
+        source_chunk_hash: str,
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
+    ) -> EntityResolutionResult:
+        """Commit one entity at a time; never carry its locks to the next entity.
+
+        Flush caller-owned work first (e.g. extra concept aliases), then use an
+        independent session on the same engine for each attempt. A deadlock
+        rollback cannot discard that work or expire the caller's ORM objects.
+        """
+        await session.commit()
+        original_traces = dict(self._identity_traces)
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                async with AsyncSessionLocal(bind=session.bind) as entity_session:
+                    try:
+                        result = await self._resolve_entity_once(
+                            entity_session,
+                            name,
+                            entity_type,
+                            description,
+                            source_chunk_hash,
+                            document_id,
+                            document_path,
+                        )
+                        await entity_session.commit()
+                    except Exception:
+                        await entity_session.rollback()
+                        raise
+                return result
+            except DBAPIError as exc:
+                self._identity_traces = dict(original_traces)
+                sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(
+                    exc.orig, "pgcode", None
+                )
+                if sqlstate != "40P01" or attempt + 1 == max_attempts:
+                    raise
+                logger.warning(
+                    "Entity resolution deadlock; retrying collection=%s name=%r attempt=%d/%d",
+                    self._collection_id,
+                    name,
+                    attempt + 1,
+                    max_attempts,
+                )
+                await asyncio.sleep(random.uniform(0.1, 0.2) * (2**attempt))
+        raise RuntimeError("Entity resolution retry attempts exhausted")
+
+    async def _resolve_entity_once(
         self,
         session: AsyncSession,
         name: str,
@@ -812,6 +870,9 @@ class IncrementalEntityResolver:
             return
 
         await self._acquire_entity_lock(session, entity_id)
+        # The entity may have been loaded before waiting for another writer.
+        # Read its current centroid count/name/type only after taking the lock.
+        await session.refresh(entity)
         # Similar descriptions can contain different facts. Only exact text is
         # deduplicated, and every distinct source passage is retained.
         existing_desc = (
