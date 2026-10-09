@@ -115,6 +115,7 @@ async def _release_slot(
 
 _llm_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:llm")
 _embedding_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:embedding")
+_decision_model_semaphore = _RedisSemaphore(key_prefix="provider-semaphore:decision-model")
 _active_llm_reservation: contextvars.ContextVar[tuple[str, int] | None] = (
     contextvars.ContextVar("active_llm_reservation", default=None)
 )
@@ -211,6 +212,18 @@ async def llm_call_slot(
     finally:
         _active_llm_reservation.reset(reservation_token)
         await _release_slot(_llm_semaphore, semaphore_scope, token, limit)
+
+
+@asynccontextmanager
+async def decision_model_call_slot() -> AsyncIterator[None]:
+    """One global pool for the decision endpoint across API and worker processes."""
+    limit = settings.decision_model_max_concurrent_calls
+    scope = "default"
+    token = await _decision_model_semaphore.acquire(scope, limit)
+    try:
+        yield
+    finally:
+        await _release_slot(_decision_model_semaphore, scope, token, limit)
 
 
 @asynccontextmanager

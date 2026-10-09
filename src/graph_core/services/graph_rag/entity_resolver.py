@@ -1039,6 +1039,7 @@ class IncrementalEntityResolver:
             embedding=embedding,
             document_id=document_id,
             document_path=document_path,
+            session=session,
         )
 
     async def _resolve_or_create_relationship_type(

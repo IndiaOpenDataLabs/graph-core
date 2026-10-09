@@ -15,6 +15,10 @@ The existing provider URL normalizer selects `http://host.docker.internal:8081/v
 
 The app entrypoint applies migration `0029_decision_scores` when rebuilt/restarted. For a non-Docker deployment, run `uv run alembic upgrade head` against the configured database. If this migration was already applied before the rename, its recorded revision must be updated to `0029_decision_scores` without reapplying the schema changes.
 
+## Concurrency
+
+SystemOne calls use the existing Redis semaphore infrastructure with a separate global decision-model pool shared by API and workers. `DECISION_MODEL_MAX_CONCURRENT_CALLS` defaults to `1` and must be positive. The existing semaphore lease, wait timeout and cancellation-safe release apply. This pool is independent of LLM and embedding limits; no Compose changes are required.
+
 ## Score semantics
 
 - **Identity:** embeddings propose candidates; cross-name reuse requires the decision model's `same` probability ≥ 0.95. Cache hits and title-cased names cannot authorize merges.

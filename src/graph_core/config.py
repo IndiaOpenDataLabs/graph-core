@@ -1,5 +1,6 @@
 """Platform configuration via environment variables."""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -10,6 +11,7 @@ class Settings(BaseSettings):
     redis_semaphore_url: str = "redis://localhost:6380/0"
     llm_max_concurrent_calls: int = 1
     embedding_max_concurrent_calls: int = 10
+    decision_model_max_concurrent_calls: int = Field(default=1, ge=1)
     provider_semaphore_lease_seconds: int = 1800
     provider_semaphore_poll_interval_ms: int = 100
     provider_semaphore_acquire_timeout_seconds: float = 600

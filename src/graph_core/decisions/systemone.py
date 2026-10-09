@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from graph_core.provider_base_url import normalize_provider_base_url
+from graph_core.provider_semaphore import decision_model_call_slot
 
 SYSTEMONE_ENDPOINT = (
     normalize_provider_base_url("http://localhost:8081/v1/systemone")
@@ -59,7 +60,7 @@ class SystemOneDecisionProvider:
         if not questions:
             return {}
         try:
-            async with httpx.AsyncClient(
+            async with decision_model_call_slot(), httpx.AsyncClient(
                 transport=self._transport, timeout=120, trust_env=False
             ) as client:
                 response = await client.post(
