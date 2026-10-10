@@ -4,9 +4,13 @@ import logging
 import uuid
 
 import dramatiq
+from sqlalchemy import func, select
 
 import graph_core.broker  # noqa: F401
 from graph_core.config import settings
+from graph_core.database import AsyncSessionLocal
+from graph_core.models.chunk import IngestionChunk
+from graph_core.models.job import Job
 from graph_core.services.graph import GraphService
 from graph_core.services.graph.ingestion.document_pipeline import (
     dispatch_pending_chunks,
@@ -45,6 +49,40 @@ async def run_ingestion(job_id: str):
         await service.append_job_event(job_uuid, "error", {"error": str(e)})
         await service.update_job_status(job_uuid, "failed", error=str(e))
         raise
+
+
+@dramatiq.actor(
+    queue_name="ingestion_control",
+    max_retries=60,
+    min_backoff=1000,
+    max_backoff=30000,
+)
+async def dispatch_retried_chunks(job_id: str):
+    """Bootstrap saved retries without re-chunking the document or redoing successes."""
+    job_uuid = uuid.UUID(job_id)
+    async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_uuid)
+        if job is None or job.status != "running":
+            return
+    if await dispatch_pending_chunks(job_uuid):
+        return
+    async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_uuid)
+        if job is None or job.status != "running":
+            return
+        counts = dict(
+            (
+                await session.execute(
+                    select(IngestionChunk.status, func.count())
+                    .where(
+                        IngestionChunk.job_id == job_uuid,
+                    )
+                    .group_by(IngestionChunk.status)
+                )
+            ).all()
+        )
+    if counts.get("pending", 0) and not counts.get("processing", 0):
+        raise RuntimeError("Waiting for provider capacity to dispatch retried chunks")
 
 
 @dramatiq.actor(

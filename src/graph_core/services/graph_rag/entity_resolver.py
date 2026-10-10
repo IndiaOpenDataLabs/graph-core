@@ -8,9 +8,11 @@ Three-tier pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import difflib
 import logging
+import random
 import re
 import unicodedata
 import uuid
@@ -18,9 +20,11 @@ from dataclasses import dataclass
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from graph_core.config import settings
+from graph_core.database import AsyncSessionLocal
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.models.domain_config import get_domain_config
 from graph_core.models.graph_rag import (
@@ -228,6 +232,50 @@ class IncrementalEntityResolver:
         )
 
     async def resolve_entity(
+        self,
+        session: AsyncSession,
+        name: str,
+        entity_type: str,
+        description: str,
+        source_chunk_hash: str,
+        document_id: uuid.UUID | None = None,
+        document_path: str | None = None,
+    ) -> EntityResolutionResult:
+        """Commit each entity independently and retry PostgreSQL deadlocks.
+
+        Commit caller-owned work first, so rollback of a failed entity attempt
+        cannot discard prior entities or aliases or expire the caller's objects.
+        Each retry uses a fresh session on the caller's engine.
+        """
+        await session.commit()
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                async with AsyncSessionLocal(bind=session.bind) as entity_session:
+                    try:
+                        result = await self._resolve_entity_once(
+                            entity_session, name, entity_type, description,
+                            source_chunk_hash, document_id, document_path,
+                        )
+                        await entity_session.commit()
+                    except Exception:
+                        await entity_session.rollback()
+                        raise
+                return result
+            except DBAPIError as exc:
+                sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(
+                    exc.orig, "pgcode", None
+                )
+                if sqlstate != "40P01" or attempt + 1 == max_attempts:
+                    raise
+                logger.warning(
+                    "Entity resolution deadlock; retrying collection=%s name=%r attempt=%d/%d",
+                    self._collection_id, name, attempt + 1, max_attempts,
+                )
+                await asyncio.sleep(random.uniform(0.1, 0.2) * (2**attempt))
+        raise RuntimeError("Entity resolution retry attempts exhausted")
+
+    async def _resolve_entity_once(
         self,
         session: AsyncSession,
         name: str,
@@ -608,7 +656,12 @@ class IncrementalEntityResolver:
             embedding=embedding,
             document_id=document_id,
             document_path=document_path,
+            session=session,
         )
+        # This path historically committed its new relationship and embedding.
+        # The vector store no longer commits a caller-owned session, so finish
+        # the embedding write here before returning.
+        await session.commit()
 
         return RelationshipResolutionResult(is_new=True, relationship_id=new_rel_id)
 
@@ -862,6 +915,7 @@ class IncrementalEntityResolver:
             embedding=embedding,
             document_id=document_id,
             document_path=document_path,
+            session=session,
         )
 
     async def _resolve_or_create_relationship_type(

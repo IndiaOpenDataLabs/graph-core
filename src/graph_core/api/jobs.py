@@ -1,13 +1,19 @@
 """FastAPI router — job status and SSE streaming."""
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from graph_core.api.auth import get_namespace_id
 from graph_core.services.graph import GraphService
+from graph_core.services.graph.ingestion.chunk_status import (
+    ChunkRetryConflict,
+    list_job_chunks,
+    retry_failed_chunks,
+)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 service = GraphService()
@@ -48,12 +54,58 @@ async def get_job_result(job_id: uuid.UUID) -> dict:
         raise HTTPException(status_code=404, detail=message)
 
 
+class ChunkRetryRequest(BaseModel):
+    chunk_indices: list[Annotated[int, Field(ge=0)]] | None = Field(
+        default=None, min_length=1, max_length=1000
+    )
+
+
+@router.get("/{job_id}/chunks")
+async def get_chunks(
+    job_id: uuid.UUID,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    status: Literal["pending", "processing", "completed", "failed", "cancelled"]
+    | None = None,
+) -> dict:
+    """Inspect chunk statuses and errors without returning document contents."""
+    try:
+        return await list_job_chunks(
+            job_id, namespace_id, offset=offset, limit=limit, status=status
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{job_id}/retry-failed-chunks", status_code=202)
+async def retry_chunks(
+    job_id: uuid.UUID,
+    request: ChunkRetryRequest,
+    namespace_id: Annotated[uuid.UUID, Depends(get_namespace_id)],
+) -> dict:
+    """Retry all failed chunks, or the selected failed chunk indices."""
+    try:
+        return await retry_failed_chunks(job_id, namespace_id, request.chunk_indices)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ChunkRetryConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not schedule retries. Refresh chunk status before retrying.",
+        ) from exc
+
+
 @router.get("/{job_id}/stream")
 async def stream_job_events(job_id: uuid.UUID):
     """SSE stream of transient job events via Redis pubsub."""
+
     # TODO: subscribe to Redis channel f"job:{job_id}" and yield SSE events
     async def event_generator():
         import json
+
         payload = json.dumps({"status": "subscribed", "job_id": str(job_id)})
         yield f"data: {payload}\n\n"
 

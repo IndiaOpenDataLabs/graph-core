@@ -1,0 +1,46 @@
+.chunk-status {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #dce2e9;
+}
+.chunk-counts,
+.chunk-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 14px 0;
+}
+.chunk-controls label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chunk-controls input[type="checkbox"] {
+  width: auto;
+}
+.chunk-table {
+  overflow-x: auto;
+}
+.chunk-table table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+.chunk-table th,
+.chunk-table td {
+  padding: 12px 10px;
+  border-bottom: 1px solid #dce2e9;
+  vertical-align: top;
+}
+.chunk-table td small {
+  display: block;
+}
+.chunk-error {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 250px;
+  max-width: 650px;
+  overflow: auto;
+  font-size: 12px;
+}

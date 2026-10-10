@@ -22,6 +22,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { loadConnection, saveConnection, type Session } from "./connection";
+import { ChunkStatus } from "./ChunkStatus";
 const namespaceIdPattern =
   "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 type Tab = "query" | "data" | "collections" | "profiles" | "jobs";
@@ -457,6 +458,7 @@ function Workspace({
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [selected, setSelected] = useState("");
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [chunkJobId, setChunkJobId] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -1029,8 +1031,22 @@ function Workspace({
                         {job.document_path && `· ${job.document_path}`}
                       </small>
                       <small>{job.id}</small>
+                      {!!job.chunks_total && (
+                        <small>
+                          {job.chunks_completed || 0}/{job.chunks_total} chunks
+                          processed · {job.progress_percent || 0}%
+                        </small>
+                      )}
                       {job.error && <p className="error-text">{job.error}</p>}
                     </div>
+                    {job.type.startsWith("ingest") && (
+                      <button
+                        className="secondary"
+                        onClick={() => setChunkJobId(job.id)}
+                      >
+                        Inspect chunks
+                      </button>
+                    )}
                     {job.type === "query" && job.status === "completed" && (
                       <button
                         className="secondary"
@@ -1051,6 +1067,15 @@ function Workspace({
                 ))
               ) : (
                 <Empty>No jobs yet. Ingest a document or run a query.</Empty>
+              )}
+              {chunkJobId && (
+                <ChunkStatus
+                  key={chunkJobId}
+                  api={api}
+                  jobId={chunkJobId}
+                  onClose={() => setChunkJobId("")}
+                  onRetried={() => refresh()}
+                />
               )}
               {result && <Result result={result} />}
             </section>
