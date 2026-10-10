@@ -34,8 +34,13 @@ async def decide_batches(
     items: list[dict[str, Any]],
     build: Callable[[list[dict[str, Any]]], dict[str, Any]],
     task: str,
+    *,
+    token_budget: int | None = None,
 ) -> dict[str, Decision]:
     """Pack by both context estimate and question count. Never truncate evidence."""
+    budget = settings.decision_model_batch_token_budget
+    if token_budget is not None:
+        budget = min(budget, token_budget)
     results: dict[str, Decision] = {}
     if len({item["id"] for item in items}) != len(items):
         raise ValueError("Decision item IDs must be unique")
@@ -45,7 +50,12 @@ async def decide_batches(
         record = build(batch)
         tokens = estimated_tokens(record)
         started = time.monotonic()
-        results.update(await provider.decide(record["state"], record["questions"]))
+        kwargs = (
+            {"instructions": record["instructions"]} if "instructions" in record else {}
+        )
+        results.update(
+            await provider.decide(record["state"], record["questions"], **kwargs)
+        )
         logger.info(
             "decision_batch task=%s questions=%d estimated_tokens=%d "
             "duration_seconds=%.3f",
@@ -59,20 +69,16 @@ async def decide_batches(
         proposal = [*batch, item]
         if batch and (
             len(proposal) > settings.decision_model_batch_max_questions
-            or estimated_tokens(build(proposal))
-            > settings.decision_model_batch_token_budget
+            or estimated_tokens(build(proposal)) > budget
         ):
             await send()
             batch = []
-        if (
-            not batch
-            and estimated_tokens(build([item]))
-            > settings.decision_model_batch_token_budget
-        ):
+        if not batch and estimated_tokens(build([item])) > budget:
             raise DecisionError(
                 f"{task} item {item['id']} exceeds the decision-model token budget; "
                 "use smaller source chunks or increase "
-                "DECISION_MODEL_BATCH_TOKEN_BUDGET "
+                "the applicable DECISION_MODEL_BATCH_TOKEN_BUDGET and "
+                "DECISION_MODEL_QUERY_BATCH_TOKEN_BUDGET "
                 "only if the server context permits it. Evidence was not truncated."
             )
         batch.append(item)

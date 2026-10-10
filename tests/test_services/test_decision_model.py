@@ -45,6 +45,18 @@ def native_provider(choose, calls, probability=0.9):
         calls.append(body)
         answers = {}
         for key, question in body["questions"].items():
+            if question["type"] != "choice":
+                state = body["state"]
+                records = state.get("entities", state.get("relationships", {}))
+                legacy = {**body, "state": {**state, "candidates": list(records.values())}}
+                option = choose(legacy, key, ["direct", "irrelevant"])
+                if question["type"] == "noul":
+                    answers[key] = {"type": "noul", "noul": probability if option == "direct" else 1 - probability}
+                else:
+                    score = 3 if option == "direct" else 0
+                    answers[key] = {"type": "score", "score": score,
+                                    "probabilities": {str(i): float(i == score) for i in range(4)}}
+                continue
             options = list(question["criteria"])
             option = choose(body, key, options)
             probabilities = {o: (1 - probability) / (len(options) - 1) for o in options}
@@ -306,7 +318,7 @@ async def test_query_filters_noise_even_with_high_legacy_weight(
     await db_session.flush()
     db_session.add_all(
         [
-            EntityDescription(entity_id=agni.id, description="Agni is sacred fire."),
+            EntityDescription(entity_id=agni.id, description="Agni is sacred fire.", weight=2),
             EntityDescription(entity_id=sun.id, description="Sun manifests as itself.", score_metadata={"choice": "supported"}),
             EntityDescription(entity_id=agni.id, description="Sarasvati is a river.", score_metadata={"choice": "supported"}),
             RelationshipDescription(
@@ -347,7 +359,7 @@ async def test_query_filters_noise_even_with_high_legacy_weight(
     assert relationships == []
     assert "Sun manifests" not in context
     assert "Sarasvati" not in context
-    assert all(c["state"]["original_question"] == "What is Agni?" for c in calls)
+    assert all(c["state"]["user_question"] == "What is Agni?" for c in calls)
     assert any(
         t["name"] == "Sun" and not t["included"] for t in state.relevance_decisions
     )
@@ -428,11 +440,11 @@ async def test_query_accepts_relevant_facts_without_ingestion_support_gate(
     assert relationships == ["Agni -[SYMBOLIZES]-> Fire"]
     assert "Agni is sacred fire." in context
     assert "Agni symbolizes fire." in context
-    assert len(state.relevance_decisions) == 2
+    assert len(state.relevance_decisions) == 3
     assert all(item["included"] for item in state.relevance_decisions)
-    assert all(item["source_confidence"] is None for item in state.relevance_decisions)
+    assert all(item.get("source_confidence") is None for item in state.relevance_decisions)
     assert all(
-        call["state"]["original_question"] == "What does Agni symbolize?"
+        call["state"]["user_question"] == "What does Agni symbolize?"
         for call in calls
     )
 

@@ -17,7 +17,7 @@ from sqlalchemy import distinct, func, or_, select
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.decisions import GraphDecisions
-from graph_core.decisions.graph import relevance_score, relevant
+from graph_core.decisions.graph import passes_query_gate, relevant
 from graph_core.embedding import get_embedding_provider
 from graph_core.embedding.interface import EmbeddingProvider
 from graph_core.llm import LocalEchoLLMProvider, get_llm_provider
@@ -43,6 +43,7 @@ from graph_core.models.rel_types import (
 from graph_core.services.crypto import CredentialCrypto
 from graph_core.services.graph.query.decision_context import (
     build_context as build_decision_context,
+    load_entity_candidate,
 )
 from graph_core.services.graph.query.vector import QueryResult
 from graph_core.storage.graph_names import collection_graph_name
@@ -390,12 +391,15 @@ class GraphQueryState:
     rel_score_cache: dict[str, float]
     rel_combined_score_cache: dict[str, float]
     relevance_decisions: list[dict[str, Any]] = field(default_factory=list)
+    anchor_entity_ids: set[str] = field(default_factory=set)
+    node_gate_complete: bool = False
 
 
 @dataclass
 class MixInterpretation:
     selected_entities: list[str]
     retrieval_subqueries: list[str]
+    node_decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1479,7 +1483,8 @@ async def _entity_anchor_state(
     *,
     query_tokens: set[str],
     document_ids: list[uuid.UUID] | None = None,
-    max_relationships: int = 40,
+    max_relationships: int | None = None,
+    entity_ids: set[str] | None = None,
 ) -> GraphQueryState:
     wanted_names = [name for name in entity_names if str(name).strip()]
     if not wanted_names:
@@ -1524,6 +1529,8 @@ async def _entity_anchor_state(
         ).all()
         anchor_ids = {str(entity_id) for entity_id, _ in entity_rows}
         anchor_ids.update(str(entity_id) for entity_id, _ in alias_rows)
+        if entity_ids is not None:
+            anchor_ids.intersection_update(entity_ids)
         if not anchor_ids:
             return GraphQueryState(
                 discovered_entity_ids=set(),
@@ -1556,14 +1563,12 @@ async def _entity_anchor_state(
                     )
                 )
             )
-        rel_rows = (
-            await session.execute(
-                select(GraphRelationship)
-                .where(*rel_conditions)
-                .order_by(GraphRelationship.weight.desc())
-                .limit(max_relationships)
-            )
-        ).scalars().all()
+        # The default anchor pool must remain complete until query-specific
+        # scoring; structural weights are often all 1 and cannot select top 40.
+        rel_query = select(GraphRelationship).where(*rel_conditions)
+        if max_relationships is not None:
+            rel_query = rel_query.limit(max_relationships)
+        rel_rows = (await session.execute(rel_query)).scalars().all()
 
     for rel in rel_rows:
         rel_id = str(rel.id)
@@ -1589,9 +1594,8 @@ async def _entity_anchor_state(
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
         rel_combined_score_cache=rel_combined_score_cache,
+        anchor_entity_ids=anchor_ids,
     )
-
-
 
 
 
@@ -1624,6 +1628,9 @@ def _merge_states(*states: GraphQueryState) -> GraphQueryState:
         traversed_rel_ids=traversed_rel_ids,
         rel_score_cache=rel_score_cache,
         rel_combined_score_cache=rel_combined_score_cache,
+        anchor_entity_ids=set().union(*(s.anchor_entity_ids for s in states)),
+        node_gate_complete=any(s.node_gate_complete for s in states),
+        relevance_decisions=[t for s in states for t in s.relevance_decisions],
     )
 
 
@@ -1649,7 +1656,7 @@ def _fallback_mix_interpretation(
             "How does " + names[0] + " relate to the question?",
         ]
     return MixInterpretation(
-        selected_entities=names,
+        selected_entities=[name for name, _, _ in candidates],
         retrieval_subqueries=[query for query in subqueries if query.strip()][:4],
     )
 
@@ -1658,23 +1665,46 @@ async def _interpret_mix_queries(
     question: str,
     candidates: list[tuple[str, str, float]],
     llm_provider: LLMProvider,
+    *,
+    collection: Collection | None = None,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> MixInterpretation:
     logger.info(
         "graph_rag mix_interpretation_start question=%r candidates=%s",
         question,
         [(name, round(score, 6)) for name, _, score in candidates[:12]],
     )
-    records = [{"id": f"candidate_{i}", "name": name, "descriptions": [description]}
-               for i, (name, description, _) in enumerate(candidates[:20])]
-    decisions = await GraphDecisions().relevance(question, records)
-    selected = sorted((record for record in records if relevant(decisions[record["id"]])),
-                      key=lambda record: relevance_score(decisions[record["id"]]), reverse=True)[:8]
-    candidates = [(record["name"], record["descriptions"][0], relevance_score(decisions[record["id"]]))
-                  for record in selected]
+    if collection is None:
+        records = [{"id": f"candidate_{i}", "name": name, "descriptions": [description]}
+                   for i, (name, description, _) in enumerate(candidates)]
+    else:
+        records = []
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(select(GraphEntity).where(
+                GraphEntity.collection_id == collection.id,
+                GraphEntity.canonical_name.in_([name for name, _, _ in candidates]),
+            ).order_by(GraphEntity.id))).scalars().all()
+            for entity in rows:
+                record = await load_entity_candidate(session, entity, document_ids)
+                if record["descriptions"]:
+                    records.append(record)
+    decisions = await GraphDecisions().entity_relevance(question, records)
+    selected = sorted((r for r in records if passes_query_gate(decisions[r["id"]])),
+                      key=lambda r: decisions[r["id"]].probabilities["true"], reverse=True)
+    traces = [{**r, "evaluation_question": question,
+               "included": passes_query_gate(decisions[r["id"]]),
+               **decisions[r["id"]].trace("query_nodes")} for r in records]
+    candidates = [(r["name"], " | ".join(r["descriptions"]),
+                   decisions[r["id"]].probabilities["true"]) for r in selected]
+
+    def finish(result: MixInterpretation) -> MixInterpretation:
+        result.node_decisions = traces
+        return result
+
     if not candidates:
-        return MixInterpretation(selected_entities=[], retrieval_subqueries=[question])
+        return finish(MixInterpretation(selected_entities=[], retrieval_subqueries=[question]))
     if isinstance(llm_provider, LocalEchoLLMProvider):
-        return _fallback_mix_interpretation(candidates)
+        return finish(_fallback_mix_interpretation(candidates))
 
     entity_lines = []
     for idx, (name, description, score) in enumerate(candidates[:20], start=1):
@@ -1713,7 +1743,7 @@ async def _interpret_mix_queries(
     try:
         result = await llm_provider.structured_extract(prompt=prompt, schema=schema)
     except Exception:
-        return _fallback_mix_interpretation(candidates)
+        return finish(_fallback_mix_interpretation(candidates))
 
     selected_entities = [name for name, _, _ in candidates]
     retrieval_subqueries = [
@@ -1723,17 +1753,17 @@ async def _interpret_mix_queries(
     ]
 
     if not retrieval_subqueries:
-        return _fallback_mix_interpretation(candidates)
+        return finish(_fallback_mix_interpretation(candidates))
 
     logger.info(
         "graph_rag mix_interpretation_done selected_entities=%s subqueries=%s",
         selected_entities[:8],
         retrieval_subqueries[:4],
     )
-    return MixInterpretation(
-        selected_entities=selected_entities[:8],
+    return finish(MixInterpretation(
+        selected_entities=selected_entities,
         retrieval_subqueries=retrieval_subqueries[:4],
-    )
+    ))
 
 
 def _diagnostic_entity_text(question: str) -> str:
@@ -1848,14 +1878,24 @@ async def _mix_state(
         namespace_id=namespace_id,
         llm_profile_id=llm_profile_id,
     )
-    interpretation = await _interpret_mix_queries(question, candidates, llm_provider)
+    interpretation = await _interpret_mix_queries(
+        question, candidates, llm_provider,
+        collection=collection, document_ids=document_ids,
+    )
 
     anchor_state = await _entity_anchor_state(
         collection,
         interpretation.selected_entities,
         query_tokens=query_tokens,
         document_ids=document_ids,
+        entity_ids={t["graph_id"] for t in interpretation.node_decisions if t["included"]},
     )
+
+    anchor_state.node_gate_complete = True
+    anchor_state.relevance_decisions = interpretation.node_decisions
+    for trace in interpretation.node_decisions:
+        if trace["included"] and trace.get("graph_id"):
+            anchor_state.entity_relevance[trace["graph_id"]] = trace["probabilities"]["true"]
 
     # Batch-embed all subquery relationship queries in one API call.
     subqueries = interpretation.retrieval_subqueries

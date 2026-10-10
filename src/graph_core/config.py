@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     # estimate using cl100k_base, not the decision model's own tokenizer.
     decision_model_batch_token_budget: int = Field(default=6000, ge=256)
     decision_model_batch_max_questions: int = Field(default=64, ge=1)
+    # Staged query schemas use the conservative budget verified in edge tests.
+    decision_model_query_batch_token_budget: int = Field(default=2500, ge=256)
     provider_semaphore_lease_seconds: int = 1800
     provider_semaphore_poll_interval_ms: int = 100
     provider_semaphore_acquire_timeout_seconds: float = 600
