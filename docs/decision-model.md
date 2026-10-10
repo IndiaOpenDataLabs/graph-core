@@ -23,7 +23,7 @@ SystemOne calls use the existing Redis semaphore infrastructure with a separate 
 
 Custom Graph RAG ingestion plans identity decisions per chunk, not per entity:
 
-1. Propose identity pairs from aliases, bounded embedding candidates and fuzzy names. Deduplicate pairs across these paths; include earlier entities from the same chunk. Score multiple pairs jointly with the source passage supplied once per request.
+1. Propose identity pairs from aliases, bounded embedding candidates and fuzzy names. Deduplicate pairs across these paths; include earlier entities from the same chunk. Score multiple pairs jointly with the source passage supplied once per request. Identity rules use request-level `instructions`; each typed question explicitly names and references its incoming/candidate entities and asks for referential identity using their descriptions and source passage. Instructions are not stored as a task directive inside `state`.
 2. Apply identity decisions and persist canonical entity/relationship identities in short transactions.
 3. Persist extracted descriptions and their original passages, document references, chunk hashes and relationship endpoint names. New descriptions are embedded without a source-support acceptance gate.
 4. Check the description snapshot under a write lock. If another chunk added evidence while embeddings were prepared, merge against a fresh snapshot rather than overwriting it. Deadlock retries repeat only the rolled-back write, not identity inference or previously committed entities.

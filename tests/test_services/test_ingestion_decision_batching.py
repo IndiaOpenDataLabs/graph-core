@@ -13,7 +13,11 @@ from sqlalchemy import select
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
 from graph_core.decisions import GraphDecisions, SystemOneDecisionProvider
-from graph_core.decisions.batching import estimated_tokens, support_record
+from graph_core.decisions.batching import (
+    estimated_tokens,
+    identity_record,
+    support_record,
+)
 from graph_core.decisions.systemone import DecisionError
 from graph_core.models.graph_rag import (
     EntityAlias,
@@ -126,6 +130,79 @@ async def test_oversized_single_item_fails_without_truncation(monkeypatch):
     with pytest.raises(DecisionError, match="Evidence was not truncated"):
         await scorer(calls).support_many(claims(1, "source " * 2000))
     assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("packing", ["together", "question_cap", "token_budget"])
+async def test_identity_uses_real_instructions_and_explicit_pair_bindings(
+    monkeypatch, packing
+):
+    source = "Idā and Ida name the lunar nadi. Pingala is a distinct solar nadi."
+    items = [
+        {
+            "id": f"identity_{i}",
+            "incoming_id": "0",
+            "candidate_id": str(i),
+            "incoming": {
+                "name": "Idā",
+                "type": "NADI",
+                "description": "The lunar nadi.",
+            },
+            "candidate": {"name": name, "type": "NADI", "descriptions": [description]},
+        }
+        for i, (name, description) in enumerate(
+            [
+                ("Ida", "The lunar nadi."),
+                ("Pingala", "The solar nadi."),
+                ("Lunar Nadi", "The channel associated with the moon."),
+            ]
+        )
+    ]
+    monkeypatch.setattr(settings, "decision_model_batch_token_budget", 6000)
+    monkeypatch.setattr(settings, "decision_model_batch_max_questions", 64)
+    if packing == "question_cap":
+        monkeypatch.setattr(settings, "decision_model_batch_max_questions", 2)
+    elif packing == "token_budget":
+        monkeypatch.setattr(
+            settings,
+            "decision_model_batch_token_budget",
+            estimated_tokens(identity_record(items[:2], source)),
+        )
+    calls = []
+    decisions = await scorer(calls).identity_many(items, source)
+    assert set(decisions) == {item["id"] for item in items}
+    assert len(calls) == (1 if packing == "together" else 2)
+    for call in calls:
+        assert "referential identity, NOT semantic similarity" in call["instructions"]
+        assert "task_instructions" not in call["state"]
+        assert call["state"]["source_passage"] == source
+        assert json.dumps(call, ensure_ascii=False).count(source) == 1
+        # Packing estimates the builder's record; the provider may serialize
+        # top-level keys in a different order (notably with Unicode names).
+        packed = identity_record(
+            [item for item in items if item["id"] in call["questions"]], source
+        )
+        assert call == packed
+        assert estimated_tokens(packed) <= settings.decision_model_batch_token_budget
+        for key, question in call["questions"].items():
+            pair = next(p for p in call["state"]["pairs"] if p["id"] == key)
+            instruction = question["instructions"]
+            assert f"incoming_entities[{pair['incoming_id']!r}]" in instruction
+            assert f"candidate_entities[{pair['candidate_id']!r}]" in instruction
+            assert (
+                repr(call["state"]["incoming_entities"][pair["incoming_id"]]["name"])
+                in instruction
+            )
+            assert (
+                repr(call["state"]["candidate_entities"][pair["candidate_id"]]["name"])
+                in instruction
+            )
+            assert question["type"] == "choice"
+            assert set(question["criteria"]) == {"same", "different", "uncertain"}
+            assert (
+                decisions[key].trace("entity_identity")["instructions"]
+                == call["instructions"]
+            )
 
 
 def resolver_for(collection, calls, choose=None, before_request=None):
