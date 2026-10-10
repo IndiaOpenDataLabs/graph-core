@@ -4,7 +4,7 @@ import inspect
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -15,7 +15,7 @@ from sqlalchemy.exc import DBAPIError
 from graph_core.models.chunk import IngestionChunk
 from graph_core.models.graph_rag import GraphEntity
 from graph_core.models.job import Job, JobEvent
-from graph_core.services.graph.ingestion import chunk_status
+from graph_core.services.graph.ingestion import chunk_status, document_pipeline
 from graph_core.services.graph_rag import entity_resolver
 from graph_core.services.graph_rag.entity_resolver import (
     EntityResolutionResult,
@@ -275,6 +275,119 @@ async def test_retry_dispatch_waits_only_when_pending_work_cannot_start(
     else:
         await run(str(job.id))
     assert dispatch.await_count == int(status == "running")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [0, 1])
+async def test_chunk_message_publish_failure_restores_unpublished_rows_and_bootstrap_retries(
+    db_session,
+    test_namespace,
+    test_graph_rag_collection,
+    monkeypatch,
+    fail_at,
+):
+    job = await make_job(db_session, test_namespace.id, ["failed"] * 3)
+    job.collection_id = test_graph_rag_collection.id
+    await db_session.commit()
+    job_id = job.id
+    monkeypatch.setattr(ingestion.dispatch_retried_chunks, "send", Mock())
+    await chunk_status.retry_failed_chunks(job_id, test_namespace.id)
+    monkeypatch.setattr(
+        document_pipeline, "is_job_cancelled", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        document_pipeline, "_resolve_chunk_dispatch_limit", lambda *args: 3
+    )
+    monkeypatch.setattr(document_pipeline.settings, "llm_max_concurrent_calls", 3)
+    reserve = AsyncMock(side_effect=[f"token-{i}" for i in range(6)])
+    release = AsyncMock()
+    monkeypatch.setattr(document_pipeline, "try_reserve_llm_call_slot", reserve)
+    monkeypatch.setattr(document_pipeline, "release_llm_call_slot", release)
+    monkeypatch.setattr(
+        ingestion, "dispatch_pending_chunks", document_pipeline.dispatch_pending_chunks
+    )
+    successful_publications = []
+    attempts = 0
+
+    def publish(*args):
+        nonlocal attempts
+        attempt = attempts
+        attempts += 1
+        if attempt == fail_at:
+            raise RuntimeError("chunk broker unavailable")
+        successful_publications.append(args)
+
+    monkeypatch.setattr(ingestion.run_chunk, "send", Mock(side_effect=publish))
+    run = inspect.unwrap(ingestion.dispatch_retried_chunks.fn)
+    with pytest.raises(RuntimeError, match="chunk broker unavailable"):
+        await run(str(job_id))
+
+    async def snapshot():
+        async with document_pipeline.AsyncSessionLocal() as session:
+            return (
+                await session.scalars(
+                    select(IngestionChunk)
+                    .where(IngestionChunk.job_id == job_id)
+                    .order_by(IngestionChunk.chunk_index)
+                )
+            ).all()
+
+    rows = await snapshot()
+    assert [c.status for c in rows] == ["processing"] * fail_at + ["pending"] * (
+        3 - fail_at
+    )
+    for chunk in rows[fail_at:]:
+        assert chunk.processing_started_at is None
+        assert chunk.lease_expires_at is None
+    assert [call.kwargs["token"] for call in release.await_args_list] == [
+        f"token-{i}" for i in range(fail_at, 3)
+    ]
+    # This is Dramatiq's next bootstrap attempt: no lease expiry or manual
+    # API intervention is needed, even when a previous message was published.
+    await run(str(job_id))
+    assert [args[1] for args in successful_publications] == [0, 1, 2]
+    assert all(c.status == "processing" for c in await snapshot())
+    assert release.await_count == 3 - fail_at
+    if fail_at:
+        assert successful_publications[0][-1] == "token-0"
+        assert rows[0].lease_expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_publish_recovery_does_not_reset_terminal_or_reassigned_leases(
+    db_session,
+    test_namespace,
+):
+    job = await make_job(
+        db_session,
+        test_namespace.id,
+        ["completed", "processing", "processing"],
+        status="running",
+    )
+    old_lease = datetime.now(timezone.utc) + timedelta(minutes=1)
+    newer_lease = old_lease + timedelta(minutes=1)
+    rows = (
+        await db_session.scalars(
+            select(IngestionChunk)
+            .where(IngestionChunk.job_id == job.id)
+            .order_by(IngestionChunk.chunk_index)
+        )
+    ).all()
+    rows[1].lease_expires_at = newer_lease
+    rows[2].lease_expires_at = old_lease
+    await db_session.commit()
+    await document_pipeline._restore_unpublished_chunks(
+        job.id,
+        [
+            (SimpleNamespace(id=row.id, lease_expires_at=old_lease), None)
+            for row in rows
+        ],
+    )
+    for row in rows:
+        await db_session.refresh(row)
+    assert [row.status for row in rows] == ["completed", "processing", "pending"]
+    assert rows[1].lease_expires_at is not None
+    assert rows[2].lease_expires_at is None
 
 
 class DatabaseFailure(Exception):
