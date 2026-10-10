@@ -1,5 +1,11 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import App from "./App";
 import { connectionKey } from "./connection";
 import type { Job } from "./api";
@@ -27,7 +33,7 @@ const calls: {
   token: string | undefined;
   body: Record<string, unknown> | undefined;
 }[] = [];
-function mockApi(jobs: Job[] = []) {
+function mockApi(jobs: Job[] = [], response = result.response) {
   calls.length = 0;
   vi.stubGlobal(
     "fetch",
@@ -63,7 +69,8 @@ function mockApi(jobs: Job[] = []) {
         data = { job_id: "job-one", status: "queued" };
       else if (path === "/api/jobs/job-one")
         data = { id: "job-one", status: "completed", progress_percent: 100 };
-      else if (path.endsWith("/result")) data = { result };
+      else if (path.endsWith("/result"))
+        data = { result: { ...result, response } };
       else if (path === "/api/platform/profiles")
         data = { profile_id: "profile-one" };
       else throw new Error(`Unexpected request: ${path}`);
@@ -89,6 +96,27 @@ async function connectUser() {
   fireEvent.click(screen.getByRole("button", { name: "Connect" }));
   await screen.findByLabelText("Your question");
 }
+
+it("renders Markdown answers with headings, lists and tables without executing raw HTML", async () => {
+  mockApi(
+    [],
+    "# Finding\n\n- **Important** evidence\n\n| Entity | Role |\n| --- | --- |\n| Ada | Author |\n\n<script>alert('unsafe')</script>",
+  );
+  const { container } = render(<App />);
+  await connectUser();
+  fireEvent.change(screen.getByLabelText("Your question"), {
+    target: { value: "Who is Ada?" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Run query →" }));
+  expect(
+    await screen.findByRole("heading", { name: "Finding" }),
+  ).toBeInTheDocument();
+  const answer = container.querySelector(".prose") as HTMLElement;
+  expect(within(answer).getByRole("list")).toBeInTheDocument();
+  expect(within(answer).getByRole("table")).toBeInTheDocument();
+  expect(within(answer).getByText("Important").tagName).toBe("STRONG");
+  expect(container.querySelector("script")).toBeNull();
+});
 
 it("selects a namespace as admin, queries with its scoped token, and inspects retrieved content", async () => {
   mockApi();

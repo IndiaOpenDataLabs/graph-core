@@ -187,6 +187,7 @@ class GraphRAGVectorStore:
         embedding: list[float],
         document_id: uuid.UUID | None = None,
         document_path: str | None = None,
+        session: AsyncSession | None = None,
     ) -> None:
         tbl = table_name(collection_id, "relationship_embeddings")
         dimensions = await get_collection_dimensions(collection_id)
@@ -195,7 +196,13 @@ class GraphRAGVectorStore:
 
         cast = _vector_cast_sql(dimensions)
 
-        async with AsyncSessionLocal() as session:
+        owns_session = session is None
+        if session is None:
+            session = AsyncSessionLocal()
+
+        try:
+            # Flush pending relationship rows before the FK-dependent raw SQL.
+            await session.flush()
             await session.execute(
                 text(
                     f"INSERT INTO {tbl} "
@@ -213,7 +220,11 @@ class GraphRAGVectorStore:
                     "emb": _embedding_literal(embedding),
                 },
             )
-            await session.commit()
+            if owns_session:
+                await session.commit()
+        finally:
+            if owns_session:
+                await session.close()
 
     async def search_relationship_embeddings(
         self,

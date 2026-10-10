@@ -38,6 +38,8 @@ export interface Job {
   type: string;
   status: string;
   progress_percent?: number;
+  chunks_total?: number;
+  chunks_completed?: number;
   error?: string | null;
   collection_id?: string;
   document_path?: string | null;

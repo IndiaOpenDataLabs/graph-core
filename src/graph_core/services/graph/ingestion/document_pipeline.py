@@ -14,7 +14,7 @@ from typing import Iterable
 
 import redis.asyncio as aioredis
 from dramatiq.message import Message
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 
 from graph_core.config import settings
 from graph_core.database import AsyncSessionLocal
@@ -582,27 +582,68 @@ async def dispatch_pending_chunks(job_id: uuid.UUID, slots: int | None = None) -
 
     from graph_core.workers.ingestion import run_chunk
 
+    published = 0
     try:
-        for chunk_index, token in (
-            (chunk.chunk_index, token) for chunk, token in reserved_chunks
-        ):
+        for chunk, token in reserved_chunks:
             run_chunk.send(  # type: ignore[attr-defined]
                 str(job_id),
-                chunk_index,
+                chunk.chunk_index,
                 llm_scope,
                 llm_limit,
                 token,
             )
+            published += 1
     except Exception:
-        for _, token in reserved_chunks:
-            await release_llm_call_slot(
-                scope=llm_scope,
-                token=token,
-                max_concurrent_calls=llm_limit,
-            )
+        # Only successful sends belong to workers. Restore the failed send and
+        # unattempted reservations before the bootstrap actor retries, rather
+        # than leaving processing rows with no messages and unexpired leases.
+        unpublished = reserved_chunks[published:]
+        logger.warning(
+            "Chunk dispatch publish failed job=%s published=%d unpublished=%d; "
+            "restoring unpublished reservations",
+            job_id, published, len(unpublished),
+        )
+        try:
+            await _restore_unpublished_chunks(job_id, unpublished)
+        finally:
+            # Published workers still own their tokens; releasing those here
+            # would allow more work than the provider's concurrency limit.
+            for _, token in unpublished:
+                await release_llm_call_slot(
+                    scope=llm_scope,
+                    token=token,
+                    max_concurrent_calls=llm_limit,
+                )
         raise
 
-    return len(reserved_chunks)
+    return published
+
+
+async def _restore_unpublished_chunks(
+    job_id: uuid.UUID,
+    reservations: list[tuple[IngestionChunk, str | None]],
+) -> None:
+    """Undo only this dispatch attempt's still-processing reservations."""
+    async with AsyncSessionLocal() as session:
+        for chunk, _ in reservations:
+            await session.execute(
+                update(IngestionChunk)
+                .where(
+                    IngestionChunk.id == chunk.id,
+                    IngestionChunk.job_id == job_id,
+                    IngestionChunk.status == "processing",
+                    IngestionChunk.lease_expires_at == chunk.lease_expires_at,
+                )
+                .values(
+                    status="pending",
+                    error=None,
+                    processing_started_at=None,
+                    lease_expires_at=None,
+                    completed_at=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+        await session.commit()
 
 
 # ── Single-chunk processing ──

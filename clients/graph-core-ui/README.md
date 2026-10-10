@@ -49,11 +49,25 @@ proxy configuration, not a client-side secret. No CORS changes are needed.
    retrieval mode or answer-model profile. The UI polls the durable job until it
    completes; worker/provider failures are shown without fabricating an answer.
 5. **Activity**: see the original question first for each query job, followed by
-   collection details and status, and reopen completed query results.
+   collection details and status, and reopen completed query results. Ingestion jobs
+   show chunk progress and an **Inspect chunks** panel with status/error details,
+   failed-only filtering, pagination, and individual/all-failed retry controls.
 
 Switching namespace clears the workspace. Switching tabs or collections stops
 local polling but does **not** cancel an already-enqueued backend job. Activity
 can reopen completed results.
+
+## Chunk inspection and retries
+
+`GET /jobs/{id}/chunks` lists namespace-scoped chunk status metadata, not document
+text. The panel refreshes every three seconds. Retry controls become available
+when a document-ingestion job has failed and no chunks remain pending/processing.
+`POST /jobs/{id}/retry-failed-chunks` accepts `{}` for all failed chunks or
+`{"chunk_indices": [0, 3]}` for selected zero-based indices. Successful chunks are
+left unchanged; saved chunk text is reused rather than re-chunking the document.
+A **Resume pending chunks** control can recover retries saved before scheduling
+failed or while provider capacity was unavailable. Cancelled jobs cannot be retried.
+These endpoints enforce namespace ownership independently of the older job routes.
 
 ## Retrieval inspection
 
@@ -93,7 +107,9 @@ uv run pytest tests/test_services/test_query_retrieval_context.py -q
   and the sidebar warns that refresh will require signing in.
 - Provider secrets are sent to the API for encrypted registration; they are
   cleared from the form after success and are not stored by the browser client.
-- Text, answers, and raw results are rendered as escaped text, not HTML.
+- Answers render Markdown headings, lists, tables, links and code blocks. Raw HTML
+  in answers is skipped; external links use `noopener noreferrer`. Source/context
+  text and raw results remain escaped text.
 - The dev/preview servers bind loopback only. They are local-development tools,
   not production authentication gateways.
 - `npm run build` writes `dist/`. For production, serve those static files with
