@@ -16,7 +16,7 @@ from graph_core.models.chunk import IngestionChunk
 from graph_core.models.graph_rag import GraphEntity
 from graph_core.models.job import Job, JobEvent
 from graph_core.services.graph.ingestion import chunk_status, document_pipeline
-from graph_core.services.graph_rag import entity_resolver
+from graph_core.services.graph_rag import ingestion_batch
 from graph_core.services.graph_rag.entity_resolver import (
     EntityResolutionResult,
     IncrementalEntityResolver,
@@ -408,10 +408,11 @@ def resolver(collection_id):
 @pytest.mark.parametrize(
     "code,failures,attempts", [("40P01", 1, 2), ("40P01", 3, 3), ("23505", 1, 1)]
 )
-async def test_entity_retries_only_deadlocks_with_fresh_sessions(
+async def test_persistence_retries_only_deadlocks_with_fresh_sessions(
     monkeypatch, code, failures, attempts
 ):
     caller = SimpleNamespace(bind=object(), commit=AsyncMock())
+    await caller.commit()
     sessions = []
 
     @asynccontextmanager
@@ -420,23 +421,23 @@ async def test_entity_retries_only_deadlocks_with_fresh_sessions(
         caller.commit.assert_awaited_once()
         session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
         sessions.append(session)
-        yield session
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
 
     sleep = AsyncMock()
-    monkeypatch.setattr(entity_resolver, "AsyncSessionLocal", factory)
-    monkeypatch.setattr(entity_resolver.asyncio, "sleep", sleep)
-    r = resolver(uuid.uuid4())
+    monkeypatch.setattr(ingestion_batch, "AsyncSessionLocal", factory)
+    monkeypatch.setattr(ingestion_batch.asyncio, "sleep", sleep)
     expected = EntityResolutionResult(True, uuid.uuid4(), "Entity")
     failure = DBAPIError("UPDATE", {}, DatabaseFailure(code))
-    r._resolve_entity_once = AsyncMock(side_effect=[failure] * failures + [expected])
+    apply = AsyncMock(side_effect=[failure] * failures + [expected])
     if failures >= 3 or code != "40P01":
         with pytest.raises(DBAPIError):
-            await r.resolve_entity(caller, "Entity", "CONCEPT", "Fact", "chunk")
+            await ingestion_batch.persist_transaction(caller.bind, apply)
     else:
-        assert (
-            await r.resolve_entity(caller, "Entity", "CONCEPT", "Fact", "chunk")
-            == expected
-        )
+        assert await ingestion_batch.persist_transaction(caller.bind, apply) == expected
     assert len(sessions) == attempts
     assert len({id(s) for s in sessions}) == attempts
     assert sleep.await_count == attempts - 1
@@ -457,7 +458,7 @@ async def test_deadlock_rollback_preserves_previously_committed_work(
         primary_type="CONCEPT",
     )
     db_session.add(earlier)
-    r = resolver(collection_id)
+    await db_session.commit()
     attempts = 0
 
     async def once(session, *args):
@@ -475,9 +476,8 @@ async def test_deadlock_rollback_preserves_previously_committed_work(
             raise DBAPIError("UPDATE", {}, DatabaseFailure("40P01"))
         return EntityResolutionResult(True, entity.id, entity.canonical_name)
 
-    monkeypatch.setattr(r, "_resolve_entity_once", once)
-    monkeypatch.setattr(entity_resolver.asyncio, "sleep", AsyncMock())
-    await r.resolve_entity(db_session, "Retried", "CONCEPT", "Fact", "chunk")
+    monkeypatch.setattr(ingestion_batch.asyncio, "sleep", AsyncMock())
+    await ingestion_batch.persist_transaction(db_session.bind, once)
     rows = (
         await db_session.scalars(
             select(GraphEntity).where(GraphEntity.collection_id == collection_id)
@@ -487,26 +487,48 @@ async def test_deadlock_rollback_preserves_previously_committed_work(
 
 
 @pytest.mark.asyncio
-async def test_new_relationship_embedding_uses_caller_session_and_finishes_commit():
-    r = resolver(uuid.uuid4())
-    session = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(scalar_one_or_none=lambda: None)
-        ),
-        get=AsyncMock(return_value=SimpleNamespace(canonical_name="Endpoint")),
-        add=Mock(),
-        commit=AsyncMock(),
-    )
-    r._resolve_rel_type = AsyncMock(
-        return_value=SimpleNamespace(
-            canonical_type="CONNECTS_TO", relationship_type_id=uuid.uuid4()
+async def test_relationship_embedding_uses_active_writer_transaction(
+    db_session,
+    test_graph_rag_collection,
+):
+    collection_id = test_graph_rag_collection.id
+    source, target = [
+        GraphEntity(
+            id=uuid.uuid4(),
+            collection_id=collection_id,
+            canonical_name=name,
+            primary_type="CONCEPT",
         )
+        for name in ["Source", "Target"]
+    ]
+    db_session.add_all([source, target])
+    await db_session.commit()
+    r = resolver(collection_id)
+    # Prefix-vector DDL is PostgreSQL-specific; keep this SQLite test focused
+    # on the relationship embedding's writer ownership and transaction.
+    r._vstore.ensure_prefix_embeddings_table = AsyncMock()
+    r._vstore.load_all_prefix_embeddings = AsyncMock(return_value={})
+    r._vstore.upsert_prefix_embedding = AsyncMock()
+    writes = []
+
+    async def capture(**kwargs):
+        writer = kwargs["session"]
+        assert writer is not db_session
+        assert writer.bind is db_session.bind
+        assert writer.in_transaction()
+        writes.append(kwargs)
+
+    r._vstore.upsert_relationship_embedding = AsyncMock(side_effect=capture)
+    result = await r.resolve_relationship(
+        db_session,
+        source.id,
+        target.id,
+        "Fact",
+        [],
+        source_chunk_hash="chunk",
+        rel_type="CONNECTS_TO",
     )
-    r._vstore.upsert_relationship_embedding = AsyncMock()
-    await r.resolve_relationship(
-        session, uuid.uuid4(), uuid.uuid4(), "Fact", [], 1.0, "chunk"
-    )
-    assert (
-        r._vstore.upsert_relationship_embedding.await_args.kwargs["session"] is session
-    )
-    assert session.commit.await_count == 2
+    assert len(writes) == 1
+    assert writes[0]["relationship_id"] == result.relationship_id
+    assert writes[0]["description"] == "Fact"
+    assert not writes[0]["session"].in_transaction()
